@@ -17,7 +17,6 @@ outbox runtime. Stable/Lazer protocol services will be implemented against this 
 ```bash
 docker compose up -d --wait postgres redis minio
 docker compose run --rm --no-deps minio-init
-uv run alembic upgrade head
 ```
 
 PostgreSQL listens on `127.0.0.1:55432`; Redis listens on `127.0.0.1:56379`; MinIO listens on `127.0.0.1:59000`, with its
@@ -26,8 +25,8 @@ console on `127.0.0.1:59001`. Copy `.env.example` to `.env` only when local valu
 ### VS Code
 
 Select `perfcho: all processes` in Run and Debug and press F5. The compound launch configuration synchronizes locked
-dependencies, starts and waits for PostgreSQL, Redis, and MinIO, initializes the object-storage bucket, applies Alembic
-migrations, and then debugs these roles in parallel:
+dependencies, starts and waits for PostgreSQL, Redis, and MinIO, initializes the object-storage bucket, and then debugs
+these roles in parallel:
 
 - API
 - Outbox Relay
@@ -56,11 +55,11 @@ docker compose --env-file .env.production -f compose.prod.yaml up -d --build
 docker compose --env-file .env.production -f compose.prod.yaml ps
 ```
 
-The production topology runs PostgreSQL, authenticated Redis, a one-shot Alembic migration, API, Outbox Relay, and
-Taskiq Worker. S3-compatible object storage remains an external production dependency. Only the API is published, on
-`127.0.0.1:8000` by default, for a same-host reverse proxy to terminate TLS. PostgreSQL and Redis use named volumes and
-are not published to the host. Back up PostgreSQL and object storage consistently; Redis AOF is only an availability aid
-and is not the source of durable task truth.
+The production topology runs PostgreSQL, authenticated Redis, API, Outbox Relay, and Taskiq Worker. Database structure
+management is outside Compose. S3-compatible object storage remains an external production dependency. Only the API is
+published, on `127.0.0.1:8000` by default, for a same-host reverse proxy to terminate TLS. PostgreSQL and Redis use named
+volumes and are not published to the host. Back up PostgreSQL and object storage consistently; Redis AOF is only an
+availability aid and is not the source of durable task truth.
 
 ## Verification
 
@@ -69,7 +68,6 @@ uv run ruff format .
 uv run ruff check .
 uv run pytest
 TEST_DATABASE_URL=postgresql+asyncpg://perfcho:perfcho@127.0.0.1:55432/perfcho_test uv run pytest -m postgres
-uv run alembic check
 ```
 
 ## Structure
@@ -82,9 +80,8 @@ src/perfcho/infra/db/
   models/                 Domain-separated models with English purpose docstrings
 src/perfcho/infra/outbox.py  PostgreSQL delivery ledger and Taskiq relay
 src/perfcho/infra/taskiq.py  Redis Stream broker and worker lifecycle
-alembic/versions/         Immutable schema migrations
 .agent-space/docs/        Chinese architecture, operations, and business contracts
-tests/                    Metadata and PostgreSQL migration tests
+tests/                    Infrastructure and domain contract tests
 ```
 
 See [the database architecture](.agent-space/docs/database/architecture.md) before changing a model or adding a

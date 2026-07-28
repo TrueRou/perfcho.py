@@ -8,7 +8,6 @@ authors = [
 ]
 dependencies = [
     "aioboto3>=15.5.0",
-    "alembic>=1.17.0",
     "argon2-cffi>=25.1.0",
     "asyncpg>=0.31.0",
     "fastapi>=0.123.0",
@@ -62,12 +61,8 @@ markers = ["postgres: requires the PostgreSQL Compose service"]
 
 [tool.coverage.run]
 source = ["src"]
-omit = ["*/tests/*", "*/alembic/*"]
+omit = ["*/tests/*"]
 
 [tool.coverage.report]
 show_missing = true
 fail_under = 80
-
-[tool.alembic]
-script_location = "%(here)s/alembic"
-prepend_sys_path = ["."]

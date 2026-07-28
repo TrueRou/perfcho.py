@@ -71,25 +71,16 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
 
-  migrate:
+  api:
     <<: *app
     build:
       context: .
-    command: ["alembic", "upgrade", "head"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-    init: false
-    restart: "no"
-
-  api:
-    <<: *app
     command: ["uvicorn", "perfcho.main:asgi_app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
     ports:
       - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PUBLISHED_PORT:-8000}:8000"
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
@@ -107,8 +98,8 @@ services:
     <<: *app
     command: ["python", "-m", "perfcho.infra.outbox"]
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
 
@@ -124,8 +115,8 @@ services:
       - --workers
       - ${TASKIQ_WORKERS:-2}
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
 

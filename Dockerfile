@@ -19,8 +19,6 @@ RUN uv python install 3.14t && \
     uv sync --locked --no-install-project
 
 COPY src ./src
-COPY alembic.ini ./
-COPY alembic ./alembic
 RUN uv sync --locked --no-editable && \
     chmod -R a+rX /opt/uv/python /app
 

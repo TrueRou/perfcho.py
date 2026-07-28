@@ -2,30 +2,18 @@
 
 ## 本地依赖
 
-启动 PostgreSQL 17、Redis 8 与 MinIO，初始化对象存储桶并应用数据库结构：
+启动 PostgreSQL 17、Redis 8 与 MinIO，并初始化对象存储桶：
 
 ```bash
 docker compose up -d --wait postgres redis minio
 docker compose run --rm --no-deps minio-init
-uv run alembic upgrade head
 ```
 
 PostgreSQL 监听 `127.0.0.1:55432`。Redis 监听 `127.0.0.1:56379`，DB 0 保存在线状态，DB 1 承载 Taskiq Stream。MinIO API 监听 `127.0.0.1:59000`，控制台监听 `127.0.0.1:59001`。开发库为 `perfcho`，集成测试库为 `perfcho_test`。只有需要覆盖本地默认值时才创建 `.env`。
 
-VS Code 中选择 `perfcho: all processes` 后按 F5，会并行执行依赖同步与 Compose 基础设施启动，待 PostgreSQL、Redis、MinIO 健康后幂等初始化对象存储桶并执行 Alembic Upgrade，最后同时调试 API、Outbox Relay 和 Taskiq Worker。结束调试只停止三个应用进程，基础设施保持运行；不再需要时执行 `docker compose down`。
+VS Code 中选择 `perfcho: all processes` 后按 F5，会并行执行依赖同步与 Compose 基础设施启动，待 PostgreSQL、Redis、MinIO 健康后幂等初始化对象存储桶，最后同时调试 API、Outbox Relay 和 Taskiq Worker。结束调试只停止三个应用进程，基础设施保持运行；不再需要时执行 `docker compose down`。
 
-当前 `0001` 是重新生成的中心化基线，不提供旧结构升级路径。已有旧开发库必须显式删除并重新创建；不要对需要保留数据的数据库执行这一操作。
-
-## Migration 流程
-
-1. 同时修改 SQLAlchemy Metadata 与测试。
-2. 创建显式 Alembic Revision。当前 `0001_initial_schema.py` 从本次中心化基线起禁止修改。
-3. 检查约束名、Server Default、Schema 限定、部分索引条件和 Downgrade 顺序。
-4. 在空数据库以及上一 Revision 的数据库副本上执行 Upgrade。
-5. 执行 `uv run alembic check`，必须不存在 Metadata Drift。
-6. Downgrade 只用于集成测试；生产回滚通常应使用新的前向修复 Migration。
-
-应用启动只检查数据库连通性。Migration 必须作为部署任务执行一次，并在新应用实例接收流量前完成。
+SQLAlchemy Metadata 是应用内数据库结构契约。数据库结构的创建和变更由 Compose 之外的部署流程负责；应用启动只检查数据库连通性，不创建或修改 Schema。
 
 ## 集成验证
 
@@ -35,7 +23,7 @@ TEST_DATABASE_URL=postgresql+asyncpg://perfcho:perfcho@127.0.0.1:55432/perfcho_t
   uv run pytest -m postgres
 ```
 
-集成测试会清理测试 Schema、升级至 Head、检查 Seed 和关键约束、降级至 Base，然后再次升级。SQLite 不受支持，因为它无法验证 Schema、`jsonb`、`inet`、部分索引、Identity 行为和 PostgreSQL CHECK 表达式。
+SQLite 不受支持，因为它无法验证 Schema、`jsonb`、`inet`、部分索引、Identity 行为和 PostgreSQL CHECK 表达式。
 
 ## 进程启动
 
@@ -56,7 +44,7 @@ docker compose --env-file .env.production -f compose.prod.yaml up -d --build
 docker compose --env-file .env.production -f compose.prod.yaml ps
 ```
 
-生产拓扑的启动顺序为 PostgreSQL/Redis 健康、一次性 Migration 成功、API/Relay/Taskiq 启动。三个应用角色使用同一 Python 3.14t 镜像并独立监管；API 提供 HTTP 健康检查，Relay 与 Taskiq 由主进程退出状态触发重启，并结合最老 Delivery 延迟、Dead Letter 和 Redis Pending Entry 监控判断业务健康。
+生产拓扑等待 PostgreSQL/Redis 健康后启动 API/Relay/Taskiq。数据库结构由 Compose 之外的部署流程负责。三个应用角色使用同一 Python 3.14t 镜像并独立监管；API 提供 HTTP 健康检查，Relay 与 Taskiq 由主进程退出状态触发重启，并结合最老 Delivery 延迟、Dead Letter 和 Redis Pending Entry 监控判断业务健康。
 
 PostgreSQL 与 Redis 不发布宿主机端口。生产对象存储是 Compose 外部依赖，必须与 PostgreSQL Manifest 的事务点一致备份。API 默认只发布到 `127.0.0.1:8000`，由同机反向代理终止 TLS；必须显式修改 `APP_BIND_ADDRESS` 才能监听其他地址。`perfcho-postgres` 和 `perfcho-redis` 是生产持久卷，执行 `down` 时禁止附带 `--volumes`，除非已确认永久删除数据。
 
@@ -69,7 +57,7 @@ PostgreSQL 与 Redis 不发布宿主机端口。生产对象存储是 Compose �
 
 ## 备份与恢复
 
-- 使用 PostgreSQL 原生逻辑或物理备份，并包含所有领域 Schema 和 `alembic_version`。
+- 使用 PostgreSQL 原生逻辑或物理备份，并包含所有领域 Schema。
 - 回放与媒体对象存储必须和 Manifest 数据库事务点一起备份。
 - 恢复测试除了行数外，还必须验证 Replay Hash 与 Media Storage Key。
 - 加密和 HMAC Key 在 PostgreSQL 外管理；备份必须保存对应 Key Version 的恢复关系。

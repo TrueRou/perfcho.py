@@ -50,18 +50,7 @@
             "problemMatcher": []
         },
         {
-            "label": "dev: migrate database",
-            "type": "process",
-            "command": "uv",
-            "args": [
-                "run",
-                "alembic",
-                "upgrade",
-                "head"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
+            "label": "dev: prepare",
             "dependsOn": [
                 "dev: sync dependencies",
                 "dev: initialize object storage"

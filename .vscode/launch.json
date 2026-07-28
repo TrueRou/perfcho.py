@@ -54,7 +54,7 @@
                 "Relay",
                 "Taskiq Worker"
             ],
-            "preLaunchTask": "dev: migrate database",
+            "preLaunchTask": "dev: prepare",
             "stopAll": true
         }
     ]

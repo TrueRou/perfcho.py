@@ -59,7 +59,7 @@
 - **模型与数据库工具：**
   - SQLModel/ORM 模型在 `app/database/`。
   - 非数据库模型在 `app/models/`。
-  - 修改模型/schema 时必须生成 Alembic 迁移，并手动检查生成的 SQL 与索引。
+  - 修改模型/schema 时必须同步更新数据库结构定义，并手动检查 SQL 与索引。
 
 - **服务层：** `app/service/` 保存领域逻辑（如缓存工具、通知/邮件逻辑）。复杂逻辑应放在 service，而不是路由处理器中。
 
@@ -95,7 +95,7 @@
   ```
 
 - **添加后台任务：** 将任务逻辑写在 `app/service/_job.py`（幂等、可重试）。调度器入口放在 `app/scheduler/_scheduler.py`，并在应用生命周期注册。
-- **数据库 schema 变更：** 修改 `app/models/` 中的 SQLModel 模型，运行 `alembic revision --autogenerate`，检查迁移并本地测试 `alembic upgrade head` 后再提交。
+- **数据库 schema 变更：** 修改 `app/models/` 中的 SQLModel 模型，同步更新数据库结构并在本地验证后再提交。
 - **缓存写入与响应：** 使用现有的 `UserResp` 模式和 `UserCacheService`；异步缓存写入应使用后台任务。
 
 ### 提示指导（给 LLM/Copilot 的输入）
@@ -122,9 +122,7 @@ pre-commit install
 pre-commit run --all-files
 pyright
 ruff .
-alembic revision --autogenerate -m "feat(db): ..."
-alembic upgrade head
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+  uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### PR 范围指导
@@ -137,7 +135,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 > GitHub Copilot PR review 可参考。
 
 1. 如果 PR 修改了端点，简要说明端点的用途和预期行为。同时检查是否满足上述的 API 位置限制。
-2. 如果 PR 修改了数据库模型，必须包含 Alembic 迁移。检查迁移的 SQL 语句和索引是否合理。
+2. 如果 PR 修改了数据库模型，必须包含对应的数据库结构变更。检查 SQL 语句和索引是否合理。
 3. 修改的其他功能需要提供简短的说明。
 4. 提供性能优化的建议（见下文）。
 
@@ -181,4 +179,3 @@ found = await session.scalar(exists_stmt)
 ### Claude Code
 
 - 禁止创建额外的测试脚本。
-
