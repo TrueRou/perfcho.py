@@ -1,3 +1,5 @@
+"""Configure the Redis Stream Taskiq worker process lifecycle."""
+
 from taskiq import TaskiqEvents, TaskiqState
 from taskiq_redis import RedisStreamBroker
 
@@ -17,5 +19,6 @@ broker = RedisStreamBroker(
 
 @broker.on_event(TaskiqEvents.WORKER_STARTUP)
 async def worker_startup(state: TaskiqState) -> None:
+    """Create worker-owned database resources after process startup."""
     state.db_engine = await infra_db.create_engine()
     state.db_session_factory = infra_db.create_session_factory(state.db_engine)

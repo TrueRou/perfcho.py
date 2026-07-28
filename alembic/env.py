@@ -1,3 +1,5 @@
+"""Configure offline and asynchronous online Alembic migrations."""
+
 import asyncio
 from logging.config import fileConfig
 
@@ -21,6 +23,7 @@ assert models
 
 
 def run_migrations_offline() -> None:
+    """Render migrations without opening a database connection."""
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
@@ -37,6 +40,7 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
+    """Apply migrations through an existing synchronous connection."""
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
@@ -50,6 +54,7 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_async_migrations() -> None:
+    """Create a temporary async engine and apply pending migrations."""
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
@@ -63,6 +68,7 @@ async def run_async_migrations() -> None:
 
 
 def run_migrations_online() -> None:
+    """Run migrations with an injected or newly created connection."""
     connectable = config.attributes.get("connection", None)
 
     if connectable is None:

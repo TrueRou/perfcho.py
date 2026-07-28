@@ -1,3 +1,5 @@
+"""Map immutable beatmap content and community metadata."""
+
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -164,6 +166,9 @@ class BeatmapRevision(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     )
 
     beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="RESTRICT"), nullable=False)
+    file_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("core.media_assets.id", ondelete="RESTRICT"), unique=True
+    )
     md5: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
     sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)

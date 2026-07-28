@@ -1,3 +1,5 @@
+"""Map play attempts, scores, replays, and ranking projections."""
+
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
@@ -19,6 +21,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -98,6 +101,13 @@ class CalculationRelease(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __table_args__ = (
         UniqueConstraint("kind", "ruleset", "engine", "artifact_digest"),
         Index("ix_calculation_releases_active", "kind", "ruleset", "active"),
+        Index(
+            "uq_calculation_releases_active_kind_ruleset",
+            "kind",
+            "ruleset",
+            unique=True,
+            postgresql_where=text("active"),
+        ),
         {"schema": "scoring"},
     )
 
@@ -280,6 +290,12 @@ class RankingPolicy(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __table_args__ = (
         UniqueConstraint("code", "version"),
         Index("ix_ranking_policies_active", "scoreboard_id", "active"),
+        Index(
+            "uq_ranking_policies_active_scoreboard",
+            "scoreboard_id",
+            unique=True,
+            postgresql_where=text("active"),
+        ),
         {"schema": "scoring"},
     )
 

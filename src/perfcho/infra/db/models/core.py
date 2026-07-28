@@ -1,3 +1,5 @@
+"""Map canonical account identities, profiles, and media assets."""
+
 import uuid
 from datetime import datetime
 
@@ -31,6 +33,7 @@ class Account(DbBase):
 
     __tablename__ = "accounts"
     __table_args__ = (
+        CheckConstraint("id BETWEEN 1 AND 2147483647", name="stable_id_range"),
         CheckConstraint("country_code IS NULL OR country_code ~ '^[A-Z]{2}$'", name="country_code_format"),
         Index("ix_accounts_status_id", "status", "id"),
         Index("ix_accounts_country_id", "country_code", "id"),

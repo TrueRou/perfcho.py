@@ -1,3 +1,5 @@
+"""Provide bounded pagination contracts for administrative HTTP APIs."""
+
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,11 +9,15 @@ MAX_RESULTS_PER_PAGE = 50
 
 
 class PaginationParams(BaseModel):
+    """Validate page-number pagination supplied by an API caller."""
+
     page_number: int = Field(default=1, ge=1)
     page_size: int = Field(default=10, ge=1, le=MAX_RESULTS_PER_PAGE)
 
 
 class Page[T](BaseModel):
+    """Return one page together with total row and page metadata."""
+
     records: list[T] = Field()
     total_row: int = Field(ge=0)
     total_page: int = Field(ge=0)
@@ -24,6 +30,7 @@ async def paginate[T](
     query: Select[T],
     params: PaginationParams,
 ) -> Page[T]:
+    """Execute a bounded count and page query in the caller transaction."""
     total_row = await session.scalar(select(func.count()).select_from(query.subquery()))
     if not isinstance(total_row, int):
         raise RuntimeError("Database error occurred while fetching `total_row`.")

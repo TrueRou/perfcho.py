@@ -1,9 +1,12 @@
+"""Create the Redis connection used for bounded online state."""
+
 from redis.asyncio import Redis
 
 from perfcho.infra.settings import settings
 
 
 async def create_redis() -> Redis:
+    """Create a binary Redis client and fail fast when unavailable."""
     redis_engine = Redis.from_url(
         settings.redis_state_url,
         decode_responses=False,

@@ -9,17 +9,32 @@ outbox runtime. Stable/Lazer protocol services will be implemented against this 
 
 - Python 3.14t
 - uv
-- PostgreSQL 17 and Redis 8, normally started through Docker Compose
+- Docker Compose V2
+- PostgreSQL 17, Redis 8, and S3-compatible object storage, normally started through Docker Compose
 
 ## Development dependencies
 
 ```bash
-docker compose up -d postgres redis
+docker compose up -d --wait postgres redis minio
+docker compose run --rm --no-deps minio-init
 uv run alembic upgrade head
 ```
 
-PostgreSQL listens on `127.0.0.1:55432`; Redis listens on `127.0.0.1:56379`. Copy `.env.example` to `.env` only when local
-values need to be overridden.
+PostgreSQL listens on `127.0.0.1:55432`; Redis listens on `127.0.0.1:56379`; MinIO listens on `127.0.0.1:59000`, with its
+console on `127.0.0.1:59001`. Copy `.env.example` to `.env` only when local values need to be overridden.
+
+### VS Code
+
+Select `perfcho: all processes` in Run and Debug and press F5. The compound launch configuration synchronizes locked
+dependencies, starts and waits for PostgreSQL, Redis, and MinIO, initializes the object-storage bucket, applies Alembic
+migrations, and then debugs these roles in parallel:
+
+- API
+- Outbox Relay
+- Taskiq Worker
+
+Stopping one debug session stops all three application roles. PostgreSQL, Redis, and MinIO remain running so that
+subsequent debug sessions start quickly; stop them explicitly with `docker compose down` when they are no longer needed.
 
 Run the process roles separately:
 
@@ -28,6 +43,24 @@ uv run uvicorn perfcho.main:asgi_app --host 127.0.0.1 --port 8000
 uv run taskiq worker perfcho.infra.taskiq:broker perfcho.tasks.outbox --ack-type when_executed
 uv run python -m perfcho.infra.outbox
 ```
+
+## Production Compose
+
+`compose.prod.yaml` is a standalone production topology; do not merge it with the development `compose.yaml`. Create a
+production environment file from `.env.production.example`, replace every credential and signing key, configure the
+external S3-compatible object store, and start the deployment:
+
+```bash
+openssl rand -hex 32
+docker compose --env-file .env.production -f compose.prod.yaml up -d --build
+docker compose --env-file .env.production -f compose.prod.yaml ps
+```
+
+The production topology runs PostgreSQL, authenticated Redis, a one-shot Alembic migration, API, Outbox Relay, and
+Taskiq Worker. S3-compatible object storage remains an external production dependency. Only the API is published, on
+`127.0.0.1:8000` by default, for a same-host reverse proxy to terminate TLS. PostgreSQL and Redis use named volumes and
+are not published to the host. Back up PostgreSQL and object storage consistently; Redis AOF is only an availability aid
+and is not the source of durable task truth.
 
 ## Verification
 
@@ -42,7 +75,7 @@ uv run alembic check
 ## Structure
 
 ```text
-src/perfcho/infra/database/
+src/perfcho/infra/db/
   base.py                 SQLAlchemy metadata and schema registry
   enums.py                Stable cross-domain values
   mixins.py               ID and timestamp policies

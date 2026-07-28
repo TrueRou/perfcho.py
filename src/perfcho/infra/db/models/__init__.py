@@ -1,3 +1,5 @@
+"""Import every canonical model so SQLAlchemy registers all tables."""
+
 from . import (
     audit,
     authz,

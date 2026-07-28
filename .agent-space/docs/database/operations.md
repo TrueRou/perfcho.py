@@ -2,14 +2,17 @@
 
 ## 本地依赖
 
-启动 PostgreSQL 17 与 Redis 8，并应用数据库结构：
+启动 PostgreSQL 17、Redis 8 与 MinIO，初始化对象存储桶并应用数据库结构：
 
 ```bash
-docker compose up -d postgres redis
+docker compose up -d --wait postgres redis minio
+docker compose run --rm --no-deps minio-init
 uv run alembic upgrade head
 ```
 
-PostgreSQL 监听 `127.0.0.1:55432`。Redis 监听 `127.0.0.1:56379`，DB 0 保存在线状态，DB 1 承载 Taskiq Stream。开发库为 `perfcho`，集成测试库为 `perfcho_test`。只有需要覆盖本地默认值时才创建 `.env`。
+PostgreSQL 监听 `127.0.0.1:55432`。Redis 监听 `127.0.0.1:56379`，DB 0 保存在线状态，DB 1 承载 Taskiq Stream。MinIO API 监听 `127.0.0.1:59000`，控制台监听 `127.0.0.1:59001`。开发库为 `perfcho`，集成测试库为 `perfcho_test`。只有需要覆盖本地默认值时才创建 `.env`。
+
+VS Code 中选择 `perfcho: all processes` 后按 F5，会并行执行依赖同步与 Compose 基础设施启动，待 PostgreSQL、Redis、MinIO 健康后幂等初始化对象存储桶并执行 Alembic Upgrade，最后同时调试 API、Outbox Relay 和 Taskiq Worker。结束调试只停止三个应用进程，基础设施保持运行；不再需要时执行 `docker compose down`。
 
 当前 `0001` 是重新生成的中心化基线，不提供旧结构升级路径。已有旧开发库必须显式删除并重新创建；不要对需要保留数据的数据库执行这一操作。
 
@@ -43,6 +46,19 @@ uv run python -m perfcho.infra.outbox
 ```
 
 API、Worker 和 Relay 是同一可信中心应用的进程角色。它们使用相同代码和数据库结构，不注册节点身份。生产环境分别监管进程并进行独立健康检查。
+
+## 生产 Compose
+
+`compose.prod.yaml` 是独立生产拓扑，禁止与包含本地端口和测试库初始化脚本的 `compose.yaml` 合并。根据 `.env.production.example` 创建不提交到 Git 的 `.env.production`，使用 `openssl rand -hex 32` 分别生成数据库、Redis、Password Pepper、Token HMAC 与 Device HMAC 密钥，并配置外部 S3 兼容对象存储凭据，然后执行：
+
+```bash
+docker compose --env-file .env.production -f compose.prod.yaml up -d --build
+docker compose --env-file .env.production -f compose.prod.yaml ps
+```
+
+生产拓扑的启动顺序为 PostgreSQL/Redis 健康、一次性 Migration 成功、API/Relay/Taskiq 启动。三个应用角色使用同一 Python 3.14t 镜像并独立监管；API 提供 HTTP 健康检查，Relay 与 Taskiq 由主进程退出状态触发重启，并结合最老 Delivery 延迟、Dead Letter 和 Redis Pending Entry 监控判断业务健康。
+
+PostgreSQL 与 Redis 不发布宿主机端口。生产对象存储是 Compose 外部依赖，必须与 PostgreSQL Manifest 的事务点一致备份。API 默认只发布到 `127.0.0.1:8000`，由同机反向代理终止 TLS；必须显式修改 `APP_BIND_ADDRESS` 才能监听其他地址。`perfcho-postgres` 和 `perfcho-redis` 是生产持久卷，执行 `down` 时禁止附带 `--volumes`，除非已确认永久删除数据。
 
 ## Redis 运维
 

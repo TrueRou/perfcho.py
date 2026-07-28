@@ -1,3 +1,5 @@
+"""Map structured settings and resumable maintenance state."""
+
 from datetime import datetime
 
 from sqlalchemy import Boolean, CheckConstraint, DateTime, String, Text

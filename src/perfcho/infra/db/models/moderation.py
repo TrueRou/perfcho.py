@@ -1,3 +1,5 @@
+"""Map moderation cases, sanctions, and anticheat findings."""
+
 import uuid
 from datetime import datetime
 

@@ -1,3 +1,5 @@
+"""Map credentials, sessions, tokens, devices, and login evidence."""
+
 import uuid
 from datetime import datetime
 
@@ -7,6 +9,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     LargeBinary,
@@ -165,6 +168,7 @@ class AuthSession(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __tablename__ = "auth_sessions"
     __table_args__ = (
         CheckConstraint("expires_at > created_at", name="valid_period"),
+        UniqueConstraint("id", "account_id", name="uq_auth_sessions_id_account"),
         Index("ix_auth_sessions_account_created", "account_id", "created_at"),
         Index(
             "ix_auth_sessions_active_account",
@@ -194,6 +198,12 @@ class AuthToken(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __tablename__ = "auth_tokens"
     __table_args__ = (
         CheckConstraint("expires_at > created_at", name="valid_period"),
+        ForeignKeyConstraint(
+            ["session_id", "account_id"],
+            ["iam.auth_sessions.id", "iam.auth_sessions.account_id"],
+            name="fk_auth_tokens_session_account",
+            ondelete="CASCADE",
+        ),
         UniqueConstraint("digest"),
         UniqueConstraint("jti"),
         Index("ix_auth_tokens_session", "session_id", "created_at"),
@@ -202,9 +212,7 @@ class AuthToken(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
         {"schema": "iam"},
     )
 
-    session_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("iam.auth_sessions.id", ondelete="CASCADE"), nullable=False
-    )
+    session_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
     parent_token_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("iam.auth_tokens.id", ondelete="RESTRICT"))
     kind: Mapped[TokenKind] = mapped_column(enum_type(TokenKind, "token_kind", 24), nullable=False)

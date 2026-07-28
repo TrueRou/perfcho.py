@@ -1,3 +1,5 @@
+"""Map immutable sensitive-operation audit facts."""
+
 import uuid
 
 from sqlalchemy import BigInteger, Index, String, Text

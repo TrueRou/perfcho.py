@@ -1,0 +1,73 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "dev: sync dependencies",
+            "type": "process",
+            "command": "uv",
+            "args": [
+                "sync",
+                "--locked"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "dev: start infrastructure",
+            "type": "process",
+            "command": "docker",
+            "args": [
+                "compose",
+                "up",
+                "-d",
+                "--wait",
+                "postgres",
+                "redis",
+                "minio"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "dev: initialize object storage",
+            "type": "process",
+            "command": "docker",
+            "args": [
+                "compose",
+                "run",
+                "--rm",
+                "--no-deps",
+                "minio-init"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "dev: start infrastructure",
+            "problemMatcher": []
+        },
+        {
+            "label": "dev: migrate database",
+            "type": "process",
+            "command": "uv",
+            "args": [
+                "run",
+                "alembic",
+                "upgrade",
+                "head"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": [
+                "dev: sync dependencies",
+                "dev: initialize object storage"
+            ],
+            "dependsOrder": "parallel",
+            "problemMatcher": []
+        }
+    ]
+}

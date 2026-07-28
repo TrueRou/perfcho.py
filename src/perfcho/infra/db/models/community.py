@@ -1,3 +1,5 @@
+"""Map channels, messages, read cursors, and notification facts."""
+
 import uuid
 from datetime import datetime
 

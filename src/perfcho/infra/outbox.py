@@ -1,3 +1,5 @@
+"""Reliably relay committed PostgreSQL events through Taskiq."""
+
 import asyncio
 import hashlib
 import os
@@ -23,6 +25,8 @@ type ConsumerHandler = Callable[[AsyncSession, OutboxEvent, str], Awaitable[None
 
 @dataclass(frozen=True, slots=True)
 class ConsumerRegistration:
+    """Bind one versioned consumer name to accepted event types."""
+
     name: str
     event_types: frozenset[str]
     handler: ConsumerHandler
@@ -30,6 +34,8 @@ class ConsumerRegistration:
 
 @dataclass(frozen=True, slots=True)
 class DeliveryReference:
+    """Identify one leased delivery and its current fencing token."""
+
     event_id: uuid.UUID
     consumer: str
     delivery_token: uuid.UUID
@@ -42,6 +48,8 @@ def register_consumer(
     name: str,
     event_types: Collection[str],
 ) -> Callable[[ConsumerHandler], ConsumerHandler]:
+    """Register exactly one handler for a versioned consumer name."""
+
     def decorator(handler: ConsumerHandler) -> ConsumerHandler:
         if name in _consumers:
             raise ValueError(f"Outbox consumer is already registered: {name}")
@@ -63,6 +71,7 @@ async def write_outbox_event(
     available_at: datetime | None = None,
     partition_key: str = "default",
 ) -> OutboxEvent:
+    """Append an event and explicit ordered deliveries in one transaction."""
     consumer_names = tuple(consumers)
     if not consumer_names:
         raise ValueError("Outbox events require at least one consumer")
@@ -102,6 +111,7 @@ async def claim_deliveries(
     session_factory: DbSessionFactory,
     owner: str,
 ) -> list[DeliveryReference]:
+    """Lease the earliest available delivery in each consumer partition."""
     now = datetime.now(UTC)
     lease_expires_at = now + timedelta(seconds=settings.outbox_lease_seconds)
 
@@ -168,6 +178,7 @@ async def mark_delivery_enqueued(
     owner: str,
     broker_task_id: str,
 ) -> None:
+    """Record a broker task identifier if the caller still owns the lease."""
     async with session_factory.begin() as session:
         delivery = await session.get(
             OutboxDelivery,
@@ -190,6 +201,7 @@ async def mark_delivery_enqueue_failed(
     owner: str,
     error: Exception,
 ) -> None:
+    """Release a failed enqueue lease and schedule bounded backoff."""
     async with session_factory.begin() as session:
         delivery = await session.get(
             OutboxDelivery,
@@ -211,6 +223,7 @@ async def process_delivery(
     consumer: str,
     delivery_token: uuid.UUID,
 ) -> None:
+    """Run one fenced consumer transaction with at-least-once delivery."""
     try:
         async with session_factory.begin() as session:
             delivery = await session.get(
@@ -247,6 +260,7 @@ async def process_delivery(
 
 
 async def relay_once(session_factory: DbSessionFactory, owner: str) -> int:
+    """Claim and enqueue one bounded delivery batch."""
     from perfcho.tasks.outbox import dispatch_outbox_delivery
 
     deliveries = await claim_deliveries(session_factory, owner)
@@ -264,6 +278,7 @@ async def relay_once(session_factory: DbSessionFactory, owner: str) -> int:
 
 
 async def run_relay() -> None:
+    """Poll PostgreSQL continuously and relay deliveries to Taskiq."""
     owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
     db_engine = await infra_db.create_engine()
     session_factory = infra_db.create_session_factory(db_engine)
@@ -280,6 +295,7 @@ async def run_relay() -> None:
 
 
 def main() -> None:
+    """Run the outbox relay as a dedicated process role."""
     asyncio.run(run_relay())
 
 

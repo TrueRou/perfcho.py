@@ -1,3 +1,5 @@
+"""Map authoritative multiplayer, tournament, and matchmaking facts."""
+
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
@@ -306,6 +308,10 @@ class Round(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __tablename__ = "rounds"
     __table_args__ = (
         CheckConstraint("round_number > 0", name="positive_round_number"),
+        CheckConstraint(
+            "num_nonnulls(playlist_revision_id, tournament_pool_item_id) = 1",
+            name="single_source",
+        ),
         CheckConstraint("ended_at IS NULL OR started_at IS NULL OR ended_at > started_at", name="valid_period"),
         UniqueConstraint("session_id", "round_number"),
         Index("ix_rounds_session_status", "session_id", "status"),

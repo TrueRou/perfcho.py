@@ -1,3 +1,5 @@
+"""Map transactional outbox, activity, and projection progress facts."""
+
 import uuid
 from datetime import datetime
 

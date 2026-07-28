@@ -1,3 +1,5 @@
+"""Translate framework and unexpected exceptions into API responses."""
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -12,7 +14,10 @@ unexpected_error_response = ResponseHandler.error("An unexpected error occurred 
 
 
 class ExceptionHandlerMiddleware(BaseHTTPMiddleware):
+    """Catch unhandled endpoint errors and hide internal details."""
+
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        """Execute one request and map unexpected failures to HTTP 500."""
         try:
             response = await call_next(request)
             return response
@@ -22,10 +27,13 @@ class ExceptionHandlerMiddleware(BaseHTTPMiddleware):
 
 
 def add_middleware(asgi_app: FastAPI) -> None:
+    """Attach the unexpected-exception middleware to an application."""
     asgi_app.add_middleware(ExceptionHandlerMiddleware)
 
 
 def add_exception_handler(asgi_app: FastAPI) -> None:
+    """Register validation and explicit HTTP exception handlers."""
+
     @asgi_app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
         errors = exc.errors()

@@ -1,3 +1,5 @@
+"""Map roles, permissions, grants, and product entitlements."""
+
 from datetime import datetime
 
 from sqlalchemy import (

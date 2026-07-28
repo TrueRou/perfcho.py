@@ -1,3 +1,5 @@
+"""Define canonical SQLAlchemy metadata and session factory types."""
+
 from sqlalchemy import MetaData
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
@@ -29,4 +31,6 @@ type DbSessionFactory = async_sessionmaker[AsyncSession]
 
 
 class DbBase(DeclarativeBase):
+    """Base every mapped model on the shared naming convention."""
+
     metadata = MetaData(naming_convention=NAMING_CONVENTION)

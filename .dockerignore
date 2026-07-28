@@ -1,0 +1,15 @@
+.agent-space/
+.git/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.vscode/
+__pycache__/
+*.py[cod]
+.coverage
+.DS_Store
+.env
+.env.*
+compose*.yaml
+docker/
+tests/

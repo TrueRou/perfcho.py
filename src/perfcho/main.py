@@ -1,3 +1,5 @@
+"""Create the central FastAPI process role and its shared resources."""
+
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import TypedDict
@@ -18,6 +20,8 @@ from perfcho.infra.settings import settings
 
 
 class AppState(TypedDict):
+    """Describe infrastructure resources available to each request."""
+
     db_engine: AsyncEngine
     redis_engine: Redis
     db_session_factory: DbSessionFactory
@@ -25,6 +29,7 @@ class AppState(TypedDict):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
+    """Create and dispose process-owned database and Redis clients."""
     logger.patch(logging.source("", "")).info(
         "Server starting, listening on: http://{}:{}", settings.app_host, settings.app_port
     )
@@ -46,16 +51,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
 
 
 def init_middlewares(asgi_app: FastAPI) -> None:
+    """Attach cross-cutting middleware and exception translation."""
     cors.add_middleware(asgi_app)
     error.add_middleware(asgi_app)
     error.add_exception_handler(asgi_app)
 
 
 def init_routes(asgi_app: FastAPI) -> None:
+    """Attach all HTTP and protocol adapters to the application."""
     asgi_app.include_router(router)
 
 
 def create_app() -> FastAPI:
+    """Construct an application without starting external resources."""
     logging.init_logger()
     openapi_url = "/openapi.json" if settings.app_debug else None
     asgi_app = FastAPI(

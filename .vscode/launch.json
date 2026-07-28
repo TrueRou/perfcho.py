@@ -1,0 +1,61 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "FastAPI",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": [
+                "perfcho.main:asgi_app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8000"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Relay",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "perfcho.infra.outbox",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Taskiq Worker",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "taskiq",
+            "args": [
+                "worker",
+                "perfcho.infra.taskiq:broker",
+                "perfcho.tasks.outbox",
+                "--ack-type",
+                "when_executed",
+                "--workers",
+                "1"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": true
+        }
+    ],
+    "compounds": [
+        {
+            "name": "All Services",
+            "configurations": [
+                "FastAPI",
+                "Relay",
+                "Taskiq Worker"
+            ],
+            "preLaunchTask": "dev: migrate database",
+            "stopAll": true
+        }
+    ]
+}

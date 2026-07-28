@@ -1,3 +1,5 @@
+"""Create and scope asynchronous PostgreSQL engines and sessions."""
+
 import json
 from collections.abc import AsyncIterator
 
@@ -9,6 +11,7 @@ from perfcho.infra.settings import settings
 
 
 async def create_engine() -> AsyncEngine:
+    """Create a pooled engine and fail fast when PostgreSQL is unavailable."""
     async_engine = create_async_engine(
         settings.database_url,
         pool_size=settings.database_pool_size,
@@ -27,9 +30,11 @@ async def create_engine() -> AsyncEngine:
 
 
 def create_session_factory(db_engine: AsyncEngine) -> DbSessionFactory:
+    """Bind request-scoped sessions to an existing engine."""
     return async_sessionmaker(bind=db_engine, class_=AsyncSession, expire_on_commit=False)
 
 
 async def session_scope(session_factory: DbSessionFactory) -> AsyncIterator[AsyncSession]:
+    """Yield one request-owned session without implicitly committing it."""
     async with session_factory() as session:
         yield session

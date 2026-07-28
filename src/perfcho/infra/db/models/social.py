@@ -1,3 +1,5 @@
+"""Map follows, blocks, teams, and achievement facts."""
+
 import uuid
 from datetime import datetime
 

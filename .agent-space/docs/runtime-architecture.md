@@ -12,6 +12,12 @@ perfcho 是一个可信中心应用，不拆分微服务，也不接受外部状
 
 这些角色共享应用服务、SQLAlchemy Model 和部署密钥。进程数量不构成业务节点身份，数据库中不保存节点、Lease、Epoch 或签名。
 
+## 部署映射
+
+本地开发由 VS Code Compound 同时启动 API、Outbox Relay 和 Taskiq Worker。启动前任务负责同步锁定依赖、启动并等待开发 Compose 中的 PostgreSQL/Redis/MinIO、幂等初始化对象存储桶，以及应用 Alembic Migration；调试结束不自动销毁基础设施和开发数据卷。
+
+生产使用独立的 `compose.prod.yaml`，三个进程角色复用同一个 Python 3.14t 镜像但分别运行和重启。PostgreSQL 与带认证的 Redis 只存在于 Compose 内部网络，S3 兼容对象存储作为外部持久依赖；一次性 Migration 必须成功完成后应用角色才可启动。API 默认仅向宿主机回环地址发布端口，由同机反向代理提供 TLS；开发 Compose 的端口映射、MinIO 与 `perfcho_test` 初始化脚本不得进入生产。
+
 ## Redis 约定
 
 状态键统一以 `perfcho:state` 开头，后续段落使用领域、对象和状态名称，例如：

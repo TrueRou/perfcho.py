@@ -1,3 +1,5 @@
+"""Bridge standard-library and Uvicorn logs into structured Loguru output."""
+
 import logging
 import sys
 from collections.abc import Callable
@@ -12,6 +14,8 @@ if TYPE_CHECKING:
 
 
 def source(name: str = "", function: str = "") -> Callable[[Record], None]:
+    """Return a Loguru patcher that overrides the displayed source."""
+
     def _source(record: Record) -> None:
         record["name"] = name
         record["function"] = function
@@ -21,7 +25,10 @@ def source(name: str = "", function: str = "") -> Callable[[Record], None]:
 
 
 class InterceptHandler(logging.Handler):
+    """Forward standard-library log records to Loguru."""
+
     def emit(self, record: logging.LogRecord) -> None:
+        """Translate and emit one standard-library log record."""
         try:
             level = logger.level(record.levelname).name
         except ValueError:
@@ -36,6 +43,7 @@ class InterceptHandler(logging.Handler):
 
 
 def init_logger() -> None:
+    """Configure process logging and intercept Uvicorn loggers."""
     logger.remove()
 
     log_level = settings.log_level.upper()

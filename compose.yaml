@@ -38,6 +38,37 @@ services:
       retries: 30
     restart: unless-stopped
 
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: perfcho
+      MINIO_ROOT_PASSWORD: perfcho-development
+    ports:
+      - "127.0.0.1:59000:9000"
+      - "127.0.0.1:59001:9001"
+    volumes:
+      - perfcho-minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mc alias set perfcho http://minio:9000 perfcho perfcho-development &&
+        mc mb --ignore-existing perfcho/perfcho
+    restart: "no"
+
 volumes:
   perfcho-postgres:
   perfcho-redis:
+  perfcho-minio:
