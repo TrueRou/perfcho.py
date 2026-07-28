@@ -4,9 +4,12 @@ from unittest.mock import MagicMock
 from urllib.parse import urlparse
 
 import pytest
+from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from taskiq_redis import RedisStreamBroker
 
+from perfcho.infra.db import DbBase
+from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.models.events import OutboxDelivery
 from perfcho.infra.outbox import write_outbox_event
 from perfcho.infra.settings import settings
@@ -27,6 +30,29 @@ def test_taskiq_uses_stream_broker_without_result_storage() -> None:
     assert broker.consumer_id == "0-0"
     assert broker.maxlen == settings.taskiq_stream_max_length
     assert dispatch_outbox_delivery.task_name in broker.get_all_tasks()
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_engine_creates_all_mapped_tables(postgres_database_url: str) -> None:
+    expected_tables = {(table.schema, table.name) for table in DbBase.metadata.sorted_tables}
+    assert expected_tables
+
+    for _ in range(2):
+        db_engine = await infra_db.create_engine()
+        try:
+            async with db_engine.connect() as connection:
+                existing_tables = await connection.run_sync(
+                    lambda sync_connection: {
+                        (schema, table_name)
+                        for schema in {table_schema for table_schema, _ in expected_tables}
+                        for table_name in inspect(sync_connection).get_table_names(schema=schema)
+                    }
+                )
+        finally:
+            await db_engine.dispose()
+
+        assert expected_tables <= existing_tables
 
 
 @pytest.mark.asyncio

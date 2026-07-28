@@ -5,13 +5,17 @@ from collections.abc import AsyncIterator
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.schema import CreateSchema
 
-from perfcho.infra.db.base import DbSessionFactory
+import perfcho.infra.db.models  # noqa: F401 - register all tables before create_all.
+from perfcho.infra.db.base import MODEL_SCHEMAS, DbBase, DbSessionFactory
 from perfcho.infra.settings import settings
+
+_SCHEMA_INITIALIZATION_LOCK_ID = 0x7065726663686F
 
 
 async def create_engine() -> AsyncEngine:
-    """Create a pooled engine and fail fast when PostgreSQL is unavailable."""
+    """Create a pooled engine and ensure every mapped PostgreSQL table exists."""
     async_engine = create_async_engine(
         settings.database_url,
         pool_size=settings.database_pool_size,
@@ -21,9 +25,16 @@ async def create_engine() -> AsyncEngine:
         json_serializer=lambda value: json.dumps(value, ensure_ascii=False, default=str),
     )
     try:
-        async with async_engine.connect() as connection:
-            await connection.execute(text("SELECT 1"))
+        async with async_engine.begin() as connection:
+            await connection.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": _SCHEMA_INITIALIZATION_LOCK_ID},
+            )
+            for schema in MODEL_SCHEMAS:
+                await connection.execute(CreateSchema(schema, if_not_exists=True))
+            await connection.run_sync(DbBase.metadata.create_all)
     except Exception as e:
+        await async_engine.dispose()
         db_url = async_engine.url.render_as_string(hide_password=True)
         raise RuntimeError(f"Failed to connect to database: {db_url}") from e
     return async_engine

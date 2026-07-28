@@ -21,6 +21,8 @@ docker compose run --rm --no-deps minio-init
 
 PostgreSQL listens on `127.0.0.1:55432`; Redis listens on `127.0.0.1:56379`; MinIO listens on `127.0.0.1:59000`, with its
 console on `127.0.0.1:59001`. Copy `.env.example` to `.env` only when local values need to be overridden.
+The first application role to connect creates missing PostgreSQL schemas and mapped tables through SQLAlchemy
+`MetaData.create_all()`.
 
 ### VS Code
 
@@ -55,11 +57,15 @@ docker compose --env-file .env.production -f compose.prod.yaml up -d --build
 docker compose --env-file .env.production -f compose.prod.yaml ps
 ```
 
-The production topology runs PostgreSQL, authenticated Redis, API, Outbox Relay, and Taskiq Worker. Database structure
-management is outside Compose. S3-compatible object storage remains an external production dependency. Only the API is
-published, on `127.0.0.1:8000` by default, for a same-host reverse proxy to terminate TLS. PostgreSQL and Redis use named
-volumes and are not published to the host. Back up PostgreSQL and object storage consistently; Redis AOF is only an
-availability aid and is not the source of durable task truth.
+The production topology runs PostgreSQL, authenticated Redis, API, Outbox Relay, and Taskiq Worker. Each application role
+ensures missing schemas and tables exist at startup; a PostgreSQL advisory lock serializes concurrent initialization.
+S3-compatible object storage remains an external production dependency. Only the API is published, on `127.0.0.1:8000`
+by default, for a same-host reverse proxy to terminate TLS. PostgreSQL and Redis use named volumes and are not published
+to the host. Back up PostgreSQL and object storage consistently; Redis AOF is only an availability aid and is not the
+source of durable task truth.
+
+`create_all()` does not alter existing columns, constraints, or indexes. Model changes that affect existing databases
+still require an explicit operational rollout.
 
 ## Verification
 
