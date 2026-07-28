@@ -26,7 +26,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from perfcho.infra.database.base import DbBase
 from perfcho.infra.database.enums import (
     AttemptStatus,
-    RoomResultPolicy,
     RoomStatus,
     SessionStatus,
     enum_type,
@@ -35,7 +34,7 @@ from perfcho.infra.database.mixins import BigIntIdentityMixin, CreatedAtMixin, T
 
 
 class Room(Uuid7PrimaryKeyMixin, TimestampMixin, DbBase):
-    """Defines a persistent multiplayer room and its result trust policy."""
+    """Defines a persistent centrally hosted multiplayer room."""
 
     __tablename__ = "rooms"
     __table_args__ = (
@@ -49,9 +48,6 @@ class Room(Uuid7PrimaryKeyMixin, TimestampMixin, DbBase):
 
     public_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), nullable=False)
     creator_account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
-    source_service_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("service.services.id", ondelete="RESTRICT"), nullable=False
-    )
     channel_id: Mapped[int | None] = mapped_column(ForeignKey("community.channels.id", ondelete="SET NULL"))
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     category: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -63,9 +59,7 @@ class Room(Uuid7PrimaryKeyMixin, TimestampMixin, DbBase):
         default=RoomStatus.PENDING,
         server_default=RoomStatus.PENDING.value,
     )
-    result_policy: Mapped[RoomResultPolicy] = mapped_column(
-        enum_type(RoomResultPolicy, "room_result_policy", 16), nullable=False
-    )
+    ranked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     capacity: Mapped[int] = mapped_column(Integer, nullable=False)
     starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -80,7 +74,7 @@ class MultiplayerSession(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
 
     __tablename__ = "sessions"
     __table_args__ = (
-        CheckConstraint("ordinal > 0 AND version >= 0 AND epoch >= 0", name="positive_ordinal_versions"),
+        CheckConstraint("ordinal > 0 AND version >= 0", name="positive_ordinal_version"),
         CheckConstraint("ended_at IS NULL OR ended_at > created_at", name="valid_period"),
         UniqueConstraint("room_id", "ordinal"),
         UniqueConstraint("id", "room_id"),
@@ -102,41 +96,9 @@ class MultiplayerSession(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
         server_default=SessionStatus.PENDING.value,
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
-    epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     room: Mapped[Room] = relationship(back_populates="sessions", lazy="raise")
-
-
-class SessionLease(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
-    """Temporarily authorizes a node to host a session using a fencing epoch."""
-
-    __tablename__ = "session_leases"
-    __table_args__ = (
-        CheckConstraint("epoch > 0", name="positive_epoch"),
-        CheckConstraint("expires_at > created_at", name="valid_period"),
-        UniqueConstraint("session_id", "epoch"),
-        UniqueConstraint("token_digest"),
-        Index(
-            "uq_session_leases_active",
-            "session_id",
-            unique=True,
-            postgresql_where=text("revoked_at IS NULL"),
-        ),
-        Index("ix_session_leases_node_expiry", "node_id", "expires_at"),
-        {"schema": "multiplayer"},
-    )
-
-    session_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("multiplayer.sessions.id", ondelete="RESTRICT"), nullable=False
-    )
-    node_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("service.service_nodes.id", ondelete="RESTRICT"), nullable=False
-    )
-    epoch: Mapped[int] = mapped_column(Integer, nullable=False)
-    token_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class RoomParticipant(CreatedAtMixin, DbBase):
@@ -170,9 +132,6 @@ class SessionPresence(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     room_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     account_id: Mapped[int] = mapped_column(nullable=False)
     join_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    node_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("service.service_nodes.id", ondelete="RESTRICT"), nullable=False
-    )
     left_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     leave_reason: Mapped[str | None] = mapped_column(String(32))
 
@@ -364,9 +323,6 @@ class Round(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     tournament_pool_item_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("multiplayer.tournament_pool_items.id", ondelete="RESTRICT")
     )
-    source_command_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("service.node_command_receipts.id", ondelete="RESTRICT")
-    )
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
     configuration: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     configuration_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
@@ -451,7 +407,6 @@ class MultiplayerEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     __table_args__ = (
         CheckConstraint("room_sequence > 0 AND aggregate_version >= 0", name="positive_versions"),
         UniqueConstraint("room_id", "room_sequence"),
-        UniqueConstraint("command_id", "command_event_number"),
         Index("ix_multiplayer_events_room_id_desc", "room_id", "id"),
         Index("ix_multiplayer_events_session_version", "session_id", "aggregate_version"),
         Index("ix_multiplayer_events_type_created", "event_type", "created_at"),
@@ -462,14 +417,8 @@ class MultiplayerEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     room_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     session_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("multiplayer.sessions.id", ondelete="RESTRICT"))
     actor_account_id: Mapped[int | None] = mapped_column(ForeignKey("core.accounts.id", ondelete="SET NULL"))
-    node_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("service.service_nodes.id", ondelete="SET NULL"))
-    command_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("service.node_command_receipts.id", ondelete="SET NULL")
-    )
-    command_event_number: Mapped[int | None] = mapped_column(SmallInteger)
     aggregate_version: Mapped[int] = mapped_column(Integer, nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    authority: Mapped[str] = mapped_column(String(16), nullable=False)
     visibility: Mapped[str] = mapped_column(String(16), nullable=False)
     payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
 
@@ -649,9 +598,6 @@ class MatchmakingTicket(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     )
     group_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("multiplayer.matchmaking_groups.id", ondelete="RESTRICT"), nullable=False
-    )
-    source_command_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("service.node_command_receipts.id", ondelete="SET NULL"), unique=True
     )
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="queued", server_default="queued")
     rating: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)

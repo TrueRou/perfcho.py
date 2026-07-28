@@ -24,12 +24,6 @@ class ClientFamily(StrEnum):
     API = "api"
 
 
-class ServiceTrustTier(StrEnum):
-    CORE = "core"
-    TRUSTED = "trusted"
-    EDGE = "edge"
-
-
 class TokenKind(StrEnum):
     ACCESS = "access"
     REFRESH = "refresh"
@@ -121,12 +115,6 @@ class RoomStatus(StrEnum):
     STARTED = "started"
     ENDED = "ended"
     CANCELLED = "cancelled"
-
-
-class RoomResultPolicy(StrEnum):
-    AUTHORITATIVE = "authoritative"
-    UNRANKED = "unranked"
-    LOCAL_ONLY = "local_only"
 
 
 class SessionStatus(StrEnum):

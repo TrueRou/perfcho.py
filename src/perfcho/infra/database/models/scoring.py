@@ -143,7 +143,7 @@ class PlayAttempt(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __table_args__ = (
         CheckConstraint("ended_at IS NULL OR ended_at >= started_at", name="valid_period"),
         CheckConstraint("progress BETWEEN 0 AND 1", name="progress_range"),
-        UniqueConstraint("node_id", "protocol", "idempotency_key"),
+        UniqueConstraint("account_id", "protocol", "idempotency_key"),
         UniqueConstraint(
             "id",
             "account_id",
@@ -166,9 +166,6 @@ class PlayAttempt(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
         ForeignKey("scoring.scoreboards.id", ondelete="RESTRICT"), nullable=False
     )
     mod_set_id: Mapped[int] = mapped_column(ForeignKey("scoring.mod_sets.id", ondelete="RESTRICT"), nullable=False)
-    node_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("service.service_nodes.id", ondelete="RESTRICT"), nullable=False
-    )
     protocol: Mapped[ClientFamily] = mapped_column(enum_type(ClientFamily, "attempt_protocol", 16), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[AttemptStatus] = mapped_column(enum_type(AttemptStatus, "play_attempt_status", 16), nullable=False)

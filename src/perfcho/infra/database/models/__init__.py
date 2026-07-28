@@ -9,7 +9,6 @@ from . import (
     moderation,
     multiplayer,
     scoring,
-    service,
     social,
     system,
 )
@@ -25,7 +24,6 @@ __all__ = [
     "moderation",
     "multiplayer",
     "scoring",
-    "service",
     "social",
     "system",
 ]

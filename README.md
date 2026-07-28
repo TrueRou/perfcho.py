@@ -1,26 +1,33 @@
 # perfcho.py
 
-PostgreSQL persistence foundation for a unified osu! Stable and Lazer server.
+Central runtime foundation for a unified osu! Stable and Lazer server.
 
-The current delivery is intentionally database-only. It defines the canonical domain model, migrations, constraints,
-indexes, projections, and trust boundaries. Stable/Lazer protocol services will be implemented against this contract in
-a later delivery.
+The current delivery defines the canonical PostgreSQL domain model, Redis online-state boundary, and Taskiq transactional
+outbox runtime. Stable/Lazer protocol services will be implemented against this contract in later deliveries.
 
 ## Requirements
 
 - Python 3.14t
 - uv
-- PostgreSQL 17, normally started through Docker Compose
+- PostgreSQL 17 and Redis 8, normally started through Docker Compose
 
-## Development database
+## Development dependencies
 
 ```bash
-docker compose up -d postgres
+docker compose up -d postgres redis
 uv run alembic upgrade head
 ```
 
-The Compose service listens on `127.0.0.1:55432`. Copy `.env.example` to `.env` only when local values need to be
-overridden.
+PostgreSQL listens on `127.0.0.1:55432`; Redis listens on `127.0.0.1:56379`. Copy `.env.example` to `.env` only when local
+values need to be overridden.
+
+Run the process roles separately:
+
+```bash
+uv run uvicorn perfcho.main:asgi_app --host 127.0.0.1 --port 8000
+uv run taskiq worker perfcho.infra.taskiq:broker perfcho.tasks.outbox --ack-type when_executed
+uv run python -m perfcho.infra.outbox
+```
 
 ## Verification
 
@@ -40,6 +47,8 @@ src/perfcho/infra/database/
   enums.py                Stable cross-domain values
   mixins.py               ID and timestamp policies
   models/                 Domain-separated models with English purpose docstrings
+src/perfcho/infra/outbox.py  PostgreSQL delivery ledger and Taskiq relay
+src/perfcho/infra/taskiq.py  Redis Stream broker and worker lifecycle
 alembic/versions/         Immutable schema migrations
 .agent-space/docs/        Chinese architecture, operations, and business contracts
 tests/                    Metadata and PostgreSQL migration tests

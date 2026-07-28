@@ -94,7 +94,7 @@ def test_migration_lifecycle(alembic_config: Config, postgres_database_url: str)
     schemas, tables, seeds = asyncio.run(_database_snapshot(postgres_database_url))
 
     assert set(MODEL_SCHEMAS) <= schemas
-    assert sum(len(schema_tables) for schema_tables in tables.values()) == 133
+    assert sum(len(schema_tables) for schema_tables in tables.values()) == 129
     assert seeds == {"accounts": 1, "sources": 1, "scoreboards": 8, "scopes": 8}
     command.check(alembic_config)
 
@@ -104,7 +104,7 @@ def test_migration_lifecycle(alembic_config: Config, postgres_database_url: str)
 
     command.upgrade(alembic_config, "head")
     _, tables_after_reupgrade, _ = asyncio.run(_database_snapshot(postgres_database_url))
-    assert sum(len(schema_tables) for schema_tables in tables_after_reupgrade.values()) == 133
+    assert sum(len(schema_tables) for schema_tables in tables_after_reupgrade.values()) == 129
 
 
 async def _database_schemas(database_url: str) -> set[str]:

@@ -1,4 +1,4 @@
-"""Initial Stable and Lazer database schema."""
+"""Initial central service schema."""
 
 from collections.abc import Sequence
 
@@ -7,7 +7,7 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision: str = "0001_initial_schema"
+revision: str = "0001"
 down_revision: str | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -23,7 +23,6 @@ def upgrade() -> None:
     op.execute(sa.text("CREATE SCHEMA social"))
     op.execute(sa.text("CREATE SCHEMA community"))
     op.execute(sa.text("CREATE SCHEMA multiplayer"))
-    op.execute(sa.text("CREATE SCHEMA service"))
     op.execute(sa.text("CREATE SCHEMA events"))
     op.execute(sa.text("CREATE SCHEMA audit"))
     op.execute(sa.text("CREATE SCHEMA system"))
@@ -32,7 +31,6 @@ def upgrade() -> None:
     op.create_table(
         "audit_events",
         sa.Column("actor_account_id", sa.BigInteger(), nullable=True),
-        sa.Column("actor_node_id", sa.Uuid(), nullable=True),
         sa.Column("action", sa.String(length=100), nullable=False),
         sa.Column("target_type", sa.String(length=64), nullable=False),
         sa.Column("target_id", sa.String(length=128), nullable=False),
@@ -97,16 +95,7 @@ def upgrade() -> None:
         sa.Column("description", sa.Text(), nullable=True),
         sa.Column(
             "ruleset",
-            sa.Enum(
-                "osu",
-                "taiko",
-                "fruits",
-                "mania",
-                name="tag_ruleset",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("osu", "taiko", "fruits", "mania", name="tag_ruleset", native_enum=False, length=16),
             nullable=True,
         ),
         sa.CheckConstraint(
@@ -120,11 +109,7 @@ def upgrade() -> None:
         "accounts",
         sa.Column("id", sa.Integer(), sa.Identity(always=False), nullable=False),
         sa.Column(
-            "type",
-            sa.Enum(
-                "user", "bot", "service", name="account_type", native_enum=False, create_constraint=False, length=16
-            ),
-            nullable=False,
+            "type", sa.Enum("user", "bot", "service", name="account_type", native_enum=False, length=16), nullable=False
         ),
         sa.Column(
             "status",
@@ -136,7 +121,6 @@ def upgrade() -> None:
                 "deleted",
                 name="account_status",
                 native_enum=False,
-                create_constraint=False,
                 length=16,
             ),
             server_default="pending",
@@ -162,21 +146,18 @@ def upgrade() -> None:
     )
     op.create_table(
         "outbox_events",
+        sa.Column("position", sa.BigInteger(), sa.Identity(always=True), nullable=False),
         sa.Column("aggregate_type", sa.String(length=64), nullable=False),
         sa.Column("aggregate_id", sa.String(length=128), nullable=False),
         sa.Column("event_type", sa.String(length=100), nullable=False),
         sa.Column("schema_version", sa.Integer(), nullable=False),
         sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("available_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("published_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("attempt_count", sa.Integer(), server_default="0", nullable=False),
-        sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint(
-            "schema_version > 0 AND attempt_count >= 0", name=op.f("ck_outbox_events_version_attempt_range")
-        ),
+        sa.CheckConstraint("schema_version > 0", name=op.f("ck_outbox_events_positive_schema_version")),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_outbox_events")),
+        sa.UniqueConstraint("position", name=op.f("uq_outbox_events_position")),
         schema="events",
     )
     op.create_table(
@@ -220,16 +201,7 @@ def upgrade() -> None:
         sa.Column("kind", sa.String(length=32), nullable=False),
         sa.Column(
             "ruleset",
-            sa.Enum(
-                "osu",
-                "taiko",
-                "fruits",
-                "mania",
-                name="calculation_ruleset",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("osu", "taiko", "fruits", "mania", name="calculation_ruleset", native_enum=False, length=16),
             nullable=False,
         ),
         sa.Column("engine", sa.String(length=64), nullable=False),
@@ -264,29 +236,12 @@ def upgrade() -> None:
         sa.Column("code", sa.String(length=32), nullable=False),
         sa.Column(
             "ruleset",
-            sa.Enum(
-                "osu",
-                "taiko",
-                "fruits",
-                "mania",
-                name="scoreboard_ruleset",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("osu", "taiko", "fruits", "mania", name="scoreboard_ruleset", native_enum=False, length=16),
             nullable=False,
         ),
         sa.Column(
             "variant",
-            sa.Enum(
-                "vanilla",
-                "relax",
-                "autopilot",
-                name="scoreboard_variant",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("vanilla", "relax", "autopilot", name="scoreboard_variant", native_enum=False, length=16),
             nullable=False,
         ),
         sa.Column("active", sa.Boolean(), server_default="true", nullable=False),
@@ -371,11 +326,7 @@ def upgrade() -> None:
         "account_permission_grants",
         sa.Column("account_id", sa.Integer(), nullable=False),
         sa.Column("permission_id", sa.SmallInteger(), nullable=False),
-        sa.Column(
-            "effect",
-            sa.Enum("allow", "deny", name="grant_effect", native_enum=False, create_constraint=False, length=8),
-            nullable=False,
-        ),
+        sa.Column("effect", sa.Enum("allow", "deny", name="grant_effect", native_enum=False, length=8), nullable=False),
         sa.Column("granted_by_id", sa.Integer(), nullable=True),
         sa.Column("starts_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("ends_at", sa.DateTime(timezone=True), nullable=True),
@@ -529,7 +480,6 @@ def upgrade() -> None:
                 "loved",
                 name="beatmapset_status",
                 native_enum=False,
-                create_constraint=False,
                 length=16,
             ),
             server_default="pending",
@@ -696,11 +646,46 @@ def upgrade() -> None:
         schema="events",
     )
     op.create_table(
+        "outbox_deliveries",
+        sa.Column("event_id", sa.Uuid(), nullable=False),
+        sa.Column("consumer", sa.String(length=100), nullable=False),
+        sa.Column("partition_key", sa.String(length=100), server_default="default", nullable=False),
+        sa.Column("available_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("enqueued_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("dead_lettered_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("attempt_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("enqueue_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("lease_owner", sa.String(length=128), nullable=True),
+        sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("delivery_token", sa.Uuid(), nullable=True),
+        sa.Column("broker_task_id", sa.String(length=128), nullable=True),
+        sa.Column("last_error", sa.Text(), nullable=True),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.CheckConstraint(
+            "attempt_count >= 0 AND enqueue_count >= 0",
+            name=op.f("ck_outbox_deliveries_nonnegative_attempt_counts"),
+        ),
+        sa.CheckConstraint(
+            "lease_expires_at IS NULL OR lease_owner IS NOT NULL",
+            name=op.f("ck_outbox_deliveries_lease_owner_required"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["event_id"],
+            ["events.outbox_events.id"],
+            name=op.f("fk_outbox_deliveries_event_id_outbox_events"),
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("event_id", "consumer", name=op.f("pk_outbox_deliveries")),
+        schema="events",
+    )
+    op.create_table(
         "projection_checkpoints",
         sa.Column("projector", sa.String(length=100), nullable=False),
         sa.Column("partition_key", sa.String(length=100), server_default="default", nullable=False),
         sa.Column("source_event_id", sa.Uuid(), nullable=True),
-        sa.Column("source_position", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("source_position", sa.BigInteger(), server_default="0", nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.ForeignKeyConstraint(
@@ -1003,40 +988,6 @@ def upgrade() -> None:
         schema="scoring",
     )
     op.create_table(
-        "services",
-        sa.Column("name", sa.String(length=100), nullable=False),
-        sa.Column("name_key", sa.String(length=100), nullable=False),
-        sa.Column("owner_account_id", sa.Integer(), nullable=True),
-        sa.Column(
-            "trust_tier",
-            sa.Enum(
-                "core",
-                "trusted",
-                "edge",
-                name="service_trust_tier",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
-            nullable=False,
-        ),
-        sa.Column("status", sa.String(length=16), server_default="active", nullable=False),
-        sa.Column("capabilities", postgresql.JSONB(astext_type=sa.Text()), server_default="[]", nullable=False),
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint("trust_tier IN ('core', 'trusted', 'edge')", name=op.f("ck_services_service_trust_tier")),
-        sa.CheckConstraint("char_length(name) > 0", name=op.f("ck_services_name_nonempty")),
-        sa.ForeignKeyConstraint(
-            ["owner_account_id"],
-            ["core.accounts.id"],
-            name=op.f("fk_services_owner_account_id_accounts"),
-            ondelete="SET NULL",
-        ),
-        sa.PrimaryKeyConstraint("id", name=op.f("pk_services")),
-        sa.UniqueConstraint("name_key", name=op.f("uq_services_name_key")),
-        schema="service",
-    )
-    op.create_table(
         "blocks",
         sa.Column("actor_account_id", sa.Integer(), nullable=False),
         sa.Column("target_account_id", sa.Integer(), nullable=False),
@@ -1140,16 +1091,7 @@ def upgrade() -> None:
         sa.Column("external_id", sa.BigInteger(), nullable=False),
         sa.Column(
             "ruleset",
-            sa.Enum(
-                "osu",
-                "taiko",
-                "fruits",
-                "mania",
-                name="beatmap_ruleset",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("osu", "taiko", "fruits", "mania", name="beatmap_ruleset", native_enum=False, length=16),
             nullable=False,
         ),
         sa.Column("difficulty_name", sa.String(length=255), nullable=False),
@@ -1165,7 +1107,6 @@ def upgrade() -> None:
                 "loved",
                 name="beatmap_status",
                 native_enum=False,
-                create_constraint=False,
                 length=16,
             ),
             server_default="pending",
@@ -1291,9 +1232,7 @@ def upgrade() -> None:
         sa.Column("social_links", postgresql.JSONB(astext_type=sa.Text()), server_default="{}", nullable=False),
         sa.Column(
             "default_ruleset",
-            sa.Enum(
-                "osu", "taiko", "fruits", "mania", name="ruleset", native_enum=False, create_constraint=False, length=16
-            ),
+            sa.Enum("osu", "taiko", "fruits", "mania", name="ruleset", native_enum=False, length=16),
             server_default="osu",
             nullable=False,
         ),
@@ -1323,6 +1262,45 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("account_id", name=op.f("pk_user_profiles")),
         schema="core",
+    )
+    op.create_table(
+        "auth_sessions",
+        sa.Column("account_id", sa.Integer(), nullable=False),
+        sa.Column("oauth_client_id", sa.Uuid(), nullable=True),
+        sa.Column("device_id", sa.Uuid(), nullable=True),
+        sa.Column(
+            "client_family",
+            sa.Enum("stable", "lazer", "web", "api", name="client_family", native_enum=False, length=16),
+            nullable=False,
+        ),
+        sa.Column("client_version", sa.String(length=64), nullable=True),
+        sa.Column("ip_address", postgresql.INET(), nullable=False),
+        sa.Column("user_agent", sa.String(length=512), nullable=True),
+        sa.Column("mfa_verified_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("closed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("close_reason", sa.String(length=64), nullable=True),
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.CheckConstraint(
+            "client_family IN ('stable', 'lazer', 'web', 'api')", name=op.f("ck_auth_sessions_client_family")
+        ),
+        sa.CheckConstraint("expires_at > created_at", name=op.f("ck_auth_sessions_valid_period")),
+        sa.ForeignKeyConstraint(
+            ["account_id"], ["core.accounts.id"], name=op.f("fk_auth_sessions_account_id_accounts"), ondelete="RESTRICT"
+        ),
+        sa.ForeignKeyConstraint(
+            ["device_id"], ["iam.devices.id"], name=op.f("fk_auth_sessions_device_id_devices"), ondelete="SET NULL"
+        ),
+        sa.ForeignKeyConstraint(
+            ["oauth_client_id"],
+            ["iam.oauth_clients.id"],
+            name=op.f("fk_auth_sessions_oauth_client_id_oauth_clients"),
+            ondelete="SET NULL",
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_auth_sessions")),
+        schema="iam",
     )
     op.create_table(
         "oauth_client_redirect_uris",
@@ -1497,25 +1475,6 @@ def upgrade() -> None:
         schema="scoring",
     )
     op.create_table(
-        "service_nodes",
-        sa.Column("service_id", sa.Uuid(), nullable=False),
-        sa.Column("external_name", sa.String(length=100), nullable=False),
-        sa.Column("status", sa.String(length=16), server_default="active", nullable=False),
-        sa.Column("region", sa.String(length=32), nullable=True),
-        sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["service_id"],
-            ["service.services.id"],
-            name=op.f("fk_service_nodes_service_id_services"),
-            ondelete="RESTRICT",
-        ),
-        sa.PrimaryKeyConstraint("id", name=op.f("pk_service_nodes")),
-        sa.UniqueConstraint("service_id", "external_name", name=op.f("uq_service_nodes_service_id")),
-        schema="service",
-    )
-    op.create_table(
         "achievement_definitions",
         sa.Column("id", sa.Integer(), sa.Identity(always=False), nullable=False),
         sa.Column("slug", sa.String(length=100), nullable=False),
@@ -1524,16 +1483,7 @@ def upgrade() -> None:
         sa.Column("parameters", postgresql.JSONB(astext_type=sa.Text()), server_default="{}", nullable=False),
         sa.Column(
             "ruleset",
-            sa.Enum(
-                "osu",
-                "taiko",
-                "fruits",
-                "mania",
-                name="achievement_ruleset",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("osu", "taiko", "fruits", "mania", name="achievement_ruleset", native_enum=False, length=16),
             nullable=True,
         ),
         sa.Column("icon_asset_id", sa.Uuid(), nullable=True),
@@ -1563,16 +1513,7 @@ def upgrade() -> None:
         sa.Column("tag_key", sa.String(length=8), nullable=False),
         sa.Column(
             "ruleset",
-            sa.Enum(
-                "osu",
-                "taiko",
-                "fruits",
-                "mania",
-                name="team_ruleset",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("osu", "taiko", "fruits", "mania", name="team_ruleset", native_enum=False, length=16),
             nullable=False,
         ),
         sa.Column("description", sa.Text(), nullable=True),
@@ -1608,7 +1549,6 @@ def upgrade() -> None:
                 "system",
                 name="channel_kind",
                 native_enum=False,
-                create_constraint=False,
                 length=16,
             ),
             nullable=False,
@@ -1743,7 +1683,6 @@ def upgrade() -> None:
                 "loved",
                 name="previous_beatmap_status",
                 native_enum=False,
-                create_constraint=False,
                 length=16,
             ),
             nullable=True,
@@ -1760,7 +1699,6 @@ def upgrade() -> None:
                 "loved",
                 name="new_beatmap_status",
                 native_enum=False,
-                create_constraint=False,
                 length=16,
             ),
             nullable=False,
@@ -1837,7 +1775,6 @@ def upgrade() -> None:
                 "loved",
                 name="requested_beatmap_status",
                 native_enum=False,
-                create_constraint=False,
                 length=16,
             ),
             nullable=False,
@@ -1906,58 +1843,144 @@ def upgrade() -> None:
         schema="core",
     )
     op.create_table(
-        "auth_sessions",
-        sa.Column("account_id", sa.Integer(), nullable=False),
-        sa.Column("oauth_client_id", sa.Uuid(), nullable=True),
+        "auth_attempts",
+        sa.Column("account_id", sa.Integer(), nullable=True),
+        sa.Column("session_id", sa.Uuid(), nullable=True),
         sa.Column("device_id", sa.Uuid(), nullable=True),
-        sa.Column("node_id", sa.Uuid(), nullable=True),
+        sa.Column("identifier_hmac", sa.LargeBinary(length=32), nullable=False),
+        sa.Column("ip_address", postgresql.INET(), nullable=False),
         sa.Column(
             "client_family",
-            sa.Enum(
-                "stable",
-                "lazer",
-                "web",
-                "api",
-                name="client_family",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("stable", "lazer", "web", "api", name="auth_attempt_client_family", native_enum=False, length=16),
             nullable=False,
         ),
         sa.Column("client_version", sa.String(length=64), nullable=True),
-        sa.Column("ip_address", postgresql.INET(), nullable=False),
-        sa.Column("user_agent", sa.String(length=512), nullable=True),
-        sa.Column("mfa_verified_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("result", sa.String(length=32), nullable=False),
+        sa.Column("failure_reason", sa.String(length=64), nullable=True),
+        sa.Column("country_code", sa.String(length=2), nullable=True),
+        sa.Column("asn", sa.BigInteger(), nullable=True),
+        sa.Column("context", postgresql.JSONB(astext_type=sa.Text()), server_default="{}", nullable=False),
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.CheckConstraint(
+            "client_family IN ('stable', 'lazer', 'web', 'api')",
+            name=op.f("ck_auth_attempts_auth_attempt_client_family"),
+        ),
+        sa.ForeignKeyConstraint(
+            ["account_id"], ["core.accounts.id"], name=op.f("fk_auth_attempts_account_id_accounts"), ondelete="SET NULL"
+        ),
+        sa.ForeignKeyConstraint(
+            ["device_id"], ["iam.devices.id"], name=op.f("fk_auth_attempts_device_id_devices"), ondelete="SET NULL"
+        ),
+        sa.ForeignKeyConstraint(
+            ["session_id"],
+            ["iam.auth_sessions.id"],
+            name=op.f("fk_auth_attempts_session_id_auth_sessions"),
+            ondelete="SET NULL",
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_auth_attempts")),
+        schema="iam",
+    )
+    op.create_table(
+        "auth_challenges",
+        sa.Column("account_id", sa.Integer(), nullable=True),
+        sa.Column("session_id", sa.Uuid(), nullable=True),
+        sa.Column("oauth_client_id", sa.Uuid(), nullable=True),
+        sa.Column(
+            "kind",
+            sa.Enum(
+                "email_verification",
+                "password_reset",
+                "login_mfa",
+                "oauth_code",
+                name="challenge_kind",
+                native_enum=False,
+                length=32,
+            ),
+            nullable=False,
+        ),
+        sa.Column("target", sa.String(length=254), nullable=True),
+        sa.Column("code_digest", sa.LargeBinary(length=32), nullable=False),
+        sa.Column("pkce_challenge", sa.String(length=128), nullable=True),
+        sa.Column("pkce_method", sa.String(length=16), nullable=True),
+        sa.Column("attempt_count", sa.SmallInteger(), server_default="0", nullable=False),
+        sa.Column("max_attempts", sa.SmallInteger(), server_default="5", nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("closed_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("close_reason", sa.String(length=64), nullable=True),
+        sa.Column("consumed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("superseded_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.CheckConstraint(
-            "client_family IN ('stable', 'lazer', 'web', 'api')", name=op.f("ck_auth_sessions_client_family")
+            "kind IN ('email_verification', 'password_reset', 'login_mfa', 'oauth_code')",
+            name=op.f("ck_auth_challenges_challenge_kind"),
         ),
-        sa.CheckConstraint("expires_at > created_at", name=op.f("ck_auth_sessions_valid_period")),
-        sa.ForeignKeyConstraint(
-            ["account_id"], ["core.accounts.id"], name=op.f("fk_auth_sessions_account_id_accounts"), ondelete="RESTRICT"
+        sa.CheckConstraint(
+            "attempt_count >= 0 AND attempt_count <= max_attempts", name=op.f("ck_auth_challenges_attempt_count_range")
         ),
+        sa.CheckConstraint("expires_at > created_at", name=op.f("ck_auth_challenges_valid_period")),
+        sa.CheckConstraint("max_attempts > 0", name=op.f("ck_auth_challenges_positive_max_attempts")),
         sa.ForeignKeyConstraint(
-            ["device_id"], ["iam.devices.id"], name=op.f("fk_auth_sessions_device_id_devices"), ondelete="SET NULL"
-        ),
-        sa.ForeignKeyConstraint(
-            ["node_id"],
-            ["service.service_nodes.id"],
-            name=op.f("fk_auth_sessions_node_id_service_nodes"),
-            ondelete="SET NULL",
+            ["account_id"],
+            ["core.accounts.id"],
+            name=op.f("fk_auth_challenges_account_id_accounts"),
+            ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
             ["oauth_client_id"],
             ["iam.oauth_clients.id"],
-            name=op.f("fk_auth_sessions_oauth_client_id_oauth_clients"),
-            ondelete="SET NULL",
+            name=op.f("fk_auth_challenges_oauth_client_id_oauth_clients"),
+            ondelete="CASCADE",
         ),
-        sa.PrimaryKeyConstraint("id", name=op.f("pk_auth_sessions")),
+        sa.ForeignKeyConstraint(
+            ["session_id"],
+            ["iam.auth_sessions.id"],
+            name=op.f("fk_auth_challenges_session_id_auth_sessions"),
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_auth_challenges")),
+        sa.UniqueConstraint("code_digest", name=op.f("uq_auth_challenges_code_digest")),
+        schema="iam",
+    )
+    op.create_table(
+        "auth_tokens",
+        sa.Column("session_id", sa.Uuid(), nullable=False),
+        sa.Column("account_id", sa.Integer(), nullable=False),
+        sa.Column("parent_token_id", sa.Uuid(), nullable=True),
+        sa.Column(
+            "kind",
+            sa.Enum("access", "refresh", "api_key", "stable_session", name="token_kind", native_enum=False, length=24),
+            nullable=False,
+        ),
+        sa.Column("digest", sa.LargeBinary(length=32), nullable=False),
+        sa.Column("prefix", sa.String(length=16), nullable=False),
+        sa.Column("jti", sa.Uuid(), nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("consumed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.CheckConstraint(
+            "kind IN ('access', 'refresh', 'api_key', 'stable_session')", name=op.f("ck_auth_tokens_token_kind")
+        ),
+        sa.CheckConstraint("expires_at > created_at", name=op.f("ck_auth_tokens_valid_period")),
+        sa.ForeignKeyConstraint(
+            ["account_id"], ["core.accounts.id"], name=op.f("fk_auth_tokens_account_id_accounts"), ondelete="RESTRICT"
+        ),
+        sa.ForeignKeyConstraint(
+            ["parent_token_id"],
+            ["iam.auth_tokens.id"],
+            name=op.f("fk_auth_tokens_parent_token_id_auth_tokens"),
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["session_id"],
+            ["iam.auth_sessions.id"],
+            name=op.f("fk_auth_tokens_session_id_auth_sessions"),
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_auth_tokens")),
+        sa.UniqueConstraint("digest", name=op.f("uq_auth_tokens_digest")),
+        sa.UniqueConstraint("jti", name=op.f("uq_auth_tokens_jti")),
         schema="iam",
     )
     op.create_table(
@@ -2085,30 +2108,6 @@ def upgrade() -> None:
         schema="scoring",
     )
     op.create_table(
-        "service_node_keys",
-        sa.Column("node_id", sa.Uuid(), nullable=False),
-        sa.Column("key_version", sa.Integer(), nullable=False),
-        sa.Column("algorithm", sa.String(length=32), server_default="Ed25519", nullable=False),
-        sa.Column("public_key", sa.LargeBinary(), nullable=False),
-        sa.Column("fingerprint", sa.LargeBinary(length=32), nullable=False),
-        sa.Column("valid_from", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("valid_until", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
-        sa.CheckConstraint("key_version > 0", name=op.f("ck_service_node_keys_positive_key_version")),
-        sa.CheckConstraint(
-            "valid_until IS NULL OR valid_until > valid_from", name=op.f("ck_service_node_keys_valid_period")
-        ),
-        sa.ForeignKeyConstraint(
-            ["node_id"],
-            ["service.service_nodes.id"],
-            name=op.f("fk_service_node_keys_node_id_service_nodes"),
-            ondelete="CASCADE",
-        ),
-        sa.PrimaryKeyConstraint("node_id", "key_version", name=op.f("pk_service_node_keys")),
-        sa.UniqueConstraint("fingerprint", name=op.f("uq_service_node_keys_fingerprint")),
-        schema="service",
-    )
-    op.create_table(
         "achievement_translations",
         sa.Column("achievement_id", sa.Integer(), nullable=False),
         sa.Column("locale", sa.String(length=16), nullable=False),
@@ -2164,9 +2163,7 @@ def upgrade() -> None:
         sa.Column("account_id", sa.Integer(), nullable=False),
         sa.Column(
             "role",
-            sa.Enum(
-                "owner", "officer", "member", name="team_role", native_enum=False, create_constraint=False, length=16
-            ),
+            sa.Enum("owner", "officer", "member", name="team_role", native_enum=False, length=16),
             nullable=False,
         ),
         sa.Column("left_at", sa.DateTime(timezone=True), nullable=True),
@@ -2303,163 +2300,19 @@ def upgrade() -> None:
         schema="content",
     )
     op.create_table(
-        "auth_attempts",
-        sa.Column("account_id", sa.Integer(), nullable=True),
-        sa.Column("session_id", sa.Uuid(), nullable=True),
-        sa.Column("device_id", sa.Uuid(), nullable=True),
-        sa.Column("identifier_hmac", sa.LargeBinary(length=32), nullable=False),
-        sa.Column("ip_address", postgresql.INET(), nullable=False),
-        sa.Column(
-            "client_family",
-            sa.Enum(
-                "stable",
-                "lazer",
-                "web",
-                "api",
-                name="auth_attempt_client_family",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
-            nullable=False,
-        ),
-        sa.Column("client_version", sa.String(length=64), nullable=True),
-        sa.Column("result", sa.String(length=32), nullable=False),
-        sa.Column("failure_reason", sa.String(length=64), nullable=True),
-        sa.Column("country_code", sa.String(length=2), nullable=True),
-        sa.Column("asn", sa.BigInteger(), nullable=True),
-        sa.Column("context", postgresql.JSONB(astext_type=sa.Text()), server_default="{}", nullable=False),
-        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint(
-            "client_family IN ('stable', 'lazer', 'web', 'api')",
-            name=op.f("ck_auth_attempts_auth_attempt_client_family"),
+        "auth_token_scopes",
+        sa.Column("token_id", sa.Uuid(), nullable=False),
+        sa.Column("scope_id", sa.SmallInteger(), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["scope_id"], ["iam.scopes.id"], name=op.f("fk_auth_token_scopes_scope_id_scopes"), ondelete="RESTRICT"
         ),
         sa.ForeignKeyConstraint(
-            ["account_id"], ["core.accounts.id"], name=op.f("fk_auth_attempts_account_id_accounts"), ondelete="SET NULL"
-        ),
-        sa.ForeignKeyConstraint(
-            ["device_id"], ["iam.devices.id"], name=op.f("fk_auth_attempts_device_id_devices"), ondelete="SET NULL"
-        ),
-        sa.ForeignKeyConstraint(
-            ["session_id"],
-            ["iam.auth_sessions.id"],
-            name=op.f("fk_auth_attempts_session_id_auth_sessions"),
-            ondelete="SET NULL",
-        ),
-        sa.PrimaryKeyConstraint("id", name=op.f("pk_auth_attempts")),
-        schema="iam",
-    )
-    op.create_table(
-        "auth_challenges",
-        sa.Column("account_id", sa.Integer(), nullable=True),
-        sa.Column("session_id", sa.Uuid(), nullable=True),
-        sa.Column("oauth_client_id", sa.Uuid(), nullable=True),
-        sa.Column(
-            "kind",
-            sa.Enum(
-                "email_verification",
-                "password_reset",
-                "login_mfa",
-                "oauth_code",
-                name="challenge_kind",
-                native_enum=False,
-                create_constraint=False,
-                length=32,
-            ),
-            nullable=False,
-        ),
-        sa.Column("target", sa.String(length=254), nullable=True),
-        sa.Column("code_digest", sa.LargeBinary(length=32), nullable=False),
-        sa.Column("pkce_challenge", sa.String(length=128), nullable=True),
-        sa.Column("pkce_method", sa.String(length=16), nullable=True),
-        sa.Column("attempt_count", sa.SmallInteger(), server_default="0", nullable=False),
-        sa.Column("max_attempts", sa.SmallInteger(), server_default="5", nullable=False),
-        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("consumed_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("superseded_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint(
-            "kind IN ('email_verification', 'password_reset', 'login_mfa', 'oauth_code')",
-            name=op.f("ck_auth_challenges_challenge_kind"),
-        ),
-        sa.CheckConstraint(
-            "attempt_count >= 0 AND attempt_count <= max_attempts", name=op.f("ck_auth_challenges_attempt_count_range")
-        ),
-        sa.CheckConstraint("expires_at > created_at", name=op.f("ck_auth_challenges_valid_period")),
-        sa.CheckConstraint("max_attempts > 0", name=op.f("ck_auth_challenges_positive_max_attempts")),
-        sa.ForeignKeyConstraint(
-            ["account_id"],
-            ["core.accounts.id"],
-            name=op.f("fk_auth_challenges_account_id_accounts"),
-            ondelete="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(
-            ["oauth_client_id"],
-            ["iam.oauth_clients.id"],
-            name=op.f("fk_auth_challenges_oauth_client_id_oauth_clients"),
-            ondelete="CASCADE",
-        ),
-        sa.ForeignKeyConstraint(
-            ["session_id"],
-            ["iam.auth_sessions.id"],
-            name=op.f("fk_auth_challenges_session_id_auth_sessions"),
-            ondelete="CASCADE",
-        ),
-        sa.PrimaryKeyConstraint("id", name=op.f("pk_auth_challenges")),
-        sa.UniqueConstraint("code_digest", name=op.f("uq_auth_challenges_code_digest")),
-        schema="iam",
-    )
-    op.create_table(
-        "auth_tokens",
-        sa.Column("session_id", sa.Uuid(), nullable=False),
-        sa.Column("account_id", sa.Integer(), nullable=False),
-        sa.Column("parent_token_id", sa.Uuid(), nullable=True),
-        sa.Column(
-            "kind",
-            sa.Enum(
-                "access",
-                "refresh",
-                "api_key",
-                "stable_session",
-                name="token_kind",
-                native_enum=False,
-                create_constraint=False,
-                length=24,
-            ),
-            nullable=False,
-        ),
-        sa.Column("digest", sa.LargeBinary(length=32), nullable=False),
-        sa.Column("prefix", sa.String(length=16), nullable=False),
-        sa.Column("jti", sa.Uuid(), nullable=False),
-        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("consumed_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint(
-            "kind IN ('access', 'refresh', 'api_key', 'stable_session')", name=op.f("ck_auth_tokens_token_kind")
-        ),
-        sa.CheckConstraint("expires_at > created_at", name=op.f("ck_auth_tokens_valid_period")),
-        sa.ForeignKeyConstraint(
-            ["account_id"], ["core.accounts.id"], name=op.f("fk_auth_tokens_account_id_accounts"), ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["parent_token_id"],
+            ["token_id"],
             ["iam.auth_tokens.id"],
-            name=op.f("fk_auth_tokens_parent_token_id_auth_tokens"),
-            ondelete="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(
-            ["session_id"],
-            ["iam.auth_sessions.id"],
-            name=op.f("fk_auth_tokens_session_id_auth_sessions"),
+            name=op.f("fk_auth_token_scopes_token_id_auth_tokens"),
             ondelete="CASCADE",
         ),
-        sa.PrimaryKeyConstraint("id", name=op.f("pk_auth_tokens")),
-        sa.UniqueConstraint("digest", name=op.f("uq_auth_tokens_digest")),
-        sa.UniqueConstraint("jti", name=op.f("uq_auth_tokens_jti")),
+        sa.PrimaryKeyConstraint("token_id", "scope_id", name=op.f("pk_auth_token_scopes")),
         schema="iam",
     )
     op.create_table(
@@ -2476,7 +2329,6 @@ def upgrade() -> None:
                 "leaderboard_freeze",
                 name="sanction_kind",
                 native_enum=False,
-                create_constraint=False,
                 length=24,
             ),
             nullable=False,
@@ -2590,7 +2442,6 @@ def upgrade() -> None:
         "rooms",
         sa.Column("public_id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
         sa.Column("creator_account_id", sa.Integer(), nullable=False),
-        sa.Column("source_service_id", sa.Uuid(), nullable=False),
         sa.Column("channel_id", sa.BigInteger(), nullable=True),
         sa.Column("name", sa.String(length=255), nullable=False),
         sa.Column("category", sa.String(length=32), nullable=False),
@@ -2599,32 +2450,12 @@ def upgrade() -> None:
         sa.Column(
             "status",
             sa.Enum(
-                "pending",
-                "open",
-                "started",
-                "ended",
-                "cancelled",
-                name="room_status",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
+                "pending", "open", "started", "ended", "cancelled", name="room_status", native_enum=False, length=16
             ),
             server_default="pending",
             nullable=False,
         ),
-        sa.Column(
-            "result_policy",
-            sa.Enum(
-                "authoritative",
-                "unranked",
-                "local_only",
-                name="room_result_policy",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
-            nullable=False,
-        ),
+        sa.Column("ranked", sa.Boolean(), server_default="false", nullable=False),
         sa.Column("capacity", sa.Integer(), nullable=False),
         sa.Column("starts_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("ends_at", sa.DateTime(timezone=True), nullable=True),
@@ -2632,9 +2463,6 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint(
-            "result_policy IN ('authoritative', 'unranked', 'local_only')", name=op.f("ck_rooms_room_result_policy")
-        ),
         sa.CheckConstraint(
             "status IN ('pending', 'open', 'started', 'ended', 'cancelled')", name=op.f("ck_rooms_room_status")
         ),
@@ -2649,12 +2477,6 @@ def upgrade() -> None:
             ["creator_account_id"],
             ["core.accounts.id"],
             name=op.f("fk_rooms_creator_account_id_accounts"),
-            ondelete="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(
-            ["source_service_id"],
-            ["service.services.id"],
-            name=op.f("fk_rooms_source_service_id_services"),
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_rooms")),
@@ -2758,19 +2580,9 @@ def upgrade() -> None:
         sa.Column("beatmap_revision_id", sa.BigInteger(), nullable=False),
         sa.Column("scoreboard_id", sa.SmallInteger(), nullable=False),
         sa.Column("mod_set_id", sa.BigInteger(), nullable=False),
-        sa.Column("node_id", sa.Uuid(), nullable=False),
         sa.Column(
             "protocol",
-            sa.Enum(
-                "stable",
-                "lazer",
-                "web",
-                "api",
-                name="attempt_protocol",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("stable", "lazer", "web", "api", name="attempt_protocol", native_enum=False, length=16),
             nullable=False,
         ),
         sa.Column("idempotency_key", sa.String(length=128), nullable=False),
@@ -2785,7 +2597,6 @@ def upgrade() -> None:
                 "expired",
                 name="play_attempt_status",
                 native_enum=False,
-                create_constraint=False,
                 length=16,
             ),
             nullable=False,
@@ -2794,15 +2605,7 @@ def upgrade() -> None:
         sa.Column("ended_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
             "outcome",
-            sa.Enum(
-                "abandoned",
-                "failed",
-                "passed",
-                name="attempt_outcome",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("abandoned", "failed", "passed", name="attempt_outcome", native_enum=False, length=16),
             nullable=True,
         ),
         sa.Column("progress", sa.Numeric(precision=8, scale=7), server_default="0", nullable=False),
@@ -2837,18 +2640,13 @@ def upgrade() -> None:
             ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
-            ["node_id"],
-            ["service.service_nodes.id"],
-            name=op.f("fk_play_attempts_node_id_service_nodes"),
-            ondelete="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(
             ["scoreboard_id"],
             ["scoring.scoreboards.id"],
             name=op.f("fk_play_attempts_scoreboard_id_scoreboards"),
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_play_attempts")),
+        sa.UniqueConstraint("account_id", "protocol", "idempotency_key", name=op.f("uq_play_attempts_account_id")),
         sa.UniqueConstraint(
             "id",
             "account_id",
@@ -2857,34 +2655,7 @@ def upgrade() -> None:
             "mod_set_id",
             name="uq_play_attempts_score_dimensions",
         ),
-        sa.UniqueConstraint("node_id", "protocol", "idempotency_key", name=op.f("uq_play_attempts_node_id")),
         schema="scoring",
-    )
-    op.create_table(
-        "node_command_receipts",
-        sa.Column("node_id", sa.Uuid(), nullable=False),
-        sa.Column("key_version", sa.Integer(), nullable=False),
-        sa.Column("idempotency_key", sa.String(length=128), nullable=False),
-        sa.Column("aggregate_type", sa.String(length=64), nullable=False),
-        sa.Column("aggregate_id", sa.Uuid(), nullable=False),
-        sa.Column("expected_version", sa.Integer(), nullable=False),
-        sa.Column("request_hash", sa.LargeBinary(length=32), nullable=False),
-        sa.Column("signature", sa.LargeBinary(), nullable=False),
-        sa.Column("status", sa.String(length=16), nullable=False),
-        sa.Column("response", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-        sa.Column("error_code", sa.String(length=64), nullable=True),
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint("expected_version >= 0", name=op.f("ck_node_command_receipts_nonnegative_version")),
-        sa.ForeignKeyConstraint(
-            ["node_id", "key_version"],
-            ["service.service_node_keys.node_id", "service.service_node_keys.key_version"],
-            name=op.f("fk_node_command_receipts_node_id_service_node_keys"),
-            ondelete="RESTRICT",
-        ),
-        sa.PrimaryKeyConstraint("id", name=op.f("pk_node_command_receipts")),
-        sa.UniqueConstraint("node_id", "idempotency_key", name=op.f("uq_node_command_receipts_node_id")),
-        schema="service",
     )
     op.create_table(
         "channel_user_states",
@@ -2942,22 +2713,6 @@ def upgrade() -> None:
         schema="community",
     )
     op.create_table(
-        "auth_token_scopes",
-        sa.Column("token_id", sa.Uuid(), nullable=False),
-        sa.Column("scope_id", sa.SmallInteger(), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["scope_id"], ["iam.scopes.id"], name=op.f("fk_auth_token_scopes_scope_id_scopes"), ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["token_id"],
-            ["iam.auth_tokens.id"],
-            name=op.f("fk_auth_token_scopes_token_id_auth_tokens"),
-            ondelete="CASCADE",
-        ),
-        sa.PrimaryKeyConstraint("token_id", "scope_id", name=op.f("pk_auth_token_scopes")),
-        schema="iam",
-    )
-    op.create_table(
         "sanction_events",
         sa.Column("sanction_id", sa.Uuid(), nullable=False),
         sa.Column("actor_account_id", sa.Integer(), nullable=True),
@@ -3009,7 +2764,6 @@ def upgrade() -> None:
         "matchmaking_tickets",
         sa.Column("queue_id", sa.Uuid(), nullable=False),
         sa.Column("group_id", sa.Uuid(), nullable=False),
-        sa.Column("source_command_id", sa.Uuid(), nullable=True),
         sa.Column("state", sa.String(length=16), server_default="queued", nullable=False),
         sa.Column("rating", sa.Numeric(precision=12, scale=4), nullable=False),
         sa.Column("rating_deviation", sa.Numeric(precision=12, scale=4), nullable=False),
@@ -3030,14 +2784,7 @@ def upgrade() -> None:
             name=op.f("fk_matchmaking_tickets_queue_id_matchmaking_queues"),
             ondelete="RESTRICT",
         ),
-        sa.ForeignKeyConstraint(
-            ["source_command_id"],
-            ["service.node_command_receipts.id"],
-            name=op.f("fk_matchmaking_tickets_source_command_id_node_command_receipts"),
-            ondelete="SET NULL",
-        ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_matchmaking_tickets")),
-        sa.UniqueConstraint("source_command_id", name=op.f("uq_matchmaking_tickets_source_command_id")),
         schema="multiplayer",
     )
     op.create_table(
@@ -3125,14 +2872,12 @@ def upgrade() -> None:
                 "aborted",
                 name="multiplayer_session_status",
                 native_enum=False,
-                create_constraint=False,
                 length=16,
             ),
             server_default="pending",
             nullable=False,
         ),
         sa.Column("version", sa.Integer(), server_default="0", nullable=False),
-        sa.Column("epoch", sa.Integer(), server_default="0", nullable=False),
         sa.Column("ended_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
@@ -3141,9 +2886,7 @@ def upgrade() -> None:
             name=op.f("ck_sessions_multiplayer_session_status"),
         ),
         sa.CheckConstraint("ended_at IS NULL OR ended_at > created_at", name=op.f("ck_sessions_valid_period")),
-        sa.CheckConstraint(
-            "ordinal > 0 AND version >= 0 AND epoch >= 0", name=op.f("ck_sessions_positive_ordinal_versions")
-        ),
+        sa.CheckConstraint("ordinal > 0 AND version >= 0", name=op.f("ck_sessions_positive_ordinal_version")),
         sa.ForeignKeyConstraint(
             ["host_account_id"],
             ["core.accounts.id"],
@@ -3173,34 +2916,13 @@ def upgrade() -> None:
         sa.Column(
             "grade",
             sa.Enum(
-                "N",
-                "F",
-                "D",
-                "C",
-                "B",
-                "A",
-                "S",
-                "SH",
-                "X",
-                "XH",
-                name="score_grade",
-                native_enum=False,
-                create_constraint=False,
-                length=4,
+                "N", "F", "D", "C", "B", "A", "S", "SH", "X", "XH", name="score_grade", native_enum=False, length=4
             ),
             nullable=False,
         ),
         sa.Column(
             "outcome",
-            sa.Enum(
-                "abandoned",
-                "failed",
-                "passed",
-                name="score_outcome",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("abandoned", "failed", "passed", name="score_outcome", native_enum=False, length=16),
             nullable=False,
         ),
         sa.Column("perfect", sa.Boolean(), server_default="false", nullable=False),
@@ -3326,12 +3048,8 @@ def upgrade() -> None:
         sa.Column("room_sequence", sa.BigInteger(), nullable=False),
         sa.Column("session_id", sa.Uuid(), nullable=True),
         sa.Column("actor_account_id", sa.Integer(), nullable=True),
-        sa.Column("node_id", sa.Uuid(), nullable=True),
-        sa.Column("command_id", sa.Uuid(), nullable=True),
-        sa.Column("command_event_number", sa.SmallInteger(), nullable=True),
         sa.Column("aggregate_version", sa.Integer(), nullable=False),
         sa.Column("event_type", sa.String(length=64), nullable=False),
-        sa.Column("authority", sa.String(length=16), nullable=False),
         sa.Column("visibility", sa.String(length=16), nullable=False),
         sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), server_default="{}", nullable=False),
         sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
@@ -3344,22 +3062,12 @@ def upgrade() -> None:
             ondelete="SET NULL",
         ),
         sa.ForeignKeyConstraint(
-            ["command_id"],
-            ["service.node_command_receipts.id"],
-            name=op.f("fk_events_command_id_node_command_receipts"),
-            ondelete="SET NULL",
-        ),
-        sa.ForeignKeyConstraint(
-            ["node_id"], ["service.service_nodes.id"], name=op.f("fk_events_node_id_service_nodes"), ondelete="SET NULL"
-        ),
-        sa.ForeignKeyConstraint(
             ["room_id"], ["multiplayer.rooms.id"], name=op.f("fk_events_room_id_rooms"), ondelete="RESTRICT"
         ),
         sa.ForeignKeyConstraint(
             ["session_id"], ["multiplayer.sessions.id"], name=op.f("fk_events_session_id_sessions"), ondelete="RESTRICT"
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_events")),
-        sa.UniqueConstraint("command_id", "command_event_number", name=op.f("uq_events_command_id")),
         sa.UniqueConstraint("room_id", "room_sequence", name=op.f("uq_events_room_id")),
         schema="multiplayer",
     )
@@ -3490,35 +3198,6 @@ def upgrade() -> None:
         schema="multiplayer",
     )
     op.create_table(
-        "session_leases",
-        sa.Column("session_id", sa.Uuid(), nullable=False),
-        sa.Column("node_id", sa.Uuid(), nullable=False),
-        sa.Column("epoch", sa.Integer(), nullable=False),
-        sa.Column("token_digest", sa.LargeBinary(length=32), nullable=False),
-        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint("epoch > 0", name=op.f("ck_session_leases_positive_epoch")),
-        sa.CheckConstraint("expires_at > created_at", name=op.f("ck_session_leases_valid_period")),
-        sa.ForeignKeyConstraint(
-            ["node_id"],
-            ["service.service_nodes.id"],
-            name=op.f("fk_session_leases_node_id_service_nodes"),
-            ondelete="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(
-            ["session_id"],
-            ["multiplayer.sessions.id"],
-            name=op.f("fk_session_leases_session_id_sessions"),
-            ondelete="RESTRICT",
-        ),
-        sa.PrimaryKeyConstraint("id", name=op.f("pk_session_leases")),
-        sa.UniqueConstraint("session_id", "epoch", name=op.f("uq_session_leases_session_id")),
-        sa.UniqueConstraint("token_digest", name=op.f("uq_session_leases_token_digest")),
-        schema="multiplayer",
-    )
-    op.create_table(
         "session_pool_bindings",
         sa.Column("session_id", sa.Uuid(), nullable=False),
         sa.Column("pool_revision_id", sa.Uuid(), nullable=False),
@@ -3556,19 +3235,12 @@ def upgrade() -> None:
         sa.Column("room_id", sa.Uuid(), nullable=False),
         sa.Column("account_id", sa.Integer(), nullable=False),
         sa.Column("join_number", sa.Integer(), nullable=False),
-        sa.Column("node_id", sa.Uuid(), nullable=False),
         sa.Column("left_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("leave_reason", sa.String(length=32), nullable=True),
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.CheckConstraint("join_number > 0", name=op.f("ck_session_presences_positive_join_number")),
         sa.CheckConstraint("left_at IS NULL OR left_at > created_at", name=op.f("ck_session_presences_valid_period")),
-        sa.ForeignKeyConstraint(
-            ["node_id"],
-            ["service.service_nodes.id"],
-            name=op.f("fk_session_presences_node_id_service_nodes"),
-            ondelete="RESTRICT",
-        ),
         sa.ForeignKeyConstraint(
             ["room_id", "account_id"],
             ["multiplayer.room_participants.room_id", "multiplayer.room_participants.account_id"],
@@ -3708,16 +3380,7 @@ def upgrade() -> None:
         sa.Column("score_id", sa.BigInteger(), nullable=False),
         sa.Column(
             "client_family",
-            sa.Enum(
-                "stable",
-                "lazer",
-                "web",
-                "api",
-                name="attestation_client_family",
-                native_enum=False,
-                create_constraint=False,
-                length=16,
-            ),
+            sa.Enum("stable", "lazer", "web", "api", name="attestation_client_family", native_enum=False, length=16),
             nullable=False,
         ),
         sa.Column("client_version", sa.String(length=64), nullable=False),
@@ -3961,7 +3624,6 @@ def upgrade() -> None:
         sa.Column("round_number", sa.Integer(), nullable=False),
         sa.Column("playlist_revision_id", sa.Uuid(), nullable=True),
         sa.Column("tournament_pool_item_id", sa.Uuid(), nullable=True),
-        sa.Column("source_command_id", sa.Uuid(), nullable=True),
         sa.Column("status", sa.String(length=16), server_default="pending", nullable=False),
         sa.Column("configuration", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("configuration_digest", sa.LargeBinary(length=32), nullable=False),
@@ -3981,12 +3643,6 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(
             ["session_id"], ["multiplayer.sessions.id"], name=op.f("fk_rounds_session_id_sessions"), ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["source_command_id"],
-            ["service.node_command_receipts.id"],
-            name=op.f("fk_rounds_source_command_id_node_command_receipts"),
-            ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
             ["tournament_pool_item_id"],
@@ -4034,7 +3690,6 @@ def upgrade() -> None:
                 "expired",
                 name="multiplayer_attempt_status",
                 native_enum=False,
-                create_constraint=False,
                 length=16,
             ),
             nullable=False,
@@ -4193,7 +3848,6 @@ def upgrade() -> None:
         unique=False,
         schema="audit",
     )
-    op.create_index("ix_audit_events_request", "audit_events", ["request_id"], unique=False, schema="audit")
     op.create_index(
         "ix_audit_events_target_created",
         "audit_events",
@@ -4201,17 +3855,15 @@ def upgrade() -> None:
         unique=False,
         schema="audit",
     )
-    op.create_index("ix_accounts_country_id", "accounts", ["country_code", "id"], unique=False, schema="core")
+    op.create_index("ix_audit_events_request", "audit_events", ["request_id"], unique=False, schema="audit")
     op.create_index("ix_accounts_status_id", "accounts", ["status", "id"], unique=False, schema="core")
+    op.create_index("ix_accounts_country_id", "accounts", ["country_code", "id"], unique=False, schema="core")
     op.create_index(
         "ix_outbox_events_aggregate",
         "outbox_events",
         ["aggregate_type", "aggregate_id", "created_at"],
         unique=False,
         schema="events",
-    )
-    op.create_index(
-        "ix_outbox_events_pending", "outbox_events", ["published_at", "available_at"], unique=False, schema="events"
     )
     op.create_index(
         "ix_calculation_releases_active",
@@ -4235,16 +3887,16 @@ def upgrade() -> None:
         schema="authz",
     )
     op.create_index(
-        "ix_account_role_grants_account_active",
+        "ix_account_role_grants_role_active",
         "account_role_grants",
-        ["account_id", "starts_at", "ends_at"],
+        ["role_id", "starts_at", "ends_at"],
         unique=False,
         schema="authz",
     )
     op.create_index(
-        "ix_account_role_grants_role_active",
+        "ix_account_role_grants_account_active",
         "account_role_grants",
-        ["role_id", "starts_at", "ends_at"],
+        ["account_id", "starts_at", "ends_at"],
         unique=False,
         schema="authz",
     )
@@ -4258,20 +3910,20 @@ def upgrade() -> None:
         "ix_beatmapsets_status_ranked", "beatmapsets", ["status", "ranked_at"], unique=False, schema="content"
     )
     op.create_index(
-        "uq_account_emails_active_key",
-        "account_emails",
-        ["email_key"],
-        unique=True,
-        schema="core",
-        postgresql_where=sa.text("retired_at IS NULL"),
-    )
-    op.create_index(
         "uq_account_emails_primary_account",
         "account_emails",
         ["account_id"],
         unique=True,
         schema="core",
         postgresql_where=sa.text("is_primary AND retired_at IS NULL"),
+    )
+    op.create_index(
+        "uq_account_emails_active_key",
+        "account_emails",
+        ["email_key"],
+        unique=True,
+        schema="core",
+        postgresql_where=sa.text("retired_at IS NULL"),
     )
     op.create_index(
         "uq_account_names_current_account",
@@ -4307,6 +3959,24 @@ def upgrade() -> None:
         schema="events",
     )
     op.create_index(
+        "ix_outbox_deliveries_due",
+        "outbox_deliveries",
+        ["available_at", "lease_expires_at"],
+        unique=False,
+        schema="events",
+        postgresql_where=sa.text("completed_at IS NULL AND dead_lettered_at IS NULL"),
+    )
+    op.create_index(
+        "ix_outbox_deliveries_broker_task", "outbox_deliveries", ["broker_task_id"], unique=False, schema="events"
+    )
+    op.create_index(
+        "ix_outbox_deliveries_partition",
+        "outbox_deliveries",
+        ["consumer", "partition_key", "completed_at", "event_id"],
+        unique=False,
+        schema="events",
+    )
+    op.create_index(
         "ix_account_devices_device", "account_devices", ["device_id", "last_used_at"], unique=False, schema="iam"
     )
     op.create_index(
@@ -4321,10 +3991,10 @@ def upgrade() -> None:
         schema="iam",
         postgresql_where=sa.text("disabled_at IS NULL"),
     )
-    op.create_index("ix_cases_status_created", "cases", ["status", "created_at"], unique=False, schema="moderation")
     op.create_index(
         "ix_cases_subject_status", "cases", ["subject_account_id", "status"], unique=False, schema="moderation"
     )
+    op.create_index("ix_cases_status_created", "cases", ["status", "created_at"], unique=False, schema="moderation")
     op.create_index(
         "ix_tournament_pools_creator_status",
         "tournament_pools",
@@ -4332,10 +4002,10 @@ def upgrade() -> None:
         unique=False,
         schema="multiplayer",
     )
+    op.create_index("ix_mod_sets_legacy", "mod_sets", ["scoreboard_id", "legacy_bits"], unique=False, schema="scoring")
     op.create_index(
         "ix_mod_sets_json", "mod_sets", ["canonical"], unique=False, schema="scoring", postgresql_using="gin"
     )
-    op.create_index("ix_mod_sets_legacy", "mod_sets", ["scoreboard_id", "legacy_bits"], unique=False, schema="scoring")
     op.create_index(
         "ix_ranking_policies_active", "ranking_policies", ["scoreboard_id", "active"], unique=False, schema="scoring"
     )
@@ -4346,10 +4016,6 @@ def upgrade() -> None:
         unique=False,
         schema="scoring",
     )
-    op.create_index(
-        op.f("ix_services_owner_account_id"), "services", ["owner_account_id"], unique=False, schema="service"
-    )
-    op.create_index("ix_services_status_trust", "services", ["status", "trust_tier"], unique=False, schema="service")
     op.create_index(
         "ix_blocks_target", "blocks", ["target_account_id", "actor_account_id"], unique=False, schema="social"
     )
@@ -4371,8 +4037,8 @@ def upgrade() -> None:
         schema="community",
         postgresql_where=sa.text("read_at IS NULL"),
     )
-    op.create_index("ix_beatmaps_set_id", "beatmaps", ["beatmapset_id", "id"], unique=False, schema="content")
     op.create_index("ix_beatmaps_status_ruleset", "beatmaps", ["status", "ruleset"], unique=False, schema="content")
+    op.create_index("ix_beatmaps_set_id", "beatmaps", ["beatmapset_id", "id"], unique=False, schema="content")
     op.create_index("ix_beatmapset_assets_asset", "beatmapset_assets", ["asset_id"], unique=False, schema="content")
     op.create_index(
         "ix_beatmapset_favourites_set_created",
@@ -4382,6 +4048,17 @@ def upgrade() -> None:
         schema="content",
     )
     op.create_index("ix_sync_states_next_check", "sync_states", ["next_check_at"], unique=False, schema="content")
+    op.create_index(
+        "ix_auth_sessions_account_created", "auth_sessions", ["account_id", "created_at"], unique=False, schema="iam"
+    )
+    op.create_index(
+        "ix_auth_sessions_active_account",
+        "auth_sessions",
+        ["account_id"],
+        unique=False,
+        schema="iam",
+        postgresql_where=sa.text("revoked_at IS NULL AND closed_at IS NULL"),
+    )
     op.create_index(
         "ix_oauth_client_secrets_client",
         "oauth_client_secrets",
@@ -4414,16 +4091,11 @@ def upgrade() -> None:
         unique=False,
         schema="scoring",
     )
-    op.create_index("ix_service_nodes_last_seen", "service_nodes", ["last_seen_at"], unique=False, schema="service")
-    op.create_index(
-        "ix_service_nodes_service_status", "service_nodes", ["service_id", "status"], unique=False, schema="service"
-    )
     op.create_index("ix_teams_ruleset_archived", "teams", ["ruleset", "archived_at"], unique=False, schema="social")
     op.create_index("ix_channels_kind_archived", "channels", ["kind", "archived_at"], unique=False, schema="community")
     op.create_index(
         "ix_beatmap_owners_account", "beatmap_owners", ["account_id", "beatmap_id"], unique=False, schema="content"
     )
-    op.create_index("ix_beatmap_revisions_md5", "beatmap_revisions", ["md5"], unique=False, schema="content")
     op.create_index(
         "uq_beatmap_revisions_current",
         "beatmap_revisions",
@@ -4432,6 +4104,7 @@ def upgrade() -> None:
         schema="content",
         postgresql_where=sa.text("is_current"),
     )
+    op.create_index("ix_beatmap_revisions_md5", "beatmap_revisions", ["md5"], unique=False, schema="content")
     op.create_index(
         "ix_beatmap_status_events_beatmap_effective",
         "beatmap_status_events",
@@ -4443,9 +4116,6 @@ def upgrade() -> None:
         "ix_beatmap_tag_votes_count", "beatmap_tag_votes", ["beatmap_id", "tag_id"], unique=False, schema="content"
     )
     op.create_index(
-        "ix_map_status_requests_queue", "map_status_requests", ["status", "created_at"], unique=False, schema="content"
-    )
-    op.create_index(
         "uq_map_status_requests_open",
         "map_status_requests",
         ["beatmap_id", "requester_account_id"],
@@ -4454,19 +4124,37 @@ def upgrade() -> None:
         postgresql_where=sa.text("status = 'open'"),
     )
     op.create_index(
+        "ix_map_status_requests_queue", "map_status_requests", ["status", "created_at"], unique=False, schema="content"
+    )
+    op.create_index(
         "ix_account_badges_account_created", "account_badges", ["account_id", "created_at"], unique=False, schema="core"
     )
     op.create_index(
-        "ix_auth_sessions_account_created", "auth_sessions", ["account_id", "created_at"], unique=False, schema="iam"
-    )
-    op.create_index(
-        "ix_auth_sessions_active_account",
-        "auth_sessions",
-        ["account_id"],
+        "ix_auth_attempts_identifier_created",
+        "auth_attempts",
+        ["identifier_hmac", "created_at"],
         unique=False,
         schema="iam",
-        postgresql_where=sa.text("revoked_at IS NULL AND closed_at IS NULL"),
     )
+    op.create_index(
+        "ix_auth_attempts_ip_created", "auth_attempts", ["ip_address", "created_at"], unique=False, schema="iam"
+    )
+    op.create_index(
+        "ix_auth_attempts_account_created", "auth_attempts", ["account_id", "created_at"], unique=False, schema="iam"
+    )
+    op.create_index("ix_auth_challenges_expiry", "auth_challenges", ["expires_at"], unique=False, schema="iam")
+    op.create_index(
+        "ix_auth_challenges_account_kind",
+        "auth_challenges",
+        ["account_id", "kind", "expires_at"],
+        unique=False,
+        schema="iam",
+    )
+    op.create_index(
+        "ix_auth_tokens_account_expiry", "auth_tokens", ["account_id", "expires_at"], unique=False, schema="iam"
+    )
+    op.create_index("ix_auth_tokens_expiry", "auth_tokens", ["expires_at"], unique=False, schema="iam")
+    op.create_index("ix_auth_tokens_session", "auth_tokens", ["session_id", "created_at"], unique=False, schema="iam")
     op.create_index(
         "ix_matchmaking_queues_active_board",
         "matchmaking_queues",
@@ -4480,13 +4168,6 @@ def upgrade() -> None:
         ["account_id", "scoreboard_id", "attempt_count"],
         unique=False,
         schema="scoring",
-    )
-    op.create_index(
-        "ix_service_node_keys_validity",
-        "service_node_keys",
-        ["node_id", "valid_from", "valid_until"],
-        unique=False,
-        schema="service",
     )
     op.create_index(
         "ix_team_join_requests_candidate",
@@ -4504,6 +4185,14 @@ def upgrade() -> None:
         postgresql_where=sa.text("status = 'pending'"),
     )
     op.create_index(
+        "uq_team_memberships_current_owner",
+        "team_memberships",
+        ["team_id"],
+        unique=True,
+        schema="social",
+        postgresql_where=sa.text("left_at IS NULL AND role = 'owner'"),
+    )
+    op.create_index(
         "ix_team_memberships_team_active",
         "team_memberships",
         ["team_id", "left_at", "account_id"],
@@ -4519,12 +4208,12 @@ def upgrade() -> None:
         postgresql_where=sa.text("left_at IS NULL"),
     )
     op.create_index(
-        "uq_team_memberships_current_owner",
-        "team_memberships",
-        ["team_id"],
+        "uq_channel_memberships_current",
+        "channel_memberships",
+        ["channel_id", "account_id"],
         unique=True,
-        schema="social",
-        postgresql_where=sa.text("left_at IS NULL AND role = 'owner'"),
+        schema="community",
+        postgresql_where=sa.text("left_at IS NULL"),
     )
     op.create_index(
         "ix_channel_memberships_account",
@@ -4532,14 +4221,6 @@ def upgrade() -> None:
         ["account_id", "left_at"],
         unique=False,
         schema="community",
-    )
-    op.create_index(
-        "uq_channel_memberships_current",
-        "channel_memberships",
-        ["channel_id", "account_id"],
-        unique=True,
-        schema="community",
-        postgresql_where=sa.text("left_at IS NULL"),
     )
     op.create_index("ix_messages_channel_id_desc", "messages", ["channel_id", "id"], unique=False, schema="community")
     op.create_index(
@@ -4553,15 +4234,15 @@ def upgrade() -> None:
         schema="content",
     )
     op.create_index(
-        "ix_rating_votes_set_rating", "rating_votes", ["beatmapset_id", "rating"], unique=False, schema="content"
-    )
-    op.create_index(
         "uq_rating_votes_revision_account",
         "rating_votes",
         ["account_id", "beatmap_revision_id"],
         unique=True,
         schema="content",
         postgresql_where=sa.text("beatmap_revision_id IS NOT NULL"),
+    )
+    op.create_index(
+        "ix_rating_votes_set_rating", "rating_votes", ["beatmapset_id", "rating"], unique=False, schema="content"
     )
     op.create_index(
         "uq_rating_votes_set_account",
@@ -4572,32 +4253,6 @@ def upgrade() -> None:
         postgresql_where=sa.text("beatmapset_id IS NOT NULL"),
     )
     op.create_index(
-        "ix_auth_attempts_account_created", "auth_attempts", ["account_id", "created_at"], unique=False, schema="iam"
-    )
-    op.create_index(
-        "ix_auth_attempts_identifier_created",
-        "auth_attempts",
-        ["identifier_hmac", "created_at"],
-        unique=False,
-        schema="iam",
-    )
-    op.create_index(
-        "ix_auth_attempts_ip_created", "auth_attempts", ["ip_address", "created_at"], unique=False, schema="iam"
-    )
-    op.create_index(
-        "ix_auth_challenges_account_kind",
-        "auth_challenges",
-        ["account_id", "kind", "expires_at"],
-        unique=False,
-        schema="iam",
-    )
-    op.create_index("ix_auth_challenges_expiry", "auth_challenges", ["expires_at"], unique=False, schema="iam")
-    op.create_index(
-        "ix_auth_tokens_account_expiry", "auth_tokens", ["account_id", "expires_at"], unique=False, schema="iam"
-    )
-    op.create_index("ix_auth_tokens_expiry", "auth_tokens", ["expires_at"], unique=False, schema="iam")
-    op.create_index("ix_auth_tokens_session", "auth_tokens", ["session_id", "created_at"], unique=False, schema="iam")
-    op.create_index(
         "ix_sanctions_subject_active",
         "sanctions",
         ["subject_account_id", "kind", "ends_at"],
@@ -4606,16 +4261,16 @@ def upgrade() -> None:
         postgresql_where=sa.text("revoked_at IS NULL"),
     )
     op.create_index(
-        "ix_matchmaking_groups_owner",
+        "ix_matchmaking_groups_queue_status",
         "matchmaking_groups",
-        ["owner_account_id", "status"],
+        ["queue_id", "status", "created_at"],
         unique=False,
         schema="multiplayer",
     )
     op.create_index(
-        "ix_matchmaking_groups_queue_status",
+        "ix_matchmaking_groups_owner",
         "matchmaking_groups",
-        ["queue_id", "status", "created_at"],
+        ["owner_account_id", "status"],
         unique=False,
         schema="multiplayer",
     )
@@ -4651,13 +4306,6 @@ def upgrade() -> None:
         schema="scoring",
     )
     op.create_index(
-        "ix_play_attempts_account_started",
-        "play_attempts",
-        ["account_id", "started_at"],
-        unique=False,
-        schema="scoring",
-    )
-    op.create_index(
         "ix_play_attempts_revision_started",
         "play_attempts",
         ["beatmap_revision_id", "started_at"],
@@ -4668,18 +4316,11 @@ def upgrade() -> None:
         "ix_play_attempts_status_created", "play_attempts", ["status", "created_at"], unique=False, schema="scoring"
     )
     op.create_index(
-        "ix_node_command_receipts_aggregate",
-        "node_command_receipts",
-        ["aggregate_type", "aggregate_id", "created_at"],
+        "ix_play_attempts_account_started",
+        "play_attempts",
+        ["account_id", "started_at"],
         unique=False,
-        schema="service",
-    )
-    op.create_index(
-        "ix_node_command_receipts_status_created",
-        "node_command_receipts",
-        ["status", "created_at"],
-        unique=False,
-        schema="service",
+        schema="scoring",
     )
     op.create_index(
         "ix_message_revisions_message_created",
@@ -4703,18 +4344,18 @@ def upgrade() -> None:
         schema="multiplayer",
     )
     op.create_index(
-        "ix_matchmaking_tickets_queue_order",
-        "matchmaking_tickets",
-        ["queue_id", "priority", "created_at"],
-        unique=False,
-        schema="multiplayer",
-        postgresql_where=sa.text("state = 'queued'"),
-    )
-    op.create_index(
         "uq_matchmaking_tickets_queued_group",
         "matchmaking_tickets",
         ["group_id"],
         unique=True,
+        schema="multiplayer",
+        postgresql_where=sa.text("state = 'queued'"),
+    )
+    op.create_index(
+        "ix_matchmaking_tickets_queue_order",
+        "matchmaking_tickets",
+        ["queue_id", "priority", "created_at"],
+        unique=False,
         schema="multiplayer",
         postgresql_where=sa.text("state = 'queued'"),
     )
@@ -4726,16 +4367,16 @@ def upgrade() -> None:
         schema="multiplayer",
     )
     op.create_index(
-        "ix_room_participants_account_activity",
+        "ix_room_participants_room_status",
         "room_participants",
-        ["account_id", "last_activity_at"],
+        ["room_id", "status"],
         unique=False,
         schema="multiplayer",
     )
     op.create_index(
-        "ix_room_participants_room_status",
+        "ix_room_participants_account_activity",
         "room_participants",
-        ["room_id", "status"],
+        ["account_id", "last_activity_at"],
         unique=False,
         schema="multiplayer",
     )
@@ -4746,16 +4387,9 @@ def upgrade() -> None:
         unique=False,
         schema="multiplayer",
     )
-    op.create_index(
-        "ix_sessions_host_status", "sessions", ["host_account_id", "status"], unique=False, schema="multiplayer"
-    )
     op.create_index("ix_sessions_room_status", "sessions", ["room_id", "status"], unique=False, schema="multiplayer")
     op.create_index(
-        "ix_scores_account_board_ended",
-        "scores",
-        ["account_id", "scoreboard_id", "ended_at"],
-        unique=False,
-        schema="scoring",
+        "ix_sessions_host_status", "sessions", ["host_account_id", "status"], unique=False, schema="multiplayer"
     )
     op.create_index(
         "ix_scores_revision_board",
@@ -4765,7 +4399,11 @@ def upgrade() -> None:
         schema="scoring",
     )
     op.create_index(
-        "ix_comments_beatmap_position", "comments", ["beatmap_id", "position_ms", "id"], unique=False, schema="content"
+        "ix_scores_account_board_ended",
+        "scores",
+        ["account_id", "scoreboard_id", "ended_at"],
+        unique=False,
+        schema="scoring",
     )
     op.create_index(
         "ix_comments_score_position", "comments", ["score_id", "position_ms", "id"], unique=False, schema="content"
@@ -4774,11 +4412,17 @@ def upgrade() -> None:
         "ix_comments_set_position", "comments", ["beatmapset_id", "position_ms", "id"], unique=False, schema="content"
     )
     op.create_index(
+        "ix_comments_beatmap_position", "comments", ["beatmap_id", "position_ms", "id"], unique=False, schema="content"
+    )
+    op.create_index(
         "ix_anticheat_runs_status_created",
         "anticheat_runs",
         ["status", "created_at"],
         unique=False,
         schema="moderation",
+    )
+    op.create_index(
+        "ix_multiplayer_events_type_created", "events", ["event_type", "created_at"], unique=False, schema="multiplayer"
     )
     op.create_index(
         "ix_multiplayer_events_room_id_desc", "events", ["room_id", "id"], unique=False, schema="multiplayer"
@@ -4789,9 +4433,6 @@ def upgrade() -> None:
         ["session_id", "aggregate_version"],
         unique=False,
         schema="multiplayer",
-    )
-    op.create_index(
-        "ix_multiplayer_events_type_created", "events", ["event_type", "created_at"], unique=False, schema="multiplayer"
     )
     op.create_index(
         "ix_matchmaking_assignments_deadline",
@@ -4821,17 +4462,6 @@ def upgrade() -> None:
         unique=True,
         schema="multiplayer",
         postgresql_where=sa.text("is_current"),
-    )
-    op.create_index(
-        "ix_session_leases_node_expiry", "session_leases", ["node_id", "expires_at"], unique=False, schema="multiplayer"
-    )
-    op.create_index(
-        "uq_session_leases_active",
-        "session_leases",
-        ["session_id"],
-        unique=True,
-        schema="multiplayer",
-        postgresql_where=sa.text("revoked_at IS NULL"),
     )
     op.create_index(
         "ix_session_pool_bindings_revision",
@@ -4867,20 +4497,19 @@ def upgrade() -> None:
         "ix_session_standings_rank", "session_standings", ["session_id", "points"], unique=False, schema="multiplayer"
     )
     op.create_index(
-        "ix_leaderboard_entries_account",
-        "leaderboard_entries",
-        ["account_id", "policy_id", "beatmap_id"],
-        unique=False,
-        schema="scoring",
-    )
-    op.create_index(
         "ix_leaderboard_entries_rank",
         "leaderboard_entries",
         ["policy_id", "beatmap_id", "scope", "filter_mod_set_id", "metric_value", "tie_break_value"],
         unique=False,
         schema="scoring",
     )
-    op.create_index("ix_leaderboard_entries_score", "leaderboard_entries", ["score_id"], unique=False, schema="scoring")
+    op.create_index(
+        "ix_leaderboard_entries_account",
+        "leaderboard_entries",
+        ["account_id", "policy_id", "beatmap_id"],
+        unique=False,
+        schema="scoring",
+    )
     op.create_index(
         "uq_leaderboard_entries_context_user",
         "leaderboard_entries",
@@ -4889,6 +4518,7 @@ def upgrade() -> None:
         schema="scoring",
         postgresql_nulls_not_distinct=True,
     )
+    op.create_index("ix_leaderboard_entries_score", "leaderboard_entries", ["score_id"], unique=False, schema="scoring")
     op.create_index(
         "ix_replay_views_owner_created",
         "replay_view_events",
@@ -4956,10 +4586,10 @@ def upgrade() -> None:
         unique=False,
         schema="multiplayer",
     )
+    op.create_index("ix_rounds_session_status", "rounds", ["session_id", "status"], unique=False, schema="multiplayer")
     op.create_index(
         "ix_rounds_playlist_revision", "rounds", ["playlist_revision_id"], unique=False, schema="multiplayer"
     )
-    op.create_index("ix_rounds_session_status", "rounds", ["session_id", "status"], unique=False, schema="multiplayer")
     op.create_index(
         "ix_multiplayer_attempts_playlist_account",
         "attempts",
@@ -4997,7 +4627,6 @@ def upgrade() -> None:
         schema="multiplayer",
         postgresql_where=sa.text("slot_number IS NOT NULL"),
     )
-    op.create_index("ix_round_results_rank", "round_results", ["round_id", "rank"], unique=False, schema="multiplayer")
     op.create_index(
         "uq_round_results_account",
         "round_results",
@@ -5006,6 +4635,7 @@ def upgrade() -> None:
         schema="multiplayer",
         postgresql_where=sa.text("account_id IS NOT NULL"),
     )
+    op.create_index("ix_round_results_rank", "round_results", ["round_id", "rank"], unique=False, schema="multiplayer")
     op.create_index(
         "uq_round_results_team",
         "round_results",
@@ -5028,7 +4658,6 @@ def upgrade() -> None:
         unique=False,
         schema="multiplayer",
     )
-    # ### end Alembic commands ###
 
     op.execute(
         sa.text(
@@ -5097,7 +4726,6 @@ def downgrade() -> None:
     op.drop_table("session_standings", schema="multiplayer")
     op.drop_table("session_presences", schema="multiplayer")
     op.drop_table("session_pool_bindings", schema="multiplayer")
-    op.drop_table("session_leases", schema="multiplayer")
     op.drop_table("playlist_revisions", schema="multiplayer")
     op.drop_table("playlist_item_user_summaries", schema="multiplayer")
     op.drop_table("matchmaking_assignments", schema="multiplayer")
@@ -5112,10 +4740,8 @@ def downgrade() -> None:
     op.drop_table("matchmaking_tickets", schema="multiplayer")
     op.drop_table("matchmaking_group_members", schema="multiplayer")
     op.drop_table("sanction_events", schema="moderation")
-    op.drop_table("auth_token_scopes", schema="iam")
     op.drop_table("message_revisions", schema="community")
     op.drop_table("channel_user_states", schema="community")
-    op.drop_table("node_command_receipts", schema="service")
     op.drop_table("play_attempts", schema="scoring")
     op.drop_table("beatmap_difficulty_attributes", schema="scoring")
     op.drop_table("tournament_pool_items", schema="multiplayer")
@@ -5123,9 +4749,7 @@ def downgrade() -> None:
     op.drop_table("matchmaking_ratings", schema="multiplayer")
     op.drop_table("matchmaking_groups", schema="multiplayer")
     op.drop_table("sanctions", schema="moderation")
-    op.drop_table("auth_tokens", schema="iam")
-    op.drop_table("auth_challenges", schema="iam")
-    op.drop_table("auth_attempts", schema="iam")
+    op.drop_table("auth_token_scopes", schema="iam")
     op.drop_table("rating_votes", schema="content")
     op.drop_table("messages", schema="community")
     op.drop_table("direct_conversations", schema="community")
@@ -5133,12 +4757,13 @@ def downgrade() -> None:
     op.drop_table("team_memberships", schema="social")
     op.drop_table("team_join_requests", schema="social")
     op.drop_table("achievement_translations", schema="social")
-    op.drop_table("service_node_keys", schema="service")
     op.drop_table("user_beatmap_activity", schema="scoring")
     op.drop_table("beatmap_fail_histograms", schema="scoring")
     op.drop_table("beatmap_activity", schema="scoring")
     op.drop_table("matchmaking_queues", schema="multiplayer")
-    op.drop_table("auth_sessions", schema="iam")
+    op.drop_table("auth_tokens", schema="iam")
+    op.drop_table("auth_challenges", schema="iam")
+    op.drop_table("auth_attempts", schema="iam")
     op.drop_table("account_badges", schema="core")
     op.drop_table("map_status_requests", schema="content")
     op.drop_table("beatmap_tag_votes", schema="content")
@@ -5148,7 +4773,6 @@ def downgrade() -> None:
     op.drop_table("channels", schema="community")
     op.drop_table("teams", schema="social")
     op.drop_table("achievement_definitions", schema="social")
-    op.drop_table("service_nodes", schema="service")
     op.drop_table("user_ranked_stats", schema="scoring")
     op.drop_table("rank_snapshots", schema="scoring")
     op.drop_table("tournament_pool_revisions", schema="multiplayer")
@@ -5157,6 +4781,7 @@ def downgrade() -> None:
     op.drop_table("oauth_client_secrets", schema="iam")
     op.drop_table("oauth_client_scopes", schema="iam")
     op.drop_table("oauth_client_redirect_uris", schema="iam")
+    op.drop_table("auth_sessions", schema="iam")
     op.drop_table("user_profiles", schema="core")
     op.drop_table("badges", schema="core")
     op.drop_table("sync_states", schema="content")
@@ -5167,7 +4792,6 @@ def downgrade() -> None:
     op.drop_table("notification_dispatches", schema="community")
     op.drop_table("follows", schema="social")
     op.drop_table("blocks", schema="social")
-    op.drop_table("services", schema="service")
     op.drop_table("user_play_stats", schema="scoring")
     op.drop_table("user_monthly_activity", schema="scoring")
     op.drop_table("ranking_policies", schema="scoring")
@@ -5181,6 +4805,7 @@ def downgrade() -> None:
     op.drop_table("device_identifiers", schema="iam")
     op.drop_table("account_devices", schema="iam")
     op.drop_table("projection_checkpoints", schema="events")
+    op.drop_table("outbox_deliveries", schema="events")
     op.drop_table("activity_events", schema="events")
     op.drop_table("user_preferences", schema="core")
     op.drop_table("media_assets", schema="core")
@@ -5209,12 +4834,10 @@ def downgrade() -> None:
     op.drop_table("permissions", schema="authz")
     op.drop_table("entitlements", schema="authz")
     op.drop_table("audit_events", schema="audit")
-    # ### end Alembic commands ###
 
     op.execute(sa.text("DROP SCHEMA system"))
     op.execute(sa.text("DROP SCHEMA audit"))
     op.execute(sa.text("DROP SCHEMA events"))
-    op.execute(sa.text("DROP SCHEMA service"))
     op.execute(sa.text("DROP SCHEMA multiplayer"))
     op.execute(sa.text("DROP SCHEMA community"))
     op.execute(sa.text("DROP SCHEMA social"))

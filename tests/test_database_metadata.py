@@ -56,7 +56,7 @@ EXPECTED_TABLES = {
         "user_preferences",
         "user_profiles",
     },
-    "events": {"activity_events", "outbox_events", "projection_checkpoints"},
+    "events": {"activity_events", "outbox_deliveries", "outbox_events", "projection_checkpoints"},
     "iam": {
         "account_devices",
         "auth_attempts",
@@ -108,7 +108,6 @@ EXPECTED_TABLES = {
         "round_participants",
         "round_results",
         "rounds",
-        "session_leases",
         "session_pool_bindings",
         "session_presences",
         "session_standings",
@@ -141,7 +140,6 @@ EXPECTED_TABLES = {
         "user_play_stats",
         "user_ranked_stats",
     },
-    "service": {"node_command_receipts", "service_node_keys", "service_nodes", "services"},
     "social": {
         "achievement_definitions",
         "achievement_translations",
@@ -175,7 +173,7 @@ def test_model_registry_is_complete() -> None:
             assert foreign_key.column.table.key in DbBase.metadata.tables
 
     assert actual == EXPECTED_TABLES
-    assert len(DbBase.metadata.tables) == 133
+    assert len(DbBase.metadata.tables) == 129
     assert "public" not in actual
 
 
@@ -217,6 +215,10 @@ def test_initial_migration_is_static_and_complete() -> None:
     assert "sa.sa." not in migration
     for schema in MODEL_SCHEMAS:
         assert f"CREATE SCHEMA {schema}" in migration
+    for table in DbBase.metadata.tables.values():
+        for index in table.indexes:
+            assert index.name is not None
+            assert f'"{index.name}"' in migration
 
 
 def test_example_schema_was_removed() -> None:

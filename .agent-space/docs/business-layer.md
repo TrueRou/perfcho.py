@@ -16,7 +16,7 @@
 | Ranking | 投影最佳成绩、用户统计、排名历史、失败进度和回放查看 | `scoring`、`events` |
 | Social | 关注、屏蔽、团队成员与成就判断 | `social`、`events` |
 | Community | 频道权限、私信、已读游标、通知扇出和外部投递 | `community`、`moderation`、`events` |
-| Multiplayer | 房间、Session、节点 Lease、谱单、回合、成绩绑定、图池 | `multiplayer`、`service`、`scoring` |
+| Multiplayer | 房间、Session、谱单、回合、成绩绑定、图池与在线状态 | `multiplayer`、`scoring`、Redis |
 | Matchmaking | 小队、队列 Ticket、Assignment 接受和评分更新 | `multiplayer`、`events` |
 | Moderation | 建案、隔离成绩、施加和撤销处罚、申诉、证据和审计 | `moderation`、`scoring`、`audit` |
 
@@ -29,7 +29,7 @@
 3. 应用服务为命令创建一个 `AsyncSession` 事务。
 4. 锁定聚合，或使用带预期版本的条件更新。
 5. 根据权威数据验证业务策略。
-6. 在同一事务写入事实和 `events.outbox_events`。
+6. 在同一事务写入事实、`events.outbox_events` 和对应 `events.outbox_deliveries`。
 7. 提交后才能发送数据包、HTTP 响应或外部消息。
 8. 由幂等 Projector 更新读模型，请求事务不能等待投影完成。
 
@@ -51,7 +51,7 @@
 
 1. 把提交谱面解析到不可变 Beatmap Revision。
 2. 规范化 Ruleset、Variant 与 Mod，并按 Digest 获取或创建 Mod Set。
-3. 根据节点、协议和幂等键插入 Play Attempt。
+3. 根据账户、协议和幂等键插入 Play Attempt。
 4. 校验 Checksum、时间、客户端版本、命中统计、计分公式和多人上下文。
 5. 原子写入 Score、Hit Statistics、Attestation、Replay Manifest 与 Outbox Event。
 6. 调度版本化难度/PP 计算和反作弊检测。
@@ -64,15 +64,23 @@
 
 ## 多人交付
 
-持久房间使用事件驱动聚合。Socket、Ready/Loading/Skip、实时 Score Frame、Spectator Frame 和 Typing Indicator 保存在节点内存或 Redis。房间配置、Admission、Session、Playlist Revision、Round、Attempt、语义事件、Result 和 Rating 使用 PostgreSQL 权威事实。
+持久房间使用事件驱动聚合。Socket、Ready/Loading/Skip、实时 Score Frame、Spectator Frame 和 Typing Indicator 保存在 Redis 并设置 TTL。房间配置、Admission、Session、Playlist Revision、Round、Attempt、语义事件、Result 和 Rating 使用 PostgreSQL 权威事实。
 
-核心为 Session 分配带单调递增 Epoch 的 Lease。节点对规范化命令签名，并携带 Expected Aggregate Version 与 Idempotency Key。命令网关先记录 Receipt，再修改聚合。旧 Epoch、错误签名以及同一幂等键配合不同 Digest 都必须拒绝并审计。
+所有多人命令由中心实时网关完成认证和规范化，然后直接调用 Multiplayer 应用服务。聚合版本和行锁处理并发，领域表唯一约束处理协议重试。任何实时状态都不能绕过 PostgreSQL 事务直接生成持久结果。
 
-成绩服务而不是房间节点负责把已接受成绩绑定到 Multiplayer Attempt。服务必须核对账户、冻结谱面修订、Scoreboard、Mod、时间和单次 Token。核心 Projector 计算 Round Result、Session Standing、Matchmaking Rating 与 Daily Challenge Streak。
+中心成绩模块负责把已接受成绩绑定到 Multiplayer Attempt。模块必须核对账户、冻结谱面修订、Scoreboard、Mod、时间和单次 Token。Taskiq Projector 计算 Round Result、Session Standing、Matchmaking Rating 与 Daily Challenge Streak。
 
-`local_only` 边缘房间可以完全离线上游运行，但其成绩、成就、Rating 与中央 Activity 永远不能事后导入。这样可以防止不可信节点把本地声明升级为全局权威状态。
+所有房间均由中心服务托管。`rooms.ranked` 只决定结果是否参与全局排名，不表示可信等级；中心保存的房间事实始终具有相同权威性。
 
-验收必须覆盖 Lease Fencing、重复命令、旧聚合版本、重连、Rematch、图池版本、Attempt Token 重放、伪造成绩绑定、Assignment 超时和 Rating 幂等。
+验收必须覆盖重复命令、旧聚合版本、Redis 状态丢失后的重连、Rematch、图池版本、Attempt Token 重放、非法成绩绑定、Assignment 超时和 Rating 幂等。
+
+## 异步任务与消息
+
+- Taskiq 使用 Redis Stream Broker，Worker 以 `when_executed` 确认消息，不启用 Result Backend。
+- 请求事务禁止直接调用 `.kiq()`；需要可靠执行的任务必须先写 Transactional Outbox。
+- Relay 使用 `FOR UPDATE SKIP LOCKED` 领取 Delivery，投递成功后记录 Task ID，租约过期或 Redis 丢失时允许重新投递。
+- Worker 按 `(event_id, consumer)` 幂等处理。处理结果、Projection Checkpoint 与 Delivery 完成必须在同一 PostgreSQL 事务提交。
+- 固定周期任务可以由 Taskiq Scheduler 唤醒，但业务游标和可恢复状态保存在 `system.maintenance_states`。
 
 ## 社区与处罚交付
 
@@ -93,7 +101,7 @@
 4. 成绩接收、回放存储、计算 Worker、Eligibility 与排行榜。
 5. Stable Bancho/Web 适配器和 Lazer OAuth/API 适配器。
 6. Community、Social、Team、Achievement 与 Notification。
-7. 可信 Multiplayer Core，然后是 Edge Node Command Gateway 与 Matchmaking。
+7. Multiplayer Core、Redis 实时状态与 Matchmaking。
 8. Moderation Tooling、Reconciliation Job、负载测试与运维仪表盘。
 
 每个阶段都必须包含 PostgreSQL 集成测试、命令幂等测试、Outbox Replay 测试以及显式 Stable/Lazer Contract Matrix，完成后才能进入下一阶段。

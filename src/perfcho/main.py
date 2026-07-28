@@ -1,23 +1,40 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import TypedDict
 
 from fastapi import FastAPI
 from loguru import logger
 
+import perfcho.infra.redis as redis_infra
 from perfcho.api import router
 from perfcho.infra import engine, logging, response
 from perfcho.infra.middleware import cors, error
 from perfcho.infra.settings import settings
 
 
+class AppState(TypedDict):
+    db_connection: str
+    debug_mode: bool
+
+
 @asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     logger.patch(logging.source("", "")).info(
         "Server starting, listening on: http://{}:{}", settings.app_host, settings.app_port
     )
-    await engine.check_database()
-    yield
-    await engine.db_engine.dispose()
+    db_engine = engine.create_database_engine()
+    state_redis = redis_infra.create_state_redis()
+    app.state.db_engine = db_engine
+    app.state.db_session_factory = engine.create_session_factory(db_engine)
+    app.state.redis = state_redis
+
+    try:
+        await engine.check_database(db_engine)
+        await redis_infra.check_redis(state_redis)
+        yield
+    finally:
+        await state_redis.aclose()
+        await db_engine.dispose()
 
 
 def init_middlewares(asgi_app: FastAPI) -> None:

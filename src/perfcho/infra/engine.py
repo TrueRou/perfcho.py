@@ -8,8 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from perfcho.infra import logging
 from perfcho.infra.settings import settings
 
+type DbSessionFactory = async_sessionmaker[AsyncSession]
 
-def _create_engine() -> AsyncEngine:
+
+def create_database_engine() -> AsyncEngine:
     return create_async_engine(
         settings.database_url,
         pool_size=settings.database_pool_size,
@@ -20,27 +22,22 @@ def _create_engine() -> AsyncEngine:
     )
 
 
-db_engine: AsyncEngine = _create_engine()
-db_session = async_sessionmaker(bind=db_engine, class_=AsyncSession, expire_on_commit=False)
+def create_session_factory(db_engine: AsyncEngine) -> DbSessionFactory:
+    return async_sessionmaker(bind=db_engine, class_=AsyncSession, expire_on_commit=False)
 
 
-async def get_db() -> AsyncIterator[AsyncSession]:
-    async with db_session() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+async def session_scope(session_factory: DbSessionFactory) -> AsyncIterator[AsyncSession]:
+    async with session_factory() as session:
+        yield session
 
 
-async def check_database() -> None:
+async def check_database(db_engine: AsyncEngine) -> None:
     try:
         async with db_engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
-        logger.patch(logging.source()).info("Database ready: {}", settings.database_url)
+        logger.patch(logging.source()).info("Database ready: {}", db_engine.url.render_as_string(hide_password=True))
     except Exception:
-        logger.patch(logging.source()).exception("Failed to connect to database: {}", settings.database_url)
+        logger.patch(logging.source()).exception(
+            "Failed to connect to database: {}", db_engine.url.render_as_string(hide_password=True)
+        )
         raise

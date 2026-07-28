@@ -177,7 +177,6 @@ class AuthSession(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
     oauth_client_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("iam.oauth_clients.id", ondelete="SET NULL"))
     device_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("iam.devices.id", ondelete="SET NULL"))
-    node_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("service.service_nodes.id", ondelete="SET NULL"))
     client_family: Mapped[ClientFamily] = mapped_column(enum_type(ClientFamily, "client_family", 16), nullable=False)
     client_version: Mapped[str | None] = mapped_column(String(64))
     ip_address: Mapped[str] = mapped_column(INET, nullable=False)

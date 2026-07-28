@@ -38,12 +38,10 @@ erDiagram
     SCORES ||--o{ LEADERBOARD_ENTRIES : "成为最佳成绩"
 ```
 
-## 多人与信任边界
+## 中心多人领域
 
 ```mermaid
 erDiagram
-    SERVICES ||--o{ SERVICE_NODES : "运行节点"
-    SERVICE_NODES ||--o{ SESSION_LEASES : "托管会话"
     ROOMS ||--o{ SESSIONS : "产生托管周期"
     ROOMS ||--o{ ROOM_PARTICIPANTS : "接纳参与者"
     ROOMS ||--o{ PLAYLIST_ITEMS : "包含谱单"
@@ -56,6 +54,19 @@ erDiagram
     ROUNDS ||--o{ ROUND_RESULTS : "投影结果"
     SESSIONS ||--o{ SESSION_STANDINGS : "投影积分"
 ```
+
+当前连接、房间即时成员状态、Ready/Loading/Skip 与实时帧位于 Redis，不进入关系图。PostgreSQL 中的 Presence 只表示需要保留的加入和离开历史。
+
+## 事件投递
+
+```mermaid
+erDiagram
+    OUTBOX_EVENTS ||--o{ OUTBOX_DELIVERIES : "分发给消费者"
+    OUTBOX_EVENTS ||--o{ ACTIVITY_EVENTS : "投影动态"
+    OUTBOX_EVENTS ||--o{ PROJECTION_CHECKPOINTS : "推进水位"
+```
+
+Relay 从 `OUTBOX_DELIVERIES` 领取到期记录并投递 Taskiq。Worker 完成领域处理后，在同一 PostgreSQL 事务中更新投影、Checkpoint 和 Delivery。
 
 ## 社区与处罚
 

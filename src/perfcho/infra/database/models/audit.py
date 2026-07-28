@@ -20,7 +20,6 @@ class AuditEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     )
 
     actor_account_id: Mapped[int | None] = mapped_column(BigInteger)
-    actor_node_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     target_type: Mapped[str] = mapped_column(String(64), nullable=False)
     target_id: Mapped[str] = mapped_column(String(128), nullable=False)

@@ -11,7 +11,6 @@ MODEL_SCHEMAS = (
     "social",
     "community",
     "multiplayer",
-    "service",
     "events",
     "audit",
     "system",
