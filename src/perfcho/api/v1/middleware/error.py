@@ -5,8 +5,8 @@ from loguru import logger
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
+from perfcho.api.v1.response import ResponseHandler
 from perfcho.infra.logging import source
-from perfcho.infra.response import ResponseHandler
 
 unexpected_error_response = ResponseHandler.error("An unexpected error occurred on the server.").model_dump()
 

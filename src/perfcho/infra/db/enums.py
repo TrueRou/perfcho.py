@@ -134,7 +134,7 @@ class AttemptStatus(StrEnum):
     EXPIRED = "expired"
 
 
-def enum_type[T: StrEnum](enum: type[T], name: str, length: int = 32) -> SqlEnum[T]:
+def enum_type[T: StrEnum](enum: type[T], name: str, length: int = 32) -> SqlEnum:
     return SqlEnum(
         enum,
         name=name,

@@ -1,7 +1,7 @@
 from taskiq import TaskiqEvents, TaskiqState
 from taskiq_redis import RedisStreamBroker
 
-from perfcho.infra.engine import check_database, create_database_engine, create_session_factory
+from perfcho.infra.db import engine as infra_db
 from perfcho.infra.settings import settings
 
 broker = RedisStreamBroker(
@@ -17,12 +17,5 @@ broker = RedisStreamBroker(
 
 @broker.on_event(TaskiqEvents.WORKER_STARTUP)
 async def worker_startup(state: TaskiqState) -> None:
-    db_engine = create_database_engine()
-    await check_database(db_engine)
-    state.db_engine = db_engine
-    state.db_session_factory = create_session_factory(db_engine)
-
-
-@broker.on_event(TaskiqEvents.WORKER_SHUTDOWN)
-async def worker_shutdown(state: TaskiqState) -> None:
-    await state.db_engine.dispose()
+    state.db_engine = await infra_db.create_engine()
+    state.db_session_factory = infra_db.create_session_factory(state.db_engine)

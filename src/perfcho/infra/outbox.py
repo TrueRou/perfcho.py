@@ -12,13 +12,9 @@ from sqlalchemy import or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from perfcho.infra.database.models.events import OutboxDelivery, OutboxEvent
-from perfcho.infra.engine import (
-    DbSessionFactory,
-    check_database,
-    create_database_engine,
-    create_session_factory,
-)
+from perfcho.infra.db import engine as infra_db
+from perfcho.infra.db.base import DbSessionFactory
+from perfcho.infra.db.models.events import OutboxDelivery, OutboxEvent
 from perfcho.infra.settings import settings
 from perfcho.infra.taskiq import broker
 
@@ -268,13 +264,12 @@ async def relay_once(session_factory: DbSessionFactory, owner: str) -> int:
 
 
 async def run_relay() -> None:
-    db_engine = create_database_engine()
-    session_factory = create_session_factory(db_engine)
     owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
+    db_engine = await infra_db.create_engine()
+    session_factory = infra_db.create_session_factory(db_engine)
 
-    await check_database(db_engine)
-    await broker.startup()
     try:
+        await broker.startup()
         while True:
             claimed = await relay_once(session_factory, owner)
             if claimed == 0:

@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 from taskiq_redis import RedisStreamBroker
 
-from perfcho.infra.database.models.events import OutboxDelivery
+from perfcho.infra.db.models.events import OutboxDelivery
 from perfcho.infra.outbox import write_outbox_event
 from perfcho.infra.settings import settings
 from perfcho.infra.taskiq import broker

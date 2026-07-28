@@ -4,37 +4,45 @@ from typing import TypedDict
 
 from fastapi import FastAPI
 from loguru import logger
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-import perfcho.infra.redis as redis_infra
 from perfcho.api import router
-from perfcho.infra import engine, logging, response
-from perfcho.infra.middleware import cors, error
+from perfcho.api.v1 import response
+from perfcho.api.v1.middleware import cors, error
+from perfcho.infra import logging
+from perfcho.infra.db import engine as infra_db
+from perfcho.infra.db.base import DbSessionFactory
+from perfcho.infra.redis import engine as infra_redis
 from perfcho.infra.settings import settings
 
 
 class AppState(TypedDict):
-    db_connection: str
-    debug_mode: bool
+    db_engine: AsyncEngine
+    redis_engine: Redis
+    db_session_factory: DbSessionFactory
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
     logger.patch(logging.source("", "")).info(
         "Server starting, listening on: http://{}:{}", settings.app_host, settings.app_port
     )
-    db_engine = engine.create_database_engine()
-    state_redis = redis_infra.create_state_redis()
-    app.state.db_engine = db_engine
-    app.state.db_session_factory = engine.create_session_factory(db_engine)
-    app.state.redis = state_redis
+
+    db_engine: AsyncEngine | None = None
+    redis_engine: Redis | None = None
 
     try:
-        await engine.check_database(db_engine)
-        await redis_infra.check_redis(state_redis)
-        yield
+        db_engine = await infra_db.create_engine()
+        redis_engine = await infra_redis.create_redis()
+        yield {
+            "db_engine": db_engine,
+            "redis_engine": redis_engine,
+            "db_session_factory": infra_db.create_session_factory(db_engine),
+        }
     finally:
-        await state_redis.aclose()
-        await db_engine.dispose()
+        await redis_engine.close() if redis_engine else None
+        await db_engine.dispose() if db_engine else None
 
 
 def init_middlewares(asgi_app: FastAPI) -> None:

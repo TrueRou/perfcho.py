@@ -21,9 +21,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from perfcho.infra.database.base import DbBase
-from perfcho.infra.database.enums import BeatmapStatus, Ruleset, enum_type
-from perfcho.infra.database.mixins import BigIntIdentityMixin, CreatedAtMixin, TimestampMixin, Uuid7PrimaryKeyMixin
+from perfcho.infra.db.base import DbBase
+from perfcho.infra.db.enums import BeatmapStatus, Ruleset, enum_type
+from perfcho.infra.db.mixins import BigIntIdentityMixin, CreatedAtMixin, TimestampMixin, Uuid7PrimaryKeyMixin
 
 
 class ContentSource(DbBase):

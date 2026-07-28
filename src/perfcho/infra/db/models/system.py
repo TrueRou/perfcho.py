@@ -4,8 +4,8 @@ from sqlalchemy import Boolean, CheckConstraint, DateTime, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from perfcho.infra.database.base import DbBase
-from perfcho.infra.database.mixins import TimestampMixin
+from perfcho.infra.db.base import DbBase
+from perfcho.infra.db.mixins import TimestampMixin
 
 
 class ServerSetting(TimestampMixin, DbBase):

@@ -8,7 +8,7 @@ from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from perfcho.infra.database import MODEL_SCHEMAS
+from perfcho.infra.db import MODEL_SCHEMAS
 
 ROOT_DIR = Path(__file__).parents[1]
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")

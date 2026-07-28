@@ -1,4 +1,5 @@
 from sqlalchemy import MetaData
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
 MODEL_SCHEMAS = (
@@ -23,6 +24,8 @@ NAMING_CONVENTION = {
     "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
     "pk": "pk_%(table_name)s",
 }
+
+type DbSessionFactory = async_sessionmaker[AsyncSession]
 
 
 class DbBase(DeclarativeBase):

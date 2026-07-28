@@ -17,8 +17,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from perfcho.infra.database.base import DbBase
-from perfcho.infra.database.mixins import BigIntIdentityMixin, CreatedAtMixin, TimestampMixin, Uuid7PrimaryKeyMixin
+from perfcho.infra.db.base import DbBase
+from perfcho.infra.db.mixins import BigIntIdentityMixin, CreatedAtMixin, TimestampMixin, Uuid7PrimaryKeyMixin
 
 
 class OutboxEvent(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):

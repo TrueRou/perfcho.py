@@ -13,9 +13,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from perfcho.infra.database.base import DbBase
-from perfcho.infra.database.enums import GrantEffect, enum_type
-from perfcho.infra.database.mixins import CreatedAtMixin, Uuid7PrimaryKeyMixin
+from perfcho.infra.db.base import DbBase
+from perfcho.infra.db.enums import GrantEffect, enum_type
+from perfcho.infra.db.mixins import CreatedAtMixin, Uuid7PrimaryKeyMixin
 
 
 class Permission(DbBase):

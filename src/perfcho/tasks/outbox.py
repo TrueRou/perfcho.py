@@ -3,7 +3,7 @@ from typing import Annotated, cast
 
 from taskiq import Context, TaskiqDepends
 
-from perfcho.infra.engine import DbSessionFactory
+from perfcho.infra.db.engine import DbSessionFactory
 from perfcho.infra.outbox import process_delivery
 from perfcho.infra.taskiq import broker
 
