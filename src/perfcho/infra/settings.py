@@ -46,6 +46,18 @@ class Settings(BaseSettings):
     stable_mailbox_batch_size: int = Field(default=256, ge=1, le=4096)
     stable_mailbox_lease_seconds: int = Field(default=10, ge=1, le=60)
     stable_welcome_notification: str = Field(default="Welcome to perfcho.py.", max_length=1024)
+    stable_beatmap_download_base_url: str = Field(
+        default="https://osu.ppy.sh/beatmapsets",
+        min_length=1,
+        max_length=512,
+    )
+    stable_beatmap_file_base_url: str = Field(
+        default="https://osu.ppy.sh/web/maps",
+        min_length=1,
+        max_length=512,
+    )
+    stable_score_submission_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    stable_replay_max_bytes: int = Field(default=16 * 1024 * 1024, ge=0, le=64 * 1024 * 1024)
 
     s3_endpoint_url: str = Field(default="http://127.0.0.1:59000")
     s3_region: str = Field(default="us-east-1")
@@ -54,6 +66,13 @@ class Settings(BaseSettings):
     s3_bucket: str = Field(default="perfcho")
     s3_addressing_style: Literal["path", "virtual"] = Field(default="path")
     object_stream_chunk_size: int = Field(default=1024 * 1024, ge=64 * 1024, le=16 * 1024 * 1024)
+
+    osu_api_base_url: str = Field(default="https://osu.ppy.sh/api/v2", min_length=1, max_length=512)
+    osu_oauth_token_url: str = Field(default="https://osu.ppy.sh/oauth/token", min_length=1, max_length=512)
+    osu_api_client_id: int = Field(default=0, ge=0)
+    osu_api_client_secret: SecretStr = Field(default=SecretStr(""))
+    upstream_beatmap_file_base_url: str = Field(default="https://osu.ppy.sh/osu", min_length=1, max_length=512)
+    upstream_beatmap_file_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
 
     taskiq_broker_url: str = Field(default="redis://127.0.0.1:56379/1")
     taskiq_queue_name: str = Field(default="perfcho:tasks")

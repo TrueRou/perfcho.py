@@ -66,3 +66,21 @@ class PendingEvent:
             raise ValueError("consumers must be non-empty and unique")
         if not self.partition_key:
             raise ValueError("partition_key must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class StoredObject:
+    """Describe one immutable object-store payload without provider details."""
+
+    storage_key: str
+    size_bytes: int
+    media_type: str
+    sha256: bytes | None
+    etag: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject invalid object metadata returned by an infrastructure adapter."""
+        if not self.storage_key or self.size_bytes < 0 or not self.media_type:
+            raise ValueError("stored object metadata is invalid")
+        if self.sha256 is not None and len(self.sha256) != 32:
+            raise ValueError("stored object sha256 must contain 32 bytes")

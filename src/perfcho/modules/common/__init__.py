@@ -17,8 +17,16 @@ from perfcho.modules.common.errors import (
     SessionExpired,
     SessionRevoked,
 )
-from perfcho.modules.common.models import Actor, ClientContext, CommandMeta, JsonValue, PendingEvent
-from perfcho.modules.common.ports import Clock, IdGenerator, OutboxWriter, UnitOfWork, UnitOfWorkFactory
+from perfcho.modules.common.models import Actor, ClientContext, CommandMeta, JsonValue, PendingEvent, StoredObject
+from perfcho.modules.common.ports import (
+    Clock,
+    IdGenerator,
+    ObjectStorage,
+    ObjectStream,
+    OutboxWriter,
+    UnitOfWork,
+    UnitOfWorkFactory,
+)
 
 __all__ = (
     "AccountUnavailable",
@@ -36,6 +44,8 @@ __all__ = (
     "InputRejected",
     "JsonValue",
     "ObjectUnavailable",
+    "ObjectStorage",
+    "ObjectStream",
     "OutboxWriter",
     "PendingEvent",
     "ProjectionUnavailable",
@@ -44,6 +54,7 @@ __all__ = (
     "ResourceNotFound",
     "SessionExpired",
     "SessionRevoked",
+    "StoredObject",
     "UnitOfWork",
     "UnitOfWorkFactory",
 )

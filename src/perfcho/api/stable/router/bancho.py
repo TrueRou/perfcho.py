@@ -12,10 +12,13 @@ from perfcho.modules.common import ClientContext, CommandMeta
 from perfcho.modules.identity import InvalidCredentials, InvalidStableSession, StableLogin, StableSessionAlreadyActive
 from perfcho.modules.realtime import MailboxBatch, PresenceSnapshot, RealtimeSessionNotFound
 from perfcho.realtime.stable import (
+    Channel,
     LoginFailureReason,
+    Message,
     ProtocolError,
     UserPresence,
     UserStats,
+    channel_info,
     channel_info_end,
     friends_list,
     login_reply,
@@ -23,6 +26,7 @@ from perfcho.realtime.stable import (
     privileges,
     protocol_version,
     restart,
+    send_message,
     silence_end,
     user_presence,
     user_stats,
@@ -103,6 +107,16 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         )
 
     stable_privileges = await services.authorization.get_stable_privileges(result.account_id)
+    channels = (
+        await services.community.list_public_channels(result.account_id) if services.community is not None else ()
+    )
+    social_friends = await services.social.list_friends(result.account_id) if services.social is not None else ()
+    friend_ids = tuple(dict.fromkeys((1, *(friend.account_id for friend in social_friends))))
+    offline_messages = (
+        await services.community.list_unread_offline_direct_messages(result.account_id)
+        if services.community is not None
+        else ()
+    )
     online_expiry = min(
         result.expires_at,
         now + timedelta(seconds=services.settings.redis_session_ttl_seconds),
@@ -135,17 +149,33 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         ),
         session_id=result.session_id,
     )
+    channel_packets = tuple(
+        channel_info(Channel(channel.name, channel.topic, 0)) for channel in channels if channel.name != "#lobby"
+    )
+    offline_packets = tuple(
+        send_message(
+            Message(
+                sender=message.sender_name,
+                text=message.content,
+                recipient=result.current_name,
+                sender_id=message.sender_account_id,
+            )
+        )
+        for message in offline_messages
+    )
     payload = b"".join(
         (
             protocol_version(services.settings.stable_protocol_version),
             login_reply(result.account_id),
             privileges(int(stable_privileges)),
             notification(services.settings.stable_welcome_notification),
+            *channel_packets,
             channel_info_end(),
-            friends_list((1,)),
+            friends_list(friend_ids),
             silence_end(0),
             presence_packet,
             stats_packet,
+            *offline_packets,
         )
     )
     return _binary_response(payload, token=result.raw_token)

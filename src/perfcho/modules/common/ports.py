@@ -1,11 +1,13 @@
 """Define infrastructure ports consumed by application services."""
 
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from types import TracebackType
 from typing import Protocol, Self, runtime_checkable
 
-from perfcho.modules.common.models import PendingEvent
+from perfcho.modules.common.models import PendingEvent, StoredObject
 
 
 @runtime_checkable
@@ -63,4 +65,40 @@ class OutboxWriter(Protocol):
 
     async def append(self, event: PendingEvent) -> uuid.UUID:
         """Persist an event and all requested deliveries."""
+        ...
+
+
+class ObjectStream(Protocol):
+    """Expose one bounded-chunk object body while its provider resource is open."""
+
+    @property
+    def metadata(self) -> StoredObject:
+        """Return immutable metadata for the open object."""
+        ...
+
+    def iter_chunks(self) -> AsyncIterator[bytes]:
+        """Yield non-empty payload chunks in order."""
+        ...
+
+
+class ObjectStorage(Protocol):
+    """Store and stream immutable binary assets through provider-neutral operations."""
+
+    async def put(
+        self,
+        storage_key: str,
+        content: bytes,
+        *,
+        media_type: str,
+        expected_sha256: bytes | None = None,
+    ) -> StoredObject:
+        """Write one complete object and return verified metadata."""
+        ...
+
+    def open(self, storage_key: str) -> AbstractAsyncContextManager[ObjectStream]:
+        """Open an object stream whose lifetime is owned by the context manager."""
+        ...
+
+    async def delete(self, storage_key: str) -> None:
+        """Idempotently remove one object."""
         ...

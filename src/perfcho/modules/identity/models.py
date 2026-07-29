@@ -127,3 +127,20 @@ class OpenStableSession:
 
     session_id: uuid.UUID
     expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StableWebPrincipal:
+    """Identify credentials proven for an already-online Stable account."""
+
+    account_id: int
+    current_name: str
+    session_id: uuid.UUID
+    expires_at: datetime
+
+    def __post_init__(self) -> None:
+        """Validate the online principal and expiry."""
+        if self.account_id < 1:
+            raise ValueError("account_id must be positive")
+        if self.expires_at.tzinfo is None or self.expires_at.utcoffset() is None:
+            raise ValueError("expires_at must be timezone-aware")

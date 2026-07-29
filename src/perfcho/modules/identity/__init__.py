@@ -6,7 +6,13 @@ from perfcho.modules.identity.errors import (
     StableLoginRejected,
     StableSessionAlreadyActive,
 )
-from perfcho.modules.identity.models import CredentialSnapshot, ResolvedStableSession, StableLogin, StableSessionResult
+from perfcho.modules.identity.models import (
+    CredentialSnapshot,
+    ResolvedStableSession,
+    StableLogin,
+    StableSessionResult,
+    StableWebPrincipal,
+)
 from perfcho.modules.identity.ports import IdentityRepository
 from perfcho.modules.identity.services import IdentityService
 
@@ -21,4 +27,5 @@ __all__ = (
     "StableLoginRejected",
     "StableSessionAlreadyActive",
     "StableSessionResult",
+    "StableWebPrincipal",
 )

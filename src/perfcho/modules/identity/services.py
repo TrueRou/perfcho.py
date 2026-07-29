@@ -17,7 +17,13 @@ from perfcho.infra.security.tokens import (
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import Clock, IdGenerator
 from perfcho.modules.identity.errors import InvalidCredentials, InvalidStableSession, StableSessionAlreadyActive
-from perfcho.modules.identity.models import CredentialSnapshot, ResolvedStableSession, StableLogin, StableSessionResult
+from perfcho.modules.identity.models import (
+    CredentialSnapshot,
+    ResolvedStableSession,
+    StableLogin,
+    StableSessionResult,
+    StableWebPrincipal,
+)
 from perfcho.modules.identity.ports import (
     IdentityOutboxWriterFactory,
     IdentityRepository,
@@ -224,6 +230,34 @@ class IdentityService:
         if resolved is None:
             raise InvalidStableSession("invalid Stable session")
         return resolved
+
+    async def verify_stable_web(self, identifier: str, password_token: str) -> StableWebPrincipal:
+        """Verify Stable web credentials and require an existing online session."""
+        normalized_identifier = _normalize_identifier(identifier)
+        snapshot: CredentialSnapshot | None = None
+        if normalized_identifier is not None:
+            async with self._uow_factory() as uow:
+                snapshot = await self._repository_factory(uow.session).find_credential(*normalized_identifier)
+        if snapshot is None or snapshot.account_status != "active" or snapshot.must_change:
+            raise InvalidCredentials("invalid credentials")
+        verification = await asyncio.to_thread(
+            verify_password,
+            password_token,
+            PasswordHash(snapshot.password_verifier, snapshot.pepper_version),
+            pepper=self._password_pepper,
+            policy=self._argon2_policy,
+        )
+        if not verification.verified:
+            raise InvalidCredentials("invalid credentials")
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            current = await repository.get_current_credential(snapshot.account_id)
+            session = await repository.find_open_stable_session(snapshot.account_id)
+        if not _credential_is_current(snapshot, current) or session is None or session.expires_at <= now:
+            raise InvalidCredentials("invalid credentials")
+        assert current is not None
+        return StableWebPrincipal(snapshot.account_id, current.current_name, session.session_id, session.expires_at)
 
     async def close_stable_session(self, raw_token: str, *, reason: str = "client_closed") -> None:
         """Close the active session represented by a bearer token."""

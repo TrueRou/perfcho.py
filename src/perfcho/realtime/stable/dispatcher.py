@@ -6,9 +6,27 @@ from datetime import datetime, timedelta
 from perfcho.composition import StableServices
 from perfcho.modules.identity import ResolvedStableSession
 from perfcho.modules.realtime import PresenceSnapshot, RealtimeSession
-from perfcho.realtime.stable.builders import pong, user_presence, user_stats
+from perfcho.realtime.stable.builders import (
+    channel_info,
+    channel_join,
+    channel_kick,
+    friends_list,
+    notification,
+    pong,
+    send_message,
+    user_presence,
+    user_stats,
+)
 from perfcho.realtime.stable.codec import Packet, PacketReader, build_packet
-from perfcho.realtime.stable.models import ClientPacket, ClientStatus, ServerPacket, UserPresence, UserStats
+from perfcho.realtime.stable.models import (
+    Channel,
+    ClientPacket,
+    ClientStatus,
+    Message,
+    ServerPacket,
+    UserPresence,
+    UserStats,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +83,26 @@ async def dispatch_packets(body: bytes, context: StableRuntimeContext, services:
             packet.payload.require_exhausted()
             if update_filter not in {0, 1, 2}:
                 raise ValueError("invalid Stable presence update filter")
+        elif packet_type is ClientPacket.CHANNEL_JOIN:
+            channel_name = packet.payload.read_string()
+            packet.payload.require_exhausted()
+            output.extend(await _join_channel(channel_name, context, services))
+        elif packet_type is ClientPacket.CHANNEL_PART:
+            channel_name = packet.payload.read_string()
+            packet.payload.require_exhausted()
+            output.extend(await _part_channel(channel_name, context, services))
+        elif packet_type is ClientPacket.SEND_PUBLIC_MESSAGE:
+            message = packet.payload.read_message()
+            packet.payload.require_exhausted()
+            output.extend(await _send_public_message(message, context, services))
+        elif packet_type is ClientPacket.FRIEND_ADD:
+            target_id = packet.payload.read_i32()
+            packet.payload.require_exhausted()
+            output.extend(await _change_friend(target_id, adding=True, context=context, services=services))
+        elif packet_type is ClientPacket.FRIEND_REMOVE:
+            target_id = packet.payload.read_i32()
+            packet.payload.require_exhausted()
+            output.extend(await _change_friend(target_id, adding=False, context=context, services=services))
         elif packet_type is ClientPacket.LOGOUT:
             if packet.payload.remaining == 4:
                 packet.payload.read_i32()
@@ -109,6 +147,85 @@ def _stats_from_status(stats: UserStats, status: ClientStatus) -> UserStats:
         global_rank=stats.global_rank,
         performance=stats.performance,
     )
+
+
+async def _join_channel(name: str, context: StableRuntimeContext, services: StableServices) -> bytes:
+    if services.community is None:
+        return b""
+    from perfcho.modules.community import ChannelNotFound
+
+    try:
+        channel = await services.community.get_public_channel_by_stable_name(context.identity.account_id, name)
+    except ChannelNotFound:
+        return notification("Channel is unavailable.")
+    await services.realtime.join_channel(
+        channel.channel_id,
+        session_id=context.identity.session_id,
+        expected_revision=context.realtime.revision,
+    )
+    members = await services.realtime.list_channel_members(channel.channel_id)
+    return channel_join(channel.name) + channel_info(Channel(channel.name, channel.topic, len(members)))
+
+
+async def _part_channel(name: str, context: StableRuntimeContext, services: StableServices) -> bytes:
+    if services.community is None:
+        return b""
+    from perfcho.modules.community import ChannelNotFound
+
+    try:
+        channel = await services.community.get_public_channel_by_stable_name(context.identity.account_id, name)
+    except ChannelNotFound:
+        return b""
+    await services.realtime.leave_channel(
+        channel.channel_id,
+        session_id=context.identity.session_id,
+        expected_revision=context.realtime.revision,
+    )
+    return channel_kick(channel.name)
+
+
+async def _send_public_message(message: Message, context: StableRuntimeContext, services: StableServices) -> bytes:
+    if services.community is None:
+        return b""
+    result = await services.community.send_public_message(
+        context.identity.account_id,
+        message.recipient,
+        services.id_generator.new(),
+        message.text.strip(),
+    )
+    channel = await services.community.get_public_channel_by_stable_name(
+        context.identity.account_id,
+        message.recipient,
+    )
+    wire = send_message(
+        Message(
+            sender=context.identity.current_name,
+            text=result.content,
+            recipient=channel.name,
+            sender_id=context.identity.account_id,
+        )
+    )
+    for account_id in await services.realtime.list_channel_members(channel.channel_id):
+        if account_id != context.identity.account_id:
+            await services.realtime.enqueue_mailbox(account_id, wire, expires_at=context.realtime.expires_at)
+    return b""
+
+
+async def _change_friend(
+    target_id: int,
+    *,
+    adding: bool,
+    context: StableRuntimeContext,
+    services: StableServices,
+) -> bytes:
+    if services.social is None or target_id < 1:
+        return b""
+    if adding:
+        await services.social.follow(context.identity.account_id, target_id)
+    else:
+        await services.social.unfollow(context.identity.account_id, target_id)
+    friends = await services.social.list_friends(context.identity.account_id)
+    return friends_list(tuple(dict.fromkeys((1, *(friend.account_id for friend in friends)))))
 
 
 def _ignore_unsupported(packet: Packet) -> None:
