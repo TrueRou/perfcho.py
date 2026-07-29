@@ -9,6 +9,7 @@ from sqlalchemy.schema import CreateSchema
 
 import perfcho.infra.db.models  # noqa: F401 - register all tables before create_all.
 from perfcho.infra.db.base import MODEL_SCHEMAS, DbBase, DbSessionFactory
+from perfcho.infra.db.bootstrap import bootstrap_database
 from perfcho.infra.settings import settings
 
 _SCHEMA_INITIALIZATION_LOCK_ID = 0x7065726663686F
@@ -33,6 +34,7 @@ async def create_engine() -> AsyncEngine:
             for schema in MODEL_SCHEMAS:
                 await connection.execute(CreateSchema(schema, if_not_exists=True))
             await connection.run_sync(DbBase.metadata.create_all)
+        await bootstrap_database(create_session_factory(async_engine))
     except Exception as e:
         await async_engine.dispose()
         db_url = async_engine.url.render_as_string(hide_password=True)

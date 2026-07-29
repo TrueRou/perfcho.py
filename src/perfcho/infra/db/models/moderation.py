@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    LargeBinary,
     SmallInteger,
     String,
     Text,
@@ -144,7 +145,15 @@ class AnticheatFinding(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __tablename__ = "anticheat_findings"
     __table_args__ = (
         CheckConstraint("severity BETWEEN 0 AND 100", name="severity_range"),
+        CheckConstraint("octet_length(finding_digest) = 32", name="finding_digest_length"),
+        CheckConstraint(
+            "(reviewed_at IS NULL AND reviewed_by_id IS NULL AND review_outcome IS NULL AND review_notes IS NULL) OR "
+            "(reviewed_at IS NOT NULL AND reviewed_by_id IS NOT NULL AND review_outcome IS NOT NULL)",
+            name="complete_review",
+        ),
+        UniqueConstraint("run_id", "finding_digest", name="uq_anticheat_findings_run_digest"),
         Index("ix_anticheat_findings_score_state", "score_id", "state", "severity"),
+        Index("ix_anticheat_findings_review_queue", "state", "severity", "created_at"),
         {"schema": "moderation"},
     )
 
@@ -153,10 +162,15 @@ class AnticheatFinding(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     )
     score_id: Mapped[int] = mapped_column(ForeignKey("scoring.scores.id", ondelete="RESTRICT"), nullable=False)
     kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    finding_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
     severity: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="open", server_default="open")
     features: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
     evidence: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    reviewed_by_id: Mapped[int | None] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_outcome: Mapped[str | None] = mapped_column(String(16))
+    review_notes: Mapped[str | None] = mapped_column(Text)
 
 
 class CaseFinding(DbBase):

@@ -41,6 +41,11 @@ class Room(Uuid7PrimaryKeyMixin, TimestampMixin, DbBase):
     __tablename__ = "rooms"
     __table_args__ = (
         CheckConstraint("capacity BETWEEN 1 AND 1024", name="capacity_range"),
+        CheckConstraint("public_id BETWEEN 1 AND 2147483647", name="stable_public_id_range"),
+        CheckConstraint(
+            "num_nonnulls(password_verifier, password_prefix) IN (0, 2)",
+            name="complete_password_credentials",
+        ),
         CheckConstraint("ends_at IS NULL OR starts_at IS NULL OR ends_at > starts_at", name="valid_period"),
         UniqueConstraint("public_id"),
         Index("ix_rooms_category_status_start", "category", "status", "starts_at"),
@@ -48,10 +53,12 @@ class Room(Uuid7PrimaryKeyMixin, TimestampMixin, DbBase):
         {"schema": "multiplayer"},
     )
 
-    public_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), nullable=False)
+    public_id: Mapped[int] = mapped_column(Integer, Identity(always=True), nullable=False)
     creator_account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
     channel_id: Mapped[int | None] = mapped_column(ForeignKey("community.channels.id", ondelete="SET NULL"))
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    password_verifier: Mapped[str | None] = mapped_column(String(512))
+    password_prefix: Mapped[str | None] = mapped_column(String(16))
     category: Mapped[str] = mapped_column(String(32), nullable=False)
     format: Mapped[str] = mapped_column(String(32), nullable=False)
     visibility: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -413,6 +420,8 @@ class MultiplayerEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     __table_args__ = (
         CheckConstraint("room_sequence > 0 AND aggregate_version >= 0", name="positive_versions"),
         UniqueConstraint("room_id", "room_sequence"),
+        UniqueConstraint("command_id"),
+        UniqueConstraint("room_id", "aggregate_version", name="uq_multiplayer_events_room_version"),
         Index("ix_multiplayer_events_room_id_desc", "room_id", "id"),
         Index("ix_multiplayer_events_session_version", "session_id", "aggregate_version"),
         Index("ix_multiplayer_events_type_created", "event_type", "created_at"),
@@ -421,6 +430,7 @@ class MultiplayerEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
 
     room_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("multiplayer.rooms.id", ondelete="RESTRICT"), nullable=False)
     room_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    command_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     session_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("multiplayer.sessions.id", ondelete="RESTRICT"))
     actor_account_id: Mapped[int | None] = mapped_column(ForeignKey("core.accounts.id", ondelete="SET NULL"))
     aggregate_version: Mapped[int] = mapped_column(Integer, nullable=False)

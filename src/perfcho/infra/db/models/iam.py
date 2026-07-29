@@ -168,12 +168,25 @@ class AuthSession(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __tablename__ = "auth_sessions"
     __table_args__ = (
         CheckConstraint("expires_at > created_at", name="valid_period"),
+        CheckConstraint("session_class IN ('normal', 'tourney')", name="session_class_values"),
+        CheckConstraint(
+            "session_class <> 'tourney' OR client_family = 'stable'",
+            name="tourney_session_stable_only",
+        ),
         UniqueConstraint("id", "account_id", name="uq_auth_sessions_id_account"),
         Index("ix_auth_sessions_account_created", "account_id", "created_at"),
         Index(
             "ix_auth_sessions_active_account",
             "account_id",
             postgresql_where=text("revoked_at IS NULL AND closed_at IS NULL"),
+        ),
+        Index(
+            "uq_auth_sessions_active_normal_stable_account",
+            "account_id",
+            unique=True,
+            postgresql_where=text(
+                "client_family = 'stable' AND session_class = 'normal' AND revoked_at IS NULL AND closed_at IS NULL"
+            ),
         ),
         {"schema": "iam"},
     )
@@ -182,6 +195,8 @@ class AuthSession(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     oauth_client_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("iam.oauth_clients.id", ondelete="SET NULL"))
     device_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("iam.devices.id", ondelete="SET NULL"))
     client_family: Mapped[ClientFamily] = mapped_column(enum_type(ClientFamily, "client_family", 16), nullable=False)
+    client_variant: Mapped[str | None] = mapped_column(String(32))
+    session_class: Mapped[str] = mapped_column(String(16), nullable=False, default="normal", server_default="normal")
     client_version: Mapped[str | None] = mapped_column(String(64))
     ip_address: Mapped[str] = mapped_column(INET, nullable=False)
     user_agent: Mapped[str | None] = mapped_column(String(512))
@@ -192,21 +207,85 @@ class AuthSession(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     close_reason: Mapped[str | None] = mapped_column(String(64))
 
 
+class AuthTokenFamily(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
+    """Groups refresh-token rotations under one independently revocable session lineage."""
+
+    __tablename__ = "auth_token_families"
+    __table_args__ = (
+        CheckConstraint(
+            "compromised_at IS NULL OR revoked_at IS NOT NULL",
+            name="compromise_revokes_family",
+        ),
+        ForeignKeyConstraint(
+            ["session_id", "account_id"],
+            ["iam.auth_sessions.id", "iam.auth_sessions.account_id"],
+            name="fk_auth_token_families_session_account",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "id",
+            "session_id",
+            "account_id",
+            name="uq_auth_token_families_id_session_account",
+        ),
+        Index("ix_auth_token_families_session_created", "session_id", "created_at"),
+        Index(
+            "ix_auth_token_families_active_session",
+            "session_id",
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+        {"schema": "iam"},
+    )
+
+    session_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    compromised_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoke_reason: Mapped[str | None] = mapped_column(String(64))
+
+
 class AuthToken(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     """Stores digests for access, refresh, API, and Stable session tokens."""
 
     __tablename__ = "auth_tokens"
     __table_args__ = (
         CheckConstraint("expires_at > created_at", name="valid_period"),
+        CheckConstraint(
+            "(kind = 'refresh' AND family_id IS NOT NULL AND rotation_number IS NOT NULL AND "
+            "((rotation_number = 0 AND parent_token_id IS NULL) OR "
+            "(rotation_number > 0 AND parent_token_id IS NOT NULL))) OR "
+            "(kind <> 'refresh' AND family_id IS NULL AND rotation_number IS NULL AND parent_token_id IS NULL)",
+            name="refresh_family_required",
+        ),
+        CheckConstraint("rotation_number IS NULL OR rotation_number >= 0", name="nonnegative_rotation"),
         ForeignKeyConstraint(
             ["session_id", "account_id"],
             ["iam.auth_sessions.id", "iam.auth_sessions.account_id"],
             name="fk_auth_tokens_session_account",
             ondelete="CASCADE",
         ),
+        ForeignKeyConstraint(
+            ["family_id", "session_id", "account_id"],
+            [
+                "iam.auth_token_families.id",
+                "iam.auth_token_families.session_id",
+                "iam.auth_token_families.account_id",
+            ],
+            name="fk_auth_tokens_family_session_account",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["parent_token_id", "family_id"],
+            ["iam.auth_tokens.id", "iam.auth_tokens.family_id"],
+            name="fk_auth_tokens_parent_family",
+            ondelete="RESTRICT",
+        ),
         UniqueConstraint("digest"),
         UniqueConstraint("jti"),
+        UniqueConstraint("id", "family_id", name="uq_auth_tokens_id_family"),
+        UniqueConstraint("family_id", "rotation_number", name="uq_auth_tokens_family_rotation"),
         Index("ix_auth_tokens_session", "session_id", "created_at"),
+        Index("ix_auth_tokens_family", "family_id", "rotation_number"),
         Index("ix_auth_tokens_account_expiry", "account_id", "expires_at"),
         Index("ix_auth_tokens_expiry", "expires_at"),
         {"schema": "iam"},
@@ -214,7 +293,9 @@ class AuthToken(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
 
     session_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
-    parent_token_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("iam.auth_tokens.id", ondelete="RESTRICT"))
+    family_id: Mapped[uuid.UUID | None] = mapped_column()
+    parent_token_id: Mapped[uuid.UUID | None] = mapped_column()
+    rotation_number: Mapped[int | None] = mapped_column(Integer)
     kind: Mapped[TokenKind] = mapped_column(enum_type(TokenKind, "token_kind", 24), nullable=False)
     digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
     prefix: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -242,6 +323,11 @@ class AuthChallenge(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
         CheckConstraint("attempt_count >= 0 AND attempt_count <= max_attempts", name="attempt_count_range"),
         CheckConstraint("max_attempts > 0", name="positive_max_attempts"),
         CheckConstraint("expires_at > created_at", name="valid_period"),
+        CheckConstraint(
+            "(kind = 'oauth_code' AND oauth_client_id IS NOT NULL AND redirect_uri IS NOT NULL) OR "
+            "(kind <> 'oauth_code' AND redirect_uri IS NULL)",
+            name="oauth_redirect_snapshot",
+        ),
         UniqueConstraint("code_digest"),
         Index("ix_auth_challenges_account_kind", "account_id", "kind", "expires_at"),
         Index("ix_auth_challenges_expiry", "expires_at"),
@@ -254,6 +340,7 @@ class AuthChallenge(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     kind: Mapped[ChallengeKind] = mapped_column(enum_type(ChallengeKind, "challenge_kind", 32), nullable=False)
     target: Mapped[str | None] = mapped_column(String(254))
     code_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    redirect_uri: Mapped[str | None] = mapped_column(String(2048))
     pkce_challenge: Mapped[str | None] = mapped_column(String(128))
     pkce_method: Mapped[str | None] = mapped_column(String(16))
     attempt_count: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default="0")
@@ -263,6 +350,18 @@ class AuthChallenge(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class AuthChallengeScope(DbBase):
+    """Snapshots the exact effective OAuth scopes bound to an authorization challenge."""
+
+    __tablename__ = "auth_challenge_scopes"
+    __table_args__ = (Index("ix_auth_challenge_scopes_scope", "scope_id", "challenge_id"), {"schema": "iam"})
+
+    challenge_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("iam.auth_challenges.id", ondelete="CASCADE"), primary_key=True
+    )
+    scope_id: Mapped[int] = mapped_column(ForeignKey("iam.scopes.id", ondelete="RESTRICT"), primary_key=True)
+
+
 class TotpFactor(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     """Stores encrypted TOTP factor secrets and their activation state."""
 
@@ -270,6 +369,7 @@ class TotpFactor(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __table_args__ = (
         CheckConstraint("digits BETWEEN 6 AND 8", name="digits_range"),
         CheckConstraint("period_seconds BETWEEN 15 AND 120", name="period_range"),
+        CheckConstraint("last_accepted_counter IS NULL OR last_accepted_counter >= 0", name="nonnegative_counter"),
         Index(
             "uq_totp_factors_active_account", "account_id", unique=True, postgresql_where=text("disabled_at IS NULL")
         ),
@@ -281,6 +381,7 @@ class TotpFactor(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     key_id: Mapped[str] = mapped_column(String(128), nullable=False)
     digits: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=6, server_default="6")
     period_seconds: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=30, server_default="30")
+    last_accepted_counter: Mapped[int | None] = mapped_column(BigInteger)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

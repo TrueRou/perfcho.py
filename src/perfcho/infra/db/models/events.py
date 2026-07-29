@@ -8,15 +8,19 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Identity,
     Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    event,
+    select,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Mapped, mapped_column
 
 from perfcho.infra.db.base import DbBase
@@ -30,7 +34,9 @@ class OutboxEvent(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __table_args__ = (
         CheckConstraint("schema_version > 0", name="positive_schema_version"),
         UniqueConstraint("position"),
+        UniqueConstraint("id", "position", name="uq_outbox_events_id_position"),
         Index("ix_outbox_events_aggregate", "aggregate_type", "aggregate_id", "created_at"),
+        Index("ix_outbox_events_available_position", "available_at", "position"),
         {"schema": "events"},
     )
 
@@ -50,10 +56,17 @@ class OutboxDelivery(TimestampMixin, DbBase):
     __table_args__ = (
         CheckConstraint("attempt_count >= 0 AND enqueue_count >= 0", name="nonnegative_attempt_counts"),
         CheckConstraint("lease_expires_at IS NULL OR lease_owner IS NOT NULL", name="lease_owner_required"),
+        ForeignKeyConstraint(
+            ["event_id", "source_position"],
+            ["events.outbox_events.id", "events.outbox_events.position"],
+            name="fk_outbox_deliveries_event_position",
+            ondelete="CASCADE",
+        ),
         Index(
             "ix_outbox_deliveries_due",
             "available_at",
             "lease_expires_at",
+            "source_position",
             postgresql_where=text("completed_at IS NULL AND dead_lettered_at IS NULL"),
         ),
         Index("ix_outbox_deliveries_broker_task", "broker_task_id"),
@@ -61,16 +74,16 @@ class OutboxDelivery(TimestampMixin, DbBase):
             "ix_outbox_deliveries_partition",
             "consumer",
             "partition_key",
-            "completed_at",
-            "event_id",
+            "source_position",
+            postgresql_where=text("completed_at IS NULL AND dead_lettered_at IS NULL"),
         ),
+        Index("ix_outbox_deliveries_consumer_position", "consumer", "source_position"),
         {"schema": "events"},
     )
 
-    event_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("events.outbox_events.id", ondelete="CASCADE"), primary_key=True
-    )
+    event_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     consumer: Mapped[str] = mapped_column(String(100), primary_key=True)
+    source_position: Mapped[int] = mapped_column(BigInteger, nullable=False)
     partition_key: Mapped[str] = mapped_column(String(100), nullable=False, default="default", server_default="default")
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -83,6 +96,17 @@ class OutboxDelivery(TimestampMixin, DbBase):
     delivery_token: Mapped[uuid.UUID | None] = mapped_column()
     broker_task_id: Mapped[str | None] = mapped_column(String(128))
     last_error: Mapped[str | None] = mapped_column(Text)
+
+
+@event.listens_for(OutboxDelivery, "before_insert")
+def _populate_delivery_source_position(_mapper: object, connection: Connection, target: OutboxDelivery) -> None:
+    """Copy the immutable event position for callers that only provide the event ID."""
+    if target.source_position is not None:
+        return
+    position = connection.scalar(select(OutboxEvent.position).where(OutboxEvent.id == target.event_id))
+    if position is None:
+        raise ValueError(f"Outbox event does not exist: {target.event_id}")
+    target.source_position = position
 
 
 class ActivityEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):

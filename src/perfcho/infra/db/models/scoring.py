@@ -68,6 +68,7 @@ class ModSet(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     __tablename__ = "mod_sets"
     __table_args__ = (
         CheckConstraint("legacy_bits >= 0", name="nonnegative_legacy_bits"),
+        UniqueConstraint("id", "scoreboard_id", name="uq_mod_sets_id_scoreboard"),
         UniqueConstraint("scoreboard_id", "canonical_digest"),
         Index("ix_mod_sets_legacy", "scoreboard_id", "legacy_bits"),
         Index("ix_mod_sets_json", "canonical", postgresql_using="gin"),
@@ -126,6 +127,12 @@ class BeatmapDifficultyAttribute(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     __tablename__ = "beatmap_difficulty_attributes"
     __table_args__ = (
         CheckConstraint("star_rating >= 0 AND max_combo >= 0", name="nonnegative_values"),
+        ForeignKeyConstraint(
+            ["mod_set_id", "scoreboard_id"],
+            ["scoring.mod_sets.id", "scoring.mod_sets.scoreboard_id"],
+            name="fk_difficulty_attributes_mod_set_scoreboard",
+            ondelete="RESTRICT",
+        ),
         UniqueConstraint("beatmap_revision_id", "scoreboard_id", "mod_set_id", "release_id"),
         Index("ix_difficulty_attributes_revision", "beatmap_revision_id", "scoreboard_id"),
         {"schema": "scoring"},
@@ -137,7 +144,7 @@ class BeatmapDifficultyAttribute(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     scoreboard_id: Mapped[int] = mapped_column(
         ForeignKey("scoring.scoreboards.id", ondelete="RESTRICT"), nullable=False
     )
-    mod_set_id: Mapped[int] = mapped_column(ForeignKey("scoring.mod_sets.id", ondelete="RESTRICT"), nullable=False)
+    mod_set_id: Mapped[int] = mapped_column(nullable=False)
     release_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("scoring.calculation_releases.id", ondelete="RESTRICT"), nullable=False
     )
@@ -153,29 +160,48 @@ class PlayAttempt(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __table_args__ = (
         CheckConstraint("ended_at IS NULL OR ended_at >= started_at", name="valid_period"),
         CheckConstraint("progress BETWEEN 0 AND 1", name="progress_range"),
+        ForeignKeyConstraint(
+            ["beatmap_revision_id", "beatmap_id"],
+            ["content.beatmap_revisions.id", "content.beatmap_revisions.beatmap_id"],
+            name="fk_play_attempts_revision_beatmap",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["mod_set_id", "scoreboard_id"],
+            ["scoring.mod_sets.id", "scoring.mod_sets.scoreboard_id"],
+            name="fk_play_attempts_mod_set_scoreboard",
+            ondelete="RESTRICT",
+        ),
         UniqueConstraint("account_id", "protocol", "idempotency_key"),
         UniqueConstraint(
             "id",
             "account_id",
+            "beatmap_id",
             "beatmap_revision_id",
             "scoreboard_id",
             "mod_set_id",
             name="uq_play_attempts_score_dimensions",
         ),
         Index("ix_play_attempts_account_started", "account_id", "started_at"),
+        Index(
+            "ix_play_attempts_account_map_started",
+            "account_id",
+            "beatmap_id",
+            text("started_at DESC"),
+            text("id DESC"),
+        ),
         Index("ix_play_attempts_revision_started", "beatmap_revision_id", "started_at"),
         Index("ix_play_attempts_status_created", "status", "created_at"),
         {"schema": "scoring"},
     )
 
     account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
-    beatmap_revision_id: Mapped[int] = mapped_column(
-        ForeignKey("content.beatmap_revisions.id", ondelete="RESTRICT"), nullable=False
-    )
+    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="RESTRICT"), nullable=False)
+    beatmap_revision_id: Mapped[int] = mapped_column(nullable=False)
     scoreboard_id: Mapped[int] = mapped_column(
         ForeignKey("scoring.scoreboards.id", ondelete="RESTRICT"), nullable=False
     )
-    mod_set_id: Mapped[int] = mapped_column(ForeignKey("scoring.mod_sets.id", ondelete="RESTRICT"), nullable=False)
+    mod_set_id: Mapped[int] = mapped_column(nullable=False)
     protocol: Mapped[ClientFamily] = mapped_column(enum_type(ClientFamily, "attempt_protocol", 16), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[AttemptStatus] = mapped_column(enum_type(AttemptStatus, "play_attempt_status", 16), nullable=False)
@@ -188,6 +214,35 @@ class PlayAttempt(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     score: Mapped[Score | None] = relationship(back_populates="attempt", lazy="raise")
 
 
+class PlayAttemptToken(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
+    """Stores single-use opaque tokens authorizing submission for a play attempt."""
+
+    __tablename__ = "play_attempt_tokens"
+    __table_args__ = (
+        CheckConstraint("expires_at > created_at", name="valid_period"),
+        CheckConstraint("consumed_at IS NULL OR consumed_at >= created_at", name="valid_consumed_at"),
+        CheckConstraint("octet_length(token_digest) = 32", name="token_digest_length"),
+        UniqueConstraint("token_digest"),
+        Index(
+            "uq_play_attempt_tokens_active_attempt",
+            "attempt_id",
+            unique=True,
+            postgresql_where=text("consumed_at IS NULL AND revoked_at IS NULL"),
+        ),
+        Index("ix_play_attempt_tokens_expiry", "expires_at"),
+        {"schema": "scoring"},
+    )
+
+    attempt_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("scoring.play_attempts.id", ondelete="CASCADE"), nullable=False
+    )
+    token_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    token_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Score(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     """Stores one verified and immutable normalized gameplay score."""
 
@@ -198,10 +253,11 @@ class Score(BigIntIdentityMixin, CreatedAtMixin, DbBase):
         CheckConstraint("max_combo >= 0", name="nonnegative_combo"),
         CheckConstraint("ended_at >= started_at", name="valid_period"),
         ForeignKeyConstraint(
-            ["attempt_id", "account_id", "beatmap_revision_id", "scoreboard_id", "mod_set_id"],
+            ["attempt_id", "account_id", "beatmap_id", "beatmap_revision_id", "scoreboard_id", "mod_set_id"],
             [
                 "scoring.play_attempts.id",
                 "scoring.play_attempts.account_id",
+                "scoring.play_attempts.beatmap_id",
                 "scoring.play_attempts.beatmap_revision_id",
                 "scoring.play_attempts.scoreboard_id",
                 "scoring.play_attempts.mod_set_id",
@@ -212,6 +268,13 @@ class Score(BigIntIdentityMixin, CreatedAtMixin, DbBase):
         UniqueConstraint("attempt_id"),
         UniqueConstraint("online_checksum"),
         Index("ix_scores_account_board_ended", "account_id", "scoreboard_id", "ended_at"),
+        Index(
+            "ix_scores_account_map_ended",
+            "account_id",
+            "beatmap_id",
+            text("ended_at DESC"),
+            text("id DESC"),
+        ),
         Index("ix_scores_revision_board", "beatmap_revision_id", "scoreboard_id", "id"),
         {"schema": "scoring"},
     )
@@ -340,6 +403,7 @@ class LeaderboardEntry(BigIntIdentityMixin, TimestampMixin, DbBase):
     __tablename__ = "leaderboard_entries"
     __table_args__ = (
         CheckConstraint("metric_value >= 0", name="nonnegative_metric"),
+        CheckConstraint("country_code IS NULL OR country_code ~ '^[A-Z]{2}$'", name="country_code_format"),
         CheckConstraint(
             "(scope = 'exact_mods' AND filter_mod_set_id IS NOT NULL) OR "
             "(scope <> 'exact_mods' AND filter_mod_set_id IS NULL)",
@@ -361,8 +425,21 @@ class LeaderboardEntry(BigIntIdentityMixin, TimestampMixin, DbBase):
             "beatmap_id",
             "scope",
             "filter_mod_set_id",
-            "metric_value",
-            "tie_break_value",
+            text("metric_value DESC"),
+            text("tie_break_value DESC"),
+            text("score_id ASC"),
+        ),
+        Index(
+            "ix_leaderboard_entries_country_rank",
+            "policy_id",
+            "beatmap_id",
+            "scope",
+            "filter_mod_set_id",
+            "country_code",
+            text("metric_value DESC"),
+            text("tie_break_value DESC"),
+            text("score_id ASC"),
+            postgresql_where=text("country_code IS NOT NULL"),
         ),
         Index("ix_leaderboard_entries_account", "account_id", "policy_id", "beatmap_id"),
         Index("ix_leaderboard_entries_score", "score_id"),
@@ -375,6 +452,7 @@ class LeaderboardEntry(BigIntIdentityMixin, TimestampMixin, DbBase):
     beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="CASCADE"), nullable=False)
     account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="CASCADE"), nullable=False)
     score_id: Mapped[int] = mapped_column(ForeignKey("scoring.scores.id", ondelete="RESTRICT"), nullable=False)
+    country_code: Mapped[str | None] = mapped_column(String(2))
     scope: Mapped[str] = mapped_column(String(16), nullable=False, default="overall", server_default="overall")
     filter_mod_set_id: Mapped[int | None] = mapped_column(ForeignKey("scoring.mod_sets.id", ondelete="RESTRICT"))
     metric_value: Mapped[Decimal] = mapped_column(Numeric(20, 5), nullable=False)
@@ -570,7 +648,7 @@ class RankSnapshot(CreatedAtMixin, DbBase):
 
 
 class ScoreAttestation(CreatedAtMixin, DbBase):
-    """Stores client, checksum, patcher, and verification evidence for a score."""
+    """Stores client, checksum, integrity, and verification evidence for a score."""
 
     __tablename__ = "score_attestations"
     __table_args__ = (Index("ix_score_attestations_state", "verification_state", "created_at"), {"schema": "scoring"})
@@ -582,6 +660,6 @@ class ScoreAttestation(CreatedAtMixin, DbBase):
     client_version: Mapped[str] = mapped_column(String(64), nullable=False)
     client_flags: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     checksum: Mapped[bytes | None] = mapped_column(LargeBinary(32))
-    patcher_digest: Mapped[bytes | None] = mapped_column(LargeBinary(32))
+    client_integrity_digest: Mapped[bytes | None] = mapped_column(LargeBinary(32))
     verification_state: Mapped[str] = mapped_column(String(16), nullable=False)
     evidence: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")

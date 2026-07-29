@@ -1,0 +1,141 @@
+"""Create and verify the shared Stable/Lazer password representation."""
+
+import hashlib
+import re
+from dataclasses import dataclass, field
+from enum import StrEnum
+
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError
+from argon2.low_level import Type
+
+_STABLE_PASSWORD_TOKEN = re.compile(r"[0-9a-f]{32}")
+
+
+@dataclass(frozen=True, slots=True)
+class Argon2Policy:
+    """Define injected Argon2id cost and output parameters."""
+
+    time_cost: int
+    memory_cost_kib: int
+    parallelism: int
+    hash_length: int = 32
+    salt_length: int = 16
+
+    def __post_init__(self) -> None:
+        """Reject parameters that cannot provide a valid Argon2 configuration."""
+        if self.time_cost < 1:
+            raise ValueError("Argon2 time_cost must be positive")
+        if self.parallelism < 1:
+            raise ValueError("Argon2 parallelism must be positive")
+        if self.memory_cost_kib < 8 * self.parallelism:
+            raise ValueError("Argon2 memory_cost_kib must be at least eight times parallelism")
+        if self.hash_length < 16:
+            raise ValueError("Argon2 hash_length must be at least 16 bytes")
+        if self.salt_length < 16:
+            raise ValueError("Argon2 salt_length must be at least 16 bytes")
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordPepper:
+    """Pair a secret password pepper with its persisted positive version."""
+
+    version: int
+    secret: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        """Ensure callers provide an explicit usable pepper."""
+        if self.version < 1:
+            raise ValueError("password pepper version must be positive")
+        if not self.secret:
+            raise ValueError("password pepper must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordHash:
+    """Carry an Argon2 verifier and the pepper version required to verify it."""
+
+    verifier: str
+    pepper_version: int
+
+
+class PasswordVerificationStatus(StrEnum):
+    """Describe the protocol-independent outcome of password verification."""
+
+    MATCH = "match"
+    MISMATCH = "mismatch"
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordVerification:
+    """Return password validity and whether current Argon2 costs require rehashing."""
+
+    status: PasswordVerificationStatus
+    needs_rehash: bool = False
+
+    @property
+    def verified(self) -> bool:
+        """Return whether the supplied password matched the verifier."""
+        return self.status is PasswordVerificationStatus.MATCH
+
+
+def validate_stable_password_token(token: str) -> str:
+    """Return a Stable password token only when it is exactly 32 lowercase hex characters."""
+    if _STABLE_PASSWORD_TOKEN.fullmatch(token) is None:
+        raise ValueError("Stable password token must be exactly 32 lowercase hexadecimal characters")
+    return token
+
+
+def preverify_lazer_password(plaintext: str) -> str:
+    """Convert Lazer plaintext into Stable's lowercase MD5 preverification representation."""
+    return hashlib.md5(plaintext.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
+def hash_password(preverification: str, *, pepper: PasswordPepper, policy: Argon2Policy) -> PasswordHash:
+    """Hash a validated preverification token with an appended, versioned pepper."""
+    token = validate_stable_password_token(preverification)
+    verifier = _make_hasher(policy).hash(_append_pepper(token, pepper))
+    return PasswordHash(verifier=verifier, pepper_version=pepper.version)
+
+
+def verify_password(
+    preverification: str,
+    password_hash: PasswordHash,
+    *,
+    pepper: PasswordPepper,
+    policy: Argon2Policy,
+) -> PasswordVerification:
+    """Verify a preverification token without exposing malformed credentials as errors."""
+    try:
+        token = validate_stable_password_token(preverification)
+    except ValueError:
+        return PasswordVerification(PasswordVerificationStatus.MISMATCH)
+
+    if password_hash.pepper_version != pepper.version:
+        return PasswordVerification(PasswordVerificationStatus.MISMATCH)
+
+    hasher = _make_hasher(policy)
+    try:
+        hasher.verify(password_hash.verifier, _append_pepper(token, pepper))
+    except InvalidHashError, VerificationError:
+        return PasswordVerification(PasswordVerificationStatus.MISMATCH)
+
+    return PasswordVerification(
+        PasswordVerificationStatus.MATCH,
+        needs_rehash=hasher.check_needs_rehash(password_hash.verifier),
+    )
+
+
+def _append_pepper(token: str, pepper: PasswordPepper) -> bytes:
+    return token.encode("ascii") + pepper.secret
+
+
+def _make_hasher(policy: Argon2Policy) -> PasswordHasher:
+    return PasswordHasher(
+        time_cost=policy.time_cost,
+        memory_cost=policy.memory_cost_kib,
+        parallelism=policy.parallelism,
+        hash_len=policy.hash_length,
+        salt_len=policy.salt_length,
+        type=Type.ID,
+    )

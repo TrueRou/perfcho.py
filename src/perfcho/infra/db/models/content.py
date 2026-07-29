@@ -154,8 +154,16 @@ class BeatmapRevision(BigIntIdentityMixin, CreatedAtMixin, DbBase):
         CheckConstraint("approach_rate BETWEEN 0 AND 20", name="approach_rate_range"),
         CheckConstraint("health_drain BETWEEN 0 AND 20", name="health_drain_range"),
         CheckConstraint("object_count >= 0 AND max_combo >= 0", name="nonnegative_counts"),
+        CheckConstraint("octet_length(md5) = 16", name="md5_length"),
+        CheckConstraint("octet_length(sha256) = 32", name="sha256_length"),
+        CheckConstraint("char_length(file_name) > 0", name="nonempty_file_name"),
+        CheckConstraint("file_name = btrim(file_name)", name="trimmed_file_name"),
+        CheckConstraint("file_name_key = lower(file_name)", name="normalized_file_name"),
+        CheckConstraint("file_name !~ '[/\\\\]'", name="file_name_is_basename"),
+        UniqueConstraint("id", "beatmap_id", name="uq_beatmap_revisions_id_beatmap"),
         UniqueConstraint("beatmap_id", "sha256"),
-        Index("ix_beatmap_revisions_md5", "md5"),
+        UniqueConstraint("md5", name="uq_beatmap_revisions_md5"),
+        Index("ix_beatmap_revisions_file_name_key", "file_name_key", "beatmap_id"),
         Index(
             "uq_beatmap_revisions_current",
             "beatmap_id",
@@ -172,6 +180,7 @@ class BeatmapRevision(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     md5: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
     sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_name_key: Mapped[str] = mapped_column(String(255), nullable=False)
     source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     total_length_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     drain_length_ms: Mapped[int] = mapped_column(Integer, nullable=False)

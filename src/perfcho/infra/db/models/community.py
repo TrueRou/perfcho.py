@@ -64,6 +64,8 @@ class DirectConversation(DbBase):
     __table_args__ = (
         CheckConstraint("low_account_id < high_account_id", name="ordered_accounts"),
         UniqueConstraint("low_account_id", "high_account_id"),
+        Index("ix_direct_conversations_low_account", "low_account_id", "channel_id"),
+        Index("ix_direct_conversations_high_account", "high_account_id", "channel_id"),
         {"schema": "community"},
     )
 
@@ -101,9 +103,15 @@ class Message(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     __tablename__ = "messages"
     __table_args__ = (
         CheckConstraint("char_length(content) BETWEEN 1 AND 10000", name="content_length"),
+        ForeignKeyConstraint(
+            ["channel_id", "reply_to_id"],
+            ["community.messages.channel_id", "community.messages.id"],
+            name="fk_messages_reply_same_channel",
+            ondelete="RESTRICT",
+        ),
         UniqueConstraint("channel_id", "id"),
         UniqueConstraint("sender_account_id", "client_message_id"),
-        Index("ix_messages_channel_id_desc", "channel_id", "id"),
+        Index("ix_messages_channel_id_desc", "channel_id", text("id DESC")),
         Index("ix_messages_sender_created", "sender_account_id", "created_at"),
         {"schema": "community"},
     )
@@ -111,7 +119,7 @@ class Message(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     channel_id: Mapped[int] = mapped_column(ForeignKey("community.channels.id", ondelete="RESTRICT"), nullable=False)
     sender_account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
     client_message_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
-    reply_to_id: Mapped[int | None] = mapped_column(ForeignKey("community.messages.id", ondelete="SET NULL"))
+    reply_to_id: Mapped[int | None] = mapped_column(BigInteger)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     is_action: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -130,6 +138,7 @@ class ChannelUserState(TimestampMixin, DbBase):
             ["community.messages.channel_id", "community.messages.id"],
             ondelete="RESTRICT",
         ),
+        Index("ix_channel_user_states_account", "account_id", "hidden", "channel_id"),
         {"schema": "community"},
     )
 
