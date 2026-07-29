@@ -44,6 +44,7 @@ class SqlAlchemyIdentityRepository:
                 current_name.display_name,
                 Account.status,
                 Account.auth_version,
+                Account.country_code,
                 PasswordCredential.verifier,
                 PasswordCredential.pepper_version,
                 PasswordCredential.password_changed_at,
@@ -266,6 +267,7 @@ class SqlAlchemyIdentityRepository:
                     Account.id.label("account_id"),
                     current_name.display_name.label("current_name"),
                     Account.auth_version,
+                    Account.country_code,
                     AuthSession.id.label("session_id"),
                     AuthSession.device_id,
                     AuthSession.client_version,
@@ -305,6 +307,7 @@ class SqlAlchemyIdentityRepository:
             client_version=row.client_version,
             client_variant=row.client_variant,
             expires_at=row.expires_at,
+            country_code=row.country_code,
         )
 
     async def get_stable_session_account_id(self, session_id: uuid.UUID) -> int | None:
@@ -366,11 +369,12 @@ def _credential_snapshot(row: object | None) -> CredentialSnapshot | None:
         current_name,
         account_status,
         auth_version,
+        country_code,
         password_verifier,
         pepper_version,
         password_changed_at,
         must_change,
-    ) = cast(tuple[int, str, AccountStatus, int, str, int, datetime, bool], row)
+    ) = cast(tuple[int, str, AccountStatus, int, str | None, str, int, datetime, bool], row)
     return CredentialSnapshot(
         account_id=account_id,
         current_name=current_name,
@@ -380,6 +384,7 @@ def _credential_snapshot(row: object | None) -> CredentialSnapshot | None:
         pepper_version=pepper_version,
         password_changed_at=password_changed_at,
         must_change=must_change,
+        country_code=country_code,
     )
 
 

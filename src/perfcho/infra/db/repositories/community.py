@@ -200,6 +200,18 @@ class SqlAlchemyCommunityRepository:
             created=True,
         )
 
+    async def set_private_message_policy(self, account_id: int, policy: str, *, now: datetime) -> str:
+        """Update one existing preference row without creating protocol defaults."""
+        result = await self._session.scalar(
+            update(UserPreference)
+            .where(UserPreference.account_id == account_id)
+            .values(private_message_policy=policy, updated_at=now)
+            .returning(UserPreference.private_message_policy)
+        )
+        if result is None:
+            raise RuntimeError("account user preference is unavailable")
+        return result
+
     async def get_message_by_client_id(
         self,
         sender_account_id: int,

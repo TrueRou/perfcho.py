@@ -1,6 +1,5 @@
 """Provide protocol-independent normalization and security primitives."""
 
-from perfcho.infra.security.normalization import normalize_email, normalize_stable_name
 from perfcho.infra.security.password import (
     Argon2Policy,
     PasswordHash,
@@ -19,6 +18,7 @@ from perfcho.infra.security.tokens import (
     hmac_sha256_digest,
     verify_hmac_sha256_digest,
 )
+from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
 
 __all__ = (
     "Argon2Policy",

@@ -19,6 +19,7 @@ from perfcho.infra.db.repositories.community import (
 )
 from perfcho.infra.db.repositories.content import SqlAlchemyContentRepository
 from perfcho.infra.db.repositories.identity import SqlAlchemyIdentityRepository
+from perfcho.infra.db.repositories.multiplayer import SqlAlchemyMultiplayerRepository
 from perfcho.infra.db.repositories.scoring import (
     SqlAlchemyAccountSubmissionValidator,
     SqlAlchemyMultiplayerSubmissionValidator,
@@ -26,6 +27,7 @@ from perfcho.infra.db.repositories.scoring import (
 )
 from perfcho.infra.db.repositories.social import SqlAlchemySocialRepository
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
+from perfcho.infra.redis.multiplayer import RedisMultiplayerStateRepository
 from perfcho.infra.redis.realtime import RedisRealtimeRepository
 from perfcho.infra.s3 import S3ObjectStorage
 from perfcho.infra.scoring import DeferredPerformanceCalculator
@@ -36,6 +38,7 @@ from perfcho.modules.common import Clock, IdGenerator, ObjectStorage
 from perfcho.modules.community import CommunityService
 from perfcho.modules.content import ContentQueryService, ContentService
 from perfcho.modules.identity import IdentityService
+from perfcho.modules.multiplayer import MultiplayerService
 from perfcho.modules.realtime import RealtimeRepository
 from perfcho.modules.scoring import RankingQueryService, ReplayQueryService, ReplayService, ScoringService
 from perfcho.modules.social import SocialService
@@ -81,6 +84,10 @@ def _multiplayer_submission_validator(session: object) -> SqlAlchemyMultiplayerS
     return SqlAlchemyMultiplayerSubmissionValidator(cast(AsyncSession, session))
 
 
+def _multiplayer_repository(session: object) -> SqlAlchemyMultiplayerRepository:
+    return SqlAlchemyMultiplayerRepository(cast(AsyncSession, session))
+
+
 class SystemClock:
     """Return the current UTC instant."""
 
@@ -116,6 +123,7 @@ class StableServices:
     replay_query: ReplayQueryService | None = None
     replay: ReplayService | None = None
     ranking_query: RankingQueryService | None = None
+    multiplayer: MultiplayerService | None = None
 
 
 @asynccontextmanager
@@ -143,7 +151,7 @@ async def compose_stable_services(
             memory_cost_kib=config.argon2_memory_cost_kib,
             parallelism=config.argon2_parallelism,
         ),
-        config.token_hmac_key.get_secret_value().encode(),
+        config.match_password_hmac_key.get_secret_value().encode(),
         config.device_hmac_key.get_secret_value().encode(),
         application_clock,
         application_ids,
@@ -181,6 +189,19 @@ async def compose_stable_services(
         application_clock,
         application_ids,
     )
+    multiplayer = MultiplayerService(
+        uow_factory,
+        _multiplayer_repository,
+        RedisMultiplayerStateRepository(
+            redis,
+            prefix=config.redis_state_prefix,
+            state_ttl=timedelta(seconds=config.redis_multiplayer_ttl_seconds),
+            max_rooms=config.redis_multiplayer_max_rooms,
+        ),
+        application_clock,
+        config.token_hmac_key.get_secret_value().encode(),
+        state_lifetime=timedelta(seconds=config.redis_multiplayer_ttl_seconds),
+    )
 
     async with session_factory() as session:
         yield StableServices(
@@ -202,4 +223,5 @@ async def compose_stable_services(
             replay_query=ReplayQueryService(uow_factory, _scoring_repository),
             replay=ReplayService(uow_factory, _scoring_repository),
             ranking_query=RankingQueryService(uow_factory, _scoring_repository),
+            multiplayer=multiplayer,
         )

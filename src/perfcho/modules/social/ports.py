@@ -7,6 +7,7 @@ from typing import Protocol
 
 from perfcho.modules.common.ports import OutboxWriter, UnitOfWork
 from perfcho.modules.social.models import (
+    AccountIdentityView,
     Achievement,
     AchievementDefinitionRecord,
     AchievementUnlockResult,
@@ -38,6 +39,10 @@ class SocialRepository(Protocol):
         """Return existing account IDs in one batch query."""
         ...
 
+    async def resolve_account_by_name(self, name_key: str) -> AccountIdentityView | None:
+        """Resolve an active account by a normalized current name key."""
+        ...
+
     async def get_pair_relationship(self, first_account_id: int, second_account_id: int) -> PairRelationship:
         """Return directional follows and blocks for one pair in one query."""
         ...
@@ -63,6 +68,10 @@ class SocialRepository(Protocol):
 
     async def list_friends(self, account_id: int) -> tuple[FollowView, ...]:
         """List outgoing follows and derive mutual friendship in one query."""
+        ...
+
+    async def list_follower_account_ids(self, account_id: int) -> frozenset[int]:
+        """Return accounts whose presence-friend filter includes this account."""
         ...
 
     async def get_block(self, actor_account_id: int, target_account_id: int) -> BlockRecord | None:

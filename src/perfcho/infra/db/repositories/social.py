@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from perfcho.infra.db.advisory_lock import acquire_transaction_lock
+from perfcho.infra.db.enums import AccountStatus
 from perfcho.infra.db.models.core import Account, AccountName
 from perfcho.infra.db.models.social import (
     AchievementDefinition,
@@ -22,6 +23,7 @@ from perfcho.infra.db.models.social import (
 )
 from perfcho.modules.social.errors import AchievementUnlockConflict
 from perfcho.modules.social.models import (
+    AccountIdentityView,
     Achievement,
     AchievementDefinitionRecord,
     AchievementUnlockResult,
@@ -59,6 +61,21 @@ class SqlAlchemySocialRepository:
             return frozenset()
         identifiers = await self._session.scalars(select(Account.id).where(Account.id.in_(set(account_ids))))
         return frozenset(identifiers)
+
+    async def resolve_account_by_name(self, name_key: str) -> AccountIdentityView | None:
+        """Resolve one active account and its current display name."""
+        row = (
+            await self._session.execute(
+                select(Account.id, AccountName.display_name)
+                .join(AccountName, AccountName.account_id == Account.id)
+                .where(
+                    Account.status == AccountStatus.ACTIVE,
+                    AccountName.name_key == name_key,
+                    AccountName.ended_at.is_(None),
+                )
+            )
+        ).one_or_none()
+        return AccountIdentityView(row.id, row.display_name) if row is not None else None
 
     async def get_pair_relationship(self, first_account_id: int, second_account_id: int) -> PairRelationship:
         """Load all directional follow and block facts for one pair in one query."""
@@ -169,6 +186,13 @@ class SqlAlchemySocialRepository:
         return tuple(
             FollowView(row.target_account_id, row.display_name, row.remark, row.created_at, row.mutual) for row in rows
         )
+
+    async def list_follower_account_ids(self, account_id: int) -> frozenset[int]:
+        """Return incoming follow actor identifiers in one scalar query."""
+        values = await self._session.scalars(
+            select(Follow.actor_account_id).where(Follow.target_account_id == account_id)
+        )
+        return frozenset(values)
 
     async def get_block(self, actor_account_id: int, target_account_id: int) -> BlockRecord | None:
         """Return one outgoing block as an immutable projection."""

@@ -40,6 +40,7 @@ LEGACY_MOD_BITS = {
     "SV2": 1 << 29,
     "MR": 1 << 30,
 }
+_KNOWN_LEGACY_MOD_MASK = sum(LEGACY_MOD_BITS.values())
 
 _KEY_MODS = frozenset({"1K", "2K", "3K", "4K", "5K", "6K", "7K", "8K", "9K", "CO"})
 _INCOMPATIBLE_GROUPS = (
@@ -119,6 +120,36 @@ def normalize_mods(
     if legacy_bits & LEGACY_MOD_BITS["PF"]:
         legacy_bits |= LEGACY_MOD_BITS["SD"]
     return NormalizedModSet(ordered, canonical, canonical_json_digest(canonical), legacy_bits)
+
+
+def parse_legacy_mods(legacy_bits: int) -> tuple[tuple[CanonicalMod, ...], ScoreboardVariant]:
+    """Convert bounded legacy bit flags into canonical mods and a scoreboard variant."""
+    if isinstance(legacy_bits, bool) or not isinstance(legacy_bits, int) or legacy_bits < 0:
+        raise ValueError("legacy mod bits must be a non-negative integer")
+    if legacy_bits & ~_KNOWN_LEGACY_MOD_MASK:
+        raise ValueError("legacy mod bits contain unknown flags")
+    if legacy_bits & LEGACY_MOD_BITS["RX"] and legacy_bits & LEGACY_MOD_BITS["AP"]:
+        raise ValueError("relax and autopilot cannot be combined")
+    variant = (
+        ScoreboardVariant.AUTOPILOT
+        if legacy_bits & LEGACY_MOD_BITS["AP"]
+        else ScoreboardVariant.RELAX
+        if legacy_bits & LEGACY_MOD_BITS["RX"]
+        else ScoreboardVariant.VANILLA
+    )
+    mods: list[CanonicalMod] = []
+    for acronym, bit in LEGACY_MOD_BITS.items():
+        if not legacy_bits & bit:
+            continue
+        if acronym in {"RX", "AP"}:
+            mods.append(CanonicalMod(acronym))
+        elif (acronym == "DT" and legacy_bits & LEGACY_MOD_BITS["NC"]) or (
+            acronym == "SD" and legacy_bits & LEGACY_MOD_BITS["PF"]
+        ):
+            continue
+        else:
+            mods.append(CanonicalMod(acronym))
+    return tuple(mods), variant
 
 
 def _settings_sort_key(mod: CanonicalMod) -> str:

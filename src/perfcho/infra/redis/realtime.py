@@ -156,6 +156,8 @@ class RedisRealtimeRepository(RealtimeRepository):
                 self._keys.spectator_frames(account_id),
                 self._keys.spectator_frame_bytes(account_id),
                 self._keys.spectator_frame_sequence(account_id),
+                self._keys.presence_index,
+                self._keys.preference(account_id),
             ],
             args=[
                 account_id,
@@ -164,6 +166,7 @@ class RedisRealtimeRepository(RealtimeRepository):
                 MAX_REVISION,
                 f"{self._keys.base}:presence:",
                 f"{self._keys.base}:spectator:host:",
+                f"{self._keys.base}:preference:",
             ],
         )
         self._raise_session_status(_text(result[0]))
@@ -220,12 +223,13 @@ class RedisRealtimeRepository(RealtimeRepository):
         _bounded_integer("expected_revision", expected_revision, MAX_REVISION)
         result = await self._run(
             self._scripts.fence_session,
-            keys=[self._keys.session(session_id)],
+            keys=[self._keys.session(session_id), self._keys.presence_index],
             args=[
                 expected_revision,
                 revision_bytes(expected_revision),
                 f"{self._keys.base}:presence:",
                 f"{self._keys.base}:spectator:host:",
+                f"{self._keys.base}:preference:",
             ],
         )
         self._raise_session_status(_text(result[0]))
@@ -238,7 +242,11 @@ class RedisRealtimeRepository(RealtimeRepository):
         expiry_ms = datetime_to_milliseconds(snapshot.expires_at)
         result = await self._run(
             self._scripts.set_presence,
-            keys=[self._keys.session(session_id), self._keys.presence(snapshot.account_id)],
+            keys=[
+                self._keys.session(session_id),
+                self._keys.presence(snapshot.account_id),
+                self._keys.presence_index,
+            ],
             args=[snapshot.account_id, snapshot.revision, expiry_ms, self._presence_ttl_ms, encode_presence(snapshot)],
         )
         self._raise_session_status(_text(result[0]))
@@ -257,19 +265,104 @@ class RedisRealtimeRepository(RealtimeRepository):
             return None
         return snapshot
 
+    async def list_presences(self, *, at: datetime, limit: int) -> tuple[PresenceSnapshot, ...]:
+        """Read a bounded online index and prune stale presence members."""
+        _positive_integer("limit", limit)
+        if limit > 8192:
+            raise ValueError("presence limit exceeds 8192")
+        at_ms = datetime_to_milliseconds(at)
+        async with self._redis.pipeline(transaction=True) as pipeline:
+            pipeline.zremrangebyscore(self._keys.presence_index, 0, at_ms)
+            pipeline.zrangebyscore(self._keys.presence_index, at_ms + 1, "+inf", start=0, num=limit)
+            result = await pipeline.execute()
+        account_ids = tuple(sorted(int(_text(value)) for value in result[1]))
+        if not account_ids:
+            return ()
+        values = await self._redis.mget([self._keys.presence(account_id) for account_id in account_ids])
+        snapshots: list[PresenceSnapshot] = []
+        for account_id, value in zip(account_ids, values, strict=True):
+            if value is None:
+                await self._redis.zrem(self._keys.presence_index, account_id)
+                continue
+            snapshot = decode_presence(_binary(value))
+            if snapshot.account_id == account_id and snapshot.expires_at > at:
+                snapshots.append(snapshot)
+        return tuple(snapshots)
+
     async def clear_presence(self, account_id: int, *, expected_revision: int) -> bool:
         """Delete presence only when its packed revision remains current."""
         _positive_integer("account_id", account_id)
         _bounded_integer("expected_revision", expected_revision, MAX_REVISION)
         result = await self._run(
             self._scripts.clear_presence,
-            keys=[self._keys.presence(account_id)],
-            args=[revision_bytes(expected_revision)],
+            keys=[self._keys.presence(account_id), self._keys.presence_index],
+            args=[revision_bytes(expected_revision), account_id],
         )
         status = _text(result[0])
         if status not in {"OK", "STALE"}:
             raise RuntimeError(f"unexpected clear presence script status: {status}")
         return status == "OK"
+
+    async def set_presence_filter(
+        self,
+        account_id: int,
+        *,
+        session_id: uuid.UUID,
+        expected_revision: int,
+        value: int,
+    ) -> None:
+        """Store a validated Stable presence filter under the session fence."""
+        if value not in {0, 1, 2}:
+            raise ValueError("presence filter must be zero, one, or two")
+        await self._set_preference(account_id, session_id, expected_revision, "presence_filter", str(value))
+
+    async def get_presence_filter(self, account_id: int) -> int:
+        """Return the current Stable presence filter or zero when absent."""
+        _positive_integer("account_id", account_id)
+        value = await self._redis.hget(self._keys.preference(account_id), "presence_filter")
+        if value is None:
+            return 0
+        result = int(_text(value))
+        if result not in {0, 1, 2}:
+            raise RuntimeError("stored presence filter is invalid")
+        return result
+
+    async def set_away_message(
+        self,
+        account_id: int,
+        *,
+        session_id: uuid.UUID,
+        expected_revision: int,
+        message: str,
+    ) -> None:
+        """Store a bounded away message under the session fence."""
+        if len(message) > 1024:
+            raise ValueError("away message exceeds 1024 characters")
+        await self._set_preference(account_id, session_id, expected_revision, "away_message", message)
+
+    async def get_away_message(self, account_id: int) -> str:
+        """Return the online away message or an empty string."""
+        _positive_integer("account_id", account_id)
+        value = await self._redis.hget(self._keys.preference(account_id), "away_message")
+        return _binary(value).decode() if value is not None else ""
+
+    async def _set_preference(
+        self,
+        account_id: int,
+        session_id: uuid.UUID,
+        expected_revision: int,
+        field: str,
+        value: str,
+    ) -> None:
+        _positive_integer("account_id", account_id)
+        _uuid("session_id", session_id)
+        _bounded_integer("expected_revision", expected_revision, MAX_REVISION)
+        result = await self._run(
+            self._scripts.set_preference,
+            keys=[self._keys.session(session_id), self._keys.preference(account_id)],
+            args=[account_id, expected_revision, field, value],
+        )
+        self._raise_session_status(_text(result[0]))
 
     async def join_channel(
         self,
@@ -523,6 +616,40 @@ class RedisRealtimeRepository(RealtimeRepository):
         status = _text(result[0])
         if status not in {"OK", "STALE"}:
             raise RuntimeError(f"unexpected detach spectator script status: {status}")
+
+    async def get_spectator_relation(
+        self,
+        spectator_account_id: int,
+        *,
+        at: datetime,
+    ) -> SpectatorRelation | None:
+        """Resolve one unexpired spectator relation and clean its stale inverse member."""
+        _positive_integer("spectator_account_id", spectator_account_id)
+        values = await self._redis.hgetall(self._keys.spectator_relation(spectator_account_id))
+        if not values:
+            return None
+        try:
+            host_account_id = int(_text(values[b"host_account_id"]))
+            revision = int(_text(values[b"revision"]))
+            expires_at = datetime_from_milliseconds(int(_text(values[b"expires_at"])))
+        except (KeyError, ValueError) as error:
+            raise RuntimeError("stored spectator relation is invalid") from error
+        if expires_at <= at:
+            await self._redis.delete(self._keys.spectator_relation(spectator_account_id))
+            await self._redis.zrem(self._keys.spectator_viewers(host_account_id), spectator_account_id)
+            return None
+        return SpectatorRelation(host_account_id, spectator_account_id, revision, expires_at)
+
+    async def list_spectators(self, host_account_id: int, *, at: datetime) -> frozenset[int]:
+        """Return unexpired inverse spectator members after pruning stale scores."""
+        _positive_integer("host_account_id", host_account_id)
+        key = self._keys.spectator_viewers(host_account_id)
+        at_ms = datetime_to_milliseconds(at)
+        async with self._redis.pipeline(transaction=True) as pipeline:
+            pipeline.zremrangebyscore(key, 0, at_ms)
+            pipeline.zrangebyscore(key, at_ms + 1, "+inf")
+            result = await pipeline.execute()
+        return frozenset(int(_text(value)) for value in result[1])
 
     async def publish_spectator_frame(
         self,

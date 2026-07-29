@@ -10,6 +10,7 @@ from perfcho.modules.scoring.errors import BeatmapRevisionNotFound, ReplayNotFou
 from perfcho.modules.scoring.models import (
     AcceptedScoreResult,
     AcceptScore,
+    AccountStatsView,
     ClientFamily,
     LeaderboardPage,
     PerformanceCalculationInput,
@@ -298,6 +299,17 @@ class RankingQueryService:
                 friend_account_ids=friend_account_ids,
                 limit=limit,
             )
+
+    async def get_account_stats(
+        self,
+        account_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant = ScoreboardVariant.VANILLA,
+    ) -> AccountStatsView:
+        """Return current score totals while leaving Performance explicitly deferred."""
+        _positive_identifier("account_id", account_id)
+        async with self._uow_factory() as uow:
+            return await self._repository_factory(uow.session).get_account_stats(account_id, ruleset, variant)
 
 
 def _positive_identifier(name: str, value: int) -> None:

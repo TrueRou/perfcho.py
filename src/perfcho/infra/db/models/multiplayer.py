@@ -12,7 +12,6 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
-    Identity,
     Index,
     Integer,
     LargeBinary,
@@ -41,19 +40,24 @@ class Room(Uuid7PrimaryKeyMixin, TimestampMixin, DbBase):
     __tablename__ = "rooms"
     __table_args__ = (
         CheckConstraint("capacity BETWEEN 1 AND 1024", name="capacity_range"),
-        CheckConstraint("public_id BETWEEN 1 AND 2147483647", name="stable_public_id_range"),
+        CheckConstraint("public_id BETWEEN 1 AND 32767", name="stable_public_id_range"),
         CheckConstraint(
             "num_nonnulls(password_verifier, password_prefix) IN (0, 2)",
             name="complete_password_credentials",
         ),
         CheckConstraint("ends_at IS NULL OR starts_at IS NULL OR ends_at > starts_at", name="valid_period"),
-        UniqueConstraint("public_id"),
+        Index(
+            "uq_rooms_active_public_id",
+            "public_id",
+            unique=True,
+            postgresql_where=text("status IN ('open', 'started')"),
+        ),
         Index("ix_rooms_category_status_start", "category", "status", "starts_at"),
         Index("ix_rooms_creator_created", "creator_account_id", "created_at"),
         {"schema": "multiplayer"},
     )
 
-    public_id: Mapped[int] = mapped_column(Integer, Identity(always=True), nullable=False)
+    public_id: Mapped[int] = mapped_column(Integer, nullable=False)
     creator_account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
     channel_id: Mapped[int | None] = mapped_column(ForeignKey("community.channels.id", ondelete="SET NULL"))
     name: Mapped[str] = mapped_column(String(255), nullable=False)

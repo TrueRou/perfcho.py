@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 from redis.asyncio import Redis
 
+from perfcho.infra.redis.multiplayer import RedisMultiplayerStateRepository
 from perfcho.infra.redis.realtime import RedisRealtimeRepository
 from perfcho.infra.redis.state import (
     RealtimeKeys,
@@ -15,6 +16,15 @@ from perfcho.infra.redis.state import (
     decode_presence,
     encode_presence,
     sequence_token,
+)
+from perfcho.modules.multiplayer import (
+    RoomRecord,
+    RoomSettings,
+    RoomSlot,
+    RoomState,
+    SlotStatus,
+    TeamMode,
+    WinCondition,
 )
 from perfcho.modules.realtime import (
     InvalidFrame,
@@ -26,6 +36,7 @@ from perfcho.modules.realtime import (
     RealtimeSessionNotFound,
     SpectatorHostOffline,
 )
+from perfcho.modules.scoring import Ruleset, ScoreboardVariant
 
 NOW = datetime.now(UTC).replace(microsecond=0)
 SESSION_EXPIRY = NOW + timedelta(seconds=40)
@@ -75,8 +86,8 @@ def ordered_value(sequence: int, expires_at: datetime, payload: bytes) -> bytes:
 
 def test_repository_registers_versioned_bounded_scripts(repository_double: RepositoryDouble) -> None:
     assert isinstance(repository_double.repository, RealtimeRepository)
-    assert len(repository_double.scripts) == 17
-    assert repository_double.redis.register_script.call_count == 17
+    assert len(repository_double.scripts) == 18
+    assert repository_double.redis.register_script.call_count == 18
 
     for call in repository_double.redis.register_script.call_args_list:
         source = call.args[0]
@@ -132,6 +143,8 @@ async def test_session_calls_use_fenced_versioned_keys(repository_double: Reposi
         f"{PREFIX}:v1:spectator:host:42:frames",
         f"{PREFIX}:v1:spectator:host:42:frame-bytes",
         f"{PREFIX}:v1:spectator:host:42:frame-sequence",
+        f"{PREFIX}:v1:presence:index",
+        f"{PREFIX}:v1:preference:42",
     ]
     assert call.kwargs["args"][1:3] == [expiry_ms, 60_000]
     assert call.kwargs["client"] is repository_double.redis
@@ -165,7 +178,11 @@ async def test_presence_is_packed_and_revision_guarded(repository_double: Reposi
 
     call = set_script.await_args
     assert call is not None
-    assert call.kwargs["keys"] == [f"{PREFIX}:v1:session:{session_id}", f"{PREFIX}:v1:presence:42"]
+    assert call.kwargs["keys"] == [
+        f"{PREFIX}:v1:session:{session_id}",
+        f"{PREFIX}:v1:presence:42",
+        f"{PREFIX}:v1:presence:index",
+    ]
     assert decode_presence(call.kwargs["args"][-1]) == snapshot
 
     repository_double.redis.get.return_value = encode_presence(snapshot)
@@ -177,6 +194,17 @@ async def test_presence_is_packed_and_revision_guarded(repository_double: Reposi
     assert not await repository.clear_presence(42, expected_revision=2)
     clear_script.return_value = [b"OK"]
     assert await repository.clear_presence(42, expected_revision=3)
+
+    preference_script = repository_double.scripts["set-preference"]
+    preference_script.return_value = [b"OK"]
+    await repository.set_presence_filter(42, session_id=session_id, expected_revision=3, value=2)
+    preference_call = preference_script.await_args
+    assert preference_call is not None
+    assert preference_call.kwargs["keys"] == [
+        f"{PREFIX}:v1:session:{session_id}",
+        f"{PREFIX}:v1:preference:42",
+    ]
+    assert preference_call.kwargs["args"] == [42, 3, "presence_filter", "2"]
 
 
 @pytest.mark.asyncio
@@ -345,6 +373,11 @@ async def test_real_redis_realtime_lifecycle() -> None:
             b"\x00online\xff",
             presence.expires_at.replace(microsecond=presence.expires_at.microsecond // 1000 * 1000),
         )
+        assert tuple(item.account_id for item in await repository.list_presences(at=now, limit=10)) == (42,)
+        await repository.set_presence_filter(42, session_id=session_id, expected_revision=1, value=2)
+        assert await repository.get_presence_filter(42) == 2
+        await repository.set_away_message(42, session_id=session_id, expected_revision=1, message="away")
+        assert await repository.get_away_message(42) == "away"
 
         await repository.join_channel(7, session_id=session_id, expected_revision=1)
         assert await repository.list_channel_members(7) == frozenset({42})
@@ -369,6 +402,8 @@ async def test_real_redis_realtime_lifecycle() -> None:
         await repository.ack_mailbox(42, lease_id=lease_id, through_sequence=first.sequence)
 
         relation = await repository.attach_spectator(42, 43, expires_at=now + timedelta(seconds=15))
+        assert await repository.get_spectator_relation(43, at=now) == relation
+        assert await repository.list_spectators(42, at=now) == frozenset({43})
         frame = await repository.publish_spectator_frame(
             42,
             sequence=1,
@@ -377,6 +412,38 @@ async def test_real_redis_realtime_lifecycle() -> None:
         )
         assert await repository.read_spectator_frames(42, after_sequence=0, limit=2, at=now) == (frame,)
         await repository.detach_spectator(42, 43, expected_revision=relation.revision)
+        assert await repository.get_spectator_relation(43, at=now) is None
+        assert await repository.list_spectators(42, at=now) == frozenset()
+
+        multiplayer = RedisMultiplayerStateRepository(
+            redis,
+            prefix=prefix,
+            state_ttl=timedelta(seconds=30),
+            max_rooms=4,
+        )
+        room_settings = RoomSettings(
+            "Redis Room",
+            "Map",
+            1,
+            b"m" * 16,
+            Ruleset.OSU,
+            ScoreboardVariant.VANILLA,
+            TeamMode.HEAD_TO_HEAD,
+            WinCondition.SCORE,
+        )
+        room = RoomRecord(uuid.uuid7(), 1, uuid.uuid7(), 1, 42, 42, 2, room_settings)
+        room_state = RoomState(
+            room,
+            1,
+            (RoomSlot(0, SlotStatus.NOT_READY, 42), RoomSlot(1, SlotStatus.OPEN)),
+            False,
+            now + timedelta(seconds=20),
+        )
+        created_room = await multiplayer.create(room_state)
+        assert await multiplayer.find_for_account(42, at=now) == created_room
+        joined_room = await multiplayer.join(room, account_id=43, expires_at=now + timedelta(seconds=20))
+        assert joined_room.slot_for(43) is not None
+        assert len(await multiplayer.list_public(at=now, limit=4)) == 1
 
         reopened = await repository.open_session(
             session_id=session_id,

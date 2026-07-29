@@ -120,6 +120,28 @@ def send_message(message: Message, *, limits: CodecLimits = DEFAULT_LIMITS) -> b
     return _build(ServerPacket.SEND_MESSAGE, lambda writer: writer.write_message(message), limits=limits)
 
 
+def user_dm_blocked(target: str, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Tell a Stable client that a recipient rejected its direct message."""
+    message = Message("", "", target, 0)
+    return _build(ServerPacket.USER_DM_BLOCKED, lambda writer: writer.write_message(message), limits=limits)
+
+
+def target_is_silenced(target: str, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Tell a Stable client that a direct-message recipient is silenced."""
+    message = Message("", "", target, 0)
+    return _build(ServerPacket.TARGET_IS_SILENCED, lambda writer: writer.write_message(message), limits=limits)
+
+
+def toggle_block_non_friend_dms(*, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build Stable's no-payload direct-message policy toggle marker."""
+    return _build(ServerPacket.TOGGLE_BLOCK_NON_FRIEND_DMS, limits=limits)
+
+
+def match_invite(message: Message, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build a Stable multiplayer invitation message."""
+    return _build(ServerPacket.MATCH_INVITE, lambda writer: writer.write_message(message), limits=limits)
+
+
 def channel_join(name: str, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
     """Build a channel-join success packet."""
     return _build(ServerPacket.CHANNEL_JOIN_SUCCESS, lambda writer: writer.write_string(name), limits=limits)
@@ -191,7 +213,11 @@ def update_match(
 
 def new_match(match: MultiplayerMatch, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
     """Build a new lobby match packet."""
-    return _build(ServerPacket.NEW_MATCH, lambda writer: writer.write_multiplayer_match(match), limits=limits)
+    return _build(
+        ServerPacket.NEW_MATCH,
+        lambda writer: writer.write_multiplayer_match(match, send_password=False),
+        limits=limits,
+    )
 
 
 def dispose_match(match_id: int, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:

@@ -480,6 +480,25 @@ class LeaderboardPage:
 
 
 @dataclass(frozen=True, slots=True)
+class AccountStatsView:
+    """Describe Stable-compatible score totals without protocol fields."""
+
+    ranked_score: int
+    accuracy: Decimal
+    play_count: int
+    total_score: int
+    global_rank: int
+    performance: int = 0
+
+    def __post_init__(self) -> None:
+        """Require non-negative totals and normalized accuracy."""
+        if min(self.ranked_score, self.play_count, self.total_score, self.global_rank, self.performance) < 0:
+            raise ValueError("account statistics must be non-negative")
+        if not Decimal(0) <= self.accuracy <= Decimal(1):
+            raise ValueError("account statistics accuracy must be between zero and one")
+
+
+@dataclass(frozen=True, slots=True)
 class AnticheatAnalysisRequested:
     """Define the future anti-cheat event contract without implementing a consumer."""
 

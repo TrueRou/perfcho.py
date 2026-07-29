@@ -4,6 +4,7 @@ import uuid
 from collections.abc import Callable, Mapping
 
 from perfcho.modules.common.models import PendingEvent
+from perfcho.modules.common.normalization import normalize_stable_name
 from perfcho.modules.common.ports import Clock
 from perfcho.modules.social.errors import (
     AchievementNotFound,
@@ -12,6 +13,7 @@ from perfcho.modules.social.errors import (
     SocialRelationRejected,
 )
 from perfcho.modules.social.models import (
+    AccountIdentityView,
     Achievement,
     AchievementUnlockResult,
     BlockResult,
@@ -200,6 +202,18 @@ class SocialService:
             await _require_accounts(repository, first_account_id, second_account_id)
             return await repository.get_pair_relationship(first_account_id, second_account_id)
 
+    async def resolve_account_by_name(self, display_name: str) -> AccountIdentityView:
+        """Resolve one current active account through the Stable name normalization rule."""
+        try:
+            name_key = normalize_stable_name(display_name)
+        except ValueError as error:
+            raise SocialAccountNotFound("account does not exist") from error
+        async with self._uow_factory() as uow:
+            account = await self._repository_factory(uow.session).resolve_account_by_name(name_key)
+        if account is None:
+            raise SocialAccountNotFound("account does not exist")
+        return account
+
     async def are_mutual_friends(self, first_account_id: int, second_account_id: int) -> bool:
         """Return whether two accounts follow each other and neither blocks the other."""
         relationship = await self.get_pair_relationship(first_account_id, second_account_id)
@@ -210,6 +224,12 @@ class SocialService:
         _validate_account_id(account_id)
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).list_friends(account_id)
+
+    async def list_follower_account_ids(self, account_id: int) -> frozenset[int]:
+        """Return accounts currently following one account."""
+        _validate_account_id(account_id)
+        async with self._uow_factory() as uow:
+            return await self._repository_factory(uow.session).list_follower_account_ids(account_id)
 
     async def list_blocks(self, account_id: int) -> tuple[BlockView, ...]:
         """Return outgoing block entries with current Stable names."""

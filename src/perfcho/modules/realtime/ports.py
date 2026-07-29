@@ -53,8 +53,42 @@ class RealtimeRepository(Protocol):
         """Return a live presence snapshot when one exists."""
         ...
 
+    async def list_presences(self, *, at: datetime, limit: int) -> tuple[PresenceSnapshot, ...]:
+        """Return a bounded online presence snapshot ordered by account ID."""
+        ...
+
     async def clear_presence(self, account_id: int, *, expected_revision: int) -> bool:
         """Remove presence only when the stored revision matches."""
+        ...
+
+    async def set_presence_filter(
+        self,
+        account_id: int,
+        *,
+        session_id: uuid.UUID,
+        expected_revision: int,
+        value: int,
+    ) -> None:
+        """Persist the current fenced session's Stable presence filter."""
+        ...
+
+    async def get_presence_filter(self, account_id: int) -> int:
+        """Return the Stable presence filter, defaulting to no subscription."""
+        ...
+
+    async def set_away_message(
+        self,
+        account_id: int,
+        *,
+        session_id: uuid.UUID,
+        expected_revision: int,
+        message: str,
+    ) -> None:
+        """Persist a bounded away message for the current fenced session."""
+        ...
+
+    async def get_away_message(self, account_id: int) -> str:
+        """Return an online account's current away message."""
         ...
 
     async def join_channel(
@@ -128,6 +162,19 @@ class RealtimeRepository(Protocol):
         expected_revision: int,
     ) -> None:
         """Remove a spectator relation only when its revision remains current."""
+        ...
+
+    async def get_spectator_relation(
+        self,
+        spectator_account_id: int,
+        *,
+        at: datetime,
+    ) -> SpectatorRelation | None:
+        """Resolve one live spectator relation."""
+        ...
+
+    async def list_spectators(self, host_account_id: int, *, at: datetime) -> frozenset[int]:
+        """Return live spectator account IDs for one host."""
         ...
 
     async def publish_spectator_frame(

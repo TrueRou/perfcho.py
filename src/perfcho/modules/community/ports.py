@@ -123,6 +123,10 @@ class CommunityRepository(Protocol):
         """List unread incoming direct messages in ascending message order."""
         ...
 
+    async def set_private_message_policy(self, account_id: int, policy: str, *, now: datetime) -> str:
+        """Persist an account private-message policy and return it."""
+        ...
+
     async def join_membership(self, channel_id: int, account_id: int, *, now: datetime) -> bool:
         """Create or reopen a durable channel membership."""
         ...

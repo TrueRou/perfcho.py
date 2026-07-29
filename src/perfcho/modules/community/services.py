@@ -310,6 +310,20 @@ class CommunityService:
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).list_unread_direct_messages(account_id, limit=limit)
 
+    async def set_private_message_policy(self, account_id: int, policy: str) -> str:
+        """Set whether direct messages are accepted from all users or mutual friends."""
+        _validate_account_id(account_id)
+        if policy not in {"all", "friends"}:
+            raise CommunityInputRejected("private message policy must be all or friends")
+        async with self._uow_factory() as uow:
+            result = await self._repository_factory(uow.session).set_private_message_policy(
+                account_id,
+                policy,
+                now=self._clock.now(),
+            )
+            await uow.commit()
+            return result
+
     async def join_channel(self, account_id: int, channel_id: int) -> ChannelMembershipResult:
         """Join a channel durably only when its kind has persistent membership."""
         return await self._change_membership(account_id, channel_id, joining=True)

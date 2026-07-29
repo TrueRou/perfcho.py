@@ -129,6 +129,15 @@ class RealtimeKeys:
         """Return an account presence key."""
         return f"{self.base}:presence:{account_id}"
 
+    @property
+    def presence_index(self) -> str:
+        """Return the expiry-sorted online account index."""
+        return f"{self.base}:presence:index"
+
+    def preference(self, account_id: int) -> str:
+        """Return one account's expiring realtime client preferences."""
+        return f"{self.base}:preference:{account_id}"
+
     def channel_members(self, channel_id: int) -> str:
         """Return a channel's expiry-sorted account membership key."""
         return f"{self.base}:channel:{channel_id}:members"

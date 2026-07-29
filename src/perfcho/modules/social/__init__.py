@@ -8,6 +8,7 @@ from perfcho.modules.social.errors import (
     SocialRelationRejected,
 )
 from perfcho.modules.social.models import (
+    AccountIdentityView,
     Achievement,
     AchievementUnlock,
     AchievementUnlockResult,
@@ -21,6 +22,7 @@ from perfcho.modules.social.services import SocialService
 
 __all__ = (
     "Achievement",
+    "AccountIdentityView",
     "AchievementNotFound",
     "AchievementUnlock",
     "AchievementUnlockConflict",

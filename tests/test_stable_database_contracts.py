@@ -134,6 +134,9 @@ def test_replies_multiplayer_events_and_outbox_positions_have_integrity() -> Non
         isinstance(constraint, CheckConstraint) and constraint.name == "ck_rooms_stable_public_id_range"
         for constraint in rooms.constraints
     )
+    public_id = _index("multiplayer.rooms", "uq_rooms_active_public_id")
+    assert public_id.unique
+    assert "status IN ('open', 'started')" in str(public_id.dialect_options["postgresql"]["where"])
 
     multiplayer_events = _table("multiplayer.events")
     assert "command_id" in multiplayer_events.c

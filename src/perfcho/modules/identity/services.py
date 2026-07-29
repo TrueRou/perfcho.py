@@ -6,7 +6,6 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime
 
-from perfcho.infra.security.normalization import normalize_email, normalize_stable_name
 from perfcho.infra.security.password import Argon2Policy, PasswordHash, PasswordPepper, verify_password
 from perfcho.infra.security.tokens import (
     digest_device_component,
@@ -15,6 +14,7 @@ from perfcho.infra.security.tokens import (
     hmac_sha256_digest,
 )
 from perfcho.modules.common.models import PendingEvent
+from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
 from perfcho.modules.common.ports import Clock, IdGenerator
 from perfcho.modules.identity.errors import InvalidCredentials, InvalidStableSession, StableSessionAlreadyActive
 from perfcho.modules.identity.models import (
@@ -213,6 +213,7 @@ class IdentityService:
                         device_id=device_id,
                         raw_token=raw_token,
                         expires_at=expires_at,
+                        country_code=current.country_code,
                     )
 
         if failure is not None:

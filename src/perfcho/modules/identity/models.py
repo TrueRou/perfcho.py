@@ -70,6 +70,7 @@ class CredentialSnapshot:
     pepper_version: int
     password_changed_at: datetime
     must_change: bool
+    country_code: str | None = None
 
     def __post_init__(self) -> None:
         """Reject malformed persistence projections."""
@@ -91,6 +92,7 @@ class StableSessionResult:
     device_id: uuid.UUID
     raw_token: str = field(repr=False)
     expires_at: datetime
+    country_code: str | None = None
 
     def __post_init__(self) -> None:
         """Require a usable creation result."""
@@ -112,6 +114,7 @@ class ResolvedStableSession:
     client_version: str | None
     client_variant: str | None
     expires_at: datetime
+    country_code: str | None = None
 
     def __post_init__(self) -> None:
         """Require authoritative identifiers and a timezone-aware expiry."""

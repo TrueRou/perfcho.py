@@ -25,6 +25,17 @@ local function unpack_u64(value, offset)
 end
 """
 
+_EXPIRING_INDEX = """
+local function refresh_expiring_index(key)
+    local latest = redis.call('ZREVRANGE', key, 0, 0, 'WITHSCORES')
+    if #latest == 0 then
+        redis.call('DEL', key)
+    else
+        redis.call('PEXPIREAT', key, latest[2])
+    end
+end
+"""
+
 _ORDERED = """
 local function ordered_stats(key, at, maximum, remove_expired)
     local members = redis.call('ZRANGE', key, 0, maximum)
@@ -70,6 +81,7 @@ end
 OPEN_SESSION = (
     "-- perfcho:open-session:v1\n"
     + _NOW
+    + _EXPIRING_INDEX
     + """
 local expiry = tonumber(ARGV[2])
 local now = now_ms()
@@ -84,15 +96,19 @@ end
 local revision = redis.call('HINCRBY', KEYS[1], 'revision', 1)
 redis.call('HSET', KEYS[1], 'account_id', ARGV[1], 'expires_at', ARGV[2])
 redis.call('PEXPIREAT', KEYS[1], expiry)
-redis.call('DEL', KEYS[2], KEYS[3], KEYS[4], KEYS[5])
+redis.call('DEL', KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[7])
+redis.call('ZREM', KEYS[6], ARGV[1])
 if previous_account and previous_account ~= ARGV[1] then
+    redis.call('ZREM', KEYS[6], previous_account)
     redis.call('DEL',
         ARGV[5] .. previous_account,
         ARGV[6] .. previous_account .. ':frames',
         ARGV[6] .. previous_account .. ':frame-bytes',
-        ARGV[6] .. previous_account .. ':frame-sequence'
+        ARGV[6] .. previous_account .. ':frame-sequence',
+        ARGV[7] .. previous_account
     )
 end
+refresh_expiring_index(KEYS[6])
 return {'OK', ARGV[1], tostring(revision), ARGV[2]}
 """
 )
@@ -134,6 +150,7 @@ return {'OK', account, revision, ARGV[2]}
 FENCE_SESSION = (
     "-- perfcho:fence-session:v1\n"
     + _NOW
+    + _EXPIRING_INDEX
     + """
 local account = redis.call('HGET', KEYS[1], 'account_id')
 local revision = redis.call('HGET', KEYS[1], 'revision')
@@ -153,8 +170,11 @@ redis.call('DEL',
     KEYS[1],
     ARGV[4] .. account .. ':frames',
     ARGV[4] .. account .. ':frame-bytes',
-    ARGV[4] .. account .. ':frame-sequence'
+    ARGV[4] .. account .. ':frame-sequence',
+    ARGV[5] .. account
 )
+redis.call('ZREM', KEYS[2], account)
+refresh_expiring_index(KEYS[2])
 return {'OK'}
 """
 )
@@ -162,6 +182,7 @@ return {'OK'}
 SET_PRESENCE = (
     "-- perfcho:set-presence:v1\n"
     + _NOW
+    + _EXPIRING_INDEX
     + """
 local account = redis.call('HGET', KEYS[1], 'account_id')
 local revision = redis.call('HGET', KEYS[1], 'revision')
@@ -179,18 +200,43 @@ if not expiry or expiry <= now or expiry > tonumber(session_expiry) or expiry - 
 end
 redis.call('SET', KEYS[2], ARGV[5])
 redis.call('PEXPIREAT', KEYS[2], expiry)
+redis.call('ZADD', KEYS[3], expiry, account)
+refresh_expiring_index(KEYS[3])
 return {'OK'}
 """
 )
 
-CLEAR_PRESENCE = """-- perfcho:clear-presence:v1
+CLEAR_PRESENCE = (
+    "-- perfcho:clear-presence:v1\n"
+    + _EXPIRING_INDEX
+    + """
 local presence = redis.call('GET', KEYS[1])
 if not presence or #presence < 16 or string.sub(presence, 9, 16) ~= ARGV[1] then
     return {'STALE'}
 end
 redis.call('DEL', KEYS[1])
+redis.call('ZREM', KEYS[2], ARGV[2])
+refresh_expiring_index(KEYS[2])
 return {'OK'}
 """
+)
+
+SET_PREFERENCE = (
+    "-- perfcho:set-preference:v1\n"
+    + _NOW
+    + """
+local account = redis.call('HGET', KEYS[1], 'account_id')
+local revision = redis.call('HGET', KEYS[1], 'revision')
+local expiry = redis.call('HGET', KEYS[1], 'expires_at')
+if not account or not revision or not expiry or tonumber(expiry) <= now_ms() then
+    return {'NOT_FOUND'}
+end
+if account ~= ARGV[1] or revision ~= ARGV[2] then return {'FENCED'} end
+redis.call('HSET', KEYS[2], ARGV[3], ARGV[4])
+redis.call('PEXPIREAT', KEYS[2], expiry)
+return {'OK'}
+"""
+)
 
 _CHANNEL_EXPIRY = """
 local function refresh_channel(members_key, epochs_key)
@@ -534,6 +580,7 @@ class RealtimeScripts:
     fence_session: AsyncScript
     set_presence: AsyncScript
     clear_presence: AsyncScript
+    set_preference: AsyncScript
     join_channel: AsyncScript
     leave_channel: AsyncScript
     list_channel: AsyncScript
@@ -556,6 +603,7 @@ class RealtimeScripts:
             fence_session=redis.register_script(FENCE_SESSION),
             set_presence=redis.register_script(SET_PRESENCE),
             clear_presence=redis.register_script(CLEAR_PRESENCE),
+            set_preference=redis.register_script(SET_PREFERENCE),
             join_channel=redis.register_script(JOIN_CHANNEL),
             leave_channel=redis.register_script(LEAVE_CHANNEL),
             list_channel=redis.register_script(LIST_CHANNEL),

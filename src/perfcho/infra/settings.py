@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     argon2_parallelism: int = Field(default=4, ge=1)
     token_hmac_key: SecretStr = Field(default=SecretStr("perfcho-development-token-hmac-key"))
     device_hmac_key: SecretStr = Field(default=SecretStr("perfcho-development-device-hmac-key"))
+    match_password_hmac_key: SecretStr = Field(default=SecretStr("perfcho-development-match-password-hmac-key"))
 
     redis_state_url: str = Field(default="redis://127.0.0.1:56379/0")
     redis_state_prefix: str = Field(default="perfcho:state")
@@ -38,6 +39,8 @@ class Settings(BaseSettings):
     redis_mailbox_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
     redis_spectator_max_frames: int = Field(default=4096, ge=1)
     redis_spectator_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
+    redis_multiplayer_ttl_seconds: int = Field(default=12 * 60 * 60, ge=300)
+    redis_multiplayer_max_rooms: int = Field(default=4096, ge=1, le=32767)
 
     stable_build: str = Field(default="b20260711.1", min_length=1, max_length=64)
     stable_protocol_version: int = Field(default=19, ge=1)
@@ -58,6 +61,9 @@ class Settings(BaseSettings):
     )
     stable_score_submission_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
     stable_replay_max_bytes: int = Field(default=16 * 1024 * 1024, ge=0, le=64 * 1024 * 1024)
+    stable_spectator_frame_batch_size: int = Field(default=256, ge=1, le=4096)
+    stable_lobby_match_limit: int = Field(default=100, ge=1, le=256)
+    stable_presence_batch_size: int = Field(default=2048, ge=1, le=8192)
 
     s3_endpoint_url: str = Field(default="http://127.0.0.1:59000")
     s3_region: str = Field(default="us-east-1")

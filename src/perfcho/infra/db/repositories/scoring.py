@@ -59,6 +59,7 @@ from perfcho.modules.scoring.errors import AttemptIdempotencyConflict, Multiplay
 from perfcho.modules.scoring.models import (
     AcceptanceClaim,
     AcceptedScoreResult,
+    AccountStatsView,
     AccountSubmissionContext,
     AttemptClaim,
     BeatmapReference,
@@ -523,6 +524,81 @@ class SqlAlchemyScoringRepository:
                 hits=hits.get(personal_row.score_id, {}),
             )
         return LeaderboardPage(scores, personal_best)
+
+    async def get_account_stats(
+        self,
+        account_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant,
+    ) -> AccountStatsView:
+        """Aggregate play totals and active-policy best-score totals."""
+        scoreboard_id = await self._session.scalar(
+            select(Scoreboard.id).where(
+                Scoreboard.ruleset == DbRuleset(ruleset.value),
+                Scoreboard.variant == DbScoreboardVariant(variant.value),
+                Scoreboard.active.is_(True),
+            )
+        )
+        if scoreboard_id is None:
+            return AccountStatsView(0, Decimal(0), 0, 0, 0)
+        play_row = (
+            await self._session.execute(
+                select(
+                    func.count(Score.id),
+                    func.coalesce(func.sum(Score.total_score), 0),
+                    func.coalesce(func.avg(Score.accuracy), 0),
+                ).where(Score.account_id == account_id, Score.scoreboard_id == scoreboard_id)
+            )
+        ).one()
+        policy_id = await self._session.scalar(
+            select(RankingPolicy.id).where(
+                RankingPolicy.scoreboard_id == scoreboard_id,
+                RankingPolicy.active.is_(True),
+            )
+        )
+        ranked_score = 0
+        global_rank = 0
+        if policy_id is not None:
+            ranked_score = int(
+                await self._session.scalar(
+                    select(func.coalesce(func.sum(Score.total_score), 0))
+                    .select_from(LeaderboardEntry)
+                    .join(Score, Score.id == LeaderboardEntry.score_id)
+                    .where(
+                        LeaderboardEntry.policy_id == policy_id,
+                        LeaderboardEntry.scope == "overall",
+                        LeaderboardEntry.filter_mod_set_id.is_(None),
+                        LeaderboardEntry.account_id == account_id,
+                    )
+                )
+                or 0
+            )
+            totals = (
+                select(
+                    LeaderboardEntry.account_id.label("account_id"),
+                    func.sum(Score.total_score).label("ranked_score"),
+                )
+                .join(Score, Score.id == LeaderboardEntry.score_id)
+                .where(
+                    LeaderboardEntry.policy_id == policy_id,
+                    LeaderboardEntry.scope == "overall",
+                    LeaderboardEntry.filter_mod_set_id.is_(None),
+                )
+                .group_by(LeaderboardEntry.account_id)
+                .subquery()
+            )
+            if ranked_score > 0:
+                higher = await self._session.scalar(
+                    select(func.count()).select_from(totals).where(totals.c.ranked_score > ranked_score)
+                )
+                global_rank = int(higher or 0) + 1
+        return AccountStatsView(
+            ranked_score=ranked_score,
+            accuracy=Decimal(play_row[2]),
+            play_count=int(play_row[0]),
+            total_score=int(play_row[1]),
+            global_rank=global_rank,
+        )
 
     async def _score_hits(self, score_ids: set[int]) -> dict[int, dict[str, int]]:
         if not score_ids:

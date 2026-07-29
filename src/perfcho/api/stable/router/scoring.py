@@ -13,7 +13,7 @@ from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException
 
 from perfcho.api.stable.dependencies import StableServicesDependency
-from perfcho.api.stable.score_submission import ParsedStableScore, decrypt_stable_score, parse_legacy_mods
+from perfcho.api.stable.score_submission import ParsedStableScore, decrypt_stable_score
 from perfcho.modules.common import (
     Actor,
     ClientContext,
@@ -40,6 +40,7 @@ from perfcho.modules.scoring import (
     ScoringService,
     StagedReplayManifest,
 )
+from perfcho.modules.scoring.mods import parse_legacy_mods
 from perfcho.modules.social import SocialService
 
 router = APIRouter(include_in_schema=False, default_response_class=Response)
@@ -232,6 +233,11 @@ async def submit_score(
             client_version=services.settings.stable_build,
         ),
         attestation=attestation,
+        multiplayer=(
+            await services.multiplayer.resolve_submission_context(principal.account_id, beatmap.revision_id)
+            if services.multiplayer is not None
+            else None
+        ),
     )
     try:
         result = await scoring.accept(command)

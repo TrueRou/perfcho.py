@@ -11,6 +11,7 @@ from perfcho.modules.scoring.errors import (
 from perfcho.modules.scoring.models import (
     AcceptedScoreResult,
     AcceptScore,
+    AccountStatsView,
     AnticheatAnalysisRequested,
     BeatmapReference,
     CanonicalMod,
@@ -34,6 +35,7 @@ from perfcho.modules.scoring.services import RankingQueryService, ReplayQuerySer
 __all__ = (
     "AcceptScore",
     "AcceptedScoreResult",
+    "AccountStatsView",
     "AnticheatAnalysisRequested",
     "AttemptIdempotencyConflict",
     "BeatmapReference",

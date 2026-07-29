@@ -23,12 +23,11 @@ from perfcho.modules.scoring import (
     ScoreOutcome,
     ScoreSubmission,
 )
-from perfcho.modules.scoring.mods import LEGACY_MOD_BITS
+from perfcho.modules.scoring.mods import parse_legacy_mods
 
 _OSU_VERSION = re.compile(r"^\d{8}$")
 _INTEGER = re.compile(r"^-?\d{1,20}$")
 _RULESETS = {0: Ruleset.OSU, 1: Ruleset.TAIKO, 2: Ruleset.FRUITS, 3: Ruleset.MANIA}
-_KNOWN_MOD_MASK = sum(LEGACY_MOD_BITS.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,34 +178,6 @@ def _hex_digest(value: str, size: int, field_name: str) -> bytes:
     if len(result) != size:
         raise ValueError(f"Stable score {field_name} is invalid")
     return result
-
-
-def parse_legacy_mods(legacy_bits: int) -> tuple[tuple[CanonicalMod, ...], ScoreboardVariant]:
-    """Convert bounded Stable mod bits into canonical mods and a scoreboard variant."""
-    if legacy_bits & ~_KNOWN_MOD_MASK:
-        raise ValueError("Stable score contains unknown mod bits")
-    if legacy_bits & LEGACY_MOD_BITS["RX"] and legacy_bits & LEGACY_MOD_BITS["AP"]:
-        raise ValueError("Stable score cannot combine relax and autopilot")
-    variant = (
-        ScoreboardVariant.AUTOPILOT
-        if legacy_bits & LEGACY_MOD_BITS["AP"]
-        else ScoreboardVariant.RELAX
-        if legacy_bits & LEGACY_MOD_BITS["RX"]
-        else ScoreboardVariant.VANILLA
-    )
-    mods: list[CanonicalMod] = []
-    for acronym, bit in LEGACY_MOD_BITS.items():
-        if not legacy_bits & bit:
-            continue
-        if acronym in {"RX", "AP"}:
-            mods.append(CanonicalMod(acronym))
-        elif (acronym == "DT" and legacy_bits & LEGACY_MOD_BITS["NC"]) or (
-            acronym == "SD" and legacy_bits & LEGACY_MOD_BITS["PF"]
-        ):
-            continue
-        else:
-            mods.append(CanonicalMod(acronym))
-    return tuple(mods), variant
 
 
 def _progress(outcome: ScoreOutcome, fail_time_ms: int, score_time_ms: int) -> Decimal:

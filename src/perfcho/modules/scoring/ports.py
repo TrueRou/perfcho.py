@@ -8,6 +8,7 @@ from perfcho.modules.common.ports import OutboxWriter, UnitOfWork
 from perfcho.modules.scoring.models import (
     AcceptanceClaim,
     AcceptedScoreResult,
+    AccountStatsView,
     AccountSubmissionContext,
     AttemptClaim,
     BeatmapReference,
@@ -102,6 +103,15 @@ class ScoringRepository(Protocol):
         limit: int,
     ) -> LeaderboardPage:
         """Return one bounded Stable leaderboard projection."""
+        ...
+
+    async def get_account_stats(
+        self,
+        account_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant,
+    ) -> AccountStatsView:
+        """Aggregate Stable-facing account statistics without calculating PP."""
         ...
 
 

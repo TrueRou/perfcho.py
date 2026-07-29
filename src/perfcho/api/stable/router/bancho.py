@@ -31,7 +31,14 @@ from perfcho.realtime.stable import (
     user_presence,
     user_stats,
 )
-from perfcho.realtime.stable.dispatcher import StableRuntimeContext, dispatch_packets, realtime_expiry
+from perfcho.realtime.stable.countries import stable_country_id
+from perfcho.realtime.stable.dispatcher import (
+    StableRuntimeContext,
+    account_stats,
+    broadcast_presence_update,
+    dispatch_packets,
+    realtime_expiry,
+)
 
 router = APIRouter(include_in_schema=False)
 
@@ -54,7 +61,7 @@ async def bancho(
         return _protocol_failure("Request body is too large.")
     if osu_token is None:
         return await _login(request, body, services)
-    return await _poll(body, osu_token, services)
+    return await _poll(request, body, osu_token, services)
 
 
 async def _login(request: Request, body: bytes, services: StableServices) -> Response:
@@ -107,6 +114,11 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         )
 
     stable_privileges = await services.authorization.get_stable_privileges(result.account_id)
+    if services.community is not None:
+        await services.community.set_private_message_policy(
+            result.account_id,
+            "friends" if parsed.private_messages_from_friends_only else "all",
+        )
     channels = (
         await services.community.list_public_channels(result.account_id) if services.community is not None else ()
     )
@@ -130,14 +142,14 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         user_id=result.account_id,
         username=result.current_name,
         utc_offset=parsed.utc_offset,
-        country_code=0,
+        country_code=stable_country_id(result.country_code),
         privileges=int(stable_privileges),
         mode=0,
         longitude=0.0,
         latitude=0.0,
         global_rank=0,
     )
-    stats = _empty_stats(result.account_id)
+    stats = await account_stats(_empty_stats(result.account_id), services)
     presence_packet = user_presence(presence)
     stats_packet = user_stats(stats)
     await services.realtime.set_presence(
@@ -149,6 +161,8 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         ),
         session_id=result.session_id,
     )
+    if services.social is not None:
+        await broadcast_presence_update(presence_packet + stats_packet, result.account_id, services)
     channel_packets = tuple(
         channel_info(Channel(channel.name, channel.topic, 0)) for channel in channels if channel.name != "#lobby"
     )
@@ -181,7 +195,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
     return _binary_response(payload, token=result.raw_token)
 
 
-async def _poll(body: bytes, raw_token: str, services: StableServices) -> Response:
+async def _poll(request: Request, body: bytes, raw_token: str, services: StableServices) -> Response:
     try:
         identity = await services.identity.resolve_stable_session(raw_token)
     except InvalidStableSession:
@@ -203,7 +217,12 @@ async def _poll(body: bytes, raw_token: str, services: StableServices) -> Respon
         )
 
     stored_presence = await services.realtime.get_presence(identity.account_id, at=services.clock.now())
-    presence, stats = _presence_and_stats(identity.account_id, identity.current_name, stored_presence)
+    presence, stats = _presence_and_stats(
+        identity.account_id,
+        identity.current_name,
+        stable_country_id(identity.country_code),
+        stored_presence,
+    )
     if stored_presence is None:
         await services.realtime.set_presence(
             PresenceSnapshot(
@@ -215,7 +234,20 @@ async def _poll(body: bytes, raw_token: str, services: StableServices) -> Respon
             session_id=identity.session_id,
         )
 
-    context = StableRuntimeContext(identity=identity, realtime=realtime, presence=presence, stats=stats)
+    context = StableRuntimeContext(
+        identity=identity,
+        realtime=realtime,
+        presence=presence,
+        stats=stats,
+        client=ClientContext(
+            family="stable",
+            version=identity.client_version,
+            variant=identity.client_variant,
+            ip_address=_client_ip(request),
+            user_agent="osu!",
+        ),
+        raw_token=raw_token,
+    )
     try:
         local_output = await dispatch_packets(body, context, services)
     except ProtocolError, ValueError:
@@ -269,6 +301,7 @@ def _empty_stats(account_id: int) -> UserStats:
 def _presence_and_stats(
     account_id: int,
     current_name: str,
+    country_code: int,
     snapshot: PresenceSnapshot | None,
 ) -> tuple[UserPresence, UserStats]:
     if snapshot is not None:
@@ -284,7 +317,7 @@ def _presence_and_stats(
         if parsed_presence is not None and parsed_stats is not None:
             return parsed_presence, parsed_stats
     return (
-        UserPresence(account_id, current_name, 0, 0, 1, 0, 0.0, 0.0, 0),
+        UserPresence(account_id, current_name, 0, country_code, 1, 0, 0.0, 0.0, 0),
         _empty_stats(account_id),
     )
 

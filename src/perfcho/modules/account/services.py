@@ -5,7 +5,6 @@ import unicodedata
 from collections.abc import Callable
 from datetime import timedelta
 
-from perfcho.infra.security.normalization import normalize_email, normalize_stable_name
 from perfcho.infra.security.password import (
     Argon2Policy,
     PasswordPepper,
@@ -20,6 +19,7 @@ from perfcho.modules.account.ports import (
     AccountUnitOfWork,
 )
 from perfcho.modules.common.models import PendingEvent
+from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
 from perfcho.modules.common.ports import Clock
 
 _RECEIPT_SCOPE = "account.register"

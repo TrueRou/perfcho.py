@@ -47,6 +47,20 @@ class PairRelationship:
 
 
 @dataclass(frozen=True, slots=True)
+class AccountIdentityView:
+    """Describe one active account using its current Stable-facing name."""
+
+    account_id: int
+    display_name: str
+
+    def __post_init__(self) -> None:
+        """Validate the account identifier and display name."""
+        _require_positive_id("account_id", self.account_id)
+        if not self.display_name:
+            raise ValueError("display_name must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class FollowView:
     """Describe one outgoing follow using current Stable-facing account identity."""
 
