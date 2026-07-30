@@ -34,9 +34,11 @@ from perfcho.infra.db.models.scoring import (
 from perfcho.infra.db.projectors.ranking import project_accepted_score
 from tools.bancho_migration.domains.common import complete_phase, run_batched_phase, run_single_phase
 from tools.bancho_migration.models import DiagnosticSeverity, MigrationRuntime, SourceRow
+from tools.bancho_migration.observability import PhaseObserver
 from tools.bancho_migration.state import MigrationCheckpoint, next_checkpoint
 from tools.bancho_migration.storage import (
     MigrationStorageError,
+    ObjectUploadFailed,
     ReplayFileMetadata,
     read_replay_file,
     upload_replay_file,
@@ -229,60 +231,79 @@ async def _migrate_difficulty(runtime: MigrationRuntime) -> None:
 
 
 async def _migrate_scores(runtime: MigrationRuntime) -> None:
-    checkpoint = await _checkpoint(runtime)
-    if _PHASE_SCORES in checkpoint.completed_phases:
-        return
-    cursor = checkpoint.cursor if checkpoint.phase == _PHASE_SCORES else 0
-    object_storage = runtime.object_storage
-    assert object_storage is not None
-    for rows in runtime.source.iter_batches(
-        "scores",
-        key="id",
-        batch_size=runtime.config.batch_size,
-        start_after=cursor,
-    ):
-        staged_replays: dict[int, _StagedReplay] = {}
-        for row in rows:
-            source_id = row.get("id")
-            try:
-                score_id = _positive(source_id, "score id")
-                if bounded_integer(row.get("status"), "score status", minimum=0, maximum=2) == 0:
-                    continue
-                metadata = read_replay_file(runtime.config.data_directory, score_id)
-                account_id = runtime.mappings.accounts[_positive(row.get("userid"), "score user id")]
-                stored = await upload_replay_file(object_storage, metadata, account_id=account_id)
-                digest = stored.sha256
-                if digest is None:
-                    raise ValueError("uploaded replay has no SHA-256 digest")
-                staged_replays[score_id] = _StagedReplay(metadata, stored.storage_key, stored.size_bytes, digest)
-            except MigrationStorageError as error:
-                runtime.report.add(
-                    DiagnosticSeverity.WARNING,
-                    "replay_unavailable",
-                    str(error),
-                    entity="scores",
-                    source_id=source_id,
-                )
-                runtime.report.increment(_PHASE_SCORES, "replay_skipped")
-            except KeyError, TypeError, ValueError:
-                # The score handler emits the authoritative dependency diagnostic.
-                continue
-
-        async with runtime.session_factory.begin() as session:
+    with PhaseObserver(runtime, _PHASE_SCORES) as observer:
+        checkpoint = await _checkpoint(runtime)
+        if _PHASE_SCORES in checkpoint.completed_phases:
+            observer.skipped()
+            return
+        cursor = checkpoint.cursor if checkpoint.phase == _PHASE_SCORES else 0
+        object_storage = runtime.object_storage
+        assert object_storage is not None
+        for rows in runtime.source.iter_batches(
+            "scores",
+            key="id",
+            batch_size=runtime.config.batch_size,
+            start_after=cursor,
+        ):
+            snapshot = runtime.report.snapshot()
+            staged_replays: dict[int, _StagedReplay] = {}
             for row in rows:
                 source_id = row.get("id")
                 try:
-                    prepared = await _prepare_score(session, runtime, row, staged_replays)
-                    target_score_id, created = await _persist_score(session, runtime, prepared)
-                    runtime.mappings.scores[prepared.source_id] = target_score_id
-                    runtime.report.increment(_PHASE_SCORES, "inserted" if created else "target_reused")
-                except (KeyError, TypeError, ValueError) as error:
-                    _warning(runtime, _PHASE_SCORES, "score_skipped", error, "scores", source_id)
-            cursor = int(rows[-1]["id"])
-            checkpoint = next_checkpoint(checkpoint, phase=_PHASE_SCORES, cursor=cursor)
-            await runtime.state.save(session, checkpoint)
-        runtime.report.write(runtime.config.report_path)
-    await complete_phase(runtime, checkpoint, _PHASE_SCORES)
+                    score_id = _positive(source_id, "score id")
+                    if bounded_integer(row.get("status"), "score status", minimum=0, maximum=2) == 0:
+                        continue
+                    metadata = read_replay_file(runtime.config.data_directory, score_id)
+                    account_id = runtime.mappings.accounts[_positive(row.get("userid"), "score user id")]
+                    stored = await upload_replay_file(
+                        object_storage,
+                        metadata,
+                        account_id=account_id,
+                        invocation_id=runtime.report.invocation_id,
+                        migration_id=runtime.config.migration_id,
+                    )
+                    digest = stored.sha256
+                    if digest is None:
+                        raise ValueError("uploaded replay has no SHA-256 digest")
+                    staged_replays[score_id] = _StagedReplay(metadata, stored.storage_key, stored.size_bytes, digest)
+                except ObjectUploadFailed:
+                    runtime.report.restore(snapshot)
+                    raise
+                except MigrationStorageError as error:
+                    runtime.report.add(
+                        DiagnosticSeverity.WARNING,
+                        "replay_unavailable",
+                        str(error),
+                        entity="scores",
+                        source_id=source_id,
+                    )
+                    runtime.report.increment(_PHASE_SCORES, "replay_skipped")
+                except KeyError, TypeError, ValueError:
+                    # The score handler emits the authoritative dependency diagnostic.
+                    continue
+            try:
+                async with runtime.session_factory.begin() as session:
+                    for row in rows:
+                        source_id = row.get("id")
+                        try:
+                            prepared = await _prepare_score(session, runtime, row, staged_replays)
+                            target_score_id, created = await _persist_score(session, runtime, prepared)
+                            runtime.mappings.scores[prepared.source_id] = target_score_id
+                            runtime.report.increment(
+                                _PHASE_SCORES,
+                                "inserted" if created else "target_reused",
+                            )
+                        except (KeyError, TypeError, ValueError) as error:
+                            _warning(runtime, _PHASE_SCORES, "score_skipped", error, "scores", source_id)
+                    cursor = int(rows[-1]["id"])
+                    checkpoint = next_checkpoint(checkpoint, phase=_PHASE_SCORES, cursor=cursor)
+                    await runtime.state.save(session, checkpoint)
+            except BaseException:
+                runtime.report.restore(snapshot)
+                raise
+            observer.batch_committed(len(rows))
+            runtime.report.write(runtime.config.report_path)
+        await complete_phase(runtime, checkpoint, _PHASE_SCORES)
 
 
 async def _prepare_score(

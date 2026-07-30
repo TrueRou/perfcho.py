@@ -348,6 +348,52 @@ async def test_stable_score_submission_stages_replay_and_calls_canonical_service
 
 
 @pytest.mark.asyncio
+async def test_score_submission_logs_stages_domain_code_and_no_submission_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    web_module = importlib.import_module("perfcho.api.stable.router.web")
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        events.append((level, event, fields))
+
+    monkeypatch.setattr(web_module, "log_event", capture)
+    services, scoring, storage, _, _ = stable_services()
+    app = stable_app(services)
+    accepted_files = submission_files()
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        accepted = await client.post("/web/osu-submit-modular-selector.php", files=accepted_files)
+        scoring.error = ScoreRejected("rejected")
+        rejected = await client.post("/web/osu-submit-modular-selector.php", files=submission_files())
+
+    assert accepted.status_code == rejected.status_code == 200
+    assert any(
+        event == "stable.score_submission.stage" and fields["stage"] == "object_staged" for _, event, fields in events
+    )
+    assert any(event == "stable.score_submission.completed" and fields["score_id"] == 40 for _, event, fields in events)
+    assert any(
+        event == "stable.score_submission.rejected"
+        and fields["error_code"] == "score_rejected"
+        and fields["error_type"] == "ScoreRejected"
+        for _, event, fields in events
+    )
+    rendered = repr(events)
+    encrypted_value = cast(str, accepted_files[0][1][1])
+    for secret in (
+        PASSWORD_MD5,
+        BEATMAP_MD5,
+        encrypted_value,
+        "client-hash",
+        storage.puts[0][0],
+        REPLAY_CONTENT.decode(),
+    ):
+        assert secret not in rendered
+
+
+@pytest.mark.asyncio
 async def test_stable_score_submission_rejects_invalid_password_before_object_write() -> None:
     services, scoring, storage, _, _ = stable_services()
     app = stable_app(services)

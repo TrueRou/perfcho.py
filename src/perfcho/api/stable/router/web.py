@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from time import monotonic_ns
 from typing import Annotated, Literal
 from urllib.parse import parse_qs, quote
 
@@ -28,6 +29,7 @@ from perfcho.api.stable.canonize.scoring import (
     verify_stable_online_checksum,
 )
 from perfcho.api.stable.dependencies import StableServicesDependency
+from perfcho.infra.logging import duration_ms, log_event, rate_limit
 from perfcho.modules.common import (
     Actor,
     ApplicationError,
@@ -157,7 +159,15 @@ async def _authenticate(
         realtime = await services.realtime.resolve_session(principal.session_id, at=services.clock.now())
         if realtime.account_id != principal.account_id:
             raise RealtimeSessionFenced("Stable Web principal does not own the realtime session")
-    except InvalidCredentials, RealtimeSessionNotFound, RealtimeSessionFenced:
+    except (InvalidCredentials, RealtimeSessionNotFound, RealtimeSessionFenced) as error:
+        if rate_limit(f"stable-web-auth:{error.code}", interval_seconds=5):
+            log_event(
+                "INFO",
+                "stable.web.auth_rejected",
+                outcome="rejected",
+                error_code=error.code,
+                error_type=type(error).__name__,
+            )
         principal = None
     return _WebAuthentication(principal)
 
@@ -189,6 +199,38 @@ async def _leaderboard_authentication(
 def _authentication_failed(*, rating: bool = False) -> Response:
     content = b"auth fail" if rating else b""
     return Response(content, status_code=status.HTTP_401_UNAUTHORIZED)
+
+
+def _log_score_stage(started_ns: int, stage: str, *, account_id: int | None = None) -> None:
+    log_event(
+        "DEBUG",
+        "stable.score_submission.stage",
+        stage=stage,
+        outcome="completed",
+        account_id=account_id,
+        duration_ms=duration_ms(started_ns),
+    )
+
+
+def _log_score_rejection(
+    started_ns: int,
+    stage: str,
+    *,
+    account_id: int | None = None,
+    error: BaseException | None = None,
+    error_code: str | None = None,
+    error_type: str | None = None,
+) -> None:
+    log_event(
+        "INFO",
+        "stable.score_submission.rejected",
+        stage=stage,
+        outcome="rejected",
+        account_id=account_id,
+        error_code=error_code or getattr(error, "code", "stable_input_rejected"),
+        error_type=error_type or (type(error).__name__ if error is not None else "SubmissionRejected"),
+        duration_ms=duration_ms(started_ns),
+    )
 
 
 async def _read_limited_body(request: Request, maximum: int) -> bytes:
@@ -587,6 +629,7 @@ async def submit_score(
     object_storage: Annotated[ObjectStorage, Depends(_object_storage)],
 ) -> Response:
     """Decrypt, authenticate, stage, and atomically accept one Stable score."""
+    started_ns = monotonic_ns()
     try:
         form = await parse_stable_submission_form(request, services.settings.stable_score_submission_max_bytes)
         parsed = decrypt_stable_score(
@@ -600,13 +643,17 @@ async def submit_score(
             supported_build=services.settings.stable_build,
         )
         validate_stable_submission_evidence(form, parsed)
-    except HTTPException, MultiPartException, ValueError:
+    except (HTTPException, MultiPartException, ValueError) as error:
+        _log_score_rejection(started_ns, "parse", error=error)
         return Response(b"error: no")
+    _log_score_stage(started_ns, "parsed")
 
     authentication = await _authenticate(services, parsed.username, form.password_token)
     principal = authentication.principal
     if principal is None:
+        _log_score_rejection(started_ns, "authentication")
         return Response(b"error: pass")
+    _log_score_stage(started_ns, "authenticated", account_id=principal.account_id)
     try:
         verify_stable_online_checksum(
             parsed,
@@ -614,21 +661,25 @@ async def submit_score(
             storyboard_hash=form.storyboard_hash,
             username=principal.current_name,
         )
-    except ValueError:
+    except ValueError as error:
+        _log_score_rejection(started_ns, "integrity_validation", account_id=principal.account_id, error=error)
         return Response(b"error: no")
     try:
         beatmap = await content_query.lookup_md5(parsed.beatmap_md5)
-    except BeatmapNotFound:
+    except BeatmapNotFound as error:
+        _log_score_rejection(started_ns, "beatmap_lookup", account_id=principal.account_id, error=error)
         return Response(b"error: beatmap")
     received_at = services.clock.now()
     try:
         validate_stable_submission_time(parsed, received_at)
-    except ValueError:
+    except ValueError as error:
+        _log_score_rejection(started_ns, "attempt_time", account_id=principal.account_id, error=error)
         return Response(b"error: no")
 
     try:
         replay_content = await read_stable_replay(form.replay, services.settings.stable_replay_max_bytes)
-    except ValueError:
+    except ValueError as error:
+        _log_score_rejection(started_ns, "artifact_validation", account_id=principal.account_id, error=error)
         return Response(b"error: no")
     finally:
         await form.replay.close()
@@ -642,12 +693,15 @@ async def submit_score(
             media_type="application/octet-stream",
             expected_sha256=replay_digest,
         )
-    except ObjectUnavailable:
+    except ObjectUnavailable as error:
+        _log_score_rejection(started_ns, "object_staging", account_id=principal.account_id, error=error)
         return Response(b"")
+    _log_score_stage(started_ns, "object_staged", account_id=principal.account_id)
 
     request_id = services.id_generator.new()
     online_checksum = parsed.score.online_checksum
     if online_checksum is None:
+        _log_score_rejection(started_ns, "integrity_validation", account_id=principal.account_id)
         return Response(b"error: no")
     command = AcceptScore(
         meta=CommandMeta(
@@ -692,12 +746,32 @@ async def submit_score(
                 ),
             )
         result = await scoring.accept(command)
-    except BeatmapRevisionNotFound:
+    except BeatmapRevisionNotFound as error:
+        _log_score_rejection(started_ns, "canonical_accept", account_id=principal.account_id, error=error)
         return Response(b"error: beatmap")
-    except ApplicationError, ValueError:
+    except (ApplicationError, ValueError) as error:
+        _log_score_rejection(started_ns, "canonical_accept", account_id=principal.account_id, error=error)
         return Response(b"error: no")
     if result.outcome.value != "passed":
+        _log_score_rejection(
+            started_ns,
+            "canonical_outcome",
+            account_id=principal.account_id,
+            error_code="score_outcome_rejected",
+            error_type=type(result.outcome).__name__,
+        )
         return Response(b"error: no")
+    log_event(
+        "INFO",
+        "stable.score_submission.completed",
+        outcome="accepted",
+        account_id=principal.account_id,
+        score_id=result.score_id,
+        beatmap_id=result.beatmap_id,
+        beatmap_revision_id=result.beatmap_revision_id,
+        ruleset=parsed.ruleset.value,
+        duration_ms=duration_ms(started_ns),
+    )
     return Response(_submission_chart(result.score_id, beatmap, parsed))
 
 

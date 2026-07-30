@@ -358,7 +358,18 @@ def id_request_packet(packet_type: ClientPacket, account_ids: tuple[int, ...]) -
 
 
 @pytest.mark.asyncio
-async def test_private_message_is_persisted_enqueued_and_returns_away_reply() -> None:
+async def test_private_message_is_persisted_enqueued_and_returns_away_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        del level
+        events.append((event, fields))
+
+    monkeypatch.setattr(dispatcher_module, "log_event", capture)
+    monkeypatch.setattr(dispatcher_module, "sampled", lambda key, rate: True)
     realtime = FakeRealtime((snapshot(10, "sender"), snapshot(20, "target", action=1)))
     community = FakeCommunity()
 
@@ -374,6 +385,20 @@ async def test_private_message_is_persisted_enqueued_and_returns_away_reply() ->
     assert delivered.payload.read_message() == Message("sender", "hello", "target", 10)
     away = next(PacketReader(response, packet_enum=ServerPacket))
     assert away.payload.read_message().text == "Away for lunch"
+    message_event = next(fields for event, fields in events if event == "stable.message.state")
+    assert message_event == {
+        "message_kind": "direct",
+        "outcome": "delivered_with_away_reply",
+        "account_id": 10,
+        "message_length": 5,
+        "recipient_count": 1,
+        "delivered_count": 1,
+        "away_message_length": 14,
+        "error_code": None,
+        "error_type": None,
+    }
+    for secret in ("hello", "sender", "target", "Away for lunch"):
+        assert secret not in repr(events)
 
 
 @pytest.mark.asyncio
@@ -458,6 +483,47 @@ async def test_dispatcher_cumulative_response_budget_keeps_complete_packets() ->
 
     assert [packet.packet_type for packet in PacketReader(response, packet_enum=ServerPacket)] == [ServerPacket.PONG]
     assert len(response) == 7
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_logs_expected_application_code_and_propagates_unexpected_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher")
+    realtime = FakeRealtime((snapshot(10, "sender"),))
+    current = context(realtime)
+    stable_services = services(realtime)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        del level
+        events.append((event, fields))
+
+    async def expected_error(*args: object) -> bytes:
+        del args
+        raise CommunityInputRejected("private detail")
+
+    monkeypatch.setattr(dispatcher_module, "log_event", capture)
+    monkeypatch.setattr(dispatcher_module, "_dispatch_packets", expected_error)
+
+    response = await dispatch_packets(b"sensitive packet bytes", current, stable_services)
+
+    assert next(PacketReader(response, packet_enum=ServerPacket)).packet_type is ServerPacket.NOTIFICATION
+    rejection = next(fields for event, fields in events if event == "stable.packet.application_rejected")
+    assert rejection["error_code"] == "community_input_rejected"
+    assert rejection["error_type"] == "CommunityInputRejected"
+    assert "private detail" not in repr(events)
+    assert "sensitive packet bytes" not in repr(events)
+
+    async def unexpected_error(*args: object) -> bytes:
+        del args
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(dispatcher_module, "_dispatch_packets", unexpected_error)
+    with pytest.raises(RuntimeError, match="unexpected"):
+        await dispatch_packets(b"", current, stable_services)
 
 
 @pytest.mark.asyncio

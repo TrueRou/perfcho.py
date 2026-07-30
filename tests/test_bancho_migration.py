@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import bcrypt
@@ -12,21 +13,29 @@ from sqlalchemy import select, text
 
 from perfcho.infra.db.enums import BeatmapStatus, Ruleset, ScoreboardVariant
 from perfcho.infra.db.models.scoring import CalculationFormula, CalculationRelease
-from perfcho.modules.common import ObjectStorage, StoredObject
+from perfcho.modules.common import ObjectStorage, ObjectUnavailable, StoredObject
+from tools.bancho_migration import cli as migration_cli
+from tools.bancho_migration import observability as migration_observability
+from tools.bancho_migration import runner as migration_runner
+from tools.bancho_migration import storage as migration_storage
 from tools.bancho_migration.config import MigrationConfig, MigrationOverrides
+from tools.bancho_migration.domains.common import run_batched_phase
 from tools.bancho_migration.domains.community import migrate_community
 from tools.bancho_migration.domains.content import migrate_content
 from tools.bancho_migration.domains.identity import migrate_identity
 from tools.bancho_migration.domains.multiplayer import migrate_multiplayer
 from tools.bancho_migration.domains.scoring import migrate_scoring
 from tools.bancho_migration.domains.social import migrate_social
-from tools.bancho_migration.models import DiagnosticSeverity, MigrationRuntime, SourceSchema
+from tools.bancho_migration.models import DiagnosticSeverity, MigrationRuntime, MigrationStatus, SourceSchema
+from tools.bancho_migration.observability import PhaseObserver
 from tools.bancho_migration.report import MigrationReport
 from tools.bancho_migration.schema import EXCLUDED_TABLES, REQUIRED_COLUMNS, validate_source_schema
 from tools.bancho_migration.source import BanchoSource
-from tools.bancho_migration.state import MigrationStateStore
+from tools.bancho_migration.state import MigrationCheckpoint, MigrationStateStore
 from tools.bancho_migration.storage import (
     BeatmapChecksumMismatch,
+    ObjectUploadFailed,
+    ReplayFileMetadata,
     SourceFileInvalid,
     read_beatmap_file,
     read_replay_file,
@@ -301,13 +310,367 @@ def test_report_bounds_diagnostics_and_writes_structured_json(tmp_path: Path) ->
     report.add(DiagnosticSeverity.ERROR, "dropped", "dropped error")
     report.increment("phase", "inserted", 2)
     report.finish()
+    assert report.has_errors
+    assert report.status is MigrationStatus.FAILED
+    assert report.diagnostic_counts == {"info": 0, "warning": 1, "error": 1}
     path = tmp_path / "nested" / "report.json"
     report.write(path)
     payload = json.loads(path.read_text())
     assert payload["migration_id"] == "test"
+    assert payload["status"] == "failed"
+    assert payload["diagnostic_counts"] == {"info": 0, "warning": 1, "error": 1}
     assert payload["counters"]["phase"]["inserted"] == 2
     assert payload["counters"]["report"]["diagnostics_dropped"] == 1
     assert payload["diagnostics"][0]["severity"] == "warning"
+
+
+def test_phase_events_have_ordered_levels_and_rate_limited_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+    progress_decisions = iter((False, False, True))
+    intervals: list[float] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        events.append((level, event, fields))
+
+    def limited(key: str, *, interval_seconds: float) -> bool:
+        assert "invocation-phase" in key
+        intervals.append(interval_seconds)
+        return next(progress_decisions)
+
+    monkeypatch.setattr(migration_observability, "log_event", capture)
+    monkeypatch.setattr(migration_observability, "rate_limit", limited)
+    report = MigrationReport("migration-phase", invocation_id="invocation-phase")
+    runtime = cast(MigrationRuntime, SimpleNamespace(report=report))
+
+    with PhaseObserver(runtime, "identity.users") as observer:
+        observer.batch_committed(2)
+        observer.batch_committed(3)
+        observer.batch_committed(4)
+
+    assert [(level, event) for level, event, _ in events] == [
+        ("INFO", "migration.phase.started"),
+        ("DEBUG", "migration.batch.committed"),
+        ("INFO", "migration.phase.progress"),
+        ("DEBUG", "migration.batch.committed"),
+        ("DEBUG", "migration.batch.committed"),
+        ("INFO", "migration.phase.progress"),
+        ("INFO", "migration.phase.completed"),
+    ]
+    assert intervals == [30.0, 30.0, 30.0]
+    assert events[-1][2]["batches_committed"] == 3
+    assert events[-1][2]["rows_committed"] == 9
+
+
+@pytest.mark.asyncio
+async def test_rolled_back_batch_restores_report_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        events.append((level, event, fields))
+
+    class Source:
+        def iter_batches(self, *args: object, **kwargs: object) -> Iterator[list[dict[str, object]]]:
+            del args, kwargs
+            yield [{"id": 1}]
+
+    class State:
+        async def load(self) -> MigrationCheckpoint:
+            return MigrationCheckpoint("fingerprint", "config", "pending", 0, (), "running", "started")
+
+        async def save(self, session: object, checkpoint: MigrationCheckpoint) -> None:
+            del session, checkpoint
+
+    class Transaction:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+            raise RuntimeError("commit failed at postgresql://user:credential@endpoint/database")
+
+    class SessionFactory:
+        def begin(self) -> Transaction:
+            return Transaction()
+
+    monkeypatch.setattr(migration_observability, "log_event", capture)
+    report = MigrationReport("rollback", invocation_id="invocation-rollback")
+    runtime = cast(
+        MigrationRuntime,
+        SimpleNamespace(
+            report=report,
+            source=Source(),
+            state=State(),
+            session_factory=SessionFactory(),
+            config=SimpleNamespace(batch_size=10, report_path=tmp_path / "rollback.json"),
+        ),
+    )
+
+    async def handler(session: object, rows: list[dict[str, object]]) -> None:
+        del session, rows
+        report.increment("identity.users", "inserted")
+        report.add(DiagnosticSeverity.WARNING, "rolled_back", "must not survive rollback")
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await run_batched_phase(
+            runtime,
+            phase="identity.users",
+            table="users",
+            key="id",
+            handler=handler,  # type: ignore[arg-type]
+        )
+
+    assert report.counters == {}
+    assert report.diagnostics == []
+    assert report.diagnostic_counts == {"info": 0, "warning": 0, "error": 0}
+    assert [(level, event) for level, event, _ in events] == [
+        ("INFO", "migration.phase.started"),
+        ("ERROR", "migration.phase.failed"),
+    ]
+    assert "credential" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_storage_retry_events_are_bounded_and_secret_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+    payload = b"retry payload"
+    metadata = ReplayFileMetadata(
+        Path("/private/migration/source/44.osr"),
+        payload,
+        hashlib.sha256(payload).digest(),
+        len(payload),
+    )
+
+    class UnavailableStorage:
+        async def put(
+            self,
+            storage_key: str,
+            content: bytes,
+            *,
+            media_type: str,
+            expected_sha256: bytes | None = None,
+        ) -> StoredObject:
+            del storage_key, content, media_type, expected_sha256
+            raise ObjectUnavailable(
+                "s3://access:credential@storage.internal/private/object-key at /private/migration/source/44.osr"
+            )
+
+        async def delete(self, storage_key: str) -> None:
+            del storage_key
+
+    async def no_sleep(delay: float) -> None:
+        assert delay in {0.1, 0.2}
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        events.append((level, event, fields))
+
+    monkeypatch.setattr(migration_storage, "log_event", capture)
+    monkeypatch.setattr(migration_storage.asyncio, "sleep", no_sleep)
+    with pytest.raises(ObjectUploadFailed, match="after 3 attempts"):
+        await upload_replay_file(
+            cast(ObjectStorage, UnavailableStorage()),
+            metadata,
+            account_id=4,
+            invocation_id="invocation-storage",
+            migration_id="migration-storage",
+        )
+
+    assert [(level, event) for level, event, _ in events] == [
+        ("WARNING", "migration.storage.retry_scheduled"),
+        ("WARNING", "migration.storage.retry_scheduled"),
+        ("ERROR", "migration.storage.failed"),
+    ]
+    assert all(event[2]["object_kind"] == "replay" for event in events)
+    assert all(event[2]["size_bytes"] == len(payload) for event in events)
+    assert all("digest_prefix" not in event[2] for event in events)
+    serialized = json.dumps(events)
+    for secret in ("credential", "storage.internal", "/private/", "object-key", "replays/stable"):
+        assert secret not in serialized
+
+
+def test_cli_initializes_logging_preserves_summary_and_redacts_fatal_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    initialized: list[str] = []
+    events: list[tuple[str, str, dict[str, object]]] = []
+    report_path = tmp_path / "fatal-report.json"
+
+    async def fail(config: MigrationConfig, *, invocation_id: str | None = None) -> MigrationReport:
+        del config, invocation_id
+        raise RuntimeError(
+            "mysql://bancho:source-secret@source.internal/bancho "
+            "postgresql://perfcho:target-secret@target.internal/perfcho"
+        )
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        events.append((level, event, fields))
+
+    monkeypatch.setattr(migration_cli, "init_logger", initialized.append)
+    monkeypatch.setattr(migration_cli, "log_event", capture)
+    monkeypatch.setattr(migration_cli, "run_preflight", fail)
+    status = migration_cli.main(
+        [
+            "preflight",
+            "--source-url",
+            "mysql+pymysql://bancho:source-secret@source.internal/bancho",
+            "--target-url",
+            "postgresql+asyncpg://perfcho:target-secret@target.internal/perfcho",
+            "--data-dir",
+            str(tmp_path),
+            "--migration-id",
+            "cli-failure",
+            "--report",
+            str(report_path),
+        ]
+    )
+
+    assert status == 1
+    assert initialized == ["migration"]
+    assert [(level, event) for level, event, _ in events] == [
+        ("INFO", "migration.command.started"),
+        ("ERROR", "migration.command.failed"),
+    ]
+    assert events[0][2]["invocation_id"] == events[1][2]["invocation_id"]
+    payload = json.loads(report_path.read_text())
+    assert payload["status"] == "failed"
+    assert payload["diagnostic_counts"]["error"] == 1
+    output = capsys.readouterr()
+    assert f"report: {report_path}" in output.out
+    assert "diagnostics: 1, errors: True" in output.out
+    serialized = json.dumps(events) + output.err
+    for secret in ("source-secret", "target-secret", "source.internal", "target.internal", str(tmp_path)):
+        assert secret not in serialized
+
+
+def test_cli_command_success_events_are_ordered_and_share_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeline: list[tuple[str, str, dict[str, object]]] = []
+
+    async def succeed(config: MigrationConfig, *, invocation_id: str | None = None) -> MigrationReport:
+        assert invocation_id is not None
+        report = MigrationReport(config.migration_id, invocation_id=invocation_id)
+        report.finish()
+        return report
+
+    def initialize(role: str) -> None:
+        timeline.append(("INIT", role, {}))
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        timeline.append((level, event, fields))
+
+    monkeypatch.setattr(migration_cli, "init_logger", initialize)
+    monkeypatch.setattr(migration_cli, "log_event", capture)
+    monkeypatch.setattr(migration_cli, "run_preflight", succeed)
+    status = migration_cli.main(
+        [
+            "preflight",
+            "--source-url",
+            "mysql+pymysql://bancho:secret@localhost/bancho",
+            "--target-url",
+            "postgresql+asyncpg://perfcho:secret@localhost/perfcho",
+            "--data-dir",
+            str(tmp_path),
+            "--migration-id",
+            "cli-success",
+        ]
+    )
+
+    assert status == 0
+    assert [(level, event) for level, event, _ in timeline] == [
+        ("INIT", "migration"),
+        ("INFO", "migration.command.started"),
+        ("INFO", "migration.command.completed"),
+    ]
+    assert timeline[1][2]["invocation_id"] == timeline[2][2]["invocation_id"]
+    assert timeline[1][2]["migration_id"] == timeline[2][2]["migration_id"] == "cli-success"
+
+
+@pytest.mark.asyncio
+async def test_runner_fatal_exception_writes_failed_report_and_safe_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+    config = MigrationConfig.from_values(
+        source_url="mysql+pymysql://bancho:source-secret@source.internal/bancho",
+        target_url="postgresql+asyncpg://perfcho:target-secret@target.internal/perfcho",
+        data_directory=tmp_path,
+        migration_id="runner-failure",
+        source_timezone="UTC",
+        batch_size=100,
+        report_path=tmp_path / "runner-report.json",
+        overrides_path=None,
+        confirm_offline=False,
+    )
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        events.append((level, event, fields))
+
+    monkeypatch.setattr(migration_runner, "log_event", capture)
+    with pytest.raises(ValueError, match="confirm-offline") as raised:
+        await migration_runner.run_migration(config, invocation_id="invocation-runner")
+
+    report = raised.value.migration_report
+    assert isinstance(report, MigrationReport)
+    assert report.status is MigrationStatus.FAILED
+    assert report.has_errors
+    assert json.loads(config.report_path.read_text())["status"] == "failed"
+    assert [(level, event) for level, event, _ in events] == [
+        ("INFO", "migration.apply.started"),
+        ("ERROR", "migration.apply.failed"),
+    ]
+    serialized = json.dumps(events)
+    for secret in ("source-secret", "target-secret", "source.internal", "target.internal", str(tmp_path)):
+        assert secret not in serialized
+
+
+def test_cli_keyboard_interrupt_writes_report_and_returns_130(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+    report_path = tmp_path / "interrupt-report.json"
+
+    async def interrupt(config: MigrationConfig, *, invocation_id: str | None = None) -> MigrationReport:
+        del config, invocation_id
+        raise KeyboardInterrupt
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        events.append((level, event, fields))
+
+    monkeypatch.setattr(migration_cli, "init_logger", lambda role: None)
+    monkeypatch.setattr(migration_cli, "log_event", capture)
+    monkeypatch.setattr(migration_cli, "run_verify", interrupt)
+    status = migration_cli.main(
+        [
+            "verify",
+            "--source-url",
+            "mysql+pymysql://bancho:secret@localhost/bancho",
+            "--target-url",
+            "postgresql+asyncpg://perfcho:secret@localhost/perfcho",
+            "--data-dir",
+            str(tmp_path),
+            "--migration-id",
+            "cli-interrupt",
+            "--report",
+            str(report_path),
+        ]
+    )
+
+    assert status == 130
+    assert [(level, event) for level, event, _ in events] == [
+        ("INFO", "migration.command.started"),
+        ("WARNING", "migration.command.interrupted"),
+    ]
+    assert json.loads(report_path.read_text())["status"] == "interrupted"
 
 
 @pytest.mark.asyncio

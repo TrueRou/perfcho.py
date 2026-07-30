@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, ge=1, le=65535)
     app_debug: bool = Field(default=False)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(default="INFO")
+    log_format: Literal["human", "json"] = Field(default="human")
+    log_http_success_sample_rate: float = Field(default=0.05, ge=0, le=1)
+    log_stable_poll_sample_rate: float = Field(default=0.01, ge=0, le=1)
+    log_hot_path_sample_rate: float = Field(default=0.001, ge=0, le=1)
+    log_slow_request_ms: int = Field(default=1000, ge=1)
     trusted_proxy_cidrs: list[str] = Field(default_factory=list)
 
     database_url: str = Field(default="postgresql+asyncpg://perfcho:perfcho@127.0.0.1:55432/perfcho")

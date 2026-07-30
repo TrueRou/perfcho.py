@@ -6,12 +6,14 @@ import hashlib
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from time import monotonic_ns
 from typing import Protocol, cast
 
 import aioboto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from perfcho.infra.logging import duration_ms, log_event
 from perfcho.infra.settings import Settings
 from perfcho.modules.common import ObjectStream, ObjectUnavailable, StoredObject
 
@@ -111,6 +113,7 @@ class S3ObjectStorage:
         expected_sha256: bytes | None = None,
     ) -> StoredObject:
         """Write one object after validating its key and expected digest."""
+        started_ns = monotonic_ns()
         key = _validate_storage_key(storage_key)
         if not media_type or len(media_type) > 127:
             raise ValueError("object media type is invalid")
@@ -128,13 +131,24 @@ class S3ObjectStorage:
                     Metadata={"sha256": digest.hex()},
                 )
         except (BotoCoreError, ClientError) as error:
+            _log_storage_failure("write", error, started_ns)
             raise ObjectUnavailable("object storage write failed") from error
+        log_event(
+            "DEBUG",
+            "object_storage.operation.completed",
+            operation="write",
+            size_bytes=len(content),
+            media_type=media_type,
+            duration_ms=duration_ms(started_ns),
+        )
         return StoredObject(key, len(content), media_type, digest, _etag(result))
 
     @asynccontextmanager
     async def open(self, storage_key: str) -> AsyncIterator[ObjectStream]:
         """Open and close one provider response body around streamed iteration."""
+        started_ns = monotonic_ns()
         key = _validate_storage_key(storage_key)
+        size_bytes = 0
         try:
             async with self._client() as client:
                 response = await client.get_object(Bucket=self._bucket, Key=key)
@@ -150,6 +164,7 @@ class S3ObjectStorage:
                     sha256=_metadata_digest(response.get("Metadata")),
                     etag=_etag(response),
                 )
+                size_bytes = metadata.size_bytes
                 try:
                     yield _S3ObjectStream(body, metadata, self._chunk_size)
                 finally:
@@ -159,19 +174,37 @@ class S3ObjectStorage:
         except ObjectUnavailable:
             raise
         except (BotoCoreError, ClientError, KeyError, TypeError, ValueError) as error:
+            _log_storage_failure("read", error, started_ns)
             raise ObjectUnavailable("object storage read failed") from error
+        else:
+            log_event(
+                "DEBUG",
+                "object_storage.operation.completed",
+                operation="read",
+                size_bytes=size_bytes,
+                duration_ms=duration_ms(started_ns),
+            )
 
     async def delete(self, storage_key: str) -> None:
         """Idempotently delete one provider object."""
+        started_ns = monotonic_ns()
         key = _validate_storage_key(storage_key)
         try:
             async with self._client() as client:
                 await client.delete_object(Bucket=self._bucket, Key=key)
         except (BotoCoreError, ClientError) as error:
+            _log_storage_failure("delete", error, started_ns)
             raise ObjectUnavailable("object storage delete failed") from error
+        log_event(
+            "DEBUG",
+            "object_storage.operation.completed",
+            operation="delete",
+            duration_ms=duration_ms(started_ns),
+        )
 
     async def presign_read(self, storage_key: str, *, expires_in_seconds: int) -> str:
         """Create a short-lived GET URL reachable by an external Calculator."""
+        started_ns = monotonic_ns()
         key = _validate_storage_key(storage_key)
         if not 1 <= expires_in_seconds <= 7 * 24 * 60 * 60:
             raise ValueError("presigned URL lifetime is outside the allowed range")
@@ -186,8 +219,15 @@ class S3ObjectStorage:
                     result = await result
                 if not isinstance(result, str) or not result:
                     raise ValueError("object storage returned an invalid presigned URL")
+                log_event(
+                    "DEBUG",
+                    "object_storage.operation.completed",
+                    operation="presign_read",
+                    duration_ms=duration_ms(started_ns),
+                )
                 return result
         except (BotoCoreError, ClientError, TypeError, ValueError) as error:
+            _log_storage_failure("presign_read", error, started_ns)
             raise ObjectUnavailable("object storage URL signing failed") from error
 
     def _client(self, *, presign: bool = False) -> AbstractAsyncContextManager[_S3Client]:
@@ -227,3 +267,21 @@ def _etag(response: object) -> str | None:
         return None
     value = response.get("ETag")
     return value.strip('"') if isinstance(value, str) else None
+
+
+def _log_storage_failure(operation: str, error: Exception, started_ns: int) -> None:
+    """Log safe provider failure metadata without object identity or endpoints."""
+    provider_code: str | None = None
+    if isinstance(error, ClientError):
+        details = error.response.get("Error", {})
+        if isinstance(details, Mapping):
+            candidate = details.get("Code")
+            provider_code = candidate if isinstance(candidate, str) else None
+    log_event(
+        "WARNING",
+        "object_storage.operation.failed",
+        operation=operation,
+        error_type=type(error).__name__,
+        provider_code=provider_code,
+        duration_ms=duration_ms(started_ns),
+    )

@@ -182,6 +182,13 @@ async def test_registration_normalizes_hashes_before_transaction_and_commits_all
     repository = FakeAccountRepository(calls, result)
     outbox = FakeOutboxWriter(calls)
     service, units = _service(monkeypatch, repository, outbox, calls)
+    logged: list[tuple[str, str, dict[str, object]]] = []
+
+    def capture_log(level: str, event: str, **fields: object) -> None:
+        assert units[-1].committed
+        logged.append((level, event, fields))
+
+    monkeypatch.setattr("perfcho.modules.account.services.log_event", capture_log)
 
     assert await service.register(_command()) == result
 
@@ -214,6 +221,10 @@ async def test_registration_normalizes_hashes_before_transaction_and_commits_all
     assert event.event_type == "account.registered.v1"
     assert event.partition_key == "account:42"
     assert "email" not in event.payload
+    assert logged[0][:2] == ("INFO", "account.registration.committed")
+    assert logged[0][2]["account_id"] == 42
+    assert "display_name" not in logged[0][2]
+    assert "email" not in logged[0][2]
 
 
 @pytest.mark.asyncio
@@ -224,11 +235,18 @@ async def test_exact_replay_returns_receipt_without_locks_or_writes(monkeypatch:
     repository.claim = RegistrationClaim(prior)
     outbox = FakeOutboxWriter(calls)
     service, units = _service(monkeypatch, repository, outbox, calls)
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "perfcho.modules.account.services.log_event",
+        lambda level, event, **fields: logged.append((level, event, fields)),
+    )
 
     assert await service.register(_command()) is prior
     assert calls == ["hash", "uow", "enter", "claim", "commit", "exit"]
     assert units[0].committed
     assert outbox.events == []
+    assert logged[0][:2] == ("DEBUG", "account.registration.replayed")
+    assert logged[0][2]["account_id"] == 42
 
 
 @pytest.mark.asyncio

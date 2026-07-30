@@ -127,7 +127,17 @@ def client_packet(packet_type: ClientPacket, write: object | None = None) -> byt
 
 
 @pytest.mark.asyncio
-async def test_create_match_maps_wire_settings_and_returns_join_success() -> None:
+async def test_create_match_maps_wire_settings_and_returns_join_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    multiplayer_module = importlib.import_module("perfcho.api.stable.multiplayer")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        del level
+        events.append((event, fields))
+
+    monkeypatch.setattr(multiplayer_module, "log_event", capture)
     multiplayer = FakeMultiplayer(room_state())
     incoming = MultiplayerMatch(
         name="Room",
@@ -150,6 +160,17 @@ async def test_create_match_maps_wire_settings_and_returns_join_success() -> Non
     assert match.match_id == 7 and match.password == "secret"
     assert multiplayer.created is not None
     assert multiplayer.created.settings.external_beatmap_id == 42
+    lifecycle = next(fields for event, fields in events if event == "stable.multiplayer.room_lifecycle")
+    assert lifecycle == {
+        "action": "created",
+        "outcome": "success",
+        "account_id": 10,
+        "room_id": 7,
+        "participant_count": 1,
+        "delivery_failure_count": 0,
+    }
+    for secret in ("Room", "secret", "Artist - Title [Hard]", (b"m" * 16).hex()):
+        assert secret not in repr(events)
 
 
 @pytest.mark.asyncio

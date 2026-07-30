@@ -6,13 +6,14 @@ import socket
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from time import monotonic_ns
+from typing import Any, NotRequired, Protocol, TypedDict, cast
 
 import httpx
-from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from taskiq import TaskiqEvents, TaskiqState
 
+from perfcho.infra import logging
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.projectors.catalog import DEFAULT_CONSUMER_CATALOG
 from perfcho.infra.db.relays.outbox_delivery import (
@@ -29,11 +30,14 @@ from perfcho.infra.db.repositories.performance.job import SqlAlchemyPerformanceJ
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
 from perfcho.infra.settings import settings
 from perfcho.infra.storage import S3ObjectStorage
-from perfcho.infra.taskiq import broker
 from perfcho.infra.upstream.calculator import HttpPerformanceCalculator
 from perfcho.modules.performance.services import PerformanceCalculationService
-from perfcho.tasks.outbox_delivery import dispatch_outbox_delivery
-from perfcho.tasks.performance_calculation import calculate_performance
+
+logging.init_logger("worker")
+
+from perfcho.infra.taskiq import broker  # noqa: E402
+from perfcho.tasks.outbox_delivery import dispatch_outbox_delivery  # noqa: E402
+from perfcho.tasks.performance_calculation import calculate_performance  # noqa: E402
 
 
 class _RelayStore[Reference](Protocol):
@@ -58,15 +62,40 @@ class _WorkerResources:
     db_engine: AsyncEngine
     http_client: httpx.AsyncClient
     relay_tasks: tuple[asyncio.Task[None], ...]
+    started_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RelayBatchResult:
+    """Summarize one committed relay batch for bounded aggregate logging."""
+
+    claimed: int
+    enqueued: int
+    enqueue_failed: int
+
+
+class _ReferenceLogFields(TypedDict):
+    """Constrain generic relay context to non-fencing durable identifiers."""
+
+    event_id: NotRequired[str]
+    consumer: NotRequired[str]
+    job_id: NotRequired[str]
 
 
 @broker.on_event(TaskiqEvents.WORKER_STARTUP)
 async def worker_startup(state: TaskiqState) -> None:
     """Create all worker-owned resources and independent relay loops."""
-    db_engine = await infra_db.create_engine()
-    session_factory = infra_db.create_session_factory(db_engine)
-    http_client = httpx.AsyncClient(timeout=settings.performance_http_timeout_seconds)
+    started_ns = monotonic_ns()
+    state.worker_started_ns = started_ns
+    state.worker_lifecycle_stopped = False
+    logging.log_event("INFO", "runtime.worker.starting")
+    db_engine: AsyncEngine | None = None
+    http_client: httpx.AsyncClient | None = None
+    relay_tasks: tuple[asyncio.Task[None], ...] = ()
     try:
+        db_engine = await infra_db.create_engine()
+        session_factory = infra_db.create_session_factory(db_engine)
+        http_client = httpx.AsyncClient(timeout=settings.performance_http_timeout_seconds)
         outbox_store = SqlAlchemyOutboxDeliveryRelayStore(
             session_factory,
             batch_size=settings.outbox_delivery_batch_size,
@@ -107,72 +136,158 @@ async def worker_startup(state: TaskiqState) -> None:
             max_retry_seconds=settings.outbox_delivery_max_retry_seconds,
         )
         state.performance_calculation_service = performance_service
-        relay_tasks = (
-            asyncio.create_task(
-                _run_relay_loop(
-                    "outbox-delivery",
-                    outbox_store,
-                    owner,
-                    _enqueue_outbox,
-                    poll_interval=settings.durable_relay_poll_interval_seconds,
-                ),
-                name="perfcho-outbox-relay",
+        outbox_relay_task = asyncio.create_task(
+            _run_relay_loop(
+                "outbox-delivery",
+                outbox_store,
+                owner,
+                _enqueue_outbox,
+                poll_interval=settings.durable_relay_poll_interval_seconds,
             ),
-            asyncio.create_task(
-                _run_relay_loop(
-                    "performance-job",
-                    performance_store,
-                    owner,
-                    _enqueue_performance,
-                    poll_interval=settings.durable_relay_poll_interval_seconds,
-                ),
-                name="perfcho-performance-relay",
-            ),
+            name="perfcho-outbox-relay",
         )
+        relay_tasks = (outbox_relay_task,)
+        performance_relay_task = asyncio.create_task(
+            _run_relay_loop(
+                "performance-job",
+                performance_store,
+                owner,
+                _enqueue_performance,
+                poll_interval=settings.durable_relay_poll_interval_seconds,
+            ),
+            name="perfcho-performance-relay",
+        )
+        relay_tasks = (outbox_relay_task, performance_relay_task)
         state.worker_resources = _WorkerResources(
             db_engine=db_engine,
             http_client=http_client,
             relay_tasks=relay_tasks,
+            started_ns=started_ns,
         )
-    except BaseException:
-        await http_client.aclose()
-        await db_engine.dispose()
+        logging.log_event("INFO", "runtime.worker.ready", duration_ms=logging.duration_ms(started_ns))
+    except BaseException as error:
+        logging.log_event(
+            "ERROR",
+            "runtime.worker.startup_failed",
+            error_type=type(error).__name__,
+            duration_ms=logging.duration_ms(started_ns),
+        )
+        logging.log_event("INFO", "runtime.worker.stopping")
+        await _cleanup_worker_resources(relay_tasks, http_client, db_engine)
+        state.worker_lifecycle_stopped = True
+        logging.log_event("INFO", "runtime.worker.stopped", duration_ms=logging.duration_ms(started_ns))
         raise
 
 
 @broker.on_event(TaskiqEvents.WORKER_SHUTDOWN)
 async def worker_shutdown(state: TaskiqState) -> None:
     """Stop relays before closing shared HTTP and database resources."""
-    resources = cast(_WorkerResources | None, getattr(state, "worker_resources", None))
-    if resources is None:
+    if bool(getattr(state, "worker_lifecycle_stopped", False)):
         return
-    for task in resources.relay_tasks:
+    resources = cast(_WorkerResources | None, getattr(state, "worker_resources", None))
+    started_ns = resources.started_ns if resources is not None else monotonic_ns()
+    logging.log_event("INFO", "runtime.worker.stopping")
+    if resources is not None:
+        await _cleanup_worker_resources(
+            resources.relay_tasks,
+            resources.http_client,
+            resources.db_engine,
+        )
+    state.worker_lifecycle_stopped = True
+    logging.log_event("INFO", "runtime.worker.stopped", duration_ms=logging.duration_ms(started_ns))
+
+
+async def _cleanup_worker_resources(
+    relay_tasks: tuple[asyncio.Task[None], ...],
+    http_client: httpx.AsyncClient | None,
+    db_engine: AsyncEngine | None,
+) -> None:
+    """Close every initialized worker resource even when an earlier close fails."""
+    for task in relay_tasks:
         task.cancel()
-    if resources.relay_tasks:
-        await asyncio.gather(*resources.relay_tasks, return_exceptions=True)
-    await resources.http_client.aclose()
-    await resources.db_engine.dispose()
+    if relay_tasks:
+        try:
+            outcomes = await asyncio.gather(*relay_tasks, return_exceptions=True)
+        except Exception as error:
+            logging.log_event(
+                "ERROR",
+                "runtime.worker.resource_close_failed",
+                resource="relay",
+                error_type=type(error).__name__,
+            )
+        else:
+            for task, outcome in zip(relay_tasks, outcomes, strict=True):
+                if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                    logging.log_event(
+                        "ERROR",
+                        "runtime.worker.resource_close_failed",
+                        resource="relay",
+                        relay_task=task.get_name(),
+                        error_type=type(outcome).__name__,
+                    )
+    if http_client is not None:
+        try:
+            await http_client.aclose()
+        except Exception as error:
+            logging.log_event(
+                "ERROR",
+                "runtime.worker.resource_close_failed",
+                resource="http",
+                error_type=type(error).__name__,
+            )
+    if db_engine is not None:
+        try:
+            await db_engine.dispose()
+        except Exception as error:
+            logging.log_event(
+                "ERROR",
+                "runtime.worker.resource_close_failed",
+                resource="postgres",
+                error_type=type(error).__name__,
+            )
 
 
 async def _relay_once[Reference](
     store: _RelayStore[Reference],
     owner: str,
     enqueue: _Enqueue[Reference],
-) -> int:
+    *,
+    relay: str = "unknown",
+) -> _RelayBatchResult:
     """Claim and publish one batch while preserving uncertain enqueue leases."""
     references = tuple(await store.claim(owner))
+    enqueued = 0
+    enqueue_failed = 0
     for index, reference in enumerate(references):
         try:
             broker_task_id = await enqueue(reference)
         except asyncio.CancelledError:
             for unattempted in references[index + 1 :]:
-                await store.release(unattempted, owner)
+                try:
+                    await store.release(unattempted, owner)
+                except Exception as error:
+                    logging.log_event(
+                        "ERROR",
+                        "runtime.worker.relay.release_failed",
+                        relay=relay,
+                        error_type=type(error).__name__,
+                        **_reference_fields(unattempted),
+                    )
             raise
         except Exception as error:
             await store.mark_enqueue_failed(reference, owner, error)
+            enqueue_failed += 1
+            logging.log_event(
+                "WARNING",
+                "runtime.worker.relay.enqueue_failed",
+                relay=relay,
+                error_type=type(error).__name__,
+                **_reference_fields(reference),
+            )
         else:
             await store.mark_enqueued(reference, owner, broker_task_id)
-    return len(references)
+            enqueued += 1
+    return _RelayBatchResult(len(references), enqueued, enqueue_failed)
 
 
 async def _run_relay_loop[Reference](
@@ -186,16 +301,52 @@ async def _run_relay_loop[Reference](
     """Run one independently supervised work-family relay."""
     if poll_interval <= 0:
         raise ValueError("poll_interval must be positive")
-    while True:
-        try:
-            claimed = await _relay_once(store, owner, enqueue)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("{} relay iteration failed", name)
-            claimed = 0
-        if claimed == 0:
-            await asyncio.sleep(poll_interval)
+    started_ns = monotonic_ns()
+    logging.log_event("INFO", "runtime.worker.relay.started", relay=name)
+    try:
+        while True:
+            iteration_started_ns = monotonic_ns()
+            try:
+                result = await _relay_once(store, owner, enqueue, relay=name)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if logging.rate_limit(f"worker-relay:{name}:iteration-failed"):
+                    logging.log_event(
+                        "ERROR",
+                        "runtime.worker.relay.iteration_failed",
+                        relay=name,
+                        error_type=type(error).__name__,
+                    )
+                result = _RelayBatchResult(0, 0, 0)
+            if result.claimed == 0:
+                await asyncio.sleep(poll_interval)
+            else:
+                logging.log_event(
+                    "DEBUG",
+                    "runtime.worker.relay.batch",
+                    relay=name,
+                    claimed=result.claimed,
+                    enqueued=result.enqueued,
+                    enqueue_failed=result.enqueue_failed,
+                    duration_ms=logging.duration_ms(iteration_started_ns),
+                )
+    finally:
+        logging.log_event(
+            "INFO",
+            "runtime.worker.relay.stopped",
+            relay=name,
+            duration_ms=logging.duration_ms(started_ns),
+        )
+
+
+def _reference_fields(reference: object) -> _ReferenceLogFields:
+    """Return only non-fencing identifiers approved for relay logs."""
+    if isinstance(reference, OutboxDeliveryReference):
+        return {"event_id": str(reference.event_id), "consumer": reference.consumer}
+    if isinstance(reference, PerformanceJobReference):
+        return {"job_id": str(reference.job_id)}
+    return {}
 
 
 async def _enqueue_outbox(reference: OutboxDeliveryReference) -> str:

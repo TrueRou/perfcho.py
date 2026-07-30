@@ -59,6 +59,7 @@ class FakeIdentity:
         self.device_id = uuid.uuid7()
         self.touch_calls = 0
         self.close_calls: list[tuple[str, str]] = []
+        self.close_error: Exception | None = None
 
     async def login_stable(self, command: StableLogin) -> StableSessionResult:
         self.login_command = command
@@ -93,6 +94,8 @@ class FakeIdentity:
 
     async def close_stable_session(self, raw_token: str, *, reason: str = "client_closed") -> None:
         self.close_calls.append((raw_token, reason))
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class FakeAuthorization:
@@ -412,6 +415,42 @@ async def test_authenticated_ping_poll_drains_mailbox() -> None:
 
 
 @pytest.mark.asyncio
+async def test_login_and_sampled_poll_logs_are_structured_and_secret_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher")
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        events.append((level, event, fields))
+
+    monkeypatch.setattr(cho_module, "log_event", capture)
+    monkeypatch.setattr(dispatcher_module, "log_event", capture)
+    services, _, _ = stable_services()
+    object.__setattr__(services, "settings", Settings(log_hot_path_sample_rate=1))
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        await client.post("/", content=login_body(), headers={"User-Agent": "osu!"})
+        await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    event_fields = {event: fields for _, event, fields in events}
+    assert event_fields["stable.login.completed"]["outcome"] == "success"
+    assert event_fields["stable.packet.dispatch_summary"]["packet_histogram"] == {"PING": 1}
+    assert event_fields["stable.poll.completed"]["mailbox_stage"] == "released"
+    rendered = repr(events)
+    for secret in ("player", "stable-token-value", "a" * 32, "path:adapters"):
+        assert secret not in rendered
+
+
+@pytest.mark.asyncio
 async def test_poll_response_budget_defers_mailbox_packets_without_acknowledging_them() -> None:
     services, identity, realtime = stable_services()
     object.__setattr__(services, "settings", Settings(stable_max_response_bytes=7))
@@ -487,6 +526,39 @@ async def test_login_bootstrap_failure_closes_durable_session_and_fences_realtim
     assert identity.close_calls == [("stable-token-value", "bootstrap_failed")]
     assert realtime.fenced == [SessionFence(identity.session_id, 1)]
     assert realtime.session is None
+
+
+@pytest.mark.asyncio
+async def test_login_cleanup_failure_is_logged_without_token_or_exception_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        del level
+        events.append((event, fields))
+
+    monkeypatch.setattr(cho_module, "log_event", capture)
+    services, identity, realtime = stable_services()
+    realtime_session = await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    identity.close_error = RuntimeError("stable-token-value must remain private")
+
+    await cho_module._compensate_failed_login("stable-token-value", realtime_session, services)
+
+    cleanup = next(fields for event, fields in events if event == "stable.login.cleanup_failed")
+    assert cleanup == {
+        "operation": "close_durable_session",
+        "error_code": "cleanup_failed",
+        "error_type": "RuntimeError",
+    }
+    assert "stable-token-value" not in repr(events)
+    assert "must remain private" not in repr(events)
 
 
 @pytest.mark.asyncio

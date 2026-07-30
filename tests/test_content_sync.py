@@ -200,10 +200,17 @@ def sync_service(
 
 
 @pytest.mark.asyncio
-async def test_content_sync_verifies_and_stores_files_before_short_transaction() -> None:
+async def test_content_sync_verifies_and_stores_files_before_short_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[str] = []
     source = FakeSource(snapshot(), BEATMAP_FILE)
     service, repository, storage, outbox, units = sync_service(source, calls)
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "perfcho.modules.content.services.log_event",
+        lambda level, event, **fields: logged.append((level, event, fields)),
+    )
 
     result = await service.synchronize(200)
 
@@ -213,6 +220,12 @@ async def test_content_sync_verifies_and_stores_files_before_short_transaction()
     assert storage.keys[0].startswith("beatmaps/osu/200/100/")
     assert repository.files[0].stored_object.sha256 == hashlib.sha256(BEATMAP_FILE).digest()
     assert outbox.events[0].event_type == "content.beatmapset-synchronized.v1"
+    assert [(level, event) for level, event, _ in logged] == [
+        ("INFO", "content.sync.started"),
+        ("INFO", "content.sync.committed"),
+    ]
+    assert logged[1][2]["beatmapset_id"] == 20
+    assert not {"creator_name", "artist", "title", "file_name"} & logged[1][2].keys()
 
 
 @pytest.mark.asyncio

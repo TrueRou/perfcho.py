@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from time import monotonic_ns
 from typing import TypedDict
 
 from fastapi import FastAPI
@@ -28,20 +29,56 @@ class AppState(TypedDict):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
     """Create and dispose process-owned database and Redis clients."""
+    started_ns = monotonic_ns()
+    logging.log_event("INFO", "runtime.api.starting")
     db_engine: AsyncEngine | None = None
     redis_engine: Redis | None = None
+    ready = False
 
     try:
         db_engine = await infra_db.create_engine()
         redis_engine = await infra_redis.create_redis()
+        logging.log_event("INFO", "runtime.api.ready", duration_ms=logging.duration_ms(started_ns))
+        ready = True
         yield {
             "db_engine": db_engine,
             "redis_engine": redis_engine,
             "db_session_factory": infra_db.create_session_factory(db_engine),
         }
+    except Exception as error:
+        logging.log_event(
+            "ERROR",
+            "runtime.api.failed" if ready else "runtime.api.startup_failed",
+            exception=error,
+            error_type=type(error).__name__,
+            duration_ms=logging.duration_ms(started_ns),
+        )
+        raise
     finally:
-        await redis_engine.close() if redis_engine else None
-        await db_engine.dispose() if db_engine else None
+        logging.log_event("INFO", "runtime.api.stopping")
+        if redis_engine is not None:
+            try:
+                await redis_engine.close()
+            except Exception as error:
+                logging.log_event(
+                    "ERROR",
+                    "runtime.api.resource_close_failed",
+                    exception=error,
+                    resource="redis",
+                    error_type=type(error).__name__,
+                )
+        if db_engine is not None:
+            try:
+                await db_engine.dispose()
+            except Exception as error:
+                logging.log_event(
+                    "ERROR",
+                    "runtime.api.resource_close_failed",
+                    exception=error,
+                    resource="postgres",
+                    error_type=type(error).__name__,
+                )
+        logging.log_event("INFO", "runtime.api.stopped", duration_ms=logging.duration_ms(started_ns))
 
 
 def init_middlewares(asgi_app: FastAPI) -> None:
@@ -58,7 +95,7 @@ def init_routes(asgi_app: FastAPI) -> None:
 
 def create_app() -> FastAPI:
     """Construct an application without starting external resources."""
-    logging.init_logger()
+    logging.init_logger("api")
     asgi_app = FastAPI(
         title="perfcho.py",
         version="0.1.0",

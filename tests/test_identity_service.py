@@ -290,6 +290,11 @@ async def test_login_verifies_outside_transactions_rechecks_and_persists_only_hm
     repository = FakeIdentityRepository(calls, _snapshot())
     outbox = FakeOutboxWriter(calls)
     service, units = _service(repository, outbox, calls)
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "perfcho.modules.identity.services.log_event",
+        lambda level, event, **fields: logged.append((level, event, fields)),
+    )
 
     def verify_outside_transaction(*args: object, **kwargs: object) -> PasswordVerification:
         assert units and not any(unit.active for unit in units)
@@ -333,6 +338,9 @@ async def test_login_verifies_outside_transactions_rechecks_and_persists_only_hm
     assert repository.attempts[0]["failure_reason"] is None
     assert outbox.events[0].payload["session_id"] == str(result.session_id)
     assert "raw-stable-token-secret" not in repr(outbox.events[0])
+    assert logged[0][:2] == ("INFO", "identity.stable_session.opened")
+    assert logged[0][2]["credential_upgraded"] is False
+    assert not {"token", "password", "ip_address", "user_agent"} & logged[0][2].keys()
 
 
 @pytest.mark.asyncio
@@ -344,6 +352,11 @@ async def test_successful_legacy_login_upgrades_after_recheck_in_the_session_tra
     repository = FakeIdentityRepository(calls, legacy)
     outbox = FakeOutboxWriter(calls)
     service, units = _service(repository, outbox, calls)
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "perfcho.modules.identity.services.log_event",
+        lambda level, event, **fields: logged.append((level, event, fields)),
+    )
 
     def verify_legacy_outside_transaction(*args: object, **kwargs: object) -> PasswordVerification:
         assert units and not any(unit.active for unit in units)
@@ -374,6 +387,7 @@ async def test_successful_legacy_login_upgrades_after_recheck_in_the_session_tra
         "password_changed_at": INSTANT,
     }
     assert units[1].committed
+    assert logged[0][2]["credential_upgraded"] is True
 
 
 @pytest.mark.asyncio

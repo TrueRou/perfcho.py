@@ -300,7 +300,9 @@ async def test_only_current_host_can_transfer_host() -> None:
 
 
 @pytest.mark.asyncio
-async def test_committed_create_returns_durable_snapshot_when_redis_is_down() -> None:
+async def test_committed_create_returns_durable_snapshot_when_redis_is_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     repository = FakeRepository()
     state = FakeState()
 
@@ -309,11 +311,26 @@ async def test_committed_create_returns_durable_snapshot_when_redis_is_down() ->
         raise ConnectionError("redis unavailable")
 
     state.create = unavailable  # type: ignore[method-assign]
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr("perfcho.modules.multiplayer.services.rate_limit", lambda key: True)
+    monkeypatch.setattr(
+        "perfcho.modules.multiplayer.services.log_event",
+        lambda level, event, **fields: logged.append((level, event, fields)),
+    )
 
     created = await service(repository, state).create_room(CreateRoom(meta(10, "create"), settings()))
 
     assert created.projection_status is ProjectionStatus.DURABLE_RECOVERY
     assert created.slot_for(10) is not None
+    assert logged[0][:2] == ("INFO", "multiplayer.room.created")
+    assert logged[1][:2] == ("WARNING", "multiplayer.projection.degraded")
+    assert logged[1][2] == {
+        "operation": "publish_create",
+        "public_id": 7,
+        "version": 1,
+        "error_type": "ConnectionError",
+    }
+    assert "redis unavailable" not in repr(logged[1])
 
 
 @pytest.mark.asyncio

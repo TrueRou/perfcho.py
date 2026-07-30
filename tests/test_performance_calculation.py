@@ -4,11 +4,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import TracebackType
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from loguru import logger
 from sqlalchemy import Index, UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -232,7 +233,12 @@ async def test_calculation_service_keeps_external_io_between_short_transactions(
         max_retry_seconds=30,
     )
 
-    await service.execute(calculation.job_id, uuid.uuid4())
+    records: list[dict[str, Any]] = []
+    sink_id = logger.add(lambda message: records.append(cast(dict[str, Any], message.record)))
+    try:
+        await service.execute(calculation.job_id, uuid.uuid4())
+    finally:
+        logger.remove(sink_id)
 
     assert calls == [
         "enter",
@@ -249,6 +255,14 @@ async def test_calculation_service_keeps_external_io_between_short_transactions(
     ]
     assert outbox.events[0].event_type == "score.performance-calculated.v1"
     assert outbox.events[0].payload["formula_code"] == "official"
+    outcomes = [record for record in records if record["extra"]["event"].startswith("performance.calculation.")]
+    assert [record["extra"]["event"] for record in outcomes] == [
+        "performance.calculation.started",
+        "performance.calculation.succeeded",
+    ]
+    assert [record["extra"]["phase"] for record in outcomes] == ["start", "complete"]
+    assert all(record["extra"]["job_id"] == str(calculation.job_id) for record in outcomes)
+    assert all("duration_ms" in record["extra"] for record in outcomes)
 
 
 @pytest.mark.asyncio
@@ -270,11 +284,63 @@ async def test_calculation_service_dead_letters_nonretryable_engine_errors() -> 
         max_retry_seconds=30,
     )
 
-    await service.execute(calculation.job_id, uuid.uuid4())
+    records: list[dict[str, Any]] = []
+    sink_id = logger.add(lambda message: records.append(cast(dict[str, Any], message.record)))
+    try:
+        await service.execute(calculation.job_id, uuid.uuid4())
+    finally:
+        logger.remove(sink_id)
 
     assert repository.failed is not None
     assert repository.failed["dead"] is True
     assert repository.failed["consume_attempt"] is False
+    dead_event = next(record for record in records if record["extra"]["event"] == "performance.calculation.dead")
+    assert dead_event["level"].name == "ERROR"
+    assert dead_event["extra"]["phase"] == "calculate"
+    assert dead_event["extra"]["error_type"] == "PerformanceCalculationError"
+    assert dead_event["exception"] is None
+    assert "unsupported mods" not in dead_event["message"]
+    assert {
+        "lease_token",
+        "beatmap_url",
+        "beatmap_storage_key",
+        "score_id",
+        "pp",
+        "error",
+    }.isdisjoint(dead_event["extra"])
+
+
+@pytest.mark.asyncio
+async def test_calculation_service_logs_retry_without_error_text_or_score_facts() -> None:
+    calls: list[str] = []
+    calculation = _calculation()
+    repository = _FakeCalculationRepository(calls, calculation)
+    service = PerformanceCalculationService(
+        lambda: _FakeUnitOfWork(calls),
+        lambda session: cast(PerformanceCalculationRepository, repository),
+        lambda session: _FakeOutbox(calls),
+        cast(PerformanceCalculator, _FakeCalculator(calls, RuntimeError("calculator secret detail"))),
+        cast(ObjectUrlProvider, _FakeUrlProvider(calls)),
+        max_attempts=3,
+        beatmap_url_expiry_seconds=600,
+        max_retry_seconds=30,
+    )
+    records: list[dict[str, Any]] = []
+    sink_id = logger.add(lambda message: records.append(cast(dict[str, Any], message.record)))
+
+    try:
+        await service.execute(calculation.job_id, uuid.uuid4())
+    finally:
+        logger.remove(sink_id)
+
+    assert repository.failed is not None and repository.failed["dead"] is False
+    retry_event = next(record for record in records if record["extra"]["event"] == "performance.calculation.retry")
+    assert retry_event["level"].name == "WARNING"
+    assert retry_event["extra"]["phase"] == "calculate"
+    assert retry_event["extra"]["error_type"] == "RuntimeError"
+    assert retry_event["exception"] is None
+    assert "calculator secret detail" not in retry_event["message"]
+    assert {"lease_token", "beatmap_url", "beatmap_storage_key", "score_id", "error"}.isdisjoint(retry_event["extra"])
 
 
 def _calculation() -> PerformanceCalculationInput:
@@ -372,9 +438,10 @@ class _FakeCalculationRepository:
             output_digest,
         )
 
-    async def fail(self, *args: object, **kwargs: object) -> None:
+    async def fail(self, *args: object, **kwargs: object) -> bool:
         self.calls.append("fail")
         self.failed = kwargs
+        return True
 
 
 class _FakeCalculator:

@@ -16,10 +16,15 @@ from perfcho.modules.common import ObjectStorage, ObjectUnavailable
 from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
 from tools.bancho_migration.config import MigrationConfig
 from tools.bancho_migration.models import DiagnosticSeverity, MigrationRuntime, SourceSchema
+from tools.bancho_migration.observability import VerificationObserver
 from tools.bancho_migration.report import MigrationReport
 from tools.bancho_migration.schema import validate_source_schema
 from tools.bancho_migration.source import BanchoSource
 from tools.bancho_migration.storage import MigrationStorageError, read_beatmap_file, read_replay_file
+
+
+def _error_count(report: MigrationReport) -> int:
+    return report.diagnostic_counts[DiagnosticSeverity.ERROR.value]
 
 
 async def preflight(
@@ -29,78 +34,100 @@ async def preflight(
     report: MigrationReport,
 ) -> SourceSchema:
     """Validate source contracts, merge identities, files, and target connectivity without writes."""
-    schema = source.inspect_schema()
-    report.source_fingerprint = schema.fingerprint
-    validate_source_schema(schema, report)
-    if schema.version != "5.2.2":
-        report.add(
-            DiagnosticSeverity.WARNING,
-            "source_version_not_baseline",
-            "source startup version differs from the v5.2.2 baseline; compatible columns will still be used",
-            details={"detected_version": schema.version or "unknown"},
+    with VerificationObserver(report, "preflight") as observer:
+        schema = source.inspect_schema()
+        report.source_fingerprint = schema.fingerprint
+        errors_before = _error_count(report)
+        validate_source_schema(schema, report)
+        observer.check("source_schema", failures=_error_count(report) - errors_before)
+        if schema.version != "5.2.2":
+            report.add(
+                DiagnosticSeverity.WARNING,
+                "source_version_not_baseline",
+                "source startup version differs from the v5.2.2 baseline; compatible columns will still be used",
+                details={"detected_version": schema.version or "unknown"},
+            )
+        errors_before = _error_count(report)
+        await _target_connectivity(engine, report)
+        observer.check("target_connectivity", failures=_error_count(report) - errors_before)
+        errors_before = _error_count(report)
+        await _account_preflight(config, source, engine, report)
+        observer.check("account_identity", failures=_error_count(report) - errors_before)
+        errors_before = _error_count(report)
+        _content_identity_preflight(config, source, report)
+        observer.check("content_identity", failures=_error_count(report) - errors_before)
+        errors_before = _error_count(report)
+        _asset_preflight(config.data_directory, source, report)
+        observer.check(
+            "source_assets",
+            failures=_error_count(report) - errors_before,
+            checked=report.counters.get("preflight", {}).get("beatmap_files_verified", 0),
         )
-    await _target_connectivity(engine, report)
-    await _account_preflight(config, source, engine, report)
-    _content_identity_preflight(config, source, report)
-    _asset_preflight(config.data_directory, source, report)
-    return schema
+        return schema
 
 
 async def reconcile(runtime: MigrationRuntime) -> None:
     """Check imported dependency graphs and source-to-target coverage after all phases."""
-    async with runtime.session_factory() as session:
-        prefix = f"bancho:{runtime.config.migration_id}:score:%"
-        imported_scores = await session.scalar(
-            select(func.count())
-            .select_from(Score)
-            .join(PlayAttempt, PlayAttempt.id == Score.attempt_id)
-            .where(PlayAttempt.idempotency_key.like(prefix))
-        )
-        missing_attestations = await session.scalar(
-            select(func.count())
-            .select_from(Score)
-            .join(PlayAttempt, PlayAttempt.id == Score.attempt_id)
-            .outerjoin(ScoreAttestation, ScoreAttestation.score_id == Score.id)
-            .where(PlayAttempt.idempotency_key.like(prefix), ScoreAttestation.score_id.is_(None))
-        )
-        scores_without_hits = await session.scalar(
-            select(func.count())
-            .select_from(Score)
-            .join(PlayAttempt, PlayAttempt.id == Score.attempt_id)
-            .outerjoin(ScoreHitStatistic, ScoreHitStatistic.score_id == Score.id)
-            .where(PlayAttempt.idempotency_key.like(prefix), ScoreHitStatistic.score_id.is_(None))
-        )
-        duplicate_md5 = await session.scalar(
-            select(func.count()).select_from(
-                select(BeatmapRevision.md5).group_by(BeatmapRevision.md5).having(func.count() > 1).subquery()
+    with VerificationObserver(runtime.report, "reconcile") as observer:
+        async with runtime.session_factory() as session:
+            prefix = f"bancho:{runtime.config.migration_id}:score:%"
+            imported_scores = await session.scalar(
+                select(func.count())
+                .select_from(Score)
+                .join(PlayAttempt, PlayAttempt.id == Score.attempt_id)
+                .where(PlayAttempt.idempotency_key.like(prefix))
             )
-        )
-    runtime.report.increment("verify", "imported_scores", int(imported_scores or 0))
-    for code, count, message in (
-        ("score_attestation_missing", missing_attestations, "imported scores are missing attestations"),
-        ("score_hit_statistics_missing", scores_without_hits, "imported scores are missing hit statistics"),
-        ("beatmap_md5_duplicate", duplicate_md5, "target beatmap revision MD5 values are not unique"),
-    ):
-        if count:
+            missing_attestations = await session.scalar(
+                select(func.count())
+                .select_from(Score)
+                .join(PlayAttempt, PlayAttempt.id == Score.attempt_id)
+                .outerjoin(ScoreAttestation, ScoreAttestation.score_id == Score.id)
+                .where(PlayAttempt.idempotency_key.like(prefix), ScoreAttestation.score_id.is_(None))
+            )
+            scores_without_hits = await session.scalar(
+                select(func.count())
+                .select_from(Score)
+                .join(PlayAttempt, PlayAttempt.id == Score.attempt_id)
+                .outerjoin(ScoreHitStatistic, ScoreHitStatistic.score_id == Score.id)
+                .where(PlayAttempt.idempotency_key.like(prefix), ScoreHitStatistic.score_id.is_(None))
+            )
+            duplicate_md5 = await session.scalar(
+                select(func.count()).select_from(
+                    select(BeatmapRevision.md5).group_by(BeatmapRevision.md5).having(func.count() > 1).subquery()
+                )
+            )
+        imported_count = int(imported_scores or 0)
+        runtime.report.increment("verify", "imported_scores", imported_count)
+        observer.check("imported_scores", checked=imported_count)
+        for code, count, message in (
+            ("score_attestation_missing", missing_attestations, "imported scores are missing attestations"),
+            ("score_hit_statistics_missing", scores_without_hits, "imported scores are missing hit statistics"),
+            ("beatmap_md5_duplicate", duplicate_md5, "target beatmap revision MD5 values are not unique"),
+        ):
+            failure_count = int(count or 0)
+            observer.check(code, failures=failure_count, checked=imported_count)
+            if failure_count:
+                runtime.report.add(
+                    DiagnosticSeverity.ERROR,
+                    code,
+                    message,
+                    details={"count": failure_count},
+                )
+        expected_accounts = runtime.source_schema.row_counts.get("users", 0)
+        skipped_accounts = sum(override.skip for override in runtime.overrides.accounts.values())
+        account_shortfall = max(0, expected_accounts - len(runtime.mappings.accounts) - skipped_accounts)
+        observer.check("account_coverage", failures=account_shortfall, checked=expected_accounts)
+        if account_shortfall:
             runtime.report.add(
                 DiagnosticSeverity.ERROR,
-                code,
-                message,
-                details={"count": int(count)},
+                "account_coverage_incomplete",
+                "not every source account was mapped or explicitly skipped",
+                details={
+                    "source": expected_accounts,
+                    "mapped": len(runtime.mappings.accounts),
+                    "explicitly_skipped": skipped_accounts,
+                },
             )
-    expected_accounts = runtime.source_schema.row_counts.get("users", 0)
-    skipped_accounts = runtime.report.counters.get("identity.users", {}).get("skipped_override", 0)
-    if len(runtime.mappings.accounts) + skipped_accounts < expected_accounts:
-        runtime.report.add(
-            DiagnosticSeverity.ERROR,
-            "account_coverage_incomplete",
-            "not every source account was mapped or explicitly skipped",
-            details={
-                "source": expected_accounts,
-                "mapped": len(runtime.mappings.accounts),
-                "explicitly_skipped": skipped_accounts,
-            },
-        )
 
 
 async def verify_completed_run(
@@ -111,25 +138,45 @@ async def verify_completed_run(
     object_storage: ObjectStorage,
 ) -> None:
     """Verify durable counts for a completed run without reconstructing all mappings."""
-    schema = source.inspect_schema()
-    report.source_fingerprint = schema.fingerprint
-    async with session_factory() as session:
-        account_count = await session.scalar(select(func.count()).select_from(Account))
-        score_count = await session.scalar(
-            select(func.count())
-            .select_from(PlayAttempt)
-            .where(PlayAttempt.idempotency_key.like(f"bancho:{config.migration_id}:score:%"))
+    with VerificationObserver(report, "completed_run") as observer:
+        schema = source.inspect_schema()
+        report.source_fingerprint = schema.fingerprint
+        async with session_factory() as session:
+            account_count = await session.scalar(select(func.count()).select_from(Account))
+            score_count = await session.scalar(
+                select(func.count())
+                .select_from(PlayAttempt)
+                .where(PlayAttempt.idempotency_key.like(f"bancho:{config.migration_id}:score:%"))
+            )
+        target_accounts = int(account_count or 0)
+        imported_scores = int(score_count or 0)
+        report.increment("verify", "target_accounts", target_accounts)
+        report.increment("verify", "imported_scores", imported_scores)
+        account_shortfall = max(0, schema.row_counts.get("users", 0) - target_accounts)
+        observer.check("target_accounts", failures=account_shortfall, checked=target_accounts)
+        observer.check("imported_scores", checked=imported_scores)
+        if account_shortfall:
+            report.add(
+                DiagnosticSeverity.WARNING,
+                "target_account_count_lower_than_source",
+                "target has fewer accounts than the source; inspect the original migration report for skips",
+            )
+        errors_before = _error_count(report)
+        verified_before = report.counters.get("verify", {}).get("objects_verified", 0)
+        await _verify_beatmap_objects(config, source, session_factory, report, object_storage)
+        observer.check(
+            "beatmap_objects",
+            failures=_error_count(report) - errors_before,
+            checked=report.counters.get("verify", {}).get("objects_verified", 0) - verified_before,
         )
-    report.increment("verify", "target_accounts", int(account_count or 0))
-    report.increment("verify", "imported_scores", int(score_count or 0))
-    if int(account_count or 0) < schema.row_counts.get("users", 0):
-        report.add(
-            DiagnosticSeverity.WARNING,
-            "target_account_count_lower_than_source",
-            "target has fewer accounts than the source; inspect the original migration report for skips",
+        errors_before = _error_count(report)
+        verified_before = report.counters.get("verify", {}).get("objects_verified", 0)
+        await _verify_replay_objects(config, source, session_factory, report, object_storage)
+        observer.check(
+            "replay_objects",
+            failures=_error_count(report) - errors_before,
+            checked=report.counters.get("verify", {}).get("objects_verified", 0) - verified_before,
         )
-    await _verify_beatmap_objects(config, source, session_factory, report, object_storage)
-    await _verify_replay_objects(config, source, session_factory, report, object_storage)
 
 
 async def _target_connectivity(engine: AsyncEngine, report: MigrationReport) -> None:

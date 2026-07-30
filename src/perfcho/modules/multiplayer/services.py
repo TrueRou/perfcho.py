@@ -5,12 +5,13 @@ import hashlib
 import hmac
 import json
 import secrets
+import time
 import uuid
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta
 
+from perfcho.infra.logging import duration_ms, log_event, rate_limit
 from perfcho.modules.common.models import CommandMeta
 from perfcho.modules.common.ports import Clock
 from perfcho.modules.multiplayer.errors import (
@@ -95,10 +96,12 @@ class MultiplayerService:
 
     async def create_room(self, command: CreateRoom) -> RoomState:
         """Create durable room facts before publishing the initial host projection."""
+        started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
         salt, verifier = self._password_fields(command.password)
         now = self._clock.now()
         command_id = _command_id(command.meta)
+        replayed = False
         async with self._uow_factory() as uow:
             await self._access_policy_factory(uow.session).require(
                 actor,
@@ -121,17 +124,28 @@ class MultiplayerService:
                 snapshot = await repository.load_snapshot(room)
                 await uow.commit()
             else:
+                replayed = True
                 snapshot = await repository.load_snapshot(room)
+        _log_room_event(
+            "DEBUG" if replayed else "INFO",
+            "multiplayer.room.created",
+            room,
+            actor_account_id=actor,
+            replayed=replayed,
+            started_ns=started_ns,
+        )
         return await self._publish_snapshot(snapshot)
 
     async def join_room(self, command: JoinRoom) -> RoomState:
         """Verify room credentials, persist admission, then occupy a realtime slot."""
+        started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
         now = self._clock.now()
         current = await self._cached_room_for_account(actor)
         if current is not None and current.room.public_id != command.public_id:
             raise MatchAlreadyJoined("account already occupies another room")
         command_id = _command_id(command.meta)
+        replayed = False
         async with self._uow_factory() as uow:
             await self._access_policy_factory(uow.session).require(actor, ("multiplayer.play",), at=now)
             repository = self._repository_factory(uow.session)
@@ -151,19 +165,33 @@ class MultiplayerService:
                 snapshot = await repository.load_snapshot(room)
                 await uow.commit()
             else:
+                replayed = True
                 snapshot = await repository.load_snapshot(room)
+        _log_room_event(
+            "DEBUG" if replayed else "INFO",
+            "multiplayer.room.joined",
+            room,
+            actor_account_id=actor,
+            replayed=replayed,
+            started_ns=started_ns,
+        )
         if current is not None and current.slot_for(actor) is not None:
             return await self._reconcile_snapshot(current, snapshot)
         try:
             projected = await self._state.get(room.public_id, at=now)
+        except Exception as error:
+            _log_projection_failure("join_get", error, public_id=room.public_id, version=room.version)
+        else:
             if projected is not None and projected.slot_for(actor) is None:
-                return await self._state.join(room, account_id=actor, expires_at=now + self._state_lifetime)
-        except Exception:
-            pass
+                try:
+                    return await self._state.join(room, account_id=actor, expires_at=now + self._state_lifetime)
+                except Exception as error:
+                    _log_projection_failure("join", error, public_id=room.public_id, version=room.version)
         return await self._publish_snapshot(snapshot)
 
     async def leave_room(self, command: LeaveRoom) -> RoomState | None:
         """Persist a leave and reflect closure or host transfer in realtime state."""
+        started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
         now = self._clock.now()
         command_id = _command_id(command.meta)
@@ -181,6 +209,16 @@ class MultiplayerService:
                 snapshot = None
             room = await repository.get_room(command.public_id, for_update=True)
             if room is None:
+                if replayed:
+                    assert durable_room is not None
+                    _log_room_event(
+                        "DEBUG",
+                        "multiplayer.room.left",
+                        durable_room,
+                        actor_account_id=actor,
+                        replayed=True,
+                        started_ns=started_ns,
+                    )
                 return None
             if not replayed:
                 durable_room = await repository.leave_room(
@@ -195,14 +233,38 @@ class MultiplayerService:
                 await uow.commit()
         if replayed:
             assert snapshot is not None
+            assert durable_room is not None
+            _log_room_event(
+                "DEBUG",
+                "multiplayer.room.left",
+                durable_room,
+                actor_account_id=actor,
+                replayed=True,
+                started_ns=started_ns,
+            )
             return await self._publish_snapshot(snapshot)
+        _log_room_event(
+            "INFO",
+            "multiplayer.room.left" if durable_room is not None else "multiplayer.room.disposed",
+            durable_room or room,
+            actor_account_id=actor,
+            replayed=False,
+            started_ns=started_ns,
+        )
         try:
             return await self._state.leave(command.public_id, account_id=actor, durable_room=durable_room)
-        except Exception:
+        except Exception as error:
+            _log_projection_failure(
+                "leave",
+                error,
+                public_id=command.public_id,
+                version=durable_room.version if durable_room is not None else room.version,
+            )
             return self._state_from_snapshot(snapshot, degraded=True) if snapshot is not None else None
 
     async def cleanup_presence(self, command: CleanupPresence) -> RoomState | None:
         """Durably close a presence only when it belongs to the expiring session."""
+        started_ns = time.monotonic_ns()
         now = self._clock.now()
         command_id = _command_id(command.meta, account_id=command.account_id)
         async with self._uow_factory() as uow:
@@ -220,20 +282,44 @@ class MultiplayerService:
             )
             snapshot = await repository.load_snapshot(durable_room) if durable_room is not None else None
             await uow.commit()
+        _log_room_event(
+            "INFO",
+            "multiplayer.room.left" if durable_room is not None else "multiplayer.room.disposed",
+            durable_room or room,
+            actor_account_id=command.account_id,
+            replayed=False,
+            started_ns=started_ns,
+        )
         try:
             return await self._state.leave(
                 room.public_id,
                 account_id=command.account_id,
                 durable_room=durable_room,
             )
-        except Exception:
+        except Exception as error:
+            _log_projection_failure(
+                "cleanup_leave",
+                error,
+                public_id=room.public_id,
+                version=durable_room.version if durable_room is not None else room.version,
+            )
             return self._state_from_snapshot(snapshot, degraded=True) if snapshot is not None else None
 
     async def kick_participant(self, command: KickParticipant) -> RoomState:
         """Persist a host-authorized kick before removing the target projection."""
+        started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
         replay = await self._replay_snapshot(command.meta, ("multiplayer.play", "multiplayer.host"))
         if replay is not None:
+            _log_room_event(
+                "DEBUG",
+                "multiplayer.room.participant_kicked",
+                replay.room,
+                actor_account_id=actor,
+                target_account_id=command.target_account_id,
+                replayed=True,
+                started_ns=started_ns,
+            )
             return await self._publish_snapshot(replay)
         current = await self._require_state(command.public_id)
         target_slot = current.slot_for(command.target_account_id)
@@ -258,6 +344,15 @@ class MultiplayerService:
             )
             snapshot = await repository.load_snapshot(room)
             await uow.commit()
+        _log_room_event(
+            "INFO",
+            "multiplayer.room.participant_kicked",
+            room,
+            actor_account_id=actor,
+            target_account_id=command.target_account_id,
+            replayed=False,
+            started_ns=started_ns,
+        )
         try:
             updated = await self._state.leave(
                 command.public_id,
@@ -266,16 +361,30 @@ class MultiplayerService:
             )
             if updated is not None:
                 return updated
-        except Exception:
-            pass
+        except Exception as error:
+            _log_projection_failure(
+                "kick_leave",
+                error,
+                public_id=command.public_id,
+                version=room.version,
+            )
         return self._state_from_snapshot(snapshot, degraded=True)
 
     async def update_settings(self, command: UpdateRoomSettings) -> RoomState:
         """Persist a host-authorized setting replacement and update its projection."""
+        started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
         now = self._clock.now()
         replay = await self._replay_snapshot(command.meta, ("multiplayer.play", "multiplayer.host"))
         if replay is not None:
+            _log_room_event(
+                "DEBUG",
+                "multiplayer.room.settings_changed",
+                replay.room,
+                actor_account_id=actor,
+                replayed=True,
+                started_ns=started_ns,
+            )
             return await self._publish_snapshot(replay)
         current = await self._require_state(command.public_id)
         settings, transitioned_slots = _settings_transition(current, command.settings)
@@ -296,6 +405,14 @@ class MultiplayerService:
             )
             snapshot = await repository.load_snapshot(room)
             await uow.commit()
+        _log_room_event(
+            "INFO",
+            "multiplayer.room.settings_changed",
+            room,
+            actor_account_id=actor,
+            replayed=False,
+            started_ns=started_ns,
+        )
         slots = tuple(
             replace(slot, status=SlotStatus.NOT_READY, loaded=False, skipped=False, failed=False)
             if slot.account_id is not None
@@ -316,9 +433,19 @@ class MultiplayerService:
 
     async def change_host(self, command: ChangeHost) -> RoomState:
         """Persist and project a host transfer to an active participant."""
+        started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
         replay = await self._replay_snapshot(command.meta, ("multiplayer.play", "multiplayer.host"))
         if replay is not None:
+            _log_room_event(
+                "DEBUG",
+                "multiplayer.room.host_changed",
+                replay.room,
+                actor_account_id=actor,
+                target_account_id=command.target_account_id,
+                replayed=True,
+                started_ns=started_ns,
+            )
             return await self._publish_snapshot(replay)
         current = await self._require_state(command.public_id)
         if current.slot_for(command.target_account_id) is None:
@@ -340,15 +467,33 @@ class MultiplayerService:
             )
             snapshot = await repository.load_snapshot(room)
             await uow.commit()
+        _log_room_event(
+            "INFO",
+            "multiplayer.room.host_changed",
+            room,
+            actor_account_id=actor,
+            target_account_id=command.target_account_id,
+            replayed=False,
+            started_ns=started_ns,
+        )
         updated = replace(current, room=room, state_revision=current.state_revision + 1)
         return await self._replace_after_commit(updated, current, snapshot)
 
     async def change_password(self, command: ChangeRoomPassword) -> RoomState:
         """Persist a host-authorized password replacement and preserve public secrecy."""
+        started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
         salt, verifier = self._password_fields(command.password)
         replay = await self._replay_snapshot(command.meta, ("multiplayer.play", "multiplayer.host"))
         if replay is not None:
+            _log_room_event(
+                "DEBUG",
+                "multiplayer.room.password_changed",
+                replay.room,
+                actor_account_id=actor,
+                replayed=True,
+                started_ns=started_ns,
+            )
             return await self._publish_snapshot(replay)
         current = await self._require_state(command.public_id)
         async with self._uow_factory() as uow:
@@ -369,14 +514,32 @@ class MultiplayerService:
             )
             snapshot = await repository.load_snapshot(room)
             await uow.commit()
+        _log_room_event(
+            "INFO",
+            "multiplayer.room.password_changed",
+            room,
+            actor_account_id=actor,
+            replayed=False,
+            started_ns=started_ns,
+        )
         updated = replace(current, room=room, state_revision=current.state_revision + 1)
         return await self._replace_after_commit(updated, current, snapshot)
 
     async def start_round(self, command: StartRound) -> RoomState:
         """Freeze active participants, persist a start, and mark occupied slots playing."""
+        started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
         replay = await self._replay_snapshot(command.meta, ("multiplayer.play", "multiplayer.host"))
         if replay is not None:
+            _log_room_event(
+                "DEBUG",
+                "multiplayer.round.started",
+                replay.room,
+                actor_account_id=actor,
+                round_id=replay.round_id,
+                replayed=True,
+                started_ns=started_ns,
+            )
             return await self._publish_snapshot(replay)
         current = await self._require_state(command.public_id)
         if current.in_progress:
@@ -405,6 +568,15 @@ class MultiplayerService:
             )
             snapshot = await repository.load_snapshot(room)
             await uow.commit()
+        _log_room_event(
+            "INFO",
+            "multiplayer.round.started",
+            room,
+            actor_account_id=actor,
+            round_id=round_id,
+            replayed=False,
+            started_ns=started_ns,
+        )
         slots = tuple(
             replace(slot, status=SlotStatus.PLAYING, loaded=False, skipped=False, failed=False)
             if slot.account_id is not None and slot.status is not SlotStatus.NO_BEATMAP
@@ -424,10 +596,20 @@ class MultiplayerService:
 
     async def complete_round(self, command: CompleteRound) -> RoomState:
         """Persist round completion and reset occupied slots to not-ready."""
+        started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
         permissions = ("multiplayer.play", "multiplayer.host") if command.aborted else ("multiplayer.play",)
         replay = await self._replay_snapshot(command.meta, permissions)
         if replay is not None:
+            _log_room_event(
+                "DEBUG",
+                "multiplayer.round.completed",
+                replay.room,
+                actor_account_id=actor,
+                round_id=replay.round_id,
+                replayed=True,
+                started_ns=started_ns,
+            )
             return await self._publish_snapshot(replay)
         current = await self._require_state(command.public_id)
         if not current.in_progress:
@@ -450,6 +632,15 @@ class MultiplayerService:
             )
             snapshot = await repository.load_snapshot(room)
             await uow.commit()
+        _log_room_event(
+            "INFO",
+            "multiplayer.round.completed",
+            room,
+            actor_account_id=actor,
+            round_id=current.round_id,
+            replayed=False,
+            started_ns=started_ns,
+        )
         slots = tuple(
             replace(slot, status=SlotStatus.NOT_READY, loaded=False, skipped=False, failed=False)
             if slot.account_id in current.round_participant_account_ids
@@ -484,11 +675,18 @@ class MultiplayerService:
             snapshot = await repository.load_snapshot(room) if room is not None else None
         if room is None:
             if state is not None:
-                with suppress(Exception):
+                try:
                     await self._state.remove(
                         state.room.public_id,
                         expected_state_revision=state.state_revision,
                         expected_session_id=state.room.session_id,
+                    )
+                except Exception as error:
+                    _log_projection_failure(
+                        "remove_stale",
+                        error,
+                        public_id=state.room.public_id,
+                        version=state.room.version,
                     )
             return None
         assert snapshot is not None
@@ -507,7 +705,8 @@ class MultiplayerService:
             raise ValueError("room list limit must be between 1 and 256")
         try:
             return await self._state.list_public(at=self._clock.now(), limit=limit)
-        except Exception:
+        except Exception as error:
+            _log_projection_failure("list_public", error, public_id=None, version=None)
             async with self._uow_factory() as uow:
                 repository = self._repository_factory(uow.session)
                 rooms = await repository.list_active_rooms(limit=limit)
@@ -608,7 +807,8 @@ class MultiplayerService:
     async def _require_state(self, public_id: int) -> RoomState:
         try:
             state = await self._state.get(public_id, at=self._clock.now())
-        except Exception:
+        except Exception as error:
+            _log_projection_failure("get", error, public_id=public_id, version=None)
             state = None
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
@@ -632,11 +832,26 @@ class MultiplayerService:
         durable_state = self._state_from_snapshot(snapshot)
         try:
             current = await self._state.get(snapshot.room.public_id, at=self._clock.now())
-            if current is None:
-                return await self._state.create(durable_state)
-            return await self._reconcile_snapshot(current, snapshot)
-        except Exception:
+        except Exception as error:
+            _log_projection_failure(
+                "publish_get",
+                error,
+                public_id=snapshot.room.public_id,
+                version=snapshot.room.version,
+            )
             return replace(durable_state, projection_status=ProjectionStatus.DURABLE_RECOVERY)
+        if current is None:
+            try:
+                return await self._state.create(durable_state)
+            except Exception as error:
+                _log_projection_failure(
+                    "publish_create",
+                    error,
+                    public_id=snapshot.room.public_id,
+                    version=snapshot.room.version,
+                )
+                return replace(durable_state, projection_status=ProjectionStatus.DURABLE_RECOVERY)
+        return await self._reconcile_snapshot(current, snapshot)
 
     async def _reconcile_snapshot(self, state: RoomState, snapshot: DurableRoomSnapshot) -> RoomState:
         """Repair stale Redis state and enforce its durable room/session epoch."""
@@ -681,7 +896,13 @@ class MultiplayerService:
                 expected_state_revision=state.state_revision,
                 expected_session_id=state.room.session_id,
             )
-        except Exception:
+        except Exception as error:
+            _log_projection_failure(
+                "reconcile_replace",
+                error,
+                public_id=room.public_id,
+                version=room.version,
+            )
             return replace(self._state_from_snapshot(snapshot), projection_status=ProjectionStatus.DURABLE_RECOVERY)
 
     def _state_from_snapshot(self, snapshot: DurableRoomSnapshot | None, *, degraded: bool = False) -> RoomState:
@@ -732,8 +953,13 @@ class MultiplayerService:
                 expected_state_revision=previous.state_revision,
                 expected_session_id=previous.room.session_id,
             )
-        except Exception:
-            del snapshot
+        except Exception as error:
+            _log_projection_failure(
+                "replace_after_commit",
+                error,
+                public_id=snapshot.room.public_id,
+                version=snapshot.room.version,
+            )
             return replace(updated, projection_status=ProjectionStatus.DURABLE_RECOVERY)
 
     async def _replay_snapshot(
@@ -755,7 +981,8 @@ class MultiplayerService:
     async def _cached_room_for_account(self, account_id: int) -> RoomState | None:
         try:
             return await self._state.find_for_account(account_id, at=self._clock.now())
-        except Exception:
+        except Exception as error:
+            _log_projection_failure("find_for_account", error, public_id=None, version=None)
             return None
 
     async def issue_admission_token(
@@ -856,6 +1083,51 @@ class MultiplayerService:
 
     def _password_verifier(self, salt: str, password: str) -> str:
         return hmac.new(self._password_key, salt.encode() + b"\0" + password.encode(), hashlib.sha256).hexdigest()
+
+
+def _log_room_event(
+    level: str,
+    event: str,
+    room: RoomRecord,
+    *,
+    actor_account_id: int,
+    replayed: bool,
+    started_ns: int,
+    target_account_id: int | None = None,
+    round_id: uuid.UUID | None = None,
+) -> None:
+    log_event(
+        level,
+        event,
+        room_id=str(room.room_id),
+        public_id=room.public_id,
+        session_id=str(room.session_id),
+        version=room.version,
+        actor_account_id=actor_account_id,
+        target_account_id=target_account_id,
+        round_id=str(round_id) if round_id is not None else None,
+        replayed=replayed,
+        duration_ms=duration_ms(started_ns),
+    )
+
+
+def _log_projection_failure(
+    operation: str,
+    error: BaseException,
+    *,
+    public_id: int | None,
+    version: int | None,
+) -> None:
+    if not rate_limit(f"multiplayer.projection:{operation}"):
+        return
+    log_event(
+        "WARNING",
+        "multiplayer.projection.degraded",
+        operation=operation,
+        public_id=public_id,
+        version=version,
+        error_type=type(error).__name__,
+    )
 
 
 def _actor_id(meta: CommandMeta) -> int:

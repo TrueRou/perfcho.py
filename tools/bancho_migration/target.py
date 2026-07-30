@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -13,6 +14,7 @@ from sqlalchemy.schema import CreateSchema
 import perfcho.infra.db.models  # noqa: F401 - register all mapped tables.
 from perfcho.infra.db.base import MODEL_SCHEMAS, DbBase
 from perfcho.infra.db.bootstrap import bootstrap_database
+from perfcho.infra.logging import duration_ms, log_event
 
 _TARGET_LOCK_KEY = "perfcho:bancho-migration"
 
@@ -47,6 +49,7 @@ def create_target_engine(database_url: str) -> AsyncEngine:
         pool_size=5,
         max_overflow=0,
         pool_pre_ping=True,
+        hide_parameters=True,
         json_serializer=lambda value: json.dumps(value, ensure_ascii=False, default=str),
     )
 
@@ -71,20 +74,93 @@ async def prepare_target(engine: AsyncEngine) -> async_sessionmaker[AsyncSession
 
 
 @asynccontextmanager
-async def target_migration_lock(engine: AsyncEngine, migration_id: str) -> AsyncIterator[None]:
+async def target_migration_lock(
+    engine: AsyncEngine,
+    migration_id: str,
+    *,
+    invocation_id: str | None = None,
+) -> AsyncIterator[None]:
     """Hold a session-level advisory lock for the complete migration run."""
-    connection = await engine.connect()
+    acquire_started_ns = time.monotonic_ns()
+    log_event(
+        "INFO",
+        "migration.target_lock.acquire_started",
+        invocation_id=invocation_id,
+        migration_id=migration_id,
+    )
+    connection = None
+    acquired = False
+    primary_error: BaseException | None = None
     try:
-        acquired = await connection.scalar(
+        connection = await engine.connect()
+        lock_result = await connection.scalar(
             text("SELECT pg_try_advisory_lock(hashtext(:key))"),
-            {"key": f"{_TARGET_LOCK_KEY}:{migration_id}"},
+            {"key": _TARGET_LOCK_KEY},
         )
-        if acquired is not True:
+        if lock_result is not True:
             raise RuntimeError("another process owns the target migration lock")
-        yield
-    finally:
-        await connection.execute(
-            text("SELECT pg_advisory_unlock(hashtext(:key))"),
-            {"key": f"{_TARGET_LOCK_KEY}:{migration_id}"},
+        acquired = True
+        log_event(
+            "INFO",
+            "migration.target_lock.acquired",
+            invocation_id=invocation_id,
+            migration_id=migration_id,
+            duration_ms=duration_ms(acquire_started_ns),
         )
-        await connection.close()
+        yield
+    except BaseException as error:
+        primary_error = error
+        if not acquired:
+            log_event(
+                "WARNING" if isinstance(error, KeyboardInterrupt) else "ERROR",
+                "migration.target_lock.acquire_failed",
+                invocation_id=invocation_id,
+                migration_id=migration_id,
+                error_type=type(error).__name__,
+                duration_ms=duration_ms(acquire_started_ns),
+            )
+        raise
+    finally:
+        if connection is not None:
+            release_started_ns = time.monotonic_ns()
+            cleanup_error: BaseException | None = None
+            try:
+                if acquired:
+                    await connection.execute(
+                        text("SELECT pg_advisory_unlock(hashtext(:key))"),
+                        {"key": _TARGET_LOCK_KEY},
+                    )
+            except BaseException as error:
+                cleanup_error = error
+                log_event(
+                    "WARNING" if isinstance(error, KeyboardInterrupt) else "ERROR",
+                    "migration.target_lock.release_failed",
+                    invocation_id=invocation_id,
+                    migration_id=migration_id,
+                    error_type=type(error).__name__,
+                    duration_ms=duration_ms(release_started_ns),
+                )
+            finally:
+                try:
+                    await connection.close()
+                except BaseException as error:
+                    cleanup_error = cleanup_error or error
+                    log_event(
+                        "WARNING" if isinstance(error, KeyboardInterrupt) else "ERROR",
+                        "migration.target_lock.release_failed",
+                        invocation_id=invocation_id,
+                        migration_id=migration_id,
+                        phase="connection_close",
+                        error_type=type(error).__name__,
+                        duration_ms=duration_ms(release_started_ns),
+                    )
+            if acquired and cleanup_error is None:
+                log_event(
+                    "INFO",
+                    "migration.target_lock.released",
+                    invocation_id=invocation_id,
+                    migration_id=migration_id,
+                    duration_ms=duration_ms(release_started_ns),
+                )
+            if primary_error is None and cleanup_error is not None:
+                raise cleanup_error

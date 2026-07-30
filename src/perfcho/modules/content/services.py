@@ -1,8 +1,10 @@
 """Provide canonical beatmap content queries and community writes."""
 
 import hashlib
+import time
 from collections.abc import Callable
 
+from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import Clock, IdGenerator, ObjectStorage, OutboxWriterFactory
 from perfcho.modules.content.errors import BeatmapNotFound, BeatmapsetNotFound, ContentInputRejected
@@ -119,15 +121,26 @@ class ContentService:
 
     async def set_favourite(self, account_id: int, beatmapset_id: int, favourited: bool = True) -> FavouriteResult:
         """Set a naturally idempotent account favourite."""
+        started_ns = time.monotonic_ns()
         _positive("account_id", account_id)
         _positive("beatmapset_id", beatmapset_id)
         async with self._uow_factory() as uow:
             result = await self._repository_factory(uow.session).set_favourite(account_id, beatmapset_id, favourited)
             await uow.commit()
+            log_event(
+                "DEBUG",
+                "content.favourite.changed",
+                account_id=result.account_id,
+                beatmapset_id=result.beatmapset_id,
+                favourited=result.favourited,
+                changed=result.changed,
+                duration_ms=duration_ms(started_ns),
+            )
             return result
 
     async def rate(self, account_id: int, beatmap_id: int, rating: int) -> RatingSummary:
         """Upsert one bounded logical-beatmap rating and return the new aggregate."""
+        started_ns = time.monotonic_ns()
         _positive("account_id", account_id)
         _positive("beatmap_id", beatmap_id)
         if isinstance(rating, bool) or not 1 <= rating <= 10:
@@ -135,6 +148,14 @@ class ContentService:
         async with self._uow_factory() as uow:
             result = await self._repository_factory(uow.session).rate(account_id, beatmap_id, rating)
             await uow.commit()
+            log_event(
+                "DEBUG",
+                "content.rating.changed",
+                account_id=account_id,
+                beatmap_id=result.beatmap_id,
+                rating=result.account_rating,
+                duration_ms=duration_ms(started_ns),
+            )
             return result
 
 
@@ -162,7 +183,13 @@ class ContentSyncService:
 
     async def synchronize(self, external_beatmapset_id: int) -> ContentSyncResult:
         """Synchronize one upstream set without holding a database transaction during I/O."""
+        started_ns = time.monotonic_ns()
         _positive("external_beatmapset_id", external_beatmapset_id)
+        log_event(
+            "INFO",
+            "content.sync.started",
+            external_beatmapset_id=external_beatmapset_id,
+        )
         snapshot = await self._upstream.fetch_beatmapset(external_beatmapset_id)
         if snapshot.external_beatmapset_id != external_beatmapset_id:
             raise ContentInputRejected("upstream beatmapset identity does not match the request")
@@ -211,6 +238,16 @@ class ContentSyncService:
                 )
             )
             await uow.commit()
+            log_event(
+                "INFO",
+                "content.sync.committed",
+                beatmapset_id=result.beatmapset_id,
+                external_beatmapset_id=result.external_beatmapset_id,
+                created_revision_count=result.created_revision_count,
+                unchanged_revision_count=result.unchanged_revision_count,
+                removed_beatmap_count=result.removed_beatmap_count,
+                duration_ms=duration_ms(started_ns),
+            )
             return result
 
 

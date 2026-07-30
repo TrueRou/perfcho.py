@@ -10,6 +10,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from perfcho.infra.logging import log_event
 from perfcho.modules.common import ObjectStorage, ObjectUnavailable, StoredObject
 
 MAX_BEATMAP_FILE_BYTES = 16 * 1024 * 1024
@@ -130,6 +131,8 @@ async def upload_beatmap_file(
     source_code: str,
     beatmapset_id: int,
     beatmap_id: int,
+    invocation_id: str | None = None,
+    migration_id: str | None = None,
 ) -> StoredObject:
     """Idempotently upload a verified beatmap using the runtime's canonical key."""
     _positive_identifier("beatmapset_id", beatmapset_id)
@@ -151,6 +154,9 @@ async def upload_beatmap_file(
         metadata.content,
         media_type="application/x-osu-beatmap",
         sha256=metadata.sha256,
+        object_kind="beatmap",
+        invocation_id=invocation_id,
+        migration_id=migration_id,
     )
 
 
@@ -159,6 +165,8 @@ async def upload_replay_file(
     metadata: ReplayFileMetadata,
     *,
     account_id: int,
+    invocation_id: str | None = None,
+    migration_id: str | None = None,
 ) -> StoredObject:
     """Idempotently upload a replay using the Stable content-addressed key."""
     _positive_identifier("account_id", account_id)
@@ -169,6 +177,9 @@ async def upload_replay_file(
         metadata.content,
         media_type="application/octet-stream",
         sha256=metadata.sha256,
+        object_kind="replay",
+        invocation_id=invocation_id,
+        migration_id=migration_id,
     )
 
 
@@ -329,20 +340,58 @@ async def _upload(
     *,
     media_type: str,
     sha256: bytes,
+    object_kind: str,
+    invocation_id: str | None,
+    migration_id: str | None,
 ) -> StoredObject:
     last_error: ObjectUnavailable | None = None
-    for attempt in range(_UPLOAD_ATTEMPTS):
+    for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
         try:
             stored = await object_storage.put(key, content, media_type=media_type, expected_sha256=sha256)
         except ObjectUnavailable as error:
             last_error = error
-            if attempt + 1 < _UPLOAD_ATTEMPTS:
-                await asyncio.sleep(0.1 * 2**attempt)
+            if attempt < _UPLOAD_ATTEMPTS:
+                delay_seconds = 0.1 * 2 ** (attempt - 1)
+                log_event(
+                    "WARNING",
+                    "migration.storage.retry_scheduled",
+                    invocation_id=invocation_id,
+                    migration_id=migration_id,
+                    object_kind=object_kind,
+                    size_bytes=len(content),
+                    attempt=attempt,
+                    maximum_attempts=_UPLOAD_ATTEMPTS,
+                    delay_ms=int(delay_seconds * 1000),
+                    error_type=type(error).__name__,
+                )
+                await asyncio.sleep(delay_seconds)
+                continue
+            log_event(
+                "ERROR",
+                "migration.storage.failed",
+                invocation_id=invocation_id,
+                migration_id=migration_id,
+                object_kind=object_kind,
+                size_bytes=len(content),
+                attempts=attempt,
+                failure="provider_unavailable",
+                error_type=type(error).__name__,
+            )
             continue
         if stored.storage_key != key or stored.size_bytes != len(content) or stored.sha256 != sha256:
-            raise ObjectUploadFailed(f"object storage returned inconsistent metadata for {key}")
+            log_event(
+                "ERROR",
+                "migration.storage.failed",
+                invocation_id=invocation_id,
+                migration_id=migration_id,
+                object_kind=object_kind,
+                size_bytes=len(content),
+                attempts=attempt,
+                failure="metadata_mismatch",
+            )
+            raise ObjectUploadFailed("object storage returned inconsistent metadata")
         return stored
-    raise ObjectUploadFailed(f"object storage write failed after {_UPLOAD_ATTEMPTS} attempts for {key}") from last_error
+    raise ObjectUploadFailed(f"object storage write failed after {_UPLOAD_ATTEMPTS} attempts") from last_error
 
 
 def _md5_digest(value: str | bytes) -> bytes:

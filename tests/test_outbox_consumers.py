@@ -1,8 +1,10 @@
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import Any, cast
 
 import pytest
+from loguru import logger
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -134,8 +136,21 @@ async def test_outbox_dead_delivery_blocks_later_partition_events(postgres_datab
 
         claims = await store.claim("tests:dead-owner")
         assert [claim.event_id for claim in claims] == [first.id]
-        with pytest.raises(RuntimeError, match="projector failed"):
-            await processor.execute(claims[0])
+        records: list[dict[str, Any]] = []
+        sink_id = logger.add(lambda message: records.append(cast(dict[str, Any], message.record)))
+        try:
+            with pytest.raises(RuntimeError, match="projector failed"):
+                await processor.execute(claims[0])
+        finally:
+            logger.remove(sink_id)
+        dead_event = next(record for record in records if record["extra"]["event"] == "outbox.delivery.dead")
+        assert dead_event["level"].name == "ERROR"
+        assert dead_event["extra"]["event_id"] == str(first.id)
+        assert dead_event["extra"]["consumer"] == TEST_CONSUMER
+        assert dead_event["extra"]["error_type"] == "RuntimeError"
+        assert dead_event["exception"] is None
+        assert "projector failed" not in dead_event["message"]
+        assert {"payload", "partition_key", "delivery_token", "lease_owner", "error"}.isdisjoint(dead_event["extra"])
         assert await store.claim("tests:next-owner") == ()
 
         async with session_factory() as session:
@@ -182,7 +197,17 @@ async def test_outbox_stale_token_and_enqueue_failure_do_not_consume_attempt(
             )
 
         reference = (await store.claim("tests:enqueue-owner"))[0]
-        await processor.execute(replace(reference, delivery_token=uuid.uuid4()))
+        records: list[dict[str, Any]] = []
+        sink_id = logger.add(lambda message: records.append(cast(dict[str, Any], message.record)))
+        try:
+            await processor.execute(replace(reference, delivery_token=uuid.uuid4()))
+        finally:
+            logger.remove(sink_id)
+        stale_event = next(record for record in records if record["extra"]["event"] == "outbox.delivery.stale")
+        assert stale_event["level"].name == "DEBUG"
+        assert stale_event["extra"]["event_id"] == str(event.id)
+        assert stale_event["extra"]["consumer"] == TEST_CONSUMER
+        assert {"partition_key", "delivery_token", "lease_owner", "error"}.isdisjoint(stale_event["extra"])
         await store.mark_enqueue_failed(reference, "tests:enqueue-owner", RuntimeError("Redis unavailable"))
 
         async with session_factory() as session:

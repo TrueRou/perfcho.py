@@ -1,9 +1,11 @@
 """Accept canonical Stable and Lazer scores in one explicit transaction."""
 
+import time
 import uuid
 from collections.abc import Callable
 from datetime import timedelta
 
+from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import Clock, IdGenerator, OutboxWriterFactory
 from perfcho.modules.scoring.errors import (
@@ -70,6 +72,7 @@ class ScoringService:
 
     async def accept(self, command: AcceptScore) -> AcceptedScoreResult:
         """Accept score facts, replay evidence, follow-up work, and one durable event."""
+        started_ns = time.monotonic_ns()
         actor = command.meta.actor
         if actor is None:
             raise ScoreRejected("score submission requires an authenticated actor")
@@ -99,6 +102,13 @@ class ScoringService:
             )
             if claim.prior_result is not None:
                 await uow.commit()
+                _log_acceptance(
+                    "DEBUG",
+                    "scoring.score.replayed",
+                    claim.prior_result,
+                    account_id=actor.account_id,
+                    started_ns=started_ns,
+                )
                 return claim.prior_result
 
             account_context = await self._account_validator_factory(uow.session).validate(actor.account_id, at=now)
@@ -136,6 +146,13 @@ class ScoringService:
             if attempt_claim.prior_result is not None:
                 await repository.complete_acceptance(command.meta.idempotency_key, attempt_claim.prior_result)
                 await uow.commit()
+                _log_acceptance(
+                    "DEBUG",
+                    "scoring.score.replayed",
+                    attempt_claim.prior_result,
+                    account_id=actor.account_id,
+                    started_ns=started_ns,
+                )
                 return attempt_claim.prior_result
 
             multiplayer_validator = self._multiplayer_validator_factory(uow.session)
@@ -210,6 +227,13 @@ class ScoringService:
             )
             await repository.complete_acceptance(command.meta.idempotency_key, result)
             await uow.commit()
+            _log_acceptance(
+                "INFO",
+                "scoring.score.accepted",
+                result,
+                account_id=account_context.account_id,
+                started_ns=started_ns,
+            )
             return result
 
 
@@ -343,3 +367,25 @@ class RankingQueryService:
 def _positive_identifier(name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
+
+
+def _log_acceptance(
+    level: str,
+    event: str,
+    result: AcceptedScoreResult,
+    *,
+    account_id: int,
+    started_ns: int,
+) -> None:
+    log_event(
+        level,
+        event,
+        account_id=account_id,
+        score_id=result.score_id,
+        attempt_id=str(result.attempt_id),
+        beatmap_id=result.beatmap_id,
+        beatmap_revision_id=result.beatmap_revision_id,
+        scoreboard_id=result.scoreboard_id,
+        mod_set_id=result.mod_set_id,
+        duration_ms=duration_ms(started_ns),
+    )

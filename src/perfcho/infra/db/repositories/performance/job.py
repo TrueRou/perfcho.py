@@ -341,7 +341,7 @@ class SqlAlchemyPerformanceJobRepository:
         retry_delay: timedelta,
         dead: bool,
         consume_attempt: bool,
-    ) -> None:
+    ) -> bool:
         """Release or dead-letter a failed job only under its current fence."""
         job = await self._session.get(PerformanceCalculationJob, job_id, with_for_update=True)
         now = await _database_now(self._session)
@@ -352,7 +352,7 @@ class SqlAlchemyPerformanceJobRepository:
             or job.lease_expires_at is None
             or job.lease_expires_at <= now
         ):
-            return
+            return False
         if consume_attempt:
             job.attempt_count += 1
         job.status = CalculationJobStatus.DEAD if dead else CalculationJobStatus.PENDING
@@ -364,6 +364,7 @@ class SqlAlchemyPerformanceJobRepository:
             job.attempt_started_at = None
         _clear_job_lease(job)
         job.last_error = error[:4000]
+        return True
 
 
 def _canonical_mods(value: object) -> tuple[CanonicalMod, ...]:

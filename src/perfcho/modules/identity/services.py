@@ -1,11 +1,13 @@
 """Provide the protocol-neutral Stable identity lifecycle."""
 
 import asyncio
+import time
 import unicodedata
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
+from perfcho.infra.logging import duration_ms, log_event
 from perfcho.infra.security.password import (
     Argon2Policy,
     PasswordHash,
@@ -84,6 +86,7 @@ class IdentityService:
 
     async def login_stable(self, command: StableLogin) -> StableSessionResult:
         """Verify outside a write transaction, then atomically open a Stable session."""
+        started_ns = time.monotonic_ns()
         normalized_identifier = _normalize_identifier(command.identifier)
         identifier_hmac = _identifier_hmac(normalized_identifier, command.identifier, key=self._device_hmac_key)
         snapshot: CredentialSnapshot | None = None
@@ -133,6 +136,7 @@ class IdentityService:
         token_jti = self._id_generator.new()
         result: StableSessionResult | None = None
         failure: InvalidCredentials | StableSessionAlreadyActive | None = None
+        replaced_session: tuple[int, uuid.UUID] | None = None
 
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
@@ -202,6 +206,7 @@ class IdentityService:
                                 revoke=False,
                             )
                             if closed_account_id is not None:
+                                replaced_session = (closed_account_id, open_session.session_id)
                                 await outbox.append(
                                     _session_closed_event(
                                         closed_account_id,
@@ -258,6 +263,23 @@ class IdentityService:
                             )
                         )
                         await uow.commit()
+                        if replaced_session is not None:
+                            log_event(
+                                "INFO",
+                                "identity.stable_session.closed",
+                                account_id=replaced_session[0],
+                                session_id=str(replaced_session[1]),
+                                duration_ms=duration_ms(started_ns),
+                            )
+                        log_event(
+                            "INFO",
+                            "identity.stable_session.opened",
+                            account_id=snapshot.account_id,
+                            session_id=str(session_id),
+                            device_id=str(device_id),
+                            credential_upgraded=replacement_hash is not None,
+                            duration_ms=duration_ms(started_ns),
+                        )
                         result = StableSessionResult(
                             account_id=snapshot.account_id,
                             current_name=current.current_name,
@@ -363,6 +385,7 @@ class IdentityService:
 
     async def close_stable_session(self, raw_token: str, *, reason: str = "client_closed") -> None:
         """Close the active session represented by a bearer token."""
+        started_ns = time.monotonic_ns()
         _validate_close_reason(reason)
         now = self._clock.now()
         token_digest = digest_opaque_token(raw_token, key=self._token_hmac_key)
@@ -384,9 +407,17 @@ class IdentityService:
                 _session_closed_event(account_id, resolved.session_id, now=now, reason=reason, revoked=False)
             )
             await uow.commit()
+            log_event(
+                "INFO",
+                "identity.stable_session.closed",
+                account_id=account_id,
+                session_id=str(resolved.session_id),
+                duration_ms=duration_ms(started_ns),
+            )
 
     async def revoke_stable_session(self, session_id: uuid.UUID, *, reason: str) -> None:
         """Administratively revoke one Stable session and advance account auth version."""
+        started_ns = time.monotonic_ns()
         _validate_close_reason(reason)
         now = self._clock.now()
         async with self._uow_factory() as uow:
@@ -407,6 +438,13 @@ class IdentityService:
                 _session_closed_event(closed_account_id, session_id, now=now, reason=reason, revoked=True)
             )
             await uow.commit()
+            log_event(
+                "INFO",
+                "identity.stable_session.revoked",
+                account_id=closed_account_id,
+                session_id=str(session_id),
+                duration_ms=duration_ms(started_ns),
+            )
 
     async def _record_failed_login(
         self,

@@ -26,6 +26,15 @@ class DiagnosticSeverity(StrEnum):
     ERROR = "error"
 
 
+class MigrationStatus(StrEnum):
+    """Describe the outcome of one migration command invocation."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
 @dataclass(frozen=True, slots=True)
 class Diagnostic:
     """Describe one source row or migration-wide problem without secrets."""

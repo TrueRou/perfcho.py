@@ -278,9 +278,19 @@ def packet_types(payloads: list[bytes] | bytes) -> list[ServerPacket]:
 
 
 @pytest.mark.asyncio
-async def test_spectator_join_frames_and_stop_notify_host_and_fellows() -> None:
+async def test_spectator_join_frames_and_stop_notify_host_and_fellows(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher")
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        events.append((level, event, fields))
+
+    monkeypatch.setattr(dispatcher_module, "log_event", capture)
     realtime = SpectatorRealtime()
     stable_services = services(realtime)
+    object.__setattr__(stable_services, "settings", Settings(log_hot_path_sample_rate=1))
 
     joined = await dispatch_packets(
         build_packet(ClientPacket.START_SPECTATING, struct.pack("<i", 2)),
@@ -307,6 +317,15 @@ async def test_spectator_join_frames_and_stop_notify_host_and_fellows() -> None:
     assert 3 not in realtime.relations
     assert packet_types(realtime.mailboxes[2])[-1] is ServerPacket.SPECTATOR_LEFT
     assert packet_types(realtime.mailboxes[9])[-1] is ServerPacket.FELLOW_SPECTATOR_LEFT
+    assert any(event == "stable.spectator.attach" and fields["outcome"] == "attached" for _, event, fields in events)
+    assert any(event == "stable.spectator.detach" and fields["outcome"] == "detached" for _, event, fields in events)
+    frame_event = next(
+        fields for level, event, fields in events if level == "DEBUG" and event == "stable.spectator.frame_summary"
+    )
+    assert frame_event["outcome"] == "published"
+    assert frame_event["recipient_count"] == 2
+    assert "spectator" not in frame_event.values()
+    assert "host" not in frame_event.values()
 
 
 @pytest.mark.asyncio

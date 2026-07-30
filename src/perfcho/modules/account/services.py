@@ -1,10 +1,12 @@
 """Provide protocol-neutral account registration."""
 
 import asyncio
+import time
 import unicodedata
 from collections.abc import Callable
 from datetime import timedelta
 
+from perfcho.infra.logging import duration_ms, log_event
 from perfcho.infra.security.password import (
     Argon2Policy,
     PasswordPepper,
@@ -50,6 +52,7 @@ class AccountService:
 
     async def register(self, command: RegisterAccount) -> RegistrationResult:
         """Validate, hash, and atomically persist one account registration."""
+        started_ns = time.monotonic_ns()
         try:
             display_name = unicodedata.normalize("NFKC", command.display_name)
             name_key = normalize_stable_name(display_name)
@@ -87,6 +90,13 @@ class AccountService:
             )
             if claim.prior_result is not None:
                 await uow.commit()
+                log_event(
+                    "DEBUG",
+                    "account.registration.replayed",
+                    account_id=claim.prior_result.account_id,
+                    request_id=str(command.meta.request_id),
+                    duration_ms=duration_ms(started_ns),
+                )
                 return claim.prior_result
 
             await repository.acquire_identifier_locks(name_key, email)
@@ -116,4 +126,12 @@ class AccountService:
             )
             await repository.complete_registration(command.meta.idempotency_key, result)
             await uow.commit()
+            log_event(
+                "INFO",
+                "account.registration.committed",
+                account_id=result.account_id,
+                status=result.status,
+                request_id=str(command.meta.request_id),
+                duration_ms=duration_ms(started_ns),
+            )
             return result

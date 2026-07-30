@@ -32,6 +32,8 @@
 
 ## 验证状态
 
+- 日志基础设施、请求关联、API/Worker 生命周期、Outbox/Performance 状态、Stable 热路径和迁移阶段事件已接线；生产 JSON 使用字段白名单，异常与协议载荷不写入日志。
+
 - Consumer 与生产者定向测试：`33 passed, 3 skipped`；Consumer 真实 PostgreSQL 全链路：`2 passed`。
 - 当前全量无外部依赖测试：`270 passed, 18 skipped`；启用本地真实 PostgreSQL 与 Redis 后：`288 passed`。
 - Ruff format/check 和 Python compileall 通过。

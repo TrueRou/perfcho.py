@@ -65,6 +65,8 @@ uv run python -m tools.bancho_migration apply \
 
 `apply` 会创建缺失 Schema/Table、升级 IAM Password Credential 约束、获取 PostgreSQL Advisory Lock，并在 `system.maintenance_states` 保存阶段和源主键游标。每个游标与其业务批次在同一事务提交。
 
+迁移命令的结构化日志写入 stderr，最终 `report:` 和 `diagnostics:` 摘要继续写 stdout。日志记录命令、阶段、Checkpoint、批次汇总、对象存储重试和验证结果，不记录连接 URL、凭据、完整路径、对象 Key、SQL、诊断正文或对象内容。报告文件由迁移工具以 `0600` 权限创建。
+
 中断后使用完全相同的 `migration-id`、数据目录、时区、批大小和 Override 文件重新执行 `apply`。源结构/行数指纹或配置摘要不同会拒绝恢复。不要删除 Checkpoint 后直接重跑；需要从头开始时，应先恢复迁移前 PostgreSQL/S3 备份，再使用新的 Migration ID。
 
 完成后再次对账：

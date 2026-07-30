@@ -5,7 +5,10 @@ import json
 import uuid
 from collections.abc import Callable
 from datetime import timedelta
+from time import monotonic_ns
+from typing import Literal
 
+from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import ObjectUrlProvider, OutboxWriterFactory
 from perfcho.modules.performance.errors import PerformanceCalculationError
@@ -49,6 +52,8 @@ class PerformanceCalculationService:
 
     async def execute(self, job_id: uuid.UUID, lease_token: uuid.UUID) -> None:
         """Load, calculate, and persist one fenced job through separate transactions."""
+        phase = "start"
+        phase_started_ns = monotonic_ns()
         try:
             async with self._uow_factory() as uow:
                 repository = self._repository_factory(uow.session)
@@ -58,7 +63,7 @@ class PerformanceCalculationService:
             retryable = not isinstance(error, PerformanceCalculationError) or error.retryable
             async with self._uow_factory() as uow:
                 repository = self._repository_factory(uow.session)
-                await repository.fail(
+                persisted = await repository.fail(
                     job_id,
                     lease_token,
                     error=f"{type(error).__name__}: {error}"[:4000],
@@ -67,17 +72,32 @@ class PerformanceCalculationService:
                     consume_attempt=True,
                 )
                 await uow.commit()
+            _log_calculation_outcome(
+                "fenced" if not persisted else "retry" if retryable else "dead",
+                job_id,
+                phase,
+                phase_started_ns,
+                error_type=type(error).__name__,
+            )
             return
         if calculation is None:
+            _log_calculation_outcome("fenced", job_id, phase, phase_started_ns)
             return
+        _log_calculation_outcome("started", job_id, phase, phase_started_ns)
 
         try:
+            phase = "object_url"
+            phase_started_ns = monotonic_ns()
             beatmap_url = await self._object_url_provider.presign_read(
                 calculation.beatmap_storage_key,
                 expires_in_seconds=self._beatmap_url_expiry_seconds,
             )
+            phase = "calculate"
+            phase_started_ns = monotonic_ns()
             result = await self._calculator.calculate(calculation, beatmap_url=beatmap_url)
             output_digest = _performance_output_digest(result)
+            phase = "complete"
+            phase_started_ns = monotonic_ns()
             async with self._uow_factory() as uow:
                 completion = await self._repository_factory(uow.session).complete(
                     calculation,
@@ -107,7 +127,21 @@ class PerformanceCalculationService:
                     )
                 await uow.commit()
         except Exception as error:
-            await self._record_failure(calculation.job_id, lease_token, calculation.attempt_count, error)
+            outcome = await self._record_failure(calculation.job_id, lease_token, calculation.attempt_count, error)
+            _log_calculation_outcome(
+                outcome,
+                job_id,
+                phase,
+                phase_started_ns,
+                error_type=type(error).__name__,
+            )
+            return
+        _log_calculation_outcome(
+            "succeeded" if completion is not None else "fenced",
+            job_id,
+            phase,
+            phase_started_ns,
+        )
 
     async def _record_failure(
         self,
@@ -115,12 +149,12 @@ class PerformanceCalculationService:
         lease_token: uuid.UUID,
         attempt_count: int,
         error: Exception,
-    ) -> None:
+    ) -> Literal["retry", "dead", "fenced"]:
         retryable = not isinstance(error, PerformanceCalculationError) or error.retryable
         dead = not retryable or attempt_count >= self._max_attempts
         delay = min(2 ** max(attempt_count, 1), self._max_retry_seconds)
         async with self._uow_factory() as uow:
-            await self._repository_factory(uow.session).fail(
+            persisted = await self._repository_factory(uow.session).fail(
                 job_id,
                 lease_token,
                 error=f"{type(error).__name__}: {error}"[:4000],
@@ -129,6 +163,9 @@ class PerformanceCalculationService:
                 consume_attempt=False,
             )
             await uow.commit()
+        if not persisted:
+            return "fenced"
+        return "dead" if dead else "retry"
 
 
 class PerformanceQueryService:
@@ -163,3 +200,37 @@ def _performance_output_digest(result: PerformanceResult) -> bytes:
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return hashlib.sha256(encoded).digest()
+
+
+def _log_calculation_outcome(
+    outcome: Literal["started", "succeeded", "retry", "dead", "fenced"],
+    job_id: uuid.UUID,
+    phase: str,
+    started_ns: int,
+    *,
+    error_type: str | None = None,
+) -> None:
+    level = {
+        "started": "INFO",
+        "succeeded": "INFO",
+        "retry": "WARNING",
+        "dead": "ERROR",
+        "fenced": "DEBUG",
+    }[outcome]
+    if error_type is None:
+        log_event(
+            level,
+            f"performance.calculation.{outcome}",
+            job_id=str(job_id),
+            phase=phase,
+            duration_ms=duration_ms(started_ns),
+        )
+    else:
+        log_event(
+            level,
+            f"performance.calculation.{outcome}",
+            job_id=str(job_id),
+            phase=phase,
+            error_type=error_type,
+            duration_ms=duration_ms(started_ns),
+        )

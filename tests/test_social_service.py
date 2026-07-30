@@ -133,9 +133,16 @@ def _pair(*, actor_blocks_target: bool = False, target_blocks_actor: bool = Fals
 
 
 @pytest.mark.asyncio
-async def test_stable_friend_add_removes_only_the_actors_own_block_then_follows() -> None:
+async def test_stable_friend_add_removes_only_the_actors_own_block_then_follows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     repository = FakeSocialRepository(_pair(actor_blocks_target=True))
     service, outbox, units = _service(repository)
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "perfcho.modules.social.services.log_event",
+        lambda level, event, **fields: logged.append((level, event, fields)),
+    )
 
     result = await service.follow(20, 10)
 
@@ -147,6 +154,11 @@ async def test_stable_friend_add_removes_only_the_actors_own_block_then_follows(
         "social.account-followed.v1",
     ]
     assert units[0].committed
+    assert [(level, event, fields["operation"]) for level, event, fields in logged] == [
+        ("DEBUG", "social.relationship.changed", "unblock"),
+        ("DEBUG", "social.relationship.changed", "follow"),
+    ]
+    assert not {"remark", "reason"} & logged[0][2].keys()
 
 
 @pytest.mark.asyncio

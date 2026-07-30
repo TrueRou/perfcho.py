@@ -5,6 +5,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from time import monotonic_ns
 
 from perfcho.api.stable.multiplayer import (
     MULTIPLAYER_PACKETS,
@@ -14,6 +15,8 @@ from perfcho.api.stable.multiplayer import (
     dispatch_multiplayer_packet,
 )
 from perfcho.infra.composition import StableServices
+from perfcho.infra.logging import duration_ms, log_event, rate_limit, sampled
+from perfcho.infra.settings import settings
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
 from perfcho.modules.common.errors import ApplicationError
 from perfcho.modules.community import (
@@ -63,7 +66,7 @@ from perfcho.modules.realtime.stable.builders import (
     user_presence,
     user_stats,
 )
-from perfcho.modules.realtime.stable.codec import Packet, PacketReader, build_packet
+from perfcho.modules.realtime.stable.codec import Packet, PacketReader, ProtocolError, build_packet
 from perfcho.modules.realtime.stable.models import (
     Channel,
     ClientPacket,
@@ -94,27 +97,77 @@ class StableRuntimeContext:
 
 async def dispatch_packets(body: bytes, context: StableRuntimeContext, services: StableServices) -> bytes:
     """Map application failures into bounded Stable responses instead of JSON errors."""
+    started_ns = monotonic_ns()
+    collect_summary = sampled(started_ns, services.settings.log_hot_path_sample_rate)
+    packet_histogram: dict[str, int] | None = {} if collect_summary else None
+    outcome = "success"
+    output = b""
     try:
-        return await _dispatch_packets(body, context, services)
-    except RealtimeSessionFenced, RealtimeSessionNotFound:
-        output = bytearray()
+        output = await _dispatch_packets(body, context, services, packet_histogram)
+    except (RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+        outcome = "realtime_fenced"
+        local_output = bytearray()
         _extend_response(
-            output,
+            local_output,
             notification("Session state changed. Please reconnect.") + restart(0),
             services.settings.stable_max_response_bytes,
         )
-        return bytes(output)
-    except ApplicationError:
-        output = bytearray()
+        output = bytes(local_output)
+        if rate_limit(f"stable-packet-fenced:{error.code}", interval_seconds=5):
+            log_event(
+                "WARNING",
+                "stable.packet.realtime_fenced",
+                outcome="reconnect",
+                account_id=context.identity.account_id,
+                error_code=error.code,
+                error_type=type(error).__name__,
+            )
+    except ApplicationError as error:
+        outcome = "application_rejected"
+        local_output = bytearray()
         _extend_response(
-            output,
+            local_output,
             notification("The request could not be completed."),
             services.settings.stable_max_response_bytes,
         )
-        return bytes(output)
+        output = bytes(local_output)
+        if rate_limit(f"stable-packet-rejected:{error.code}", interval_seconds=5):
+            log_event(
+                "INFO",
+                "stable.packet.application_rejected",
+                outcome="rejected",
+                account_id=context.identity.account_id,
+                error_code=error.code,
+                error_type=type(error).__name__,
+            )
+    except ProtocolError, ValueError:
+        outcome = "malformed"
+        raise
+    except BaseException:
+        outcome = "failed"
+        raise
+    finally:
+        if packet_histogram is not None:
+            log_event(
+                "DEBUG",
+                "stable.packet.dispatch_summary",
+                outcome=outcome,
+                account_id=context.identity.account_id,
+                packet_count=sum(packet_histogram.values()),
+                packet_histogram=packet_histogram,
+                input_bytes=len(body),
+                output_bytes=len(output),
+                duration_ms=duration_ms(started_ns),
+            )
+    return output
 
 
-async def _dispatch_packets(body: bytes, context: StableRuntimeContext, services: StableServices) -> bytes:
+async def _dispatch_packets(
+    body: bytes,
+    context: StableRuntimeContext,
+    services: StableServices,
+    packet_histogram: dict[str, int] | None,
+) -> bytes:
     """Process supported core packets sequentially and return request-local output."""
     output = bytearray()
     response_limit = services.settings.stable_max_response_bytes
@@ -122,6 +175,9 @@ async def _dispatch_packets(body: bytes, context: StableRuntimeContext, services
     current_stats = context.stats
     for packet in PacketReader(body):
         packet_type = packet.packet_type
+        if packet_histogram is not None:
+            packet_name = packet_type.name if isinstance(packet_type, ClientPacket) else "UNKNOWN"
+            packet_histogram[packet_name] = packet_histogram.get(packet_name, 0) + 1
         if packet_type is ClientPacket.PING:
             packet.payload.require_exhausted()
             _extend_response(output, pong(), response_limit)
@@ -244,11 +300,19 @@ async def _dispatch_packets(body: bytes, context: StableRuntimeContext, services
         elif packet_type is ClientPacket.SET_AWAY_MESSAGE:
             message = packet.payload.read_message()
             packet.payload.require_exhausted()
+            away_text = message.text.strip()
             await services.realtime.set_away_message(
                 context.identity.account_id,
                 session_id=context.identity.session_id,
                 expected_revision=context.realtime.revision,
-                message=message.text.strip(),
+                message=away_text,
+            )
+            log_event(
+                "DEBUG",
+                "stable.message.away_state",
+                outcome="updated",
+                account_id=context.identity.account_id,
+                message_length=len(away_text),
             )
         elif packet_type is ClientPacket.TOGGLE_BLOCK_NON_FRIEND_DMS:
             value = packet.payload.read_i32()
@@ -299,6 +363,12 @@ async def _dispatch_packets(body: bytes, context: StableRuntimeContext, services
             packet.payload.read_i32()
             packet.payload.require_exhausted()
             if _is_spurious_logout(context, services):
+                log_event(
+                    "DEBUG",
+                    "stable.logout.ignored",
+                    outcome="spurious",
+                    account_id=context.identity.account_id,
+                )
                 continue
             _extend_response(output, await _logout(context, services), response_limit)
             break
@@ -561,6 +631,7 @@ async def _send_public_message(message: Message, context: StableRuntimeContext, 
         return b""
     content = message.text.strip()
     if not content:
+        _log_message_state("public", "empty", context.identity.account_id, message_length=0)
         return b""
     try:
         result = await services.community.send_public_message(
@@ -570,6 +641,12 @@ async def _send_public_message(message: Message, context: StableRuntimeContext, 
             content,
         )
         if not result.created:
+            _log_message_state(
+                "public",
+                "duplicate",
+                context.identity.account_id,
+                message_length=len(content),
+            )
             return b""
         channel = await services.community.get_public_channel_by_stable_name(
             context.identity.account_id,
@@ -586,6 +663,13 @@ async def _send_public_message(message: Message, context: StableRuntimeContext, 
                 member_ids,
             )
     except ApplicationError as error:
+        _log_message_state(
+            "public",
+            "rejected",
+            context.identity.account_id,
+            message_length=len(content),
+            error=error,
+        )
         return _public_message_error_response(error)
     wire = send_message(
         Message(
@@ -595,8 +679,17 @@ async def _send_public_message(message: Message, context: StableRuntimeContext, 
             sender_id=context.identity.account_id,
         )
     )
+    delivered_count = 0
     for account_id in member_ids:
-        await _enqueue_online_recipient(account_id, wire, services)
+        delivered_count += int(await _enqueue_online_recipient(account_id, wire, services))
+    _log_message_state(
+        "public",
+        "persisted",
+        context.identity.account_id,
+        message_length=len(content),
+        recipient_count=len(member_ids),
+        delivered_count=delivered_count,
+    )
     return b""
 
 
@@ -606,6 +699,7 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
 
     content = message.text.strip()
     if not content:
+        _log_message_state("direct", "empty", context.identity.account_id, message_length=0)
         return b""
     try:
         target = await services.social.resolve_account_by_name(message.recipient)
@@ -615,18 +709,59 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
             _stable_message_id("direct", str(target.account_id), content, context, services),
             content,
         )
-    except SocialAccountNotFound:
+    except SocialAccountNotFound as error:
+        _log_message_state(
+            "direct",
+            "recipient_not_found",
+            context.identity.account_id,
+            message_length=len(content),
+            error=error,
+        )
         return notification("The direct-message recipient does not exist.")
-    except DirectMessageBlocked, PrivateMessageRejected:
+    except (DirectMessageBlocked, PrivateMessageRejected) as error:
+        _log_message_state(
+            "direct",
+            "blocked",
+            context.identity.account_id,
+            message_length=len(content),
+            error=error,
+        )
         return user_dm_blocked(message.recipient)
-    except TargetAccountSilenced:
+    except TargetAccountSilenced as error:
+        _log_message_state(
+            "direct",
+            "target_silenced",
+            context.identity.account_id,
+            message_length=len(content),
+            error=error,
+        )
         return target_is_silenced(message.recipient)
-    except AccountSilenced:
+    except AccountSilenced as error:
+        _log_message_state(
+            "direct",
+            "sender_silenced",
+            context.identity.account_id,
+            message_length=len(content),
+            error=error,
+        )
         return notification("You cannot send messages while silenced.")
-    except ApplicationError:
+    except ApplicationError as error:
+        _log_message_state(
+            "direct",
+            "rejected",
+            context.identity.account_id,
+            message_length=len(content),
+            error=error,
+        )
         return notification("The direct message could not be sent.")
 
     if not result.created:
+        _log_message_state(
+            "direct",
+            "duplicate",
+            context.identity.account_id,
+            message_length=len(content),
+        )
         return b""
     wire = send_message(
         Message(
@@ -638,6 +773,13 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
     )
     target_presence = await services.realtime.get_presence(target.account_id, at=services.clock.now())
     if target_presence is None:
+        _log_message_state(
+            "direct",
+            "persisted_offline",
+            context.identity.account_id,
+            message_length=len(content),
+            recipient_count=1,
+        )
         return notification(f"{target.display_name} is offline and will receive your message on their next login.")
     try:
         await services.realtime.enqueue_mailbox(
@@ -646,7 +788,15 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
             recipient_fence=target_presence.fence,
             expires_at=target_presence.expires_at,
         )
-    except MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound:
+    except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+        _log_message_state(
+            "direct",
+            "delivery_deferred",
+            context.identity.account_id,
+            message_length=len(content),
+            recipient_count=1,
+            error=error,
+        )
         return notification("The recipient is temporarily unable to receive messages.")
 
     target_stats_packet = _packet_from_snapshot(target_presence, ServerPacket.USER_STATS)
@@ -656,10 +806,61 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
         if target_stats.action == 1:
             away_message = await services.realtime.get_away_message(target.account_id)
             if away_message:
+                _log_message_state(
+                    "direct",
+                    "delivered_with_away_reply",
+                    context.identity.account_id,
+                    message_length=len(content),
+                    recipient_count=1,
+                    delivered_count=1,
+                    away_message_length=len(away_message),
+                )
                 return send_message(
                     Message(target.display_name, away_message, context.identity.current_name, target.account_id)
                 )
+    _log_message_state(
+        "direct",
+        "delivered",
+        context.identity.account_id,
+        message_length=len(content),
+        recipient_count=1,
+        delivered_count=1,
+    )
     return b""
+
+
+def _log_message_state(
+    message_kind: str,
+    outcome: str,
+    account_id: int,
+    *,
+    message_length: int,
+    recipient_count: int = 0,
+    delivered_count: int = 0,
+    away_message_length: int = 0,
+    error: ApplicationError | None = None,
+) -> None:
+    if error is None:
+        if not sampled(monotonic_ns(), settings.log_hot_path_sample_rate):
+            return
+        level = "DEBUG"
+    else:
+        if not rate_limit(f"stable-message-rejected:{error.code}", interval_seconds=5):
+            return
+        level = "INFO"
+    log_event(
+        level,
+        "stable.message.state",
+        message_kind=message_kind,
+        outcome=outcome,
+        account_id=account_id,
+        message_length=message_length,
+        recipient_count=recipient_count,
+        delivered_count=delivered_count,
+        away_message_length=away_message_length,
+        error_code=error.code if error is not None else None,
+        error_type=type(error).__name__ if error is not None else None,
+    )
 
 
 def _stable_message_id(
@@ -737,14 +938,19 @@ async def _enqueue_online_recipient(account_id: int, payload: bytes, services: S
 
 
 async def _logout(context: StableRuntimeContext, services: StableServices) -> bytes:
+    started_ns = monotonic_ns()
     now = services.clock.now()
     output = bytearray()
+    multiplayer_outcome = "not_configured"
+    durable_session_outcome = "not_available"
+    realtime_outcome = "fenced"
     snapshots = await services.realtime.list_presences(
         at=now,
         limit=services.settings.stable_presence_batch_size,
     )
     await _stop_spectating(context, services)
     if services.multiplayer is not None:
+        multiplayer_outcome = "cleaned"
         try:
             previous = await services.multiplayer.find_room_for_account(context.identity.account_id)
             digest = hashlib.sha256(f"logout:{context.identity.session_id}".encode()).digest()
@@ -789,28 +995,75 @@ async def _logout(context: StableRuntimeContext, services: StableServices) -> by
                             state,
                             services,
                         )
-        except ApplicationError:
+        except ApplicationError as error:
+            multiplayer_outcome = "failed"
+            log_event(
+                "WARNING",
+                "stable.logout.cleanup_failed",
+                operation="multiplayer_presence",
+                account_id=context.identity.account_id,
+                error_code=error.code,
+                error_type=type(error).__name__,
+            )
             output.extend(notification("Multiplayer presence cleanup could not be completed."))
     if context.raw_token is not None:
+        durable_session_outcome = "closed"
         try:
             await services.identity.close_stable_session(context.raw_token, reason="client_logout")
-        except ApplicationError:
+        except ApplicationError as error:
+            durable_session_outcome = "failed"
+            log_event(
+                "WARNING",
+                "stable.logout.cleanup_failed",
+                operation="close_durable_session",
+                account_id=context.identity.account_id,
+                error_code=error.code,
+                error_type=type(error).__name__,
+            )
             output.extend(notification("The durable session could not be closed cleanly."))
-    with suppress(RealtimeSessionNotFound, RealtimeSessionFenced):
+    try:
         await services.realtime.fence_session(
             context.identity.session_id,
             expected_revision=context.realtime.revision,
         )
+    except (RealtimeSessionNotFound, RealtimeSessionFenced) as error:
+        realtime_outcome = "already_fenced"
+        log_event(
+            "DEBUG",
+            "stable.logout.cleanup_state",
+            operation="fence_realtime_session",
+            outcome=realtime_outcome,
+            account_id=context.identity.account_id,
+            error_code=error.code,
+            error_type=type(error).__name__,
+        )
     wire = user_logout(context.identity.account_id)
+    recipient_count = 0
+    delivery_failure_count = 0
     for snapshot in snapshots:
         if snapshot.account_id != context.identity.account_id:
-            with suppress(MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound):
+            recipient_count += 1
+            try:
                 await services.realtime.enqueue_mailbox(
                     snapshot.account_id,
                     wire,
                     recipient_fence=snapshot.fence,
                     expires_at=snapshot.expires_at,
                 )
+            except MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound:
+                delivery_failure_count += 1
+    log_event(
+        "INFO",
+        "stable.logout.completed",
+        outcome="completed",
+        account_id=context.identity.account_id,
+        multiplayer_outcome=multiplayer_outcome,
+        durable_session_outcome=durable_session_outcome,
+        realtime_outcome=realtime_outcome,
+        recipient_count=recipient_count,
+        delivery_failure_count=delivery_failure_count,
+        duration_ms=duration_ms(started_ns),
+    )
     return bytes(output)
 
 
@@ -865,10 +1118,23 @@ async def _start_spectating(
     max_bytes: int,
 ) -> bytes:
     if host_account_id < 1 or host_account_id == context.identity.account_id:
+        log_event(
+            "INFO",
+            "stable.spectator.attach",
+            outcome="invalid_target",
+            spectator_account_id=context.identity.account_id,
+        )
         return b""
     now = services.clock.now()
     host_presence = await services.realtime.get_presence(host_account_id, at=now)
     if host_presence is None:
+        log_event(
+            "INFO",
+            "stable.spectator.attach",
+            outcome="host_offline",
+            host_account_id=host_account_id,
+            spectator_account_id=context.identity.account_id,
+        )
         return b""
     try:
         current = await services.realtime.get_spectator_relation(
@@ -877,6 +1143,13 @@ async def _start_spectating(
             at=now,
         )
         if current is not None and current.host_account_id == host_account_id:
+            log_event(
+                "DEBUG",
+                "stable.spectator.attach",
+                outcome="already_attached",
+                host_account_id=host_account_id,
+                spectator_account_id=context.identity.account_id,
+            )
             return b""
         if current is not None:
             await _detach_spectator(current, services, at=now)
@@ -885,7 +1158,16 @@ async def _start_spectating(
             host_fence=host_presence.fence,
             at=now,
         )
-    except RealtimeSessionFenced, RealtimeSessionNotFound:
+    except (RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+        log_event(
+            "INFO",
+            "stable.spectator.attach",
+            outcome="realtime_fenced",
+            host_account_id=host_account_id,
+            spectator_account_id=context.identity.account_id,
+            error_code=error.code,
+            error_type=type(error).__name__,
+        )
         return b""
     expiry = min(context.realtime.expires_at, host_presence.expires_at)
     try:
@@ -898,35 +1180,61 @@ async def _start_spectating(
             expires_at=expiry,
             history_limit=services.settings.stable_spectator_frame_batch_size,
         )
-    except SpectatorHostOffline, RealtimeSessionFenced, RealtimeSessionNotFound:
+    except (SpectatorHostOffline, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+        log_event(
+            "INFO",
+            "stable.spectator.attach",
+            outcome="rejected",
+            host_account_id=host_account_id,
+            spectator_account_id=context.identity.account_id,
+            error_code=error.code,
+            error_type=type(error).__name__,
+        )
         return b""
     relation = attachment.relation
-    await _enqueue_spectator_packet(
-        host_account_id,
-        spectator_joined(context.identity.account_id),
-        relation.host_fence,
-        relation.expires_at,
-        services,
+    delivery_failure_count = int(
+        not await _enqueue_spectator_packet(
+            host_account_id,
+            spectator_joined(context.identity.account_id),
+            relation.host_fence,
+            relation.expires_at,
+            services,
+        )
     )
     output = bytearray()
+    fellow_count = 0
     for existing_relation in existing:
         if existing_relation.spectator_account_id == context.identity.account_id:
             continue
+        fellow_count += 1
         _extend_response(
             output,
             fellow_spectator_joined(existing_relation.spectator_account_id),
             max_bytes,
         )
-        await _enqueue_spectator_packet(
+        delivered = await _enqueue_spectator_packet(
             existing_relation.spectator_account_id,
             fellow_spectator_joined(context.identity.account_id),
             existing_relation.spectator_fence,
             min(relation.expires_at, existing_relation.expires_at),
             services,
         )
+        delivery_failure_count += int(not delivered)
+    history_frame_count = 0
     for frame in attachment.history.frames:
         if not _extend_response(output, frame.payload, max_bytes):
             break
+        history_frame_count += 1
+    log_event(
+        "INFO",
+        "stable.spectator.attach",
+        outcome="attached",
+        host_account_id=host_account_id,
+        spectator_account_id=context.identity.account_id,
+        fellow_count=fellow_count,
+        history_frame_count=history_frame_count,
+        delivery_failure_count=delivery_failure_count,
+    )
     return bytes(output)
 
 
@@ -963,24 +1271,45 @@ async def _detach_spectator(
         spectator_fence=relation.spectator_fence,
     )
     if not detached:
+        log_event(
+            "DEBUG",
+            "stable.spectator.detach",
+            outcome="stale_relation",
+            host_account_id=relation.host_account_id,
+            spectator_account_id=relation.spectator_account_id,
+        )
         return
-    await _enqueue_spectator_packet(
-        relation.host_account_id,
-        spectator_left(relation.spectator_account_id),
-        relation.host_fence,
-        relation.expires_at,
-        services,
+    delivery_failure_count = int(
+        not await _enqueue_spectator_packet(
+            relation.host_account_id,
+            spectator_left(relation.spectator_account_id),
+            relation.host_fence,
+            relation.expires_at,
+            services,
+        )
     )
     wire = fellow_spectator_left(relation.spectator_account_id)
+    fellow_count = 0
     for spectator in spectators:
         if spectator.spectator_account_id != relation.spectator_account_id:
-            await _enqueue_spectator_packet(
+            fellow_count += 1
+            delivered = await _enqueue_spectator_packet(
                 spectator.spectator_account_id,
                 wire,
                 spectator.spectator_fence,
                 min(relation.expires_at, spectator.expires_at),
                 services,
             )
+            delivery_failure_count += int(not delivered)
+    log_event(
+        "INFO",
+        "stable.spectator.detach",
+        outcome="detached",
+        host_account_id=relation.host_account_id,
+        spectator_account_id=relation.spectator_account_id,
+        fellow_count=fellow_count,
+        delivery_failure_count=delivery_failure_count,
+    )
 
 
 async def _publish_spectator_frames(
@@ -989,17 +1318,40 @@ async def _publish_spectator_frames(
     context: StableRuntimeContext,
     services: StableServices,
 ) -> None:
+    started_ns = monotonic_ns()
     wire = spectate_frames(raw_data)
     try:
-        await services.realtime.publish_spectator_frame(
+        result = await services.realtime.publish_spectator_frame(
             context.identity.account_id,
             host_fence=context.realtime.fence,
             sequence=sequence,
             payload=wire,
             expires_at=context.realtime.expires_at,
         )
-    except InvalidFrame, SpectatorHostOffline, RealtimeSessionFenced, RealtimeSessionNotFound:
+    except (InvalidFrame, SpectatorHostOffline, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+        if sampled((started_ns, sequence, "spectator_frame"), services.settings.log_hot_path_sample_rate):
+            log_event(
+                "DEBUG",
+                "stable.spectator.frame_summary",
+                outcome="rejected",
+                host_account_id=context.identity.account_id,
+                frame_bytes=len(raw_data),
+                recipient_count=0,
+                error_code=error.code,
+                error_type=type(error).__name__,
+                duration_ms=duration_ms(started_ns),
+            )
         return
+    if sampled((started_ns, sequence, "spectator_frame"), services.settings.log_hot_path_sample_rate):
+        log_event(
+            "DEBUG",
+            "stable.spectator.frame_summary",
+            outcome="published",
+            host_account_id=context.identity.account_id,
+            frame_bytes=len(raw_data),
+            recipient_count=len(result.recipient_account_ids),
+            duration_ms=duration_ms(started_ns),
+        )
 
 
 async def _cant_spectate(context: StableRuntimeContext, services: StableServices) -> None:
@@ -1043,14 +1395,17 @@ async def _enqueue_spectator_packet(
     recipient_fence: SessionFence,
     expires_at: datetime,
     services: StableServices,
-) -> None:
-    with suppress(MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound):
+) -> bool:
+    try:
         await services.realtime.enqueue_mailbox(
             account_id,
             payload,
             recipient_fence=recipient_fence,
             expires_at=expires_at,
         )
+    except MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound:
+        return False
+    return True
 
 
 def _ignore_unsupported(packet: Packet) -> None:

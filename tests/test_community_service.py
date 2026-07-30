@@ -386,11 +386,18 @@ async def test_public_message_requires_authoritative_active_membership_even_with
 
 
 @pytest.mark.asyncio
-async def test_public_message_replay_with_same_deterministic_uuid_persists_and_emits_once() -> None:
+async def test_public_message_replay_with_same_deterministic_uuid_persists_and_emits_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     repository = FakeCommunityRepository()
     memberships = FakeActiveMemberships(member=True)
     service, outbox, units = _service(repository, memberships=memberships)
     client_message_id = uuid.UUID("1b0bd5bf-d560-5f6d-a90d-cf55a8c81e89")
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "perfcho.modules.community.services.log_event",
+        lambda level, event, **fields: logged.append((level, event, fields)),
+    )
 
     created = await service.send_public_message(20, "#general", client_message_id, "hello")
     replayed = await service.send_public_message(20, "#general", client_message_id, "hello")
@@ -402,6 +409,12 @@ async def test_public_message_replay_with_same_deterministic_uuid_persists_and_e
     assert memberships.member_calls == [(7, 20, INSTANT)]
     assert [event.event_type for event in outbox.events] == ["community.message-sent.v1"]
     assert all(unit.committed for unit in units)
+    assert [(level, event, fields["replayed"]) for level, event, fields in logged] == [
+        ("DEBUG", "community.message.committed", False),
+        ("DEBUG", "community.message.committed", True),
+    ]
+    assert all(fields["content_length"] == 5 for _, _, fields in logged)
+    assert all(not {"content", "channel_name", "sender_name"} & fields.keys() for _, _, fields in logged)
 
 
 @pytest.mark.asyncio

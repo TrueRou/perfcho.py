@@ -1,11 +1,11 @@
 """Adapt Stable lobby and match packets to the canonical multiplayer service."""
 
 import hashlib
-from contextlib import suppress
 from dataclasses import replace
 from typing import Protocol
 
 from perfcho.infra.composition import StableServices
+from perfcho.infra.logging import log_event, sampled
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
 from perfcho.modules.common.errors import ApplicationError
 from perfcho.modules.identity import ResolvedStableSession
@@ -152,8 +152,27 @@ async def dispatch_multiplayer_packet(
                 await multiplayer.leave_room(
                     LeaveRoom(_meta("dispose", packet_type, raw_payload, context, services), state.room.public_id)
                 )
+                log_event(
+                    "INFO",
+                    "stable.multiplayer.room_lifecycle",
+                    action="create",
+                    outcome="not_stable_visible",
+                    account_id=context.identity.account_id,
+                    room_id=state.room.public_id,
+                    participant_count=_participant_count(state),
+                )
                 return match_join_fail()
-            await _broadcast_lobby(new_match(_wire_match(state)), context.identity.account_id, services)
+            failed = await _broadcast_lobby(new_match(_wire_match(state)), context.identity.account_id, services)
+            log_event(
+                "INFO",
+                "stable.multiplayer.room_lifecycle",
+                action="created",
+                outcome="success",
+                account_id=context.identity.account_id,
+                room_id=state.room.public_id,
+                participant_count=_participant_count(state),
+                delivery_failure_count=len(failed),
+            )
             return match_join_success(_wire_match(state, password=incoming.password))
         if packet_type is ClientPacket.JOIN_MATCH:
             public_id = packet.payload.read_i32()
@@ -162,9 +181,18 @@ async def dispatch_multiplayer_packet(
             state = await multiplayer.join_room(
                 JoinRoom(_meta("join", packet_type, raw_payload, context, services), public_id, password)
             )
-            with suppress(Exception):
-                await _set_lobby_membership(context, services, joining=False)
+            await _leave_lobby_after_join(context, state, services)
             failed = await _broadcast_state(state, context.identity.account_id, services)
+            log_event(
+                "INFO",
+                "stable.multiplayer.room_lifecycle",
+                action="joined",
+                outcome="success",
+                account_id=context.identity.account_id,
+                room_id=state.room.public_id,
+                participant_count=_participant_count(state),
+                delivery_failure_count=len(failed),
+            )
             return match_join_success(_wire_match(state, password=password)) + _delivery_warning(failed)
 
         if packet_type is ClientPacket.MATCH_SCORE_UPDATE:
@@ -177,7 +205,8 @@ async def dispatch_multiplayer_packet(
             if slot is None or context.identity.account_id not in cached.round_participant_account_ids:
                 return b""
             wire = match_score_update(replace(frame, frame_id=slot.position))
-            await _broadcast_match(wire, cached, context.identity.account_id, services)
+            failed = await _broadcast_match(wire, cached, context.identity.account_id, services)
+            _log_ephemeral_state(packet_type, cached, context, services, delivery_failure_count=len(failed))
             return b""
 
         current = await multiplayer.find_room_for_account(context.identity.account_id)
@@ -202,8 +231,12 @@ async def dispatch_multiplayer_packet(
             )
             if state is None:
                 failed = await _broadcast_lobby(dispose_match(public_id), context.identity.account_id, services)
+                action = "closed"
+                participant_count = 0
             else:
                 failed = set(await _broadcast_state(state, context.identity.account_id, services))
+                action = "left"
+                participant_count = _participant_count(state)
                 if current.room.host_account_id == context.identity.account_id and not await _enqueue(
                     state.room.host_account_id,
                     match_transfer_host(),
@@ -211,15 +244,27 @@ async def dispatch_multiplayer_packet(
                     services,
                 ):
                     failed.add(state.room.host_account_id)
+            log_event(
+                "INFO",
+                "stable.multiplayer.room_lifecycle",
+                action=action,
+                outcome="success",
+                account_id=context.identity.account_id,
+                room_id=public_id,
+                participant_count=participant_count,
+                delivery_failure_count=len(failed),
+            )
             return _delivery_warning(failed)
         if packet_type is ClientPacket.MATCH_CHANGE_SLOT:
             target = packet.payload.read_i32()
             packet.payload.require_exhausted()
             state = await multiplayer.move_slot(public_id, context.identity.account_id, target)
+            _log_ephemeral_state(packet_type, state, context, services)
             return await _state_response(state, context.identity.account_id, services)
         if packet_type is ClientPacket.MATCH_READY:
             packet.payload.require_exhausted()
             state = await multiplayer.set_slot_status(public_id, context.identity.account_id, SlotStatus.READY)
+            _log_ephemeral_state(packet_type, state, context, services)
             return await _state_response(state, context.identity.account_id, services, lobby=False)
         if packet_type is ClientPacket.MATCH_LOCK:
             target = packet.payload.read_i32()
@@ -247,6 +292,7 @@ async def dispatch_multiplayer_packet(
                 state = await multiplayer.lock_slot(public_id, context.identity.account_id, target)
             else:
                 state = await multiplayer.lock_slot(public_id, context.identity.account_id, target)
+            _log_ephemeral_state(packet_type, state, context, services)
             return await _state_response(state, context.identity.account_id, services)
         if packet_type is ClientPacket.MATCH_CHANGE_SETTINGS:
             incoming = packet.payload.read_multiplayer_match()
@@ -309,6 +355,15 @@ async def dispatch_multiplayer_packet(
             wire = match_start(_wire_match(state))
             failed = set(await _broadcast_playing(wire, state, context.identity.account_id, services))
             failed.update(await _broadcast_lobby(update_match(_wire_match(state), send_password=False), None, services))
+            log_event(
+                "INFO",
+                "stable.multiplayer.round_started",
+                outcome="started",
+                account_id=context.identity.account_id,
+                room_id=state.room.public_id,
+                participant_count=len(state.round_participant_account_ids),
+                delivery_failure_count=len(failed),
+            )
             return wire + _delivery_warning(failed)
         if packet_type is ClientPacket.MATCH_COMPLETE:
             packet.payload.require_exhausted()
@@ -341,6 +396,15 @@ async def dispatch_multiplayer_packet(
                 )
             )
             failed.update(await _broadcast_state(completed, None, services))
+            log_event(
+                "INFO",
+                "stable.multiplayer.round_completed",
+                outcome="completed",
+                account_id=context.identity.account_id,
+                room_id=completed.room.public_id,
+                participant_count=len(round_accounts),
+                delivery_failure_count=len(failed),
+            )
             return wire + _delivery_warning(failed)
         if packet_type is ClientPacket.MATCH_CHANGE_MODS:
             legacy_bits = packet.payload.read_i32()
@@ -385,22 +449,27 @@ async def dispatch_multiplayer_packet(
                 )
             else:
                 return b""
+            _log_ephemeral_state(packet_type, state, context, services)
             return await _state_response(state, context.identity.account_id, services)
         if packet_type is ClientPacket.MATCH_LOAD_COMPLETE:
             packet.payload.require_exhausted()
             state = await multiplayer.mark_loaded(public_id, context.identity.account_id)
             if all(slot.loaded for slot in state.slots if slot.status is SlotStatus.PLAYING):
                 wire = match_all_players_loaded()
-                await _broadcast_match(wire, state, context.identity.account_id, services)
+                failed = await _broadcast_match(wire, state, context.identity.account_id, services)
+                _log_ephemeral_state(packet_type, state, context, services, delivery_failure_count=len(failed))
                 return wire
+            _log_ephemeral_state(packet_type, state, context, services)
             return b""
         if packet_type is ClientPacket.MATCH_NO_BEATMAP:
             packet.payload.require_exhausted()
             state = await multiplayer.set_slot_status(public_id, context.identity.account_id, SlotStatus.NO_BEATMAP)
+            _log_ephemeral_state(packet_type, state, context, services)
             return await _state_response(state, context.identity.account_id, services, lobby=False)
         if packet_type in {ClientPacket.MATCH_NOT_READY, ClientPacket.MATCH_HAS_BEATMAP}:
             packet.payload.require_exhausted()
             state = await multiplayer.set_slot_status(public_id, context.identity.account_id, SlotStatus.NOT_READY)
+            _log_ephemeral_state(packet_type, state, context, services)
             return await _state_response(state, context.identity.account_id, services, lobby=False)
         if packet_type is ClientPacket.MATCH_FAILED:
             packet.payload.require_exhausted()
@@ -409,17 +478,20 @@ async def dispatch_multiplayer_packet(
             if slot is None:
                 return b""
             wire = match_player_failed(slot.position)
-            await _broadcast_match(wire, state, context.identity.account_id, services)
+            failed = await _broadcast_match(wire, state, context.identity.account_id, services)
+            _log_ephemeral_state(packet_type, state, context, services, delivery_failure_count=len(failed))
             return wire
         if packet_type is ClientPacket.MATCH_SKIP_REQUEST:
             packet.payload.require_exhausted()
             state = await multiplayer.mark_skipped(public_id, context.identity.account_id)
             player_wire = match_player_skipped(context.identity.account_id)
-            await _broadcast_match(player_wire, state, context.identity.account_id, services)
+            failed = set(await _broadcast_match(player_wire, state, context.identity.account_id, services))
             if all(slot.skipped for slot in state.slots if slot.status is SlotStatus.PLAYING):
                 skip_wire = match_skip()
-                await _broadcast_match(skip_wire, state, context.identity.account_id, services)
+                failed.update(await _broadcast_match(skip_wire, state, context.identity.account_id, services))
+                _log_ephemeral_state(packet_type, state, context, services, delivery_failure_count=len(failed))
                 return player_wire + skip_wire
+            _log_ephemeral_state(packet_type, state, context, services, delivery_failure_count=len(failed))
             return player_wire
         if packet_type is ClientPacket.MATCH_TRANSFER_HOST:
             position = packet.payload.read_i32()
@@ -445,6 +517,13 @@ async def dispatch_multiplayer_packet(
                 )
             )
             delivered = await _enqueue(target, match_transfer_host(), state, services)
+            _log_ephemeral_state(
+                packet_type,
+                state,
+                context,
+                services,
+                delivery_failure_count=int(not delivered),
+            )
             response = await _state_response(state, context.identity.account_id, services)
             return response + _delivery_warning(() if delivered else (target,))
         if packet_type is ClientPacket.MATCH_CHANGE_TEAM:
@@ -457,6 +536,7 @@ async def dispatch_multiplayer_packet(
                 context.identity.account_id,
                 1 if slot.team == 2 else 2,
             )
+            _log_ephemeral_state(packet_type, state, context, services)
             return await _state_response(state, context.identity.account_id, services, lobby=False)
         if packet_type is ClientPacket.MATCH_INVITE:
             target_account_id = packet.payload.read_i32()
@@ -483,12 +563,30 @@ async def dispatch_multiplayer_packet(
             delivered = await _enqueue(target_account_id, wire, current, services)
             return b"" if delivered else notification("The invite could not be delivered; the room is still available.")
     except MultiplayerError as error:
+        log_event(
+            "INFO",
+            "stable.multiplayer.rejected",
+            operation=packet_type.name,
+            outcome="rejected",
+            account_id=context.identity.account_id,
+            error_code=error.code,
+            error_type=type(error).__name__,
+        )
         if packet_type in {ClientPacket.CREATE_MATCH, ClientPacket.JOIN_MATCH}:
             return match_join_fail() + notification(_failure_message(error))
         return notification(_failure_message(error))
     except ProtocolError:
         raise
-    except ValueError:
+    except ValueError as error:
+        log_event(
+            "INFO",
+            "stable.multiplayer.rejected",
+            operation=packet_type.name,
+            outcome="invalid_input",
+            account_id=context.identity.account_id,
+            error_code="stable_multiplayer_input_rejected",
+            error_type=type(error).__name__,
+        )
         if packet_type in {ClientPacket.CREATE_MATCH, ClientPacket.JOIN_MATCH}:
             return match_join_fail() + notification("The multiplayer request is invalid.")
         return notification("The multiplayer request is invalid.")
@@ -552,6 +650,39 @@ def _wire_match(state: RoomState, *, password: str | None = None) -> Multiplayer
     )
 
 
+def _participant_count(state: RoomState) -> int:
+    return sum(slot.account_id is not None for slot in state.slots)
+
+
+def _log_ephemeral_state(
+    packet_type: ClientPacket,
+    state: RoomState,
+    context: MultiplayerRuntimeContext,
+    services: StableServices,
+    *,
+    delivery_failure_count: int = 0,
+) -> None:
+    sample_key = (
+        context.realtime.session_id,
+        packet_type.value,
+        state.room.public_id,
+        state.state_revision,
+    )
+    if not sampled(sample_key, services.settings.log_hot_path_sample_rate):
+        return
+    log_event(
+        "DEBUG",
+        "stable.multiplayer.ephemeral_state",
+        outcome="updated",
+        operation=packet_type.name,
+        account_id=context.identity.account_id,
+        room_id=state.room.public_id,
+        state_revision=state.state_revision,
+        participant_count=_participant_count(state),
+        delivery_failure_count=delivery_failure_count,
+    )
+
+
 async def _state_response(
     state: RoomState,
     caller_account_id: int,
@@ -587,6 +718,7 @@ async def _broadcast_match(
     for account_id in {slot.account_id for slot in state.slots if slot.account_id is not None}:
         if account_id != excluded_account_id and not await _enqueue(account_id, payload, state, services):
             failed.add(account_id)
+    _log_broadcast_failures("match", failed, room_id=state.room.public_id)
     return frozenset(failed)
 
 
@@ -601,6 +733,7 @@ async def _broadcast_accounts(
     for account_id in account_ids:
         if account_id != excluded_account_id and not await _enqueue(account_id, payload, state, services):
             failed.add(account_id)
+    _log_broadcast_failures("round_accounts", failed, room_id=state.room.public_id)
     return frozenset(failed)
 
 
@@ -619,6 +752,7 @@ async def _broadcast_playing(
             and not await _enqueue(slot.account_id, payload, state, services)
         ):
             failed.add(slot.account_id)
+    _log_broadcast_failures("playing", failed, room_id=state.room.public_id)
     return frozenset(failed)
 
 
@@ -632,7 +766,15 @@ async def _broadcast_lobby(
     lookup_account_id = excluded_account_id or 1
     try:
         lobby = await services.community.get_public_channel_by_stable_name(lookup_account_id, "#lobby")
-    except ApplicationError:
+    except ApplicationError as error:
+        log_event(
+            "WARNING",
+            "stable.multiplayer.broadcast_failed",
+            scope="lobby_lookup",
+            failure_count=1,
+            error_code=error.code,
+            error_type=type(error).__name__,
+        )
         return frozenset()
     failed: set[int] = set()
     for account_id in await services.realtime.list_channel_members(lobby.channel_id):
@@ -650,6 +792,7 @@ async def _broadcast_lobby(
             )
         except MailboxOverflow:
             failed.add(account_id)
+    _log_broadcast_failures("lobby", failed)
     return frozenset(failed)
 
 
@@ -689,6 +832,25 @@ async def _set_lobby_membership(
             lobby.channel_id,
             session_id=context.identity.session_id,
             expected_revision=context.realtime.revision,
+        )
+
+
+async def _leave_lobby_after_join(
+    context: MultiplayerRuntimeContext,
+    state: RoomState,
+    services: StableServices,
+) -> None:
+    try:
+        await _set_lobby_membership(context, services, joining=False)
+    except Exception as error:
+        log_event(
+            "WARNING",
+            "stable.multiplayer.cleanup_failed",
+            operation="leave_lobby_after_join",
+            account_id=context.identity.account_id,
+            room_id=state.room.public_id,
+            error_code=getattr(error, "code", "cleanup_failed"),
+            error_type=type(error).__name__,
         )
 
 
@@ -768,3 +930,20 @@ def _delivery_warning(failed_account_ids: object) -> bytes:
     if not failed_account_ids:
         return b""
     return notification("A multiplayer update was deferred; affected players will recover the current room state.")
+
+
+def _log_broadcast_failures(
+    scope: str,
+    failed_account_ids: set[int],
+    *,
+    room_id: int | None = None,
+) -> None:
+    if not failed_account_ids:
+        return
+    log_event(
+        "WARNING",
+        "stable.multiplayer.broadcast_failed",
+        scope=scope,
+        room_id=room_id,
+        failure_count=len(failed_account_ids),
+    )

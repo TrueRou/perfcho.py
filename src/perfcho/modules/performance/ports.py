@@ -66,8 +66,8 @@ class PerformanceCalculationRepository(Protocol):
         retry_delay: timedelta,
         dead: bool,
         consume_attempt: bool,
-    ) -> None:
-        """Release or dead-letter a failed fenced job."""
+    ) -> bool:
+        """Release or dead-letter a failed fenced job and report whether it persisted."""
         ...
 
 

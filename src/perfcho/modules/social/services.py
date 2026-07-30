@@ -1,8 +1,10 @@
 """Provide protocol-neutral social relationship and achievement services."""
 
+import time
 import uuid
 from collections.abc import Callable, Mapping
 
+from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.normalization import normalize_stable_name
 from perfcho.modules.common.ports import Clock, OutboxWriterFactory
@@ -56,11 +58,13 @@ class SocialService:
         remark: str | None = None,
     ) -> FollowRecord:
         """Create a follow after clearing only the actor's block; preserve target blocks."""
+        started_ns = time.monotonic_ns()
         _validate_pair(actor_account_id, target_account_id)
         if remark is not None and len(remark) > 64:
             raise SocialRelationRejected("friend remark exceeds 64 characters")
         now = self._clock.now()
         low_account_id, high_account_id = sorted((actor_account_id, target_account_id))
+        removed_block = False
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
             await repository.acquire_pair_lock(actor_account_id, target_account_id)
@@ -72,6 +76,7 @@ class SocialService:
                 removed = await repository.delete_block(actor_account_id, target_account_id)
                 if not removed:
                     raise RuntimeError("the actor's block disappeared under the account-pair lock")
+                removed_block = True
                 await self._outbox_writer_factory(uow.session).append(
                     PendingEvent(
                         aggregate_type="social_pair",
@@ -86,6 +91,13 @@ class SocialService:
             previous = await repository.get_follow(actor_account_id, target_account_id)
             if previous is not None and previous.remark == remark:
                 await uow.commit()
+                if removed_block:
+                    _log_relationship_change(
+                        "unblock",
+                        actor_account_id,
+                        target_account_id,
+                        started_ns=started_ns,
+                    )
                 return previous
             follow = await repository.upsert_follow(
                 actor_account_id,
@@ -110,10 +122,24 @@ class SocialService:
                 )
             )
             await uow.commit()
+            if removed_block:
+                _log_relationship_change(
+                    "unblock",
+                    actor_account_id,
+                    target_account_id,
+                    started_ns=started_ns,
+                )
+            _log_relationship_change(
+                "follow",
+                actor_account_id,
+                target_account_id,
+                started_ns=started_ns,
+            )
             return follow
 
     async def unfollow(self, actor_account_id: int, target_account_id: int) -> bool:
         """Remove an outgoing follow idempotently under the pair lock."""
+        started_ns = time.monotonic_ns()
         _validate_pair(actor_account_id, target_account_id)
         low_account_id, high_account_id = sorted((actor_account_id, target_account_id))
         async with self._uow_factory() as uow:
@@ -133,6 +159,13 @@ class SocialService:
                     )
                 )
             await uow.commit()
+            if removed:
+                _log_relationship_change(
+                    "unfollow",
+                    actor_account_id,
+                    target_account_id,
+                    started_ns=started_ns,
+                )
             return removed
 
     async def block(
@@ -143,6 +176,7 @@ class SocialService:
         reason: str | None = None,
     ) -> BlockResult:
         """Create a block and atomically remove both conflicting follow directions."""
+        started_ns = time.monotonic_ns()
         _validate_pair(actor_account_id, target_account_id)
         if reason is not None and len(reason) > 255:
             raise SocialRelationRejected("block reason exceeds 255 characters")
@@ -183,10 +217,19 @@ class SocialService:
                     )
                 )
             await uow.commit()
+            if changed:
+                _log_relationship_change(
+                    "block",
+                    actor_account_id,
+                    target_account_id,
+                    started_ns=started_ns,
+                    removed_follow_count=removed_follow_count,
+                )
             return BlockResult(block, removed_follow_count, changed)
 
     async def unblock(self, actor_account_id: int, target_account_id: int) -> bool:
         """Remove an outgoing block idempotently under the pair lock."""
+        started_ns = time.monotonic_ns()
         _validate_pair(actor_account_id, target_account_id)
         low_account_id, high_account_id = sorted((actor_account_id, target_account_id))
         async with self._uow_factory() as uow:
@@ -206,6 +249,13 @@ class SocialService:
                     )
                 )
             await uow.commit()
+            if removed:
+                _log_relationship_change(
+                    "unblock",
+                    actor_account_id,
+                    target_account_id,
+                    started_ns=started_ns,
+                )
             return removed
 
     async def get_pair_relationship(self, first_account_id: int, second_account_id: int) -> PairRelationship:
@@ -302,6 +352,7 @@ class SocialService:
         snapshot: Mapping[str, object] | None = None,
     ) -> AchievementUnlockResult:
         """Record an achievement's first unlock without implementing detection."""
+        started_ns = time.monotonic_ns()
         _validate_account_id(account_id)
         _validate_account_id(achievement_id)
         if score_id is not None:
@@ -341,6 +392,17 @@ class SocialService:
                     )
                 )
             await uow.commit()
+            log_event(
+                "INFO" if result.created else "DEBUG",
+                "social.achievement.unlocked" if result.created else "social.achievement.replayed",
+                account_id=result.unlock.account_id,
+                achievement_id=result.unlock.achievement_id,
+                score_id=result.unlock.score_id,
+                source_event_id=str(result.unlock.source_event_id)
+                if result.unlock.source_event_id is not None
+                else None,
+                duration_ms=duration_ms(started_ns),
+            )
             return result
 
 
@@ -366,3 +428,22 @@ def _would_be_mutual(pair: PairRelationship, actor_account_id: int) -> bool:
     if actor_account_id == pair.low_account_id:
         return pair.high_follows_low
     return pair.low_follows_high
+
+
+def _log_relationship_change(
+    operation: str,
+    actor_account_id: int,
+    target_account_id: int,
+    *,
+    started_ns: int,
+    removed_follow_count: int | None = None,
+) -> None:
+    log_event(
+        "DEBUG",
+        "social.relationship.changed",
+        operation=operation,
+        actor_account_id=actor_account_id,
+        target_account_id=target_account_id,
+        removed_follow_count=removed_follow_count,
+        duration_ms=duration_ms(started_ns),
+    )

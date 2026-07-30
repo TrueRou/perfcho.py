@@ -267,6 +267,44 @@ async def test_web_credentials_require_the_matching_realtime_epoch() -> None:
     assert response.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_web_auth_rejection_log_excludes_identifier_and_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    web_module = importlib.import_module("perfcho.api.stable.router.web")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        del level
+        events.append((event, fields))
+
+    monkeypatch.setattr(web_module, "log_event", capture)
+    monkeypatch.setattr(web_module, "rate_limit", lambda key, **kwargs: True)
+    services, _, _, _ = stable_services()
+    app = stable_app(services)
+    rejected_token = "0" * 32
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.get(
+            "/web/osu-getfriends.php",
+            params={"u": "player", "h": rejected_token},
+        )
+
+    assert response.status_code == 401
+    assert events == [
+        (
+            "stable.web.auth_rejected",
+            {
+                "outcome": "rejected",
+                "error_code": "invalid_credentials",
+                "error_type": "InvalidCredentials",
+            },
+        )
+    ]
+    assert "player" not in repr(events)
+    assert rejected_token not in repr(events)
+
+
 def auth_params(*, password_name: str = "h") -> dict[str, str]:
     return {"u": "player", password_name: PASSWORD_MD5}
 

@@ -216,6 +216,8 @@ Mailbox Overflow 不可无限扩容。Spectator 通知投递会抑制单个接�
 
 ## 9. 当前已知限制
 
+- 运行日志已统一为生产 JSON/开发文本事件格式；API 请求、Worker Relay、Outbox、Performance、Stable 和迁移阶段均有生命周期与失败事件，热路径使用采样和限频。
+
 - Multiplayer 已完成 Stable 创建、加入、准备、开始、帧扇出和完成；未知或未同步谱面可联机但不会创建排名 Attempt。当前使用 Event Command ID 和自然幂等，尚未实现面向未来 Lazer 写命令的可重放 Command Receipt。
 - `ContentSyncService` 没有 Scheduler、Worker 或管理命令接线。
 - Activity、Notification、Beatmapset Sync 和 Channel Read 投影已由 Outbox Consumer 生成，但尚无 Lazer Query API、分页读取服务或全量 Rebuild。

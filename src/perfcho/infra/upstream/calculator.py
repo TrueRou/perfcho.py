@@ -3,10 +3,12 @@
 import json
 from collections.abc import Mapping
 from decimal import Decimal, DecimalException
+from time import monotonic_ns
 from typing import cast
 
 import httpx
 
+from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import JsonValue
 from perfcho.modules.performance.errors import PerformanceCalculationError
 from perfcho.modules.performance.models import (
@@ -31,8 +33,17 @@ class HttpPerformanceCalculator:
         beatmap_url: str,
     ) -> PerformanceResult:
         """Send one pure request containing a short-lived immutable Beatmap URL."""
+        started_ns = monotonic_ns()
         base_url = self._calculator_urls.get(calculation.calculator)
         if base_url is None:
+            log_event(
+                "ERROR",
+                "calculator.request.rejected",
+                job_id=str(calculation.job_id),
+                calculator=calculation.calculator,
+                release_version=calculation.release_version,
+                reason="endpoint_not_configured",
+            )
             raise PerformanceCalculationError(
                 f"calculator endpoint is not configured: {calculation.calculator}",
                 retryable=False,
@@ -58,9 +69,29 @@ class HttpPerformanceCalculator:
                 },
             )
         except httpx.HTTPError as error:
+            log_event(
+                "WARNING",
+                "calculator.request.failed",
+                job_id=str(calculation.job_id),
+                calculator=calculation.calculator,
+                release_version=calculation.release_version,
+                error_type=type(error).__name__,
+                retryable=True,
+                duration_ms=duration_ms(started_ns),
+            )
             raise PerformanceCalculationError("calculator request failed", retryable=True) from error
         if response.status_code >= 400:
             retryable = response.status_code == 429 or response.status_code >= 500
+            log_event(
+                "WARNING" if retryable else "ERROR",
+                "calculator.request.failed",
+                job_id=str(calculation.job_id),
+                calculator=calculation.calculator,
+                release_version=calculation.release_version,
+                status_code=response.status_code,
+                retryable=retryable,
+                duration_ms=duration_ms(started_ns),
+            )
             raise PerformanceCalculationError(
                 f"calculator returned HTTP {response.status_code}",
                 retryable=retryable,
@@ -80,7 +111,7 @@ class HttpPerformanceCalculator:
             performance = _mapping(payload.get("performance"), "performance")
             attributes = _mapping(difficulty.get("attributes", {}), "difficulty.attributes")
             breakdown = _mapping(performance.get("breakdown", {}), "performance.breakdown")
-            return PerformanceResult(
+            result = PerformanceResult(
                 pp=Decimal(_text(performance.get("pp"), "performance.pp")),
                 difficulty=DifficultyCalculationResult(
                     star_rating=Decimal(_text(difficulty.get("star_rating"), "difficulty.star_rating")),
@@ -90,7 +121,26 @@ class HttpPerformanceCalculator:
                 breakdown=breakdown,
             )
         except (KeyError, TypeError, ValueError, DecimalException) as error:
+            log_event(
+                "ERROR",
+                "calculator.response.invalid",
+                job_id=str(calculation.job_id),
+                calculator=calculation.calculator,
+                release_version=calculation.release_version,
+                error_type=type(error).__name__,
+                duration_ms=duration_ms(started_ns),
+            )
             raise PerformanceCalculationError("calculator returned an invalid response", retryable=False) from error
+        log_event(
+            "DEBUG",
+            "calculator.request.completed",
+            job_id=str(calculation.job_id),
+            calculator=calculation.calculator,
+            release_version=calculation.release_version,
+            status_code=response.status_code,
+            duration_ms=duration_ms(started_ns),
+        )
+        return result
 
 
 def _mapping(value: object, name: str) -> dict[str, JsonValue]:

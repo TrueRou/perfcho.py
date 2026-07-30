@@ -10,6 +10,7 @@ from decimal import Decimal
 
 import httpx
 
+from perfcho.infra.logging import duration_ms, log_event
 from perfcho.infra.settings import Settings
 from perfcho.modules.content import (
     BeatmapNotFound,
@@ -74,25 +75,44 @@ class OsuUpstreamContentSource:
 
     async def fetch_beatmapset(self, external_beatmapset_id: int) -> UpstreamBeatmapsetSnapshot:
         """Fetch and strictly normalize one complete official beatmapset."""
+        started_ns = time.monotonic_ns()
         if external_beatmapset_id < 1:
             raise ValueError("beatmapset ID must be positive")
         response = await self._authorized_get(f"{self._api_base_url}/beatmapsets/{external_beatmapset_id}")
         if response.status_code == 404:
+            _log_upstream_result("beatmapset", started_ns, status_code=404, outcome="not_found")
             raise BeatmapsetNotFound("upstream beatmapset was not found")
         if response.status_code != 200:
+            _log_upstream_result("beatmapset", started_ns, status_code=response.status_code, outcome="failed")
             raise UpstreamContentUnavailable("upstream beatmapset request failed")
         try:
             payload = _mapping(response.json(), "beatmapset")
-            return _parse_beatmapset(
+            result = _parse_beatmapset(
                 payload,
                 etag=response.headers.get("etag"),
                 last_modified=response.headers.get("last-modified"),
             )
         except (TypeError, ValueError, KeyError) as error:
+            _log_upstream_result(
+                "beatmapset",
+                started_ns,
+                status_code=response.status_code,
+                outcome="invalid_response",
+                error_type=type(error).__name__,
+            )
             raise UpstreamContentUnavailable("upstream beatmapset response is invalid") from error
+        _log_upstream_result(
+            "beatmapset",
+            started_ns,
+            status_code=response.status_code,
+            outcome="success",
+            item_count=len(result.beatmaps),
+        )
+        return result
 
     async def fetch_beatmap_file(self, external_beatmap_id: int) -> bytes:
         """Stream one official .osu body into a strictly bounded buffer."""
+        started_ns = time.monotonic_ns()
         if external_beatmap_id < 1:
             raise ValueError("beatmap ID must be positive")
         try:
@@ -101,8 +121,15 @@ class OsuUpstreamContentSource:
                 f"{self._beatmap_file_base_url}/{external_beatmap_id}",
             ) as response:
                 if response.status_code == 404:
+                    _log_upstream_result("beatmap_file", started_ns, status_code=404, outcome="not_found")
                     raise BeatmapNotFound("upstream beatmap file was not found")
                 if response.status_code != 200:
+                    _log_upstream_result(
+                        "beatmap_file",
+                        started_ns,
+                        status_code=response.status_code,
+                        outcome="failed",
+                    )
                     raise UpstreamContentUnavailable("upstream beatmap file request failed")
                 content_length = response.headers.get("content-length")
                 if content_length is not None and int(content_length) > self._max_beatmap_file_bytes:
@@ -113,7 +140,20 @@ class OsuUpstreamContentSource:
                         raise UpstreamContentUnavailable("upstream beatmap file exceeds the configured limit")
                     body.extend(chunk)
         except (httpx.HTTPError, ValueError) as error:
+            _log_upstream_result(
+                "beatmap_file",
+                started_ns,
+                outcome="failed",
+                error_type=type(error).__name__,
+            )
             raise UpstreamContentUnavailable("upstream beatmap file request failed") from error
+        _log_upstream_result(
+            "beatmap_file",
+            started_ns,
+            status_code=200,
+            outcome="success",
+            size_bytes=len(body),
+        )
         return bytes(body)
 
     async def _authorized_get(self, url: str) -> httpx.Response:
@@ -147,18 +187,54 @@ class OsuUpstreamContentSource:
                     },
                 )
             except httpx.HTTPError as error:
+                log_event(
+                    "WARNING",
+                    "upstream.osu.oauth.failed",
+                    error_type=type(error).__name__,
+                )
                 raise UpstreamContentUnavailable("osu! OAuth token request failed") from error
             if response.status_code != 200:
+                log_event("WARNING", "upstream.osu.oauth.failed", status_code=response.status_code)
                 raise UpstreamContentUnavailable("osu! OAuth token request failed")
             try:
                 payload = _mapping(response.json(), "OAuth token")
                 token = _string(payload, "access_token")
                 expires_in = _integer(payload, "expires_in")
             except (TypeError, ValueError, KeyError) as error:
+                log_event(
+                    "ERROR",
+                    "upstream.osu.oauth.invalid_response",
+                    error_type=type(error).__name__,
+                )
                 raise UpstreamContentUnavailable("osu! OAuth token response is invalid") from error
             self._token = token
             self._token_expires_at = time.monotonic() + max(1, expires_in - 30)
             return token
+
+
+def _log_upstream_result(
+    operation: str,
+    started_ns: int,
+    *,
+    outcome: str,
+    status_code: int | None = None,
+    error_type: str | None = None,
+    item_count: int | None = None,
+    size_bytes: int | None = None,
+) -> None:
+    """Emit allow-listed upstream result fields without content metadata."""
+    level = "DEBUG" if outcome in {"success", "not_found"} else "WARNING"
+    log_event(
+        level,
+        "upstream.osu.request.completed",
+        operation=operation,
+        outcome=outcome,
+        status_code=status_code,
+        error_type=error_type,
+        item_count=item_count,
+        size_bytes=size_bytes,
+        duration_ms=duration_ms(started_ns),
+    )
 
 
 def _parse_beatmapset(

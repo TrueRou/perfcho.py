@@ -3,13 +3,15 @@
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from time import monotonic_ns
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.base import DbSessionFactory
 from perfcho.infra.db.enums import CalculationJobStatus
 from perfcho.infra.db.models.scoring import PerformanceCalculationJob
+from perfcho.infra.logging import duration_ms, log_event
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +45,8 @@ class SqlAlchemyPerformanceJobRelayStore:
 
     async def claim(self, owner: str) -> tuple[PerformanceJobReference, ...]:
         """Lease a bounded batch of pending or abandoned calculation jobs."""
+        started_ns = monotonic_ns()
+        dead_count = 0
         async with self._session_factory.begin() as session:
             now = await _database_now(session)
             claimable = or_(
@@ -52,17 +56,20 @@ class SqlAlchemyPerformanceJobRelayStore:
                     PerformanceCalculationJob.lease_expires_at <= now,
                 ),
             )
-            await session.execute(
-                update(PerformanceCalculationJob)
-                .where(claimable, PerformanceCalculationJob.attempt_count >= self._max_attempts)
-                .values(
-                    status=CalculationJobStatus.DEAD,
-                    dead_lettered_at=now,
-                    lease_owner=None,
-                    lease_token=None,
-                    lease_expires_at=None,
+            exhausted = tuple(
+                await session.scalars(
+                    select(PerformanceCalculationJob)
+                    .where(claimable, PerformanceCalculationJob.attempt_count >= self._max_attempts)
+                    .order_by(PerformanceCalculationJob.available_at, PerformanceCalculationJob.created_at)
+                    .limit(self._batch_size)
+                    .with_for_update(skip_locked=True)
                 )
             )
+            for job in exhausted:
+                job.status = CalculationJobStatus.DEAD
+                job.dead_lettered_at = now
+                _clear_job_lease(job)
+            dead_count = len(exhausted)
             jobs = tuple(
                 await session.scalars(
                     select(PerformanceCalculationJob)
@@ -89,7 +96,17 @@ class SqlAlchemyPerformanceJobRelayStore:
                 job.broker_task_id = None
                 job.enqueue_count += 1
                 references.append(PerformanceJobReference(job.id, lease_token))
-            return tuple(references)
+        if dead_count:
+            log_event(
+                "ERROR",
+                "performance.calculation.dead",
+                failure_count=dead_count,
+                phase="relay",
+                maximum_attempts=self._max_attempts,
+                reason="attempts_exhausted",
+                duration_ms=duration_ms(started_ns),
+            )
+        return tuple(references)
 
     async def mark_enqueued(
         self,

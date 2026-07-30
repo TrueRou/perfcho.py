@@ -116,10 +116,11 @@ class FakeRepository:
         self.calls = calls
         self.record: ScoreAcceptanceRecord | None = None
         self.attempt_id = uuid.uuid7()
+        self.acceptance_claim = AcceptanceClaim()
 
     async def claim_acceptance(self, **kwargs: object) -> AcceptanceClaim:
         self.calls.append("claim-acceptance")
-        return AcceptanceClaim()
+        return self.acceptance_claim
 
     async def resolve_current_revision(self, reference: BeatmapReference) -> BeatmapRevisionInfo:
         self.calls.append("revision")
@@ -234,7 +235,9 @@ def command() -> AcceptScore:
 
 
 @pytest.mark.asyncio
-async def test_scoring_service_persists_validated_facts_and_event_in_one_transaction() -> None:
+async def test_scoring_service_persists_validated_facts_and_event_in_one_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[str] = []
     repository = FakeRepository(calls)
     account = FakeAccountValidator(calls)
@@ -255,6 +258,11 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
         lambda session: FakeTaskScheduler(calls),
         cast(Clock, FixedClock()),
         cast(IdGenerator, FakeIds()),
+    )
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "perfcho.modules.scoring.services.log_event",
+        lambda level, event, **fields: logged.append((level, event, fields)),
     )
 
     result = await service.accept(command())
@@ -281,6 +289,42 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
     assert outbox.events[0].event_type == "score.accepted.v1"
     assert outbox.events[0].payload["country_code"] == "JP"
     assert "performance_release_ids" not in outbox.events[0].payload
+    assert logged[0][:2] == ("INFO", "scoring.score.accepted")
+    assert logged[0][2]["score_id"] == 40
+    assert not {"replay", "checksum", "facts", "request_digest"} & logged[0][2].keys()
+
+
+@pytest.mark.asyncio
+async def test_scoring_replay_logs_only_stable_ids_at_debug(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    repository = FakeRepository(calls)
+    prior = AcceptedScoreResult(repository.attempt_id, 40, 10, 20, 1, 30, ScoreOutcome.PASSED)
+    repository.acceptance_claim = AcceptanceClaim(prior)
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "perfcho.modules.scoring.services.log_event",
+        lambda level, event, **fields: logged.append((level, event, fields)),
+    )
+
+    def uow_factory() -> FakeUnitOfWork:
+        return FakeUnitOfWork(calls)
+
+    service = ScoringService(
+        uow_factory,
+        lambda session: cast(ScoringRepository, repository),
+        lambda session: FakeOutbox(calls),
+        lambda session: FakeAccountValidator(calls),
+        lambda session: FakeMultiplayerValidator(),
+        lambda session: FakeTaskScheduler(calls),
+        cast(Clock, FixedClock()),
+        cast(IdGenerator, FakeIds()),
+    )
+
+    assert await service.accept(command()) is prior
+
+    assert logged[0][:2] == ("DEBUG", "scoring.score.replayed")
+    assert logged[0][2]["attempt_id"] == str(prior.attempt_id)
+    assert not {"replay", "checksum", "facts", "request_digest"} & logged[0][2].keys()
 
 
 def test_score_validation_enforces_object_count_and_vanilla_combo_bounds() -> None:

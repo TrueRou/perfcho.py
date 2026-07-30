@@ -5,6 +5,7 @@ from typing import Annotated, cast
 
 from taskiq import Context, TaskiqDepends
 
+from perfcho.infra.logging import log_event
 from perfcho.infra.taskiq import broker
 from perfcho.modules.performance.services import PerformanceCalculationService
 
@@ -16,5 +17,34 @@ async def calculate_performance(
     context: Annotated[Context, TaskiqDepends()],
 ) -> None:
     """Run one fenced calculation through short database phases."""
-    service = cast(PerformanceCalculationService, context.state.performance_calculation_service)
-    await service.execute(uuid.UUID(job_id), uuid.UUID(lease_token))
+    parsed_job_id: uuid.UUID | None = None
+    try:
+        parsed_job_id = uuid.UUID(job_id)
+        parsed_lease_token = uuid.UUID(lease_token)
+    except (AttributeError, TypeError, ValueError) as error:
+        if parsed_job_id is None:
+            log_event(
+                "ERROR",
+                "task.performance_calculation.malformed_payload",
+                error_type=type(error).__name__,
+            )
+        else:
+            log_event(
+                "ERROR",
+                "task.performance_calculation.malformed_payload",
+                job_id=str(parsed_job_id),
+                error_type=type(error).__name__,
+            )
+        raise
+
+    try:
+        service = cast(PerformanceCalculationService, context.state.performance_calculation_service)
+        await service.execute(parsed_job_id, parsed_lease_token)
+    except Exception as error:
+        log_event(
+            "ERROR",
+            "task.performance_calculation.failed",
+            job_id=str(parsed_job_id),
+            error_type=type(error).__name__,
+        )
+        raise

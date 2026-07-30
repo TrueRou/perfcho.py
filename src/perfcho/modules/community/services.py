@@ -1,10 +1,12 @@
 """Provide protocol-neutral durable channel and messaging services."""
 
+import time
 import uuid
 from collections.abc import Callable
 from datetime import datetime
 from math import ceil
 
+from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.authorization.models import EffectiveAuthorization
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import Clock, OutboxWriterFactory
@@ -129,6 +131,7 @@ class CommunityService:
         second_account_id: int,
     ) -> DirectConversationResult:
         """Create or return the unique durable channel for an ordered account pair."""
+        started_ns = time.monotonic_ns()
         _validate_pair(first_account_id, second_account_id)
         now = self._clock.now()
         low_account_id, high_account_id = sorted((first_account_id, second_account_id))
@@ -145,6 +148,8 @@ class CommunityService:
             if conversation.created:
                 await self._append_conversation_event(uow.session, conversation)
             await uow.commit()
+            if conversation.created:
+                _log_conversation_change(conversation, started_ns=started_ns)
             return conversation
 
     async def send_public_message(
@@ -158,6 +163,7 @@ class CommunityService:
         reply_to_id: int | None = None,
     ) -> MessageResult:
         """Authorize and durably send one idempotent public-channel message."""
+        started_ns = time.monotonic_ns()
         _validate_account_id(sender_account_id)
         _validate_client_message_id(client_message_id)
         if reply_to_id is not None:
@@ -173,7 +179,9 @@ class CommunityService:
             if previous is not None:
                 _require_exact_message(previous, channel.channel_id, content, is_action, reply_to_id, None)
                 await uow.commit()
-                return _as_replay(previous)
+                replay = _as_replay(previous)
+                _log_message(replay, started_ns=started_ns)
+                return replay
             _validate_message_content(content, channel.message_length_limit)
             authorization = await self._authorization_repository_factory(uow.session).get_effective(
                 sender_account_id,
@@ -204,6 +212,7 @@ class CommunityService:
             if message.created:
                 await self._append_message_event(uow.session, message)
             await uow.commit()
+            _log_message(message, started_ns=started_ns)
             return message
 
     async def send_direct_message(
@@ -217,6 +226,7 @@ class CommunityService:
         reply_to_id: int | None = None,
     ) -> MessageResult:
         """Apply blocks, PM policy, silence, and idempotency before a durable DM."""
+        started_ns = time.monotonic_ns()
         _validate_pair(sender_account_id, recipient_account_id)
         _validate_client_message_id(client_message_id)
         if reply_to_id is not None:
@@ -238,7 +248,9 @@ class CommunityService:
                     reply_to_id,
                 )
                 await uow.commit()
-                return _as_replay(previous)
+                replay = _as_replay(previous)
+                _log_message(replay, started_ns=started_ns)
+                return replay
             _enforce_direct_message_context(context, sender_account_id, recipient_account_id)
             await self._require_target_not_silenced(uow.session, recipient_account_id, now)
             authorization = await self._authorization_repository_factory(uow.session).get_effective(
@@ -282,6 +294,9 @@ class CommunityService:
             if message.created:
                 await self._append_message_event(uow.session, message)
             await uow.commit()
+            if conversation.created:
+                _log_conversation_change(conversation, started_ns=started_ns)
+            _log_message(message, started_ns=started_ns)
             return message
 
     async def mark_read(self, account_id: int, channel_id: int, message_id: int) -> ReadCursorResult:
@@ -451,6 +466,7 @@ class CommunityService:
 
     async def set_private_message_policy(self, account_id: int, policy: str) -> str:
         """Set whether direct messages are accepted from all users or outgoing follows."""
+        started_ns = time.monotonic_ns()
         _validate_account_id(account_id)
         if policy not in {"all", "friends"}:
             raise CommunityInputRejected("private message policy must be all or friends")
@@ -461,6 +477,13 @@ class CommunityService:
                 now=self._clock.now(),
             )
             await uow.commit()
+            log_event(
+                "DEBUG",
+                "community.message_policy.changed",
+                account_id=account_id,
+                policy=result,
+                duration_ms=duration_ms(started_ns),
+            )
             return result
 
     async def join_channel(self, account_id: int, channel_id: int) -> ChannelMembershipResult:
@@ -478,6 +501,7 @@ class CommunityService:
         *,
         joining: bool,
     ) -> ChannelMembershipResult:
+        started_ns = time.monotonic_ns()
         _validate_account_id(account_id)
         _validate_account_id(channel_id)
         now = self._clock.now()
@@ -520,7 +544,17 @@ class CommunityService:
                         )
                     )
             await uow.commit()
-            return ChannelMembershipResult(channel_id, account_id, joining, durable, changed)
+            result = ChannelMembershipResult(channel_id, account_id, joining, durable, changed)
+            if durable and changed:
+                log_event(
+                    "DEBUG",
+                    "community.membership.changed",
+                    channel_id=channel_id,
+                    account_id=account_id,
+                    joined=joining,
+                    duration_ms=duration_ms(started_ns),
+                )
+            return result
 
     async def _require_not_silenced(
         self,
@@ -768,3 +802,30 @@ def _validate_pair(first_account_id: int, second_account_id: int) -> None:
     _validate_account_id(second_account_id)
     if first_account_id == second_account_id:
         raise CommunityInputRejected("direct-conversation accounts must be distinct")
+
+
+def _log_conversation_change(result: DirectConversationResult, *, started_ns: int) -> None:
+    log_event(
+        "DEBUG",
+        "community.conversation.created",
+        channel_id=result.channel_id,
+        low_account_id=result.low_account_id,
+        high_account_id=result.high_account_id,
+        duration_ms=duration_ms(started_ns),
+    )
+
+
+def _log_message(message: MessageResult, *, started_ns: int) -> None:
+    log_event(
+        "DEBUG",
+        "community.message.committed",
+        message_id=message.message_id,
+        channel_id=message.channel_id,
+        sender_account_id=message.sender_account_id,
+        direct_recipient_account_id=message.direct_recipient_account_id,
+        client_message_id=str(message.client_message_id),
+        reply_to_id=message.reply_to_id,
+        content_length=len(message.content),
+        replayed=not message.created,
+        duration_ms=duration_ms(started_ns),
+    )

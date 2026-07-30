@@ -31,10 +31,12 @@ from perfcho.infra.db.models.core import MediaAsset
 from perfcho.modules.common import StoredObject
 from tools.bancho_migration.domains.common import complete_phase, run_batched_phase, run_single_phase
 from tools.bancho_migration.models import DiagnosticSeverity, MigrationRuntime, SourceRow
+from tools.bancho_migration.observability import PhaseObserver
 from tools.bancho_migration.state import MigrationCheckpoint, next_checkpoint
 from tools.bancho_migration.storage import (
     BeatmapFileMetadata,
     MigrationStorageError,
+    ObjectUploadFailed,
     read_beatmap_file,
     upload_beatmap_file,
 )
@@ -131,107 +133,135 @@ async def _migrate_sources(runtime: MigrationRuntime) -> None:
 
 
 async def _migrate_mapsets(runtime: MigrationRuntime) -> None:
-    checkpoint = await _checkpoint(runtime)
-    if _PHASE_MAPSETS in checkpoint.completed_phases:
-        runtime.report.increment(_PHASE_MAPSETS, "resumed_complete", 0)
-        return
-    cursor = checkpoint.cursor if checkpoint.phase == _PHASE_MAPSETS else 0
-    for rows in runtime.source.iter_batches(
-        "mapsets",
-        key="id",
-        batch_size=runtime.config.batch_size,
-        start_after=cursor,
-    ):
-        prepared: list[tuple[int, _SetMetadata]] = []
-        for row in rows:
-            source_set_id = _positive(row, "id")
-            try:
-                server = _source_server(row["server"])
-                maps = runtime.source.fetch_all(
-                    "maps",
-                    where="`server` = %s AND `set_id` = %s",
-                    parameters=(server, source_set_id),
-                    order_by=("last_update DESC", "id DESC"),
-                )
-                prepared.append((source_set_id, _derive_set_metadata(runtime, row, maps)))
-            except ValueError as error:
-                _diagnose(runtime, _PHASE_MAPSETS, "mapset_invalid", error, "mapset", source_set_id)
-
-        mapped: list[tuple[int, int]] = []
-        async with runtime.session_factory.begin() as session:
-            for source_set_id, metadata in prepared:
+    with PhaseObserver(runtime, _PHASE_MAPSETS) as observer:
+        checkpoint = await _checkpoint(runtime)
+        if _PHASE_MAPSETS in checkpoint.completed_phases:
+            runtime.report.increment(_PHASE_MAPSETS, "resumed_complete", 0)
+            observer.skipped()
+            return
+        cursor = checkpoint.cursor if checkpoint.phase == _PHASE_MAPSETS else 0
+        for rows in runtime.source.iter_batches(
+            "mapsets",
+            key="id",
+            batch_size=runtime.config.batch_size,
+            start_after=cursor,
+        ):
+            snapshot = runtime.report.snapshot()
+            prepared: list[tuple[int, _SetMetadata]] = []
+            for row in rows:
+                source_set_id = _positive(row, "id")
                 try:
-                    async with session.begin_nested():
-                        target_set_id, created = await _persist_mapset(session, metadata)
-                except IntegrityError as error:
-                    _diagnose(runtime, _PHASE_MAPSETS, "mapset_target_conflict", error, "mapset", source_set_id)
-                    continue
-                mapped.append((source_set_id, target_set_id))
-                runtime.report.increment(_PHASE_MAPSETS, "inserted" if created else "target_reused")
-            cursor = int(rows[-1]["id"])
-            checkpoint = next_checkpoint(checkpoint, phase=_PHASE_MAPSETS, cursor=cursor)
-            await runtime.state.save(session, checkpoint)
-        runtime.mappings.beatmapsets.update(mapped)
-        runtime.report.write(runtime.config.report_path)
-    await complete_phase(runtime, checkpoint, _PHASE_MAPSETS)
+                    server = _source_server(row["server"])
+                    maps = runtime.source.fetch_all(
+                        "maps",
+                        where="`server` = %s AND `set_id` = %s",
+                        parameters=(server, source_set_id),
+                        order_by=("last_update DESC", "id DESC"),
+                    )
+                    prepared.append((source_set_id, _derive_set_metadata(runtime, row, maps)))
+                except ValueError as error:
+                    _diagnose(runtime, _PHASE_MAPSETS, "mapset_invalid", error, "mapset", source_set_id)
+
+            mapped: list[tuple[int, int]] = []
+            try:
+                async with runtime.session_factory.begin() as session:
+                    for source_set_id, metadata in prepared:
+                        try:
+                            async with session.begin_nested():
+                                target_set_id, created = await _persist_mapset(session, metadata)
+                        except IntegrityError as error:
+                            _diagnose(
+                                runtime,
+                                _PHASE_MAPSETS,
+                                "mapset_target_conflict",
+                                error,
+                                "mapset",
+                                source_set_id,
+                            )
+                            continue
+                        mapped.append((source_set_id, target_set_id))
+                        runtime.report.increment(_PHASE_MAPSETS, "inserted" if created else "target_reused")
+                    cursor = int(rows[-1]["id"])
+                    checkpoint = next_checkpoint(checkpoint, phase=_PHASE_MAPSETS, cursor=cursor)
+                    await runtime.state.save(session, checkpoint)
+            except BaseException:
+                runtime.report.restore(snapshot)
+                raise
+            runtime.mappings.beatmapsets.update(mapped)
+            observer.batch_committed(len(rows))
+            runtime.report.write(runtime.config.report_path)
+        await complete_phase(runtime, checkpoint, _PHASE_MAPSETS)
 
 
 async def _migrate_maps(runtime: MigrationRuntime) -> None:
-    checkpoint = await _checkpoint(runtime)
-    if _PHASE_MAPS in checkpoint.completed_phases:
-        runtime.report.increment(_PHASE_MAPS, "resumed_complete", 0)
-        return
-    cursor = checkpoint.cursor if checkpoint.phase == _PHASE_MAPS else 0
-    object_storage = runtime.object_storage
-    assert object_storage is not None
-    for rows in runtime.source.iter_batches(
-        "maps",
-        key="id",
-        batch_size=runtime.config.batch_size,
-        start_after=cursor,
-    ):
-        staged: list[_StagedMap] = []
-        for row in rows:
-            source_map_id = _positive(row, "id")
-            source_set_id = _positive(row, "set_id")
-            target_set_id = runtime.mappings.beatmapsets.get(source_set_id)
-            if target_set_id is None:
-                _dependency_missing(runtime, _PHASE_MAPS, "map", source_map_id, "mapset", source_set_id)
-                continue
-            try:
-                source_code = _source_code(row["server"])
-                file_metadata = read_beatmap_file(runtime.config.data_directory, source_map_id, row["md5"])
-                stored = await upload_beatmap_file(
-                    object_storage,
-                    file_metadata,
-                    source_code=source_code,
-                    beatmapset_id=source_set_id,
-                    beatmap_id=source_map_id,
-                )
-                staged.append(_stage_map(runtime, row, target_set_id, source_code, file_metadata, stored))
-            except (MigrationStorageError, KeyError, TypeError, ValueError) as error:
-                _diagnose(runtime, _PHASE_MAPS, "map_file_invalid", error, "map", source_map_id)
-                runtime.report.increment(_PHASE_MAPS, "skipped_file")
-
-        mapped: list[tuple[int, int, str, int]] = []
-        async with runtime.session_factory.begin() as session:
-            for item in staged:
-                try:
-                    async with session.begin_nested():
-                        beatmap_id, revision_id, outcome = await _persist_map(runtime, session, item)
-                except IntegrityError as error:
-                    _diagnose(runtime, _PHASE_MAPS, "map_target_conflict", error, "map", item.source_id)
+    with PhaseObserver(runtime, _PHASE_MAPS) as observer:
+        checkpoint = await _checkpoint(runtime)
+        if _PHASE_MAPS in checkpoint.completed_phases:
+            runtime.report.increment(_PHASE_MAPS, "resumed_complete", 0)
+            observer.skipped()
+            return
+        cursor = checkpoint.cursor if checkpoint.phase == _PHASE_MAPS else 0
+        object_storage = runtime.object_storage
+        assert object_storage is not None
+        for rows in runtime.source.iter_batches(
+            "maps",
+            key="id",
+            batch_size=runtime.config.batch_size,
+            start_after=cursor,
+        ):
+            snapshot = runtime.report.snapshot()
+            staged: list[_StagedMap] = []
+            for row in rows:
+                source_map_id = _positive(row, "id")
+                source_set_id = _positive(row, "set_id")
+                target_set_id = runtime.mappings.beatmapsets.get(source_set_id)
+                if target_set_id is None:
+                    _dependency_missing(runtime, _PHASE_MAPS, "map", source_map_id, "mapset", source_set_id)
                     continue
-                mapped.append((item.source_id, beatmap_id, item.file.md5.hex(), revision_id))
-                runtime.report.increment(_PHASE_MAPS, outcome)
-            cursor = int(rows[-1]["id"])
-            checkpoint = next_checkpoint(checkpoint, phase=_PHASE_MAPS, cursor=cursor)
-            await runtime.state.save(session, checkpoint)
-        for source_map_id, beatmap_id, md5, revision_id in mapped:
-            runtime.mappings.beatmaps[source_map_id] = beatmap_id
-            runtime.mappings.revisions_by_md5[md5] = revision_id
-        runtime.report.write(runtime.config.report_path)
-    await complete_phase(runtime, checkpoint, _PHASE_MAPS)
+                try:
+                    source_code = _source_code(row["server"])
+                    file_metadata = read_beatmap_file(runtime.config.data_directory, source_map_id, row["md5"])
+                    stored = await upload_beatmap_file(
+                        object_storage,
+                        file_metadata,
+                        source_code=source_code,
+                        beatmapset_id=source_set_id,
+                        beatmap_id=source_map_id,
+                        invocation_id=runtime.report.invocation_id,
+                        migration_id=runtime.config.migration_id,
+                    )
+                    staged.append(_stage_map(runtime, row, target_set_id, source_code, file_metadata, stored))
+                except ObjectUploadFailed:
+                    runtime.report.restore(snapshot)
+                    raise
+                except (MigrationStorageError, KeyError, TypeError, ValueError) as error:
+                    _diagnose(runtime, _PHASE_MAPS, "map_file_invalid", error, "map", source_map_id)
+                    runtime.report.increment(_PHASE_MAPS, "skipped_file")
+
+            mapped: list[tuple[int, int, str, int]] = []
+            try:
+                async with runtime.session_factory.begin() as session:
+                    for item in staged:
+                        try:
+                            async with session.begin_nested():
+                                beatmap_id, revision_id, outcome = await _persist_map(runtime, session, item)
+                        except IntegrityError as error:
+                            _diagnose(runtime, _PHASE_MAPS, "map_target_conflict", error, "map", item.source_id)
+                            continue
+                        mapped.append((item.source_id, beatmap_id, item.file.md5.hex(), revision_id))
+                        runtime.report.increment(_PHASE_MAPS, outcome)
+                    cursor = int(rows[-1]["id"])
+                    checkpoint = next_checkpoint(checkpoint, phase=_PHASE_MAPS, cursor=cursor)
+                    await runtime.state.save(session, checkpoint)
+            except BaseException:
+                runtime.report.restore(snapshot)
+                raise
+            for source_map_id, beatmap_id, md5, revision_id in mapped:
+                runtime.mappings.beatmaps[source_map_id] = beatmap_id
+                runtime.mappings.revisions_by_md5[md5] = revision_id
+            observer.batch_committed(len(rows))
+            runtime.report.write(runtime.config.report_path)
+        await complete_phase(runtime, checkpoint, _PHASE_MAPS)
 
 
 async def _migrate_favourites(runtime: MigrationRuntime) -> None:
@@ -722,33 +752,41 @@ async def _run_rows_by_account(
     order_by: Sequence[str],
     handler: _RowsHandler,
 ) -> None:
-    checkpoint = await _checkpoint(runtime)
-    if phase in checkpoint.completed_phases:
-        runtime.report.increment(phase, "resumed_complete", 0)
-        return
-    cursor = checkpoint.cursor if checkpoint.phase == phase else 0
-    for accounts in runtime.source.iter_batches(
-        "users",
-        key="id",
-        batch_size=runtime.config.batch_size,
-        start_after=cursor,
-        columns=("id",),
-    ):
-        source_ids = [_positive(row, "id") for row in accounts]
-        placeholders = ", ".join("%s" for _ in source_ids)
-        rows = runtime.source.fetch_all(
-            table,
-            where=f"`userid` IN ({placeholders})",
-            parameters=source_ids,
-            order_by=order_by,
-        )
-        async with runtime.session_factory.begin() as session:
-            await handler(session, rows)
-            cursor = source_ids[-1]
-            checkpoint = next_checkpoint(checkpoint, phase=phase, cursor=cursor)
-            await runtime.state.save(session, checkpoint)
-        runtime.report.write(runtime.config.report_path)
-    await complete_phase(runtime, checkpoint, phase)
+    with PhaseObserver(runtime, phase) as observer:
+        checkpoint = await _checkpoint(runtime)
+        if phase in checkpoint.completed_phases:
+            runtime.report.increment(phase, "resumed_complete", 0)
+            observer.skipped()
+            return
+        cursor = checkpoint.cursor if checkpoint.phase == phase else 0
+        for accounts in runtime.source.iter_batches(
+            "users",
+            key="id",
+            batch_size=runtime.config.batch_size,
+            start_after=cursor,
+            columns=("id",),
+        ):
+            source_ids = [_positive(row, "id") for row in accounts]
+            placeholders = ", ".join("%s" for _ in source_ids)
+            rows = runtime.source.fetch_all(
+                table,
+                where=f"`userid` IN ({placeholders})",
+                parameters=source_ids,
+                order_by=order_by,
+            )
+            snapshot = runtime.report.snapshot()
+            try:
+                async with runtime.session_factory.begin() as session:
+                    await handler(session, rows)
+                    cursor = source_ids[-1]
+                    checkpoint = next_checkpoint(checkpoint, phase=phase, cursor=cursor)
+                    await runtime.state.save(session, checkpoint)
+            except BaseException:
+                runtime.report.restore(snapshot)
+                raise
+            observer.batch_committed(len(rows))
+            runtime.report.write(runtime.config.report_path)
+        await complete_phase(runtime, checkpoint, phase)
 
 
 async def _checkpoint(runtime: MigrationRuntime) -> MigrationCheckpoint:
