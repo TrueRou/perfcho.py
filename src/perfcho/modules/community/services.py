@@ -3,6 +3,7 @@
 import uuid
 from collections.abc import Callable
 from datetime import datetime
+from math import ceil
 
 from perfcho.modules.authorization.models import EffectiveAuthorization
 from perfcho.modules.common.models import PendingEvent
@@ -10,6 +11,7 @@ from perfcho.modules.common.ports import Clock
 from perfcho.modules.community.errors import (
     AccountSilenced,
     ChannelAccessDenied,
+    ChannelMembershipUnavailable,
     ChannelNotFound,
     CommunityInputRejected,
     DirectMessageBlocked,
@@ -17,19 +19,23 @@ from perfcho.modules.community.errors import (
     MessageIdempotencyConflict,
     MessageNotFound,
     PrivateMessageRejected,
+    TargetAccountSilenced,
 )
 from perfcho.modules.community.models import (
     ChannelMembershipResult,
     ChannelPermissions,
     ChannelRecord,
+    ConversationReadCursor,
     DirectConversationResult,
     DirectMessageContext,
     MessageResult,
     OfflineDirectMessage,
+    OfflineDirectMessagePage,
     ReadCursorResult,
     StableChannel,
 )
 from perfcho.modules.community.ports import (
+    ActiveChannelMembershipQuery,
     ActiveSilencePolicyFactory,
     AuthorizationRepositoryFactory,
     CommunityOutboxWriterFactory,
@@ -54,6 +60,7 @@ class CommunityService:
         silence_policy_factory: ActiveSilencePolicyFactory,
         outbox_writer_factory: CommunityOutboxWriterFactory,
         clock: Clock,
+        active_memberships: ActiveChannelMembershipQuery | None = None,
     ) -> None:
         """Bind transaction, persistence, policy, event, and time dependencies."""
         self._uow_factory = uow_factory
@@ -62,6 +69,7 @@ class CommunityService:
         self._silence_policy_factory = silence_policy_factory
         self._outbox_writer_factory = outbox_writer_factory
         self._clock = clock
+        self._active_memberships = active_memberships
 
     async def list_public_channels(self, account_id: int) -> tuple[StableChannel, ...]:
         """Return active public channels readable by current canonical authorization."""
@@ -175,6 +183,13 @@ class CommunityService:
             permissions = _evaluate_permissions(channel, sender_account_id, authorization)
             if not permissions.can_write:
                 raise ChannelAccessDenied("channel is not writable")
+            active_memberships = self._require_active_memberships()
+            if not await active_memberships.is_active_member(
+                channel.channel_id,
+                sender_account_id,
+                at=now,
+            ):
+                raise ChannelAccessDenied("sender is not an active channel member")
             await self._require_not_silenced(uow.session, sender_account_id, channel.channel_id, now)
             await _require_reply_target(repository, channel.channel_id, reply_to_id)
             message = await repository.insert_message(
@@ -225,7 +240,8 @@ class CommunityService:
                 )
                 await uow.commit()
                 return _as_replay(previous)
-            _enforce_direct_message_context(context)
+            _enforce_direct_message_context(context, sender_account_id, recipient_account_id)
+            await self._require_target_not_silenced(uow.session, recipient_account_id, now)
             authorization = await self._authorization_repository_factory(uow.session).get_effective(
                 sender_account_id,
                 at=now,
@@ -303,15 +319,139 @@ class CommunityService:
         *,
         limit: int = 100,
     ) -> tuple[OfflineDirectMessage, ...]:
-        """Return unread incoming direct messages for ordered Stable delivery."""
+        """Return the first unread incoming direct-message page for legacy callers."""
+        page = await self.list_unread_offline_direct_message_page(account_id, limit=limit)
+        return page.messages
+
+    async def list_unread_offline_direct_message_page(
+        self,
+        account_id: int,
+        *,
+        after_message_id: int | None = None,
+        limit: int = 100,
+    ) -> OfflineDirectMessagePage:
+        """Return an ascending keyset page that can continue beyond Stable's first batch."""
         _validate_account_id(account_id)
+        if after_message_id is not None:
+            _validate_account_id(after_message_id)
         if isinstance(limit, bool) or not 1 <= limit <= 500:
             raise CommunityInputRejected("offline direct-message limit must be between 1 and 500")
         async with self._uow_factory() as uow:
-            return await self._repository_factory(uow.session).list_unread_direct_messages(account_id, limit=limit)
+            messages = await self._repository_factory(uow.session).list_unread_direct_messages(
+                account_id,
+                after_message_id=after_message_id,
+                limit=limit + 1,
+            )
+        page_messages = messages[:limit]
+        next_after_message_id = page_messages[-1].message_id if len(messages) > limit else None
+        return OfflineDirectMessagePage(page_messages, next_after_message_id)
+
+    async def mark_direct_messages_read(
+        self,
+        account_id: int,
+        cursors: tuple[ConversationReadCursor, ...],
+    ) -> tuple[ReadCursorResult, ...]:
+        """Atomically advance delivered Stable mail to one cursor per direct conversation."""
+        _validate_account_id(account_id)
+        if not isinstance(cursors, tuple) or any(not isinstance(cursor, ConversationReadCursor) for cursor in cursors):
+            raise CommunityInputRejected("direct-message cursors must be a tuple of conversation cursors")
+        if len(cursors) > 500:
+            raise CommunityInputRejected("at most 500 direct-message cursors may be marked at once")
+        if not cursors:
+            return ()
+        latest_by_channel: dict[int, int] = {}
+        for cursor in cursors:
+            latest_by_channel[cursor.channel_id] = max(
+                cursor.message_id,
+                latest_by_channel.get(cursor.channel_id, 0),
+            )
+        normalized = tuple(
+            ConversationReadCursor(channel_id, message_id)
+            for channel_id, message_id in sorted(latest_by_channel.items())
+        )
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            authorization = await self._authorization_repository_factory(uow.session).get_effective(
+                account_id,
+                at=now,
+            )
+            if not (authorization.allows("chat.read") or authorization.allows("chat.manage")):
+                raise ChannelAccessDenied("direct messages are not readable")
+            valid_cursors = await repository.list_valid_direct_read_cursors(account_id, normalized)
+            if valid_cursors != frozenset(normalized):
+                raise MessageNotFound("one or more direct-message cursors are invalid")
+            results = await repository.advance_read_cursors(account_id, normalized, now=now)
+            await uow.commit()
+            return results
+
+    async def mark_direct_conversation_read(
+        self,
+        account_id: int,
+        other_account_id: int,
+    ) -> ReadCursorResult | None:
+        """Advance a direct-conversation cursor to the peer's latest durable message."""
+        _validate_pair(account_id, other_account_id)
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            authorization = await self._authorization_repository_factory(uow.session).get_effective(
+                account_id,
+                at=now,
+            )
+            if not (authorization.allows("chat.read") or authorization.allows("chat.manage")):
+                raise ChannelAccessDenied("direct messages are not readable")
+            cursor = await repository.get_direct_conversation_read_cursor(account_id, other_account_id)
+            if cursor is None:
+                return None
+            result = await repository.advance_read_cursor(
+                cursor.channel_id,
+                account_id,
+                cursor.message_id,
+                now=now,
+            )
+            await uow.commit()
+            return result
+
+    async def get_global_silence_remaining_seconds(self, account_id: int) -> int:
+        """Return the Stable-compatible remaining duration of an active global silence."""
+        _validate_account_id(account_id)
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            silence = await self._silence_policy_factory(uow.session).get_active_silence(
+                account_id,
+                channel_id=None,
+                at=now,
+            )
+        if silence is None:
+            return 0
+        remaining = _remaining_seconds(silence.ends_at, now)
+        return 2**31 - 1 if remaining is None else min(remaining, 2**31 - 1)
+
+    async def get_channel_member_count(self, account_id: int, channel_id: int) -> int:
+        """Return authoritative active membership size for channel join/part updates."""
+        _validate_account_id(account_id)
+        _validate_account_id(channel_id)
+        active_memberships = self._require_active_memberships()
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            channel = await repository.get_channel(channel_id, account_id)
+            if channel is None or channel.archived:
+                raise ChannelNotFound("channel does not exist")
+            authorization = await self._authorization_repository_factory(uow.session).get_effective(
+                account_id,
+                at=now,
+            )
+            if not _evaluate_permissions(channel, account_id, authorization).can_read:
+                raise ChannelAccessDenied("channel is not readable")
+        count = await active_memberships.count_active_members(channel_id, at=now)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise RuntimeError("active channel membership query returned an invalid count")
+        return count
 
     async def set_private_message_policy(self, account_id: int, policy: str) -> str:
-        """Set whether direct messages are accepted from all users or mutual friends."""
+        """Set whether direct messages are accepted from all users or outgoing follows."""
         _validate_account_id(account_id)
         if policy not in {"all", "friends"}:
             raise CommunityInputRejected("private message policy must be all or friends")
@@ -387,7 +527,7 @@ class CommunityService:
         self,
         session: object,
         account_id: int,
-        channel_id: int,
+        channel_id: int | None,
         now: datetime,
     ) -> None:
         silence = await self._silence_policy_factory(session).get_active_silence(
@@ -396,7 +536,38 @@ class CommunityService:
             at=now,
         )
         if silence is not None:
-            raise AccountSilenced(silence.reason)
+            raise AccountSilenced(
+                silence.reason,
+                account_id=account_id,
+                ends_at=silence.ends_at,
+                remaining_seconds=_remaining_seconds(silence.ends_at, now),
+                channel_id=silence.channel_id,
+            )
+
+    async def _require_target_not_silenced(
+        self,
+        session: object,
+        account_id: int,
+        now: datetime,
+    ) -> None:
+        silence = await self._silence_policy_factory(session).get_active_silence(
+            account_id,
+            channel_id=None,
+            at=now,
+        )
+        if silence is not None:
+            raise TargetAccountSilenced(
+                silence.reason,
+                account_id=account_id,
+                ends_at=silence.ends_at,
+                remaining_seconds=_remaining_seconds(silence.ends_at, now),
+                channel_id=silence.channel_id,
+            )
+
+    def _require_active_memberships(self) -> ActiveChannelMembershipQuery:
+        if self._active_memberships is None:
+            raise ChannelMembershipUnavailable("active channel membership is unavailable")
+        return self._active_memberships
 
     async def _append_conversation_event(self, session: object, result: DirectConversationResult) -> None:
         await self._outbox_writer_factory(session).append(
@@ -483,12 +654,16 @@ def _stable_channel(channel: ChannelRecord, permissions: ChannelPermissions) -> 
     )
 
 
-def _enforce_direct_message_context(context: DirectMessageContext) -> None:
+def _enforce_direct_message_context(
+    context: DirectMessageContext,
+    sender_account_id: int,
+    recipient_account_id: int,
+) -> None:
     if context.blocked:
         raise DirectMessageBlocked("direct messages are blocked between these accounts")
     if context.recipient_policy == "all":
         return
-    if context.recipient_policy == "friends" and context.mutual_friends:
+    if context.recipient_policy == "friends" and context.follows(recipient_account_id, sender_account_id):
         return
     raise PrivateMessageRejected("recipient does not accept this private message")
 
@@ -557,6 +732,12 @@ def _as_replay(message: MessageResult) -> MessageResult:
         direct_recipient_account_id=message.direct_recipient_account_id,
         created=False,
     )
+
+
+def _remaining_seconds(ends_at: datetime | None, now: datetime) -> int | None:
+    if ends_at is None:
+        return None
+    return max(0, ceil((ends_at - now).total_seconds()))
 
 
 def _normalize_stable_channel_name(stable_name: str) -> str:

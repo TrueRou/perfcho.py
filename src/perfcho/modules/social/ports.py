@@ -101,6 +101,14 @@ class SocialRepository(Protocol):
         """List outgoing blocks with current account names in one query."""
         ...
 
+    async def list_blocking_account_ids(
+        self,
+        target_account_id: int,
+        actor_account_ids: tuple[int, ...],
+    ) -> frozenset[int]:
+        """Return candidate actors who block the target in one batch query."""
+        ...
+
     async def list_achievements(
         self,
         *,

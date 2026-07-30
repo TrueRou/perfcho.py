@@ -35,6 +35,7 @@
                 "worker",
                 "perfcho.infra.taskiq:broker",
                 "perfcho.tasks.outbox",
+                "perfcho.tasks.performance",
                 "--ack-type",
                 "when_executed",
                 "--workers",

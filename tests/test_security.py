@@ -4,6 +4,7 @@ import hmac
 import re
 from dataclasses import FrozenInstanceError
 
+import bcrypt
 import pytest
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
@@ -22,7 +23,9 @@ from perfcho.infra.security import (
     normalize_stable_name,
     preverify_lazer_password,
     validate_stable_password_token,
+    verify_dummy_password,
     verify_hmac_sha256_digest,
+    verify_legacy_bcrypt_md5,
     verify_password,
 )
 
@@ -87,6 +90,22 @@ def test_argon2id_password_hash_uses_appended_versioned_pepper() -> None:
         PasswordHasher().verify(password_hash.verifier, token)
 
 
+def test_legacy_bcrypt_verifies_the_stable_md5_token_and_treats_malformed_hashes_as_mismatch() -> None:
+    token = preverify_lazer_password("password")
+    verifier = bcrypt.hashpw(token.encode("ascii"), bcrypt.gensalt(rounds=4)).decode("ascii")
+
+    assert verify_legacy_bcrypt_md5(token, verifier).verified
+    for candidate_token, candidate_verifier in (
+        (preverify_lazer_password("wrong"), verifier),
+        (token.upper(), verifier),
+        (token, "not-a-bcrypt-hash"),
+        (token, "\N{SNOWMAN}"),
+    ):
+        result = verify_legacy_bcrypt_md5(candidate_token, candidate_verifier)
+        assert result.status is PasswordVerificationStatus.MISMATCH
+        assert not result.verified
+
+
 def test_password_verification_rejects_wrong_input_pepper_version_and_malformed_hash() -> None:
     token = preverify_lazer_password("password")
     pepper = PasswordPepper(version=2, secret=b"current-pepper")
@@ -135,6 +154,16 @@ def test_password_verification_reports_policy_rehash_and_results_are_frozen() ->
     assert result.needs_rehash
     with pytest.raises(FrozenInstanceError):
         result.needs_rehash = False  # type: ignore[misc]
+
+
+def test_dummy_password_verification_spends_current_policy_without_authenticating() -> None:
+    result = verify_dummy_password(
+        pepper=PasswordPepper(version=1, secret=b"dummy-test-pepper"),
+        policy=TEST_POLICY,
+    )
+
+    assert result.status is PasswordVerificationStatus.MISMATCH
+    assert not result.verified
 
 
 @pytest.mark.parametrize(

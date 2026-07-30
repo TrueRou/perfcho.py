@@ -23,6 +23,7 @@ from perfcho.realtime.stable import (
     PacketTooLargeError,
     PacketWriter,
     ProtocolStateError,
+    ReplayAction,
     ReplayFrame,
     ReplayFrameBundle,
     ScoreFrame,
@@ -382,6 +383,15 @@ def test_message_channel_and_client_status_structures_round_trip() -> None:
     reader.require_exhausted()
 
 
+@pytest.mark.parametrize(
+    ("action", "mode"),
+    [(-1, 0), (14, 0), (0, -1), (0, 4)],
+)
+def test_client_status_rejects_unknown_action_and_mode(action: int, mode: int) -> None:
+    with pytest.raises(ValueError):
+        ClientStatus(action, "", "", 0, mode, 0)
+
+
 def test_presence_and_stats_builders_round_trip() -> None:
     presence = UserPresence(
         user_id=17,
@@ -508,7 +518,7 @@ def test_score_v2_frame_and_replay_bundle_round_trip_with_exact_raw_view() -> No
     bundle = ReplayFrameBundle(
         frames=(ReplayFrame(1, 2, 3.5, 4.5, 5),),
         score_frame=score,
-        action=3,
+        action=ReplayAction.COMPLETION,
         extra=-1,
         sequence=42,
         raw_data=memoryview(b"ignored on encode"),
@@ -527,6 +537,20 @@ def test_score_v2_frame_and_replay_bundle_round_trip_with_exact_raw_view() -> No
     assert decoded.raw_data.readonly
     assert decoded.raw_data.tobytes() == encoded
     reader.require_exhausted()
+
+
+def test_replay_bundle_rejects_actions_outside_stable_inventory() -> None:
+    score = ScoreFrame(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, False, 0, 0, False)
+    with pytest.raises(ValueError, match="between 0 and 8"):
+        ReplayFrameBundle((), score, 9, 0, 0, memoryview(b""))  # type: ignore[arg-type]
+
+    valid = ReplayFrameBundle((), score, ReplayAction.STANDARD, 0, 0, memoryview(b""))
+    writer = payload_writer()
+    writer.write_replay_frame_bundle(valid)
+    encoded = bytearray(writer.to_bytes())
+    encoded[6] = 9
+    with pytest.raises(InvalidStructureError, match="replay action"):
+        PacketReader(encoded).read_replay_frame_bundle()
 
 
 def test_score_frame_rejects_invalid_boolean_bytes_and_inconsistent_v2_fields() -> None:
@@ -581,6 +605,8 @@ def test_body_packet_string_list_packet_count_and_frame_bounds() -> None:
 
     with pytest.raises(ListTooLargeError):
         PacketReader(b"\x03\x00" + bytes(12), limits=CodecLimits(max_list_length=2)).read_i32_list_u16()
+    with pytest.raises(ListTooLargeError):
+        PacketReader(b"\x02\x00" + bytes(8)).read_i32_list_u16(max_length=1)
 
     stream = build_packet(ClientPacket.PING) * 2
     packet_reader = PacketReader(stream, limits=CodecLimits(max_packet_count=1))
@@ -615,7 +641,7 @@ def test_writer_enforces_body_packet_string_list_packet_count_and_frame_bounds()
     bundle = ReplayFrameBundle(
         frames=(ReplayFrame(0, 0, 0.0, 0.0, 0),),
         score_frame=score,
-        action=0,
+        action=ReplayAction.STANDARD,
         extra=0,
         sequence=0,
         raw_data=memoryview(b""),

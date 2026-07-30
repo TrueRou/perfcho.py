@@ -110,7 +110,6 @@ class AccountService:
                     payload={
                         "account_id": result.account_id,
                         "display_name": result.display_name,
-                        "email": result.email,
                         "status": result.status,
                         "registered_at": now.isoformat(),
                         "request_id": str(command.meta.request_id),

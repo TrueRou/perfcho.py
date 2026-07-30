@@ -127,6 +127,14 @@ class DirectMessageContext:
         """Return whether either account direction contains a block."""
         return self.low_blocks_high or self.high_blocks_low
 
+    def follows(self, actor_account_id: int, target_account_id: int) -> bool:
+        """Return one directional follow from the canonical pair facts."""
+        if (actor_account_id, target_account_id) == (self.low_account_id, self.high_account_id):
+            return self.low_follows_high
+        if (actor_account_id, target_account_id) == (self.high_account_id, self.low_account_id):
+            return self.high_follows_low
+        raise ValueError("accounts do not belong to the direct-message context")
+
 
 @dataclass(frozen=True, slots=True)
 class MessageResult:
@@ -190,6 +198,48 @@ class OfflineDirectMessage:
         _require_positive_id("channel_id", self.channel_id)
         _require_positive_id("sender_account_id", self.sender_account_id)
         _require_aware("created_at", self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationReadCursor:
+    """Identify the latest delivered message read in one direct conversation."""
+
+    channel_id: int
+    message_id: int
+
+    def __post_init__(self) -> None:
+        """Validate both cursor identifiers."""
+        _require_positive_id("channel_id", self.channel_id)
+        _require_positive_id("message_id", self.message_id)
+
+
+@dataclass(frozen=True, slots=True)
+class OfflineDirectMessagePage:
+    """Return one keyset page and the cursor needed to continue without starvation."""
+
+    messages: tuple[OfflineDirectMessage, ...]
+    next_after_message_id: int | None
+
+    def __post_init__(self) -> None:
+        """Require ascending messages and a continuation cursor at the page boundary."""
+        message_ids = tuple(message.message_id for message in self.messages)
+        if any(current >= following for current, following in zip(message_ids, message_ids[1:], strict=False)):
+            raise ValueError("offline direct messages must be in ascending message order")
+        if self.next_after_message_id is not None:
+            _require_positive_id("next_after_message_id", self.next_after_message_id)
+            if not message_ids or self.next_after_message_id != message_ids[-1]:
+                raise ValueError("next cursor must identify the final message in the page")
+
+    @property
+    def read_cursors(self) -> tuple[ConversationReadCursor, ...]:
+        """Collapse delivered messages to one highest cursor per conversation."""
+        latest_by_channel: dict[int, int] = {}
+        for message in self.messages:
+            latest_by_channel[message.channel_id] = message.message_id
+        return tuple(
+            ConversationReadCursor(channel_id, message_id)
+            for channel_id, message_id in sorted(latest_by_channel.items())
+        )
 
 
 @dataclass(frozen=True, slots=True)

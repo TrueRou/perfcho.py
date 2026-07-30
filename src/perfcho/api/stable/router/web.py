@@ -14,7 +14,8 @@ from fastapi import APIRouter, Depends, Query, Request, Response, status
 from fastapi.responses import RedirectResponse, StreamingResponse
 
 from perfcho.api.stable.dependencies import StableServicesDependency
-from perfcho.modules.common import ObjectStorage, ObjectUnavailable
+from perfcho.modules.common import ApplicationError, ObjectStorage, ObjectUnavailable
+from perfcho.modules.community import CommunityService
 from perfcho.modules.content import (
     BeatmapNotFound,
     BeatmapRevisionView,
@@ -25,7 +26,9 @@ from perfcho.modules.content import (
     ContentService,
     RatingSummary,
 )
-from perfcho.modules.identity import IdentityService, InvalidCredentials, StableWebPrincipal
+from perfcho.modules.identity import InvalidCredentials, StableWebPrincipal
+from perfcho.modules.realtime import RealtimeSessionFenced, RealtimeSessionNotFound
+from perfcho.modules.scoring import RankingQueryService, Ruleset, ScoreGrade
 from perfcho.modules.social import SocialService
 
 router = APIRouter(include_in_schema=False, default_response_class=Response)
@@ -43,6 +46,9 @@ _DIRECT_STATUS_FILTERS = {
     8: ("loved",),
 }
 _EMPTY_DATETIME = datetime(1970, 1, 1, tzinfo=UTC)
+_GRADE_RULESETS = (Ruleset.OSU, Ruleset.TAIKO, Ruleset.FRUITS, Ruleset.MANIA)
+_OFFICIAL_DOWNLOAD_BASE_URL = "https://osu.ppy.sh/beatmapsets"
+_PUBLIC_DOWNLOAD_BASE_URL = "https://api.nerinyan.moe/d"
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +74,12 @@ def _social(services: StableServicesDependency) -> SocialService:
     return services.social
 
 
+def _community(services: StableServicesDependency) -> CommunityService:
+    if services.community is None:
+        raise RuntimeError("Stable community services are not configured")
+    return services.community
+
+
 def _object_storage(services: StableServicesDependency) -> ObjectStorage:
     if services.object_storage is None:
         raise RuntimeError("Stable object storage is not configured")
@@ -75,13 +87,16 @@ def _object_storage(services: StableServicesDependency) -> ObjectStorage:
 
 
 async def _authenticate(
-    identity: IdentityService,
+    services: StableServicesDependency,
     username: str,
     password_token: str,
 ) -> _WebAuthentication:
     try:
-        principal = await identity.verify_stable_web(username, password_token)
-    except InvalidCredentials:
+        principal = await services.identity.verify_stable_web(username, password_token)
+        realtime = await services.realtime.resolve_session(principal.session_id, at=services.clock.now())
+        if realtime.account_id != principal.account_id:
+            raise RealtimeSessionFenced("Stable Web principal does not own the realtime session")
+    except InvalidCredentials, RealtimeSessionNotFound, RealtimeSessionFenced:
         principal = None
     return _WebAuthentication(principal)
 
@@ -91,7 +106,7 @@ async def _web_authentication(
     username: Annotated[str, Query(alias="u", min_length=1, max_length=64)],
     password_token: Annotated[str, Query(alias="h", min_length=32, max_length=32)],
 ) -> _WebAuthentication:
-    return await _authenticate(services.identity, username, password_token)
+    return await _authenticate(services, username, password_token)
 
 
 async def _rating_authentication(
@@ -99,7 +114,7 @@ async def _rating_authentication(
     username: Annotated[str, Query(alias="u", min_length=1, max_length=64)],
     password_token: Annotated[str, Query(alias="p", min_length=32, max_length=32)],
 ) -> _WebAuthentication:
-    return await _authenticate(services.identity, username, password_token)
+    return await _authenticate(services, username, password_token)
 
 
 def _authentication_failed(*, rating: bool = False) -> Response:
@@ -184,10 +199,15 @@ def _clean_direct_text(value: str) -> str:
     return value.replace("|", "I").replace("\r", " ").replace("\n", " ")
 
 
-def _format_beatmap_info(request_index: int, beatmap: BeatmapRevisionView) -> str:
+def _format_beatmap_info(
+    request_index: int,
+    beatmap: BeatmapRevisionView,
+    grades: dict[Ruleset, ScoreGrade],
+) -> str:
+    grade_fields = "|".join(grades.get(ruleset, ScoreGrade.N).value for ruleset in _GRADE_RULESETS)
     return (
         f"{request_index}|{beatmap.external_beatmap_id}|{beatmap.external_beatmapset_id}|"
-        f"{beatmap.md5_hex}|{_beatmap_info_status(beatmap.status)}|N|N|N|N"
+        f"{beatmap.md5_hex}|{_beatmap_info_status(beatmap.status)}|{grade_fields}"
     )
 
 
@@ -234,7 +254,29 @@ async def get_friends(
     if authentication.principal is None:
         return _authentication_failed()
     friends = await social.list_friends(authentication.principal.account_id)
-    return Response("\n".join(str(friend.account_id) for friend in friends))
+    friend_ids = tuple(dict.fromkeys((1, *(friend.account_id for friend in friends))))
+    return Response("\n".join(str(account_id) for account_id in friend_ids))
+
+
+@router.get("/web/osu-markasread.php")
+async def mark_direct_conversation_read(
+    authentication: Annotated[_WebAuthentication, Depends(_web_authentication)],
+    social: Annotated[SocialService, Depends(_social)],
+    community: Annotated[CommunityService, Depends(_community)],
+    channel: Annotated[str, Query(max_length=64)],
+) -> Response:
+    """Advance the authenticated account's read cursor for one direct-message peer."""
+    principal = authentication.principal
+    if principal is None:
+        return _authentication_failed()
+    if not channel:
+        return Response(b"")
+    try:
+        target = await social.resolve_account_by_name(channel)
+        await community.mark_direct_conversation_read(principal.account_id, target.account_id)
+    except ApplicationError:
+        pass
+    return Response(b"")
 
 
 @router.post("/web/osu-getbeatmapinfo.php")
@@ -253,15 +295,24 @@ async def get_beatmap_info(
     except ValueError:
         return Response(b"", status_code=status.HTTP_400_BAD_REQUEST)
     beatmaps = await content_query.batch_lookup(filenames, beatmap_ids)
+    grades: dict[int, dict[Ruleset, ScoreGrade]] = {}
+    ranking_query: RankingQueryService | None = services.ranking_query
+    if ranking_query is not None:
+        projected_grades = await ranking_query.get_beatmap_grades(
+            authentication.principal.account_id,
+            tuple(dict.fromkeys(beatmap.beatmap_id for beatmap in beatmaps)),
+        )
+        for projected in projected_grades:
+            grades.setdefault(projected.beatmap_id, {})[projected.ruleset] = projected.grade
     by_filename = {beatmap.file_name.strip().casefold(): beatmap for beatmap in beatmaps}
     by_id = {beatmap.external_beatmap_id: beatmap for beatmap in beatmaps}
     lines = [
-        _format_beatmap_info(index, beatmap)
+        _format_beatmap_info(index, beatmap, grades.get(beatmap.beatmap_id, {}))
         for index, filename in enumerate(filenames)
         if (beatmap := by_filename.get(filename.strip().casefold())) is not None
     ]
     lines.extend(
-        _format_beatmap_info(len(filenames) + index, beatmap)
+        _format_beatmap_info(len(filenames) + index, beatmap, grades.get(beatmap.beatmap_id, {}))
         for index, identifier in enumerate(beatmap_ids)
         if (beatmap := by_id.get(identifier)) is not None
     )
@@ -350,7 +401,7 @@ async def add_favourite(
 
 
 @router.get("/web/osu-rate.php")
-async def rate_beatmapset(
+async def rate_beatmap(
     authentication: Annotated[_WebAuthentication, Depends(_rating_authentication)],
     content_query: Annotated[ContentQueryService, Depends(_content_query)],
     content: Annotated[ContentService, Depends(_content)],
@@ -366,11 +417,11 @@ async def rate_beatmapset(
         return Response(b"no exist")
     account_id = authentication.principal.account_id
     if rating is None:
-        summary = await content_query.get_rating(beatmap.external_beatmapset_id, account_id)
+        summary = await content_query.get_rating(beatmap.beatmap_id, account_id)
         if summary.account_rating is None:
             return Response(b"ok")
     else:
-        summary = await content.rate(account_id, beatmap.external_beatmapset_id, rating)
+        summary = await content.rate(account_id, beatmap.beatmap_id, rating)
     return Response(f"alreadyvoted\n{_format_rating(summary)}")
 
 
@@ -444,7 +495,15 @@ async def download_beatmapset(
     identifier = beatmapset_selector[:-1] if no_video else beatmapset_selector
     if not identifier.isascii() or not identifier.isdigit() or int(identifier) < 1:
         return Response(b"", status_code=status.HTTP_404_NOT_FOUND)
-    target = f"{services.settings.stable_beatmap_download_base_url.rstrip('/')}/{identifier}/download"
-    if no_video:
-        target += "?noVideo=1"
+    base_url = services.settings.stable_beatmap_download_base_url.rstrip("/")
+    if base_url == _OFFICIAL_DOWNLOAD_BASE_URL:
+        base_url = _PUBLIC_DOWNLOAD_BASE_URL
+    if base_url.endswith("/d"):
+        target = f"{base_url}/{identifier}"
+        if no_video:
+            target += "?nv=1"
+    else:
+        target = f"{base_url}/{identifier}/download"
+        if no_video:
+            target += "?noVideo=1"
     return RedirectResponse(target, status_code=status.HTTP_302_FOUND)

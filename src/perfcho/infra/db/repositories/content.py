@@ -185,15 +185,17 @@ class SqlAlchemyContentRepository:
         )
         return FavouriteResult(account_id, beatmapset_id, False, removed)
 
-    async def get_rating(self, beatmapset_id: int, account_id: int | None) -> RatingSummary:
-        """Return an aggregate and optional account rating by public set ID."""
-        internal_id = await self._session.scalar(select(Beatmapset.id).where(Beatmapset.external_id == beatmapset_id))
-        if internal_id is None:
-            return RatingSummary(beatmapset_id, None, 0, None)
+    async def get_rating(self, beatmap_id: int, account_id: int | None) -> RatingSummary:
+        """Return an aggregate and optional account rating by canonical logical beatmap ID."""
+        exists = await self._session.scalar(
+            select(Beatmap.id).where(Beatmap.id == beatmap_id, Beatmap.deleted_at.is_(None))
+        )
+        if exists is None:
+            return RatingSummary(beatmap_id, None, 0, None)
         aggregate = (
             await self._session.execute(
                 select(func.avg(RatingVote.rating), func.count(RatingVote.id)).where(
-                    RatingVote.beatmapset_id == internal_id
+                    RatingVote.beatmap_id == beatmap_id
                 )
             )
         ).one()
@@ -202,31 +204,33 @@ class SqlAlchemyContentRepository:
             account_rating = await self._session.scalar(
                 select(RatingVote.rating).where(
                     RatingVote.account_id == account_id,
-                    RatingVote.beatmapset_id == internal_id,
+                    RatingVote.beatmap_id == beatmap_id,
                 )
             )
         return RatingSummary(
-            beatmapset_id,
+            beatmap_id,
             Decimal(aggregate[0]) if aggregate[0] is not None else None,
             aggregate[1],
             account_rating,
         )
 
-    async def rate(self, account_id: int, beatmapset_id: int, rating: int) -> RatingSummary:
-        """Upsert one set rating by public beatmapset ID."""
-        internal_id = await self._session.scalar(select(Beatmapset.id).where(Beatmapset.external_id == beatmapset_id))
-        if internal_id is None:
-            return RatingSummary(beatmapset_id, None, 0, None)
+    async def rate(self, account_id: int, beatmap_id: int, rating: int) -> RatingSummary:
+        """Upsert one rating by canonical logical beatmap ID."""
+        exists = await self._session.scalar(
+            select(Beatmap.id).where(Beatmap.id == beatmap_id, Beatmap.deleted_at.is_(None))
+        )
+        if exists is None:
+            return RatingSummary(beatmap_id, None, 0, None)
         await self._session.execute(
             insert(RatingVote)
-            .values(account_id=account_id, beatmapset_id=internal_id, rating=rating)
+            .values(account_id=account_id, beatmap_id=beatmap_id, rating=rating)
             .on_conflict_do_update(
-                index_elements=(RatingVote.account_id, RatingVote.beatmapset_id),
-                index_where=RatingVote.beatmapset_id.is_not(None),
+                index_elements=(RatingVote.account_id, RatingVote.beatmap_id),
+                index_where=RatingVote.beatmap_id.is_not(None),
                 set_={"rating": rating},
             )
         )
-        return await self.get_rating(beatmapset_id, account_id)
+        return await self.get_rating(beatmap_id, account_id)
 
     async def synchronize_beatmapset(
         self,

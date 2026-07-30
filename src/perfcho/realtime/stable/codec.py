@@ -18,6 +18,7 @@ from .models import (
     ClientStatus,
     Message,
     MultiplayerMatch,
+    ReplayAction,
     ReplayFrame,
     ReplayFrameBundle,
     ScoreFrame,
@@ -390,22 +391,32 @@ class PacketReader(Iterator[Packet]):
         except UnicodeDecodeError as exc:
             raise InvalidStringEncodingError("Stable string is not valid UTF-8") from exc
 
-    def _read_i32_list(self, length_struct: struct.Struct) -> tuple[int, ...]:
+    def _read_i32_list(
+        self,
+        length_struct: struct.Struct,
+        *,
+        max_length: int | None = None,
+    ) -> tuple[int, ...]:
         count = int(self._unpack(length_struct))
-        if count > self.limits.max_list_length:
-            raise ListTooLargeError(f"list length {count} exceeds limit {self.limits.max_list_length}")
+        effective_limit = self.limits.max_list_length
+        if max_length is not None:
+            if isinstance(max_length, bool) or not isinstance(max_length, int) or max_length < 0:
+                raise ValueError("max_length must be a non-negative integer")
+            effective_limit = min(effective_limit, max_length)
+        if count > effective_limit:
+            raise ListTooLargeError(f"list length {count} exceeds limit {effective_limit}")
         if count == 0:
             return ()
         encoded = self._take(count * _I32.size)
         return struct.unpack_from(f"<{count}i", encoded)
 
-    def read_i32_list_u16(self) -> tuple[int, ...]:
+    def read_i32_list_u16(self, *, max_length: int | None = None) -> tuple[int, ...]:
         """Read signed i32 values prefixed by an unsigned 16-bit item count."""
-        return self._read_i32_list(_U16)
+        return self._read_i32_list(_U16, max_length=max_length)
 
-    def read_i32_list_u32(self) -> tuple[int, ...]:
+    def read_i32_list_u32(self, *, max_length: int | None = None) -> tuple[int, ...]:
         """Read signed i32 values prefixed by an unsigned 32-bit item count."""
-        return self._read_i32_list(_U32)
+        return self._read_i32_list(_U32, max_length=max_length)
 
     def read_message(self) -> Message:
         """Read a Stable chat message structure."""
@@ -564,7 +575,11 @@ class PacketReader(Iterator[Packet]):
                 f"frame count {frame_count} exceeds limit {self.limits.max_frame_count}",
             )
         frames = tuple(self.read_replay_frame() for _ in range(frame_count))
-        action = self.read_u8()
+        action_value = self.read_u8()
+        try:
+            action = ReplayAction(action_value)
+        except ValueError as error:
+            raise InvalidStructureError(f"invalid replay action {action_value}") from error
         score_frame = self.read_score_frame()
         sequence = self.read_u16()
         return ReplayFrameBundle(

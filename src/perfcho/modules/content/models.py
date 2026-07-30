@@ -115,7 +115,7 @@ class FavouriteResult:
 class RatingSummary:
     """Return aggregate rating and the requesting account's vote."""
 
-    beatmapset_id: int
+    beatmap_id: int
     average: Decimal | None
     vote_count: int
     account_rating: int | None

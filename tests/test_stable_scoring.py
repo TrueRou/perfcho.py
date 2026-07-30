@@ -1,25 +1,31 @@
+import hashlib
 import uuid
 from base64 import b64encode
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import cast
 
 import httpx
 import pytest
 from fastapi import FastAPI
 from py3rijndael import Pkcs7Padding, RijndaelCbc
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.api.stable import router
 from perfcho.api.stable.dependencies import get_stable_services
 from perfcho.composition import StableServices
+from perfcho.infra.db.models.scoring import RankingPolicy, Score
+from perfcho.infra.db.projectors.ranking import _metric_value, _tie_break_value
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage, StoredObject
 from perfcho.modules.content import BeatmapRevisionView, ContentQueryService, RatingSummary
 from perfcho.modules.identity import IdentityService, InvalidCredentials, StableWebPrincipal
-from perfcho.modules.realtime import RealtimeRepository
+from perfcho.modules.realtime import RealtimeRepository, RealtimeSession, RealtimeSessionNotFound
 from perfcho.modules.scoring import (
     AcceptedScoreResult,
     AcceptScore,
@@ -30,6 +36,7 @@ from perfcho.modules.scoring import (
     ReplayReference,
     ReplayService,
     Ruleset,
+    ScoreRejected,
     ScoringService,
 )
 from perfcho.modules.social import FollowView, SocialService
@@ -38,7 +45,8 @@ NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 PASSWORD_MD5 = "c" * 32
 BEATMAP_MD5 = "a" * 32
 OSU_VERSION = "20260711"
-REPLAY_CONTENT = b"stable replay frames"
+REPLAY_CONTENT = b"stable replay frame payload"
+SESSION_ID = uuid.uuid5(uuid.NAMESPACE_URL, "perfcho:test:stable-scoring-session")
 
 
 class FixedClock:
@@ -60,7 +68,18 @@ class FakeIdentity:
     async def verify_stable_web(self, identifier: str, password_token: str) -> StableWebPrincipal:
         if identifier != "player" or password_token != PASSWORD_MD5:
             raise InvalidCredentials()
-        return StableWebPrincipal(3, "player", uuid.uuid7(), NOW + timedelta(hours=1))
+        return StableWebPrincipal(3, "player", SESSION_ID, NOW + timedelta(hours=1))
+
+
+class FakeRealtime:
+    def __init__(self) -> None:
+        self.online = True
+
+    async def resolve_session(self, session_id: uuid.UUID, *, at: datetime) -> RealtimeSession:
+        assert session_id == SESSION_ID and at == NOW
+        if not self.online:
+            raise RealtimeSessionNotFound()
+        return RealtimeSession(SESSION_ID, 3, 1, NOW + timedelta(minutes=5))
 
 
 class FakeContentQuery:
@@ -71,17 +90,20 @@ class FakeContentQuery:
         assert md5 in {BEATMAP_MD5, bytes.fromhex(BEATMAP_MD5)}
         return self.beatmap
 
-    async def get_rating(self, beatmapset_id: int, account_id: int | None = None) -> RatingSummary:
-        assert beatmapset_id == 200 and account_id == 3
-        return RatingSummary(200, None, 0, None)
+    async def get_rating(self, beatmap_id: int, account_id: int | None = None) -> RatingSummary:
+        assert beatmap_id == 10 and account_id == 3
+        return RatingSummary(10, None, 0, None)
 
 
 class FakeScoring:
     def __init__(self) -> None:
         self.commands: list[AcceptScore] = []
+        self.error: Exception | None = None
 
     async def accept(self, command: AcceptScore) -> AcceptedScoreResult:
         self.commands.append(command)
+        if self.error is not None:
+            raise self.error
         return AcceptedScoreResult(
             attempt_id=uuid.uuid7(),
             score_id=40,
@@ -216,7 +238,7 @@ def stable_services() -> tuple[StableServices, FakeScoring, FakeStorage, FakeRep
     services = StableServices(
         identity=cast(IdentityService, FakeIdentity()),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=cast(RealtimeRepository, object()),
+        realtime=cast(RealtimeRepository, FakeRealtime()),
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, FakeIds()),
         settings=Settings(),
@@ -238,11 +260,11 @@ def stable_app(services: StableServices) -> FastAPI:
     return app
 
 
-def encrypted_score() -> tuple[str, str, str]:
+def encrypted_score(*, checksum: str | None = None, play_time: str = "260729123000") -> tuple[str, str, str]:
     fields = [
         BEATMAP_MD5,
         "player ",
-        "b" * 32,
+        "",
         "10",
         "0",
         "0",
@@ -256,9 +278,14 @@ def encrypted_score() -> tuple[str, str, str]:
         "0",
         "True",
         "0",
-        "260729123000",
+        play_time,
         "b20260711.1",
     ]
+    checksum_payload = (
+        f"chickenmcnuggets10o1500smustard00uu{BEATMAP_MD5}10Trueplayer1000000X0QTrue0"
+        f"{OSU_VERSION}{play_time}client-hash"
+    )
+    fields[2] = checksum or hashlib.md5(checksum_payload.encode(), usedforsecurity=False).hexdigest()
     iv = b"i" * 32
     cipher = RijndaelCbc(
         key=f"osu!-scoreburgr---------{OSU_VERSION}".encode(),
@@ -271,11 +298,18 @@ def encrypted_score() -> tuple[str, str, str]:
     return score, client_hash, b64encode(iv).decode()
 
 
-def submission_files(password: str = PASSWORD_MD5) -> list[tuple[str, tuple]]:
-    score, client_hash, iv = encrypted_score()
+def submission_files(
+    password: str = PASSWORD_MD5,
+    *,
+    checksum: str | None = None,
+    replay: bytes = REPLAY_CONTENT,
+    unique_ids: str = "uninstall-id|disk-id",
+    play_time: str = "260729123000",
+) -> list[tuple[str, tuple]]:
+    score, client_hash, iv = encrypted_score(checksum=checksum, play_time=play_time)
     return [
         ("score", (None, score)),
-        ("score", ("replay.osr", REPLAY_CONTENT, "application/octet-stream")),
+        ("score", ("replay.osr", replay, "application/octet-stream")),
         ("x", (None, "0")),
         ("ft", (None, "0")),
         ("st", (None, "60000")),
@@ -285,8 +319,12 @@ def submission_files(password: str = PASSWORD_MD5) -> list[tuple[str, tuple]]:
         ("iv", (None, iv)),
         ("bmk", (None, BEATMAP_MD5)),
         ("sbk", (None, "")),
-        ("c1", (None, "device-identifiers")),
+        ("c1", (None, unique_ids)),
     ]
+
+
+def replace_form_field(files: list[tuple[str, tuple]], name: str, value: str) -> list[tuple[str, tuple]]:
+    return [(key, (None, value) if key == name else item) for key, item in files]
 
 
 @pytest.mark.asyncio
@@ -304,6 +342,9 @@ async def test_stable_score_submission_stages_replay_and_calls_canonical_service
     assert command.meta.actor is not None and command.meta.actor.account_id == 3
     assert command.replay.storage_key.startswith("replays/stable/3/")
     assert command.attestation.client_integrity_digest is not None
+    assert command.attestation.checksum == command.score.online_checksum
+    assert command.attestation.checksum != command.meta.request_digest
+    assert command.attestation.verification_state == "pending"
 
 
 @pytest.mark.asyncio
@@ -319,6 +360,113 @@ async def test_stable_score_submission_rejects_invalid_password_before_object_wr
     assert response.text == "error: pass"
     assert storage.puts == []
     assert scoring.commands == []
+
+
+@pytest.mark.asyncio
+async def test_stable_score_submission_rejects_checksum_timing_and_short_replay_as_text() -> None:
+    services, scoring, storage, _, _ = stable_services()
+    app = stable_app(services)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        checksum = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            files=submission_files(checksum="b" * 32),
+        )
+        timing = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            files=replace_form_field(submission_files(), "st", str(10**20)),
+        )
+        fail_timing = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            files=replace_form_field(submission_files(), "ft", str(10**20)),
+        )
+        storyboard = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            files=replace_form_field(submission_files(), "sbk", "not-an-md5"),
+        )
+        client_ids = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            files=replace_form_field(submission_files(), "c1", "one-component"),
+        )
+        stale_time = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            files=submission_files(play_time="690101000000"),
+        )
+        replay = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            files=submission_files(replay=b"too short"),
+        )
+
+    assert {
+        checksum.text,
+        timing.text,
+        fail_timing.text,
+        storyboard.text,
+        client_ids.text,
+        stale_time.text,
+        replay.text,
+    } == {"error: no"}
+    assert storage.puts == []
+    assert scoring.commands == []
+
+
+@pytest.mark.asyncio
+async def test_stable_score_request_digest_covers_unique_client_fields() -> None:
+    services, scoring, _, _, _ = stable_services()
+    app = stable_app(services)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        first = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            files=submission_files(unique_ids="uninstall-a|disk-a"),
+        )
+        second = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            files=submission_files(unique_ids="uninstall-b|disk-b"),
+        )
+
+    assert first.status_code == second.status_code == 200
+    assert scoring.commands[0].meta.request_digest != scoring.commands[1].meta.request_digest
+
+
+@pytest.mark.asyncio
+async def test_stable_score_chunked_multipart_is_bounded_before_form_parsing() -> None:
+    services, scoring, storage, _, _ = stable_services()
+    services = replace(services, settings=Settings(stable_score_submission_max_bytes=1024))
+    app = stable_app(services)
+    encoded = httpx.Request(
+        "POST",
+        "http://c.test/web/osu-submit-modular-selector.php",
+        files=submission_files(replay=b"r" * 2048),
+    )
+    body = encoded.read()
+
+    async def chunks() -> AsyncIterator[bytes]:
+        for offset in range(0, len(body), 127):
+            yield body[offset : offset + 127]
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            content=chunks(),
+            headers={"Content-Type": encoded.headers["Content-Type"]},
+        )
+
+    assert response.text == "error: no"
+    assert "content-length" not in encoded.headers or int(encoded.headers["content-length"]) > 1024
+    assert storage.puts == []
+    assert scoring.commands == []
+
+
+@pytest.mark.asyncio
+async def test_stable_score_expected_application_error_uses_stable_text() -> None:
+    services, scoring, storage, _, _ = stable_services()
+    scoring.error = ScoreRejected("rejected")
+    app = stable_app(services)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post("/web/osu-submit-modular-selector.php", files=submission_files())
+
+    assert response.status_code == 200
+    assert response.text == "error: no"
+    assert storage.puts
 
 
 @pytest.mark.asyncio
@@ -367,3 +515,20 @@ async def test_stable_leaderboard_serializes_projection_and_friend_filter() -> N
     assert score_fields[-3:] == ["1", str(int(NOW.timestamp())), "1"]
     assert ranking.calls[0]["leaderboard_type"] == 3
     assert ranking.calls[0]["friend_account_ids"] == (7,)
+
+
+@pytest.mark.asyncio
+async def test_ranking_uses_exact_microseconds_and_defers_unconfigured_pp() -> None:
+    ended_at = datetime(2026, 7, 29, 12, 30, 0, 123456, tzinfo=UTC)
+    score = cast(Score, SimpleNamespace(ended_at=ended_at))
+    expected = int((ended_at - datetime(1970, 1, 1, tzinfo=UTC)).total_seconds()) * 1_000_000 + 123456
+
+    assert _tie_break_value(score, "ended_at") == Decimal(expected)
+    assert (
+        await _metric_value(
+            cast(AsyncSession, None),
+            score,
+            cast(RankingPolicy, SimpleNamespace(metric="pp", calculation_release_id=None)),
+        )
+        is None
+    )

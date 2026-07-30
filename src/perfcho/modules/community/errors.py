@@ -1,6 +1,14 @@
 """Define protocol-neutral channel and messaging failures."""
 
-from perfcho.modules.common.errors import AuthorizationDenied, InputRejected, ResourceConflict, ResourceNotFound
+from datetime import datetime
+
+from perfcho.modules.common.errors import (
+    AuthorizationDenied,
+    DependencyUnavailable,
+    InputRejected,
+    ResourceConflict,
+    ResourceNotFound,
+)
 
 
 class CommunityInputRejected(InputRejected):
@@ -39,10 +47,41 @@ class PrivateMessageRejected(AuthorizationDenied):
     code = "private_message_rejected"
 
 
-class AccountSilenced(AuthorizationDenied):
-    """Reject message sending under an active silence policy decision."""
+class _MessageSilenced(AuthorizationDenied):
+    """Carry protocol-neutral sanction timing for message denial adapters."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        account_id: int,
+        ends_at: datetime | None,
+        remaining_seconds: int | None,
+        channel_id: int | None,
+    ) -> None:
+        super().__init__(message)
+        self.account_id = account_id
+        self.ends_at = ends_at
+        self.remaining_seconds = remaining_seconds
+        self.channel_id = channel_id
+
+
+class AccountSilenced(_MessageSilenced):
+    """Reject message sending while the sender has an active silence."""
 
     code = "account_silenced"
+
+
+class TargetAccountSilenced(_MessageSilenced):
+    """Reject a direct message while its recipient has an active silence."""
+
+    code = "target_account_silenced"
+
+
+class ChannelMembershipUnavailable(DependencyUnavailable):
+    """Indicate that authoritative active channel membership cannot be queried."""
+
+    code = "channel_membership_unavailable"
 
 
 class MessageIdempotencyConflict(ResourceConflict):

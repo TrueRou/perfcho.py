@@ -60,14 +60,15 @@ class StableLogin:
 
 @dataclass(frozen=True, slots=True)
 class CredentialSnapshot:
-    """Carry scalar account and password facts across Argon2 verification."""
+    """Carry scalar account and password facts across password verification."""
 
     account_id: int
     current_name: str
     account_status: str
     auth_version: int
     password_verifier: str = field(repr=False)
-    pepper_version: int
+    algorithm: str
+    pepper_version: int | None
     password_changed_at: datetime
     must_change: bool
     country_code: str | None = None
@@ -78,6 +79,14 @@ class CredentialSnapshot:
             raise ValueError("account_id must be positive")
         if self.auth_version < 1:
             raise ValueError("auth_version must be positive")
+        if self.algorithm == "argon2id":
+            if self.pepper_version is None or self.pepper_version < 1:
+                raise ValueError("Argon2id credentials require a positive pepper version")
+        elif self.algorithm == "bcrypt_md5":
+            if self.pepper_version is not None:
+                raise ValueError("bcrypt_md5 credentials must not have a pepper version")
+        else:
+            raise ValueError("unsupported password credential algorithm")
         if self.password_changed_at.tzinfo is None or self.password_changed_at.utcoffset() is None:
             raise ValueError("password_changed_at must be timezone-aware")
 
@@ -115,13 +124,26 @@ class ResolvedStableSession:
     client_variant: str | None
     expires_at: datetime
     country_code: str | None = None
+    opened_at: datetime | None = None
+    last_activity_at: datetime | None = None
 
     def __post_init__(self) -> None:
         """Require authoritative identifiers and a timezone-aware expiry."""
         if self.account_id < 1 or self.auth_version < 1:
             raise ValueError("resolved sessions require positive account and auth versions")
-        if self.expires_at.tzinfo is None or self.expires_at.utcoffset() is None:
-            raise ValueError("expires_at must be timezone-aware")
+        for field_name, value in (
+            ("expires_at", self.expires_at),
+            ("opened_at", self.opened_at),
+            ("last_activity_at", self.last_activity_at),
+        ):
+            if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+                raise ValueError(f"{field_name} must be timezone-aware")
+        if (
+            self.opened_at is not None
+            and self.last_activity_at is not None
+            and not self.opened_at <= self.last_activity_at <= self.expires_at
+        ):
+            raise ValueError("resolved session activity must fall within its lifetime")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +151,21 @@ class OpenStableSession:
     """Identify the one unclosed normal Stable session for an account."""
 
     session_id: uuid.UUID
+    opened_at: datetime
+    last_activity_at: datetime
     expires_at: datetime
+
+    def __post_init__(self) -> None:
+        """Require ordered timezone-aware session activity facts."""
+        for field_name, value in (
+            ("opened_at", self.opened_at),
+            ("last_activity_at", self.last_activity_at),
+            ("expires_at", self.expires_at),
+        ):
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f"{field_name} must be timezone-aware")
+        if not self.opened_at <= self.last_activity_at <= self.expires_at:
+            raise ValueError("session activity must fall within its lifetime")
 
 
 @dataclass(frozen=True, slots=True)

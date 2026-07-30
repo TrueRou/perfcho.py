@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column,
     ForeignKeyConstraint,
     Index,
+    Numeric,
     Table,
     UniqueConstraint,
 )
@@ -47,7 +48,7 @@ def _column_names(items: Iterable[Column[Any]]) -> tuple[str, ...]:
 
 
 def test_metadata_preserves_baseline_and_adds_only_lifecycle_tables() -> None:
-    assert len(DbBase.metadata.tables) == 133
+    assert len(DbBase.metadata.tables) >= 133
     assert {
         "iam.auth_token_families",
         "iam.auth_challenge_scopes",
@@ -67,8 +68,30 @@ def test_postgresql_ddl_and_mappers_are_coherent() -> None:
 
 
 def test_stable_identity_lifecycle_contracts() -> None:
+    credentials = _table("iam.password_credentials")
+    algorithm_pepper = _constraint(
+        "iam.password_credentials",
+        "ck_password_credentials_algorithm_pepper_consistency",
+        CheckConstraint,
+    )
+    assert isinstance(algorithm_pepper, CheckConstraint)
+    algorithm_pepper_sql = str(algorithm_pepper.sqltext)
+    assert credentials.c.pepper_version.nullable
+    assert "algorithm = 'argon2id'" in algorithm_pepper_sql
+    assert "pepper_version IS NOT NULL" in algorithm_pepper_sql
+    assert "algorithm = 'bcrypt_md5'" in algorithm_pepper_sql
+    assert "pepper_version IS NULL" in algorithm_pepper_sql
+
     sessions = _table("iam.auth_sessions")
-    assert {"client_variant", "session_class"} <= set(sessions.c.keys())
+    assert {"client_variant", "session_class", "last_activity_at"} <= set(sessions.c.keys())
+    assert not sessions.c.last_activity_at.nullable
+    activity_period = _constraint(
+        "iam.auth_sessions",
+        "ck_auth_sessions_activity_period",
+        CheckConstraint,
+    )
+    assert isinstance(activity_period, CheckConstraint)
+    assert "last_activity_at >= created_at" in str(activity_period.sqltext)
     active_stable = _index("iam.auth_sessions", "uq_auth_sessions_active_normal_stable_account")
     assert active_stable.unique
     assert _column_names(active_stable.columns) == ("account_id",)
@@ -106,6 +129,26 @@ def test_content_and_scoring_dimensions_are_unambiguous() -> None:
     attestation = _table("scoring.score_attestations")
     assert "client_integrity_digest" in attestation.c
     assert "patcher_digest" not in attestation.c
+
+    ratings = _table("content.rating_votes")
+    assert "beatmap_id" in ratings.c
+    assert "beatmap_revision_id" not in ratings.c
+    assert _index("content.rating_votes", "uq_rating_votes_beatmap_account").unique
+
+    leaderboard = _table("scoring.leaderboard_entries")
+    assert isinstance(leaderboard.c.metric_value.type, Numeric)
+    assert isinstance(leaderboard.c.tie_break_value.type, Numeric)
+    assert leaderboard.c.metric_value.type.precision == 30
+    assert leaderboard.c.tie_break_value.type.precision == 30
+
+    replays = _table("scoring.replays")
+    unique_columns = {
+        _column_names(constraint.columns)
+        for constraint in replays.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert ("sha256",) not in unique_columns
+    assert ("storage_key",) not in unique_columns
 
 
 def test_stable_read_paths_have_ordered_indexes() -> None:

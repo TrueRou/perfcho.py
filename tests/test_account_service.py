@@ -212,6 +212,7 @@ async def test_registration_normalizes_hashes_before_transaction_and_commits_all
     event = outbox.events[0]
     assert event.event_type == "account.registered.v1"
     assert event.partition_key == "account:42"
+    assert "email" not in event.payload
 
 
 @pytest.mark.asyncio

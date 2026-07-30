@@ -4,9 +4,20 @@ import asyncio
 import unicodedata
 import uuid
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from perfcho.infra.security.password import Argon2Policy, PasswordHash, PasswordPepper, verify_password
+from perfcho.infra.security.password import (
+    Argon2Policy,
+    PasswordHash,
+    PasswordPepper,
+    PasswordVerification,
+    PasswordVerificationStatus,
+    hash_password,
+    validate_stable_password_token,
+    verify_dummy_password,
+    verify_legacy_bcrypt_md5,
+    verify_password,
+)
 from perfcho.infra.security.tokens import (
     digest_device_component,
     digest_opaque_token,
@@ -19,6 +30,7 @@ from perfcho.modules.common.ports import Clock, IdGenerator
 from perfcho.modules.identity.errors import InvalidCredentials, InvalidStableSession, StableSessionAlreadyActive
 from perfcho.modules.identity.models import (
     CredentialSnapshot,
+    OpenStableSession,
     ResolvedStableSession,
     StableLogin,
     StableSessionResult,
@@ -51,11 +63,14 @@ class IdentityService:
         clock: Clock,
         id_generator: IdGenerator,
         *,
+        stable_session_stale_grace: timedelta,
         token_factory: Callable[[], str] = generate_urlsafe_token,
     ) -> None:
         """Bind explicit transaction, security, event, time, and ID dependencies."""
         if not token_hmac_key or not device_hmac_key:
             raise ValueError("identity HMAC keys must not be empty")
+        if stable_session_stale_grace <= timedelta(0):
+            raise ValueError("Stable session stale grace must be positive")
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
         self._outbox_writer_factory = outbox_writer_factory
@@ -65,6 +80,7 @@ class IdentityService:
         self._device_hmac_key = device_hmac_key
         self._clock = clock
         self._id_generator = id_generator
+        self._stable_session_stale_grace = stable_session_stale_grace
         self._token_factory = token_factory
 
     async def login_stable(self, command: StableLogin) -> StableSessionResult:
@@ -83,15 +99,24 @@ class IdentityService:
             raise InvalidCredentials("invalid credentials")
 
         verification = await asyncio.to_thread(
-            verify_password,
+            _verify_credential,
             command.password_token,
-            PasswordHash(snapshot.password_verifier, snapshot.pepper_version),
+            snapshot,
             pepper=self._password_pepper,
             policy=self._argon2_policy,
         )
         if not verification.verified:
             await self._record_failed_login(command, identifier_hmac, snapshot, "invalid_credentials")
             raise InvalidCredentials("invalid credentials")
+
+        replacement_hash: PasswordHash | None = None
+        if snapshot.algorithm == "bcrypt_md5":
+            replacement_hash = await asyncio.to_thread(
+                hash_password,
+                command.password_token,
+                pepper=self._password_pepper,
+                policy=self._argon2_policy,
+            )
 
         component_hmacs, fingerprint_hmac = _digest_device_components(
             command.device_components,
@@ -128,7 +153,13 @@ class IdentityService:
                 failure = InvalidCredentials("invalid credentials")
             else:
                 open_session = await repository.find_open_stable_session(snapshot.account_id)
-                if open_session is not None and open_session.expires_at > now:
+                if (
+                    open_session is not None
+                    and open_session.expires_at > now
+                    and not _session_is_stale(
+                        open_session.last_activity_at, at=now, grace=self._stable_session_stale_grace
+                    )
+                ):
                     await _append_attempt(
                         repository,
                         command,
@@ -141,80 +172,102 @@ class IdentityService:
                     await uow.commit()
                     failure = StableSessionAlreadyActive("a normal Stable session is already active")
                 else:
-                    outbox = self._outbox_writer_factory(uow.session)
-                    if open_session is not None:
-                        closed_account_id = await repository.close_stable_session(
-                            open_session.session_id,
-                            now=now,
-                            reason="expired",
-                            revoke=False,
-                        )
-                        if closed_account_id is not None:
-                            await outbox.append(
-                                _session_closed_event(
-                                    closed_account_id,
-                                    open_session.session_id,
-                                    now=now,
-                                    reason="expired",
-                                    revoked=False,
-                                )
-                            )
-
-                    assert current is not None
-                    device_id = await repository.get_or_create_device(
-                        proposed_device_id=proposed_device_id,
-                        fingerprint_hmac=fingerprint_hmac,
-                        component_hmacs=component_hmacs,
+                    upgraded = replacement_hash is None or await repository.upgrade_legacy_credential(
                         account_id=snapshot.account_id,
-                        platform=None,
-                        now=now,
+                        expected_verifier=snapshot.password_verifier,
+                        expected_password_changed_at=snapshot.password_changed_at,
+                        password_verifier=replacement_hash.verifier,
+                        pepper_version=replacement_hash.pepper_version,
+                        password_changed_at=now,
                     )
-                    await repository.create_stable_session(
-                        session_id=session_id,
-                        token_id=token_id,
-                        token_jti=token_jti,
-                        account_id=snapshot.account_id,
-                        device_id=device_id,
-                        client_version=command.client_version,
-                        client_variant=command.client_variant,
-                        ip_address=command.ip_address,
-                        user_agent=command.user_agent,
-                        token_digest=token_digest,
-                        token_prefix=raw_token[:_TOKEN_PREFIX_LENGTH],
-                        now=now,
-                        expires_at=expires_at,
-                    )
-                    await _append_attempt(
-                        repository,
-                        command,
-                        identifier_hmac,
-                        account_id=snapshot.account_id,
-                        session_id=session_id,
-                        device_id=device_id,
-                        result="success",
-                        failure_reason=None,
-                        now=now,
-                    )
-                    await outbox.append(
-                        _session_opened_event(
+                    if not upgraded:
+                        await _append_attempt(
+                            repository,
                             command,
+                            identifier_hmac,
+                            account_id=snapshot.account_id,
+                            result="failure",
+                            failure_reason="invalid_credentials",
+                            now=now,
+                        )
+                        await uow.commit()
+                        failure = InvalidCredentials("invalid credentials")
+                    else:
+                        outbox = self._outbox_writer_factory(uow.session)
+                        if open_session is not None:
+                            close_reason = "expired" if open_session.expires_at <= now else "stale"
+                            closed_account_id = await repository.close_stable_session(
+                                open_session.session_id,
+                                now=now,
+                                reason=close_reason,
+                                revoke=False,
+                            )
+                            if closed_account_id is not None:
+                                await outbox.append(
+                                    _session_closed_event(
+                                        closed_account_id,
+                                        open_session.session_id,
+                                        now=now,
+                                        reason=close_reason,
+                                        revoked=False,
+                                    )
+                                )
+
+                        assert current is not None
+                        device_id = await repository.get_or_create_device(
+                            proposed_device_id=proposed_device_id,
+                            fingerprint_hmac=fingerprint_hmac,
+                            component_hmacs=component_hmacs,
+                            account_id=snapshot.account_id,
+                            platform=None,
+                            now=now,
+                        )
+                        await repository.create_stable_session(
+                            session_id=session_id,
+                            token_id=token_id,
+                            token_jti=token_jti,
+                            account_id=snapshot.account_id,
+                            device_id=device_id,
+                            client_version=command.client_version,
+                            client_variant=command.client_variant,
+                            ip_address=command.ip_address,
+                            user_agent=command.user_agent,
+                            token_digest=token_digest,
+                            token_prefix=raw_token[:_TOKEN_PREFIX_LENGTH],
+                            now=now,
+                            expires_at=expires_at,
+                        )
+                        await _append_attempt(
+                            repository,
+                            command,
+                            identifier_hmac,
                             account_id=snapshot.account_id,
                             session_id=session_id,
                             device_id=device_id,
-                            opened_at=now,
-                            expires_at=expires_at,
+                            result="success",
+                            failure_reason=None,
+                            now=now,
                         )
-                    )
-                    await uow.commit()
-                    result = StableSessionResult(
-                        account_id=snapshot.account_id,
-                        current_name=current.current_name,
-                        session_id=session_id,
-                        device_id=device_id,
-                        raw_token=raw_token,
-                        expires_at=expires_at,
-                        country_code=current.country_code,
-                    )
+                        await outbox.append(
+                            _session_opened_event(
+                                command,
+                                account_id=snapshot.account_id,
+                                session_id=session_id,
+                                device_id=device_id,
+                                opened_at=now,
+                                expires_at=expires_at,
+                            )
+                        )
+                        await uow.commit()
+                        result = StableSessionResult(
+                            account_id=snapshot.account_id,
+                            current_name=current.current_name,
+                            session_id=session_id,
+                            device_id=device_id,
+                            raw_token=raw_token,
+                            expires_at=expires_at,
+                            country_code=current.country_code,
+                        )
 
         if failure is not None:
             raise failure
@@ -232,30 +285,79 @@ class IdentityService:
             raise InvalidStableSession("invalid Stable session")
         return resolved
 
+    async def touch_stable_session(self, raw_token: str) -> ResolvedStableSession:
+        """Resolve a Poll bearer and persist a monotonic last-activity heartbeat."""
+        token_digest = digest_opaque_token(raw_token, key=self._token_hmac_key)
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            resolved = await repository.touch_stable_session(token_digest, at=self._clock.now())
+            if resolved is None:
+                raise InvalidStableSession("invalid Stable session")
+            await uow.commit()
+        return resolved
+
     async def verify_stable_web(self, identifier: str, password_token: str) -> StableWebPrincipal:
         """Verify Stable web credentials and require an existing online session."""
         normalized_identifier = _normalize_identifier(identifier)
-        snapshot: CredentialSnapshot | None = None
+        now = self._clock.now()
+        candidate: tuple[CredentialSnapshot, OpenStableSession] | None = None
         if normalized_identifier is not None:
             async with self._uow_factory() as uow:
-                snapshot = await self._repository_factory(uow.session).find_credential(*normalized_identifier)
-        if snapshot is None or snapshot.account_status != "active" or snapshot.must_change:
+                candidate = await self._repository_factory(uow.session).find_stable_web_candidate(
+                    *normalized_identifier,
+                    at=now,
+                )
+        if candidate is None:
+            await asyncio.to_thread(
+                verify_dummy_password,
+                pepper=self._password_pepper,
+                policy=self._argon2_policy,
+            )
             raise InvalidCredentials("invalid credentials")
+
+        snapshot, observed_session = candidate
+        if (
+            snapshot.account_status != "active"
+            or snapshot.must_change
+            or _session_is_stale(
+                observed_session.last_activity_at,
+                at=now,
+                grace=self._stable_session_stale_grace,
+            )
+            or not _is_stable_password_token(password_token)
+        ):
+            await asyncio.to_thread(
+                verify_dummy_password,
+                pepper=self._password_pepper,
+                policy=self._argon2_policy,
+            )
+            raise InvalidCredentials("invalid credentials")
+
         verification = await asyncio.to_thread(
-            verify_password,
+            _verify_credential,
             password_token,
-            PasswordHash(snapshot.password_verifier, snapshot.pepper_version),
+            snapshot,
             pepper=self._password_pepper,
             policy=self._argon2_policy,
         )
         if not verification.verified:
             raise InvalidCredentials("invalid credentials")
-        now = self._clock.now()
+        validated_at = self._clock.now()
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
             current = await repository.get_current_credential(snapshot.account_id)
             session = await repository.find_open_stable_session(snapshot.account_id)
-        if not _credential_is_current(snapshot, current) or session is None or session.expires_at <= now:
+        if (
+            not _credential_is_current(snapshot, current)
+            or session is None
+            or session.session_id != observed_session.session_id
+            or session.expires_at <= validated_at
+            or _session_is_stale(
+                session.last_activity_at,
+                at=validated_at,
+                grace=self._stable_session_stale_grace,
+            )
+        ):
             raise InvalidCredentials("invalid credentials")
         assert current is not None
         return StableWebPrincipal(snapshot.account_id, current.current_name, session.session_id, session.expires_at)
@@ -372,9 +474,41 @@ def _credential_is_current(original: CredentialSnapshot, current: CredentialSnap
         and not current.must_change
         and current.auth_version == original.auth_version
         and current.password_verifier == original.password_verifier
+        and current.algorithm == original.algorithm
         and current.pepper_version == original.pepper_version
         and current.password_changed_at == original.password_changed_at
     )
+
+
+def _session_is_stale(last_activity_at: datetime, *, at: datetime, grace: timedelta) -> bool:
+    return last_activity_at <= at - grace
+
+
+def _is_stable_password_token(value: str) -> bool:
+    try:
+        validate_stable_password_token(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _verify_credential(
+    preverification: str,
+    snapshot: CredentialSnapshot,
+    *,
+    pepper: PasswordPepper,
+    policy: Argon2Policy,
+) -> PasswordVerification:
+    if snapshot.algorithm == "bcrypt_md5":
+        return verify_legacy_bcrypt_md5(preverification, snapshot.password_verifier)
+    if snapshot.algorithm == "argon2id" and snapshot.pepper_version is not None:
+        return verify_password(
+            preverification,
+            PasswordHash(snapshot.password_verifier, snapshot.pepper_version),
+            pepper=pepper,
+            policy=policy,
+        )
+    return PasswordVerification(PasswordVerificationStatus.MISMATCH)
 
 
 async def _append_attempt(

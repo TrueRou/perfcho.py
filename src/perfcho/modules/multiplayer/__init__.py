@@ -7,17 +7,21 @@ from .errors import (
     MatchNotFound,
     MatchPasswordRejected,
     MatchPermissionDenied,
+    MatchProjectionUnavailable,
     MatchStateRejected,
     MultiplayerError,
 )
 from .models import (
     ChangeHost,
     ChangeRoomPassword,
+    CleanupPresence,
     CompleteRound,
     CreateRoom,
+    DurableRoomSnapshot,
     JoinRoom,
     KickParticipant,
     LeaveRoom,
+    ProjectionStatus,
     RoomRecord,
     RoomSettings,
     RoomSlot,
@@ -29,14 +33,16 @@ from .models import (
     UpdateRoomSettings,
     WinCondition,
 )
-from .ports import MultiplayerRepository, MultiplayerStateRepository
+from .ports import MultiplayerAccessPolicy, MultiplayerRepository, MultiplayerStateRepository
 from .services import MultiplayerService
 
 __all__ = [
     "ChangeHost",
     "ChangeRoomPassword",
+    "CleanupPresence",
     "CompleteRound",
     "CreateRoom",
+    "DurableRoomSnapshot",
     "JoinRoom",
     "KickParticipant",
     "LeaveRoom",
@@ -46,9 +52,11 @@ __all__ = [
     "MatchNotFound",
     "MatchPasswordRejected",
     "MatchPermissionDenied",
+    "MatchProjectionUnavailable",
     "MatchStateRejected",
     "MultiplayerError",
     "MultiplayerRepository",
+    "MultiplayerAccessPolicy",
     "MultiplayerService",
     "MultiplayerStateRepository",
     "RoomRecord",
@@ -56,6 +64,7 @@ __all__ = [
     "RoomSettings",
     "RoomSlot",
     "RoomState",
+    "ProjectionStatus",
     "SlotStatus",
     "StartRound",
     "TeamMode",

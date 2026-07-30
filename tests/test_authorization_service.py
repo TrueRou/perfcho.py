@@ -115,7 +115,12 @@ def test_stable_projection_uses_canonical_codes() -> None:
         | StablePrivilege.DEVELOPER
         | StablePrivilege.OWNER
     )
-    assert int(project_stable_privileges(authorization)) == 61
+    assert int(StablePrivilege.PLAYER) == 1
+    assert int(StablePrivilege.MODERATOR) == 2
+    assert int(StablePrivilege.SUPPORTER) == 4
+    assert int(StablePrivilege.OWNER) == 8
+    assert int(StablePrivilege.DEVELOPER) == 16
+    assert int(project_stable_privileges(authorization)) == 31
     assert (
         project_stable_privileges(
             _authorization(

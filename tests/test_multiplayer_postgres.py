@@ -1,5 +1,6 @@
+import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -15,13 +16,32 @@ from perfcho.infra.db.models.multiplayer import (
     MultiplayerEvent,
     MultiplayerSession,
     Room,
+    Round,
     SessionPresence,
 )
 from perfcho.infra.db.repositories.multiplayer import SqlAlchemyMultiplayerRepository
-from perfcho.modules.multiplayer import RoomSettings, RoundParticipantSelection, TeamMode, WinCondition
+from perfcho.modules.multiplayer import (
+    MatchAlreadyJoined,
+    MatchStateRejected,
+    RoomRecord,
+    RoomSettings,
+    RoundParticipantSelection,
+    TeamMode,
+    WinCondition,
+)
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant
 
 NOW = datetime(2026, 7, 29, 12, tzinfo=UTC)
+
+
+def test_multiplayer_partial_unique_indexes_cover_global_presence_and_active_round() -> None:
+    presence_indexes = {index.name: index for index in SessionPresence.__table__.indexes}
+    round_indexes = {index.name: index for index in Round.__table__.indexes}
+
+    assert presence_indexes["uq_session_presences_account_current"].unique
+    assert str(presence_indexes["uq_session_presences_account_current"].dialect_options["postgresql"]["where"])
+    assert round_indexes["uq_rounds_session_active"].unique
+    assert str(round_indexes["uq_rounds_session_active"].dialect_options["postgresql"]["where"])
 
 
 def settings() -> RoomSettings:
@@ -104,6 +124,7 @@ async def test_postgres_multiplayer_lifecycle_and_known_map_attempts(postgres_da
             room = await repository.create_room(
                 command_id=uuid.uuid7(),
                 actor_account_id=1,
+                connection_session_id=uuid.uuid7(),
                 settings=settings(),
                 capacity=16,
                 password_salt=None,
@@ -114,6 +135,7 @@ async def test_postgres_multiplayer_lifecycle_and_known_map_attempts(postgres_da
                 room,
                 command_id=uuid.uuid7(),
                 account_id=2,
+                connection_session_id=uuid.uuid7(),
                 now=NOW,
             )
             started, round_id = await repository.start_round(
@@ -127,10 +149,34 @@ async def test_postgres_multiplayer_lifecycle_and_known_map_attempts(postgres_da
                 now=NOW,
             )
             assert round_id is not None
-            left = await repository.leave_room(
+            snapshot = await repository.load_snapshot(started)
+            assert snapshot.round_id == round_id
+            assert tuple((item.account_id, item.slot_position, item.team) for item in snapshot.round_participants) == (
+                (1, 0, 0),
+                (2, 1, 0),
+            )
+            with pytest.raises(MatchStateRejected):
+                await repository.update_settings(
+                    started,
+                    command_id=uuid.uuid7(),
+                    actor_account_id=1,
+                    settings=settings(),
+                    now=NOW,
+                )
+            completed = await repository.complete_round(
                 started,
                 command_id=uuid.uuid7(),
+                actor_account_id=1,
+                round_id=round_id,
+                aborted=False,
+                now=NOW,
+            )
+            left = await repository.leave_room(
+                completed,
+                command_id=uuid.uuid7(),
                 account_id=1,
+                connection_session_id=None,
+                reason="client_parted",
                 now=NOW,
             )
             assert left is not None and left.host_account_id == 2
@@ -140,8 +186,87 @@ async def test_postgres_multiplayer_lifecycle_and_known_map_attempts(postgres_da
             assert await session.scalar(select(func.count()).select_from(MultiplayerSession)) == 1
             assert await session.scalar(select(func.count()).select_from(SessionPresence)) == 2
             assert await session.scalar(select(func.count()).select_from(MultiplayerAttempt)) == 2
-            assert await session.scalar(select(func.count()).select_from(MultiplayerEvent)) == 4
+            assert await session.scalar(select(func.count()).select_from(MultiplayerEvent)) == 5
             room_row = (await session.execute(select(Room))).scalar_one()
             assert room_row.public_id == 1
+            attempts = tuple((await session.scalars(select(MultiplayerAttempt))).all())
+            assert all(
+                attempt.expires_at <= NOW.replace(microsecond=0) + timedelta(minutes=2, seconds=1)
+                for attempt in attempts
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_postgres_concurrent_rooms_map_global_presence_conflict(postgres_database_url: str) -> None:
+    del postgres_database_url
+    engine = await infra_db.create_engine()
+    session_factory = infra_db.create_session_factory(engine)
+    try:
+        async with session_factory.begin() as session:
+            session.add_all(
+                Account(
+                    id=account_id,
+                    type=AccountType.USER,
+                    status=AccountStatus.ACTIVE,
+                    registered_at=NOW,
+                    activated_at=NOW,
+                )
+                for account_id in (1001, 1002)
+            )
+
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyMultiplayerRepository(session)
+            first = await repository.create_room(
+                command_id=uuid.uuid7(),
+                actor_account_id=1,
+                connection_session_id=uuid.uuid7(),
+                settings=settings(),
+                capacity=16,
+                password_salt=None,
+                password_verifier=None,
+                now=NOW,
+            )
+            second = await repository.create_room(
+                command_id=uuid.uuid7(),
+                actor_account_id=1001,
+                connection_session_id=uuid.uuid7(),
+                settings=settings(),
+                capacity=16,
+                password_salt=None,
+                password_verifier=None,
+                now=NOW,
+            )
+
+        async def join(room: RoomRecord) -> object:
+            async with session_factory() as session:
+                repository = SqlAlchemyMultiplayerRepository(session)
+                try:
+                    result = await repository.join_room(
+                        room,
+                        command_id=uuid.uuid7(),
+                        account_id=1002,
+                        connection_session_id=uuid.uuid7(),
+                        now=NOW,
+                    )
+                    await session.commit()
+                    return result
+                except Exception as error:
+                    await session.rollback()
+                    return error
+
+        results = await asyncio.gather(join(first), join(second))
+
+        assert sum(not isinstance(result, Exception) for result in results) == 1
+        assert sum(isinstance(result, MatchAlreadyJoined) for result in results) == 1
+        async with session_factory() as session:
+            active_count = await session.scalar(
+                select(func.count())
+                .select_from(SessionPresence)
+                .where(SessionPresence.account_id == 1002, SessionPresence.left_at.is_(None))
+            )
+            assert active_count == 1
     finally:
         await engine.dispose()

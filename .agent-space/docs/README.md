@@ -17,6 +17,7 @@
 3. [Stable 适配器支持矩阵](stable-adapter.md)：当前支持的 HTTP 路由、Bancho Packet、状态语义和缺口。
 4. [剩余设计与交付路线](remaining-design.md)：Multiplayer 后续验证、PP、Lazer 和投影体系的实施顺序。
 5. [实现进度](implementation-progress.md)：适合快速检查的简表和最近验证结果。
+6. [Stable 实现复核与修复记录](stable-review-2026-07-29.md)：2026-07-29 复核发现、修复位置、测试与残余边界。
 
 ## 深入设计
 

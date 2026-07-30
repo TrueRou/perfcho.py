@@ -42,6 +42,13 @@ class SlotStatus(StrEnum):
     COMPLETE = "complete"
 
 
+class ProjectionStatus(StrEnum):
+    """Describe whether a room snapshot is backed by the live Redis projection."""
+
+    LIVE = "live"
+    DURABLE_RECOVERY = "durable_recovery"
+
+
 def _positive(name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
@@ -75,8 +82,8 @@ class RoomSettings:
             raise ValueError("room name must contain at most 255 characters")
         if len(self.beatmap_name) > 255:
             raise ValueError("beatmap_name must contain at most 255 characters")
-        if self.external_beatmap_id < 0:
-            raise ValueError("external_beatmap_id must be non-negative")
+        if self.external_beatmap_id < -1:
+            raise ValueError("external_beatmap_id must be -1 or greater")
         if self.beatmap_md5 is not None and len(self.beatmap_md5) != 16:
             raise ValueError("beatmap_md5 must contain 16 bytes")
         mods = tuple(self.mods)
@@ -162,6 +169,8 @@ class RoomState:
     in_progress: bool
     expires_at: datetime
     round_id: uuid.UUID | None = None
+    round_participant_account_ids: tuple[int, ...] = ()
+    projection_status: ProjectionStatus = ProjectionStatus.LIVE
 
     def __post_init__(self) -> None:
         """Require complete ordered slots and a timezone-aware expiry."""
@@ -177,8 +186,16 @@ class RoomState:
             raise ValueError("an account cannot occupy multiple slots")
         if self.room.host_account_id not in account_ids:
             raise ValueError("the room host must occupy a slot")
+        round_accounts = tuple(self.round_participant_account_ids)
+        if len(round_accounts) != len(set(round_accounts)) or any(account_id < 1 for account_id in round_accounts):
+            raise ValueError("round participant account IDs must be unique and positive")
+        if self.in_progress != (self.round_id is not None):
+            raise ValueError("in-progress room state requires exactly one active round")
+        if not set(round_accounts) <= set(account_ids):
+            raise ValueError("round participants must occupy the room projection")
         _aware("expires_at", self.expires_at)
         object.__setattr__(self, "slots", slots)
+        object.__setattr__(self, "round_participant_account_ids", round_accounts)
 
     def slot_for(self, account_id: int) -> RoomSlot | None:
         """Return the slot occupied by an account."""
@@ -202,6 +219,29 @@ class RoundParticipantSelection:
         if self.team not in {0, 1, 2}:
             raise ValueError("round participant team is invalid")
         object.__setattr__(self, "mods", tuple(self.mods))
+
+
+@dataclass(frozen=True, slots=True)
+class DurableRoomSnapshot:
+    """Carry the PostgreSQL facts needed to rebuild a lost room projection."""
+
+    room: RoomRecord
+    active_account_ids: tuple[int, ...]
+    round_id: uuid.UUID | None = None
+    round_participants: tuple[RoundParticipantSelection, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Freeze participant collections and require a coherent active round."""
+        accounts = tuple(self.active_account_ids)
+        participants = tuple(self.round_participants)
+        if len(accounts) != len(set(accounts)) or any(account_id < 1 for account_id in accounts):
+            raise ValueError("active account IDs must be unique and positive")
+        if self.round_id is None and participants:
+            raise ValueError("round participants require an active round identity")
+        if not {participant.account_id for participant in participants} <= set(accounts):
+            raise ValueError("active round participants must have an active presence")
+        object.__setattr__(self, "active_account_ids", accounts)
+        object.__setattr__(self, "round_participants", participants)
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,8 +276,8 @@ class JoinRoom:
         if self.meta.actor is None:
             raise ValueError("join room requires an authenticated actor")
         _positive("public_id", self.public_id)
-        if len(self.password) > 64:
-            raise ValueError("room password must contain at most 64 characters")
+        if len(self.password) > 512:
+            raise ValueError("room admission credential must contain at most 512 characters")
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,3 +350,19 @@ class CompleteRound:
     public_id: int
     expected_version: int
     aborted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupPresence:
+    """Close a durable multiplayer presence owned by an expired realtime session."""
+
+    meta: CommandMeta
+    account_id: int
+    connection_session_id: uuid.UUID
+    reason: str = "session_expired"
+
+    def __post_init__(self) -> None:
+        """Require a bounded cleanup reason and positive account identity."""
+        _positive("account_id", self.account_id)
+        if not self.reason or len(self.reason) > 32:
+            raise ValueError("cleanup reason must contain at most 32 characters")

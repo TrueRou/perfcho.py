@@ -7,8 +7,8 @@ perfcho 是一个可信中心应用，不拆分微服务，也不接受外部状
 | 角色 | 职责 | 连接 |
 | --- | --- | --- |
 | API/实时网关 | Stable、Lazer 与实时协议适配，认证、命令和查询 | PostgreSQL、Redis DB 0 |
-| Outbox Relay | 扫描到期 Delivery 并投递 Taskiq | PostgreSQL、Redis DB 1 |
-| Taskiq Worker | 执行投影、计算、通知和维护任务 | PostgreSQL、Redis DB 1，按任务需要访问 DB 0 |
+| Outbox Relay | 扫描到期 Delivery 与 Calculation Job 并投递 Taskiq | PostgreSQL、Redis DB 1 |
+| Taskiq Worker | 执行投影、外部 Calculator 编排、通知和维护任务 | PostgreSQL、Redis DB 1、S3，按任务访问 Calculator HTTP/DB 0 |
 
 这些角色共享应用服务、SQLAlchemy Model 和部署密钥。进程数量不构成业务节点身份，数据库中不保存节点、Lease、Epoch 或签名。
 
@@ -42,6 +42,8 @@ perfcho:state:ratelimit:{scope}:{subject}
 6. 入队与业务执行分别计数。Worker 不可用时 Relay 可以重新入队但不会消耗业务执行次数；消费者实际失败达到上限后才标记 Dead Letter。
 
 Taskiq 使用 `when_executed` 确认和 Redis Stream Pending Entry 降低运输损失，但业务恢复不依赖 Broker Ack。Relay 会重新领取租约过期且未完成的 Delivery，因此消费者必须幂等。
+
+Performance Calculation 不作为普通 Outbox Consumer 执行，避免在 Delivery 行锁事务内等待 HTTP。成绩事务直接写 PostgreSQL Job；Relay 租赁 Job 并投递 `(job_id, lease_token)`。Worker 用第一个短事务固化 Input Digest 和业务 Attempt，事务外从 S3 读取不可变谱面并按 Formula Calculator Code 调用 C#/Rust，第二个短事务在 Fence 有效时写 Difficulty、PP、完成事件和 Job 状态。相同 `(score_id, release_id)` 重复计算必须得到相同 Output Digest。
 
 ## 故障语义
 

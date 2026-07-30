@@ -97,13 +97,13 @@ class ContentQueryService:
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).list_favourites(account_id)
 
-    async def get_rating(self, beatmapset_id: int, account_id: int | None = None) -> RatingSummary:
-        """Return aggregate and optional account rating state."""
-        _positive("beatmapset_id", beatmapset_id)
+    async def get_rating(self, beatmap_id: int, account_id: int | None = None) -> RatingSummary:
+        """Return aggregate and optional account rating state for a logical beatmap."""
+        _positive("beatmap_id", beatmap_id)
         if account_id is not None:
             _positive("account_id", account_id)
         async with self._uow_factory() as uow:
-            return await self._repository_factory(uow.session).get_rating(beatmapset_id, account_id)
+            return await self._repository_factory(uow.session).get_rating(beatmap_id, account_id)
 
 
 class ContentService:
@@ -127,14 +127,14 @@ class ContentService:
             await uow.commit()
             return result
 
-    async def rate(self, account_id: int, beatmapset_id: int, rating: int) -> RatingSummary:
-        """Upsert one bounded account rating and return the new aggregate."""
+    async def rate(self, account_id: int, beatmap_id: int, rating: int) -> RatingSummary:
+        """Upsert one bounded logical-beatmap rating and return the new aggregate."""
         _positive("account_id", account_id)
-        _positive("beatmapset_id", beatmapset_id)
+        _positive("beatmap_id", beatmap_id)
         if isinstance(rating, bool) or not 1 <= rating <= 10:
             raise ContentInputRejected("rating must be between 1 and 10")
         async with self._uow_factory() as uow:
-            result = await self._repository_factory(uow.session).rate(account_id, beatmapset_id, rating)
+            result = await self._repository_factory(uow.session).rate(account_id, beatmap_id, rating)
             await uow.commit()
             return result
 

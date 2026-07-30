@@ -8,6 +8,7 @@ from perfcho.modules.scoring.models import (
     CanonicalMod,
     PlayAttemptSubmission,
     Ruleset,
+    ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
     ScoreSubmission,
@@ -29,6 +30,7 @@ def validate_score(
     attempt: PlayAttemptSubmission,
     score: ScoreSubmission,
     revision: BeatmapRevisionInfo,
+    variant: ScoreboardVariant = ScoreboardVariant.VANILLA,
 ) -> ValidatedScore:
     """Validate hits, derived accuracy, grade, outcome, progress, and full combo."""
     values = {statistic.hit_result: statistic.actual for statistic in score.hits}
@@ -38,6 +40,11 @@ def validate_score(
     total_hits = _judged_total(ruleset, values)
     if total_hits <= 0:
         raise ScoreRejected("score must contain at least one judged hit")
+    if ruleset in {Ruleset.OSU, Ruleset.TAIKO, Ruleset.MANIA}:
+        if score.outcome is ScoreOutcome.PASSED and total_hits != revision.object_count:
+            raise ScoreRejected("passed score hit count does not match the beatmap revision")
+        if score.outcome is not ScoreOutcome.PASSED and total_hits > revision.object_count:
+            raise ScoreRejected("score hit count exceeds the beatmap revision")
 
     accuracy = _accuracy(ruleset, values, {mod.acronym for mod in mods})
     if abs(score.accuracy - accuracy) > _ACCURACY_TOLERANCE:
@@ -57,10 +64,12 @@ def validate_score(
         raise ScoreRejected(f"grade {score.grade} does not match derived grade {expected_grade}")
 
     misses = values["miss"] + values.get("small_tick_miss", 0) + values.get("large_tick_miss", 0)
+    if variant is ScoreboardVariant.VANILLA and revision.max_combo > 0 and score.max_combo > revision.max_combo:
+        raise ScoreRejected("score combo exceeds the beatmap revision")
     if score.perfect:
         if score.outcome is not ScoreOutcome.PASSED or misses != 0:
             raise ScoreRejected("perfect scores must pass without misses")
-        if revision.max_combo > 0 and score.max_combo != revision.max_combo:
+        if variant is ScoreboardVariant.VANILLA and revision.max_combo > 0 and score.max_combo != revision.max_combo:
             raise ScoreRejected("perfect score combo does not match the beatmap revision")
     return ValidatedScore(accuracy, expected_grade, total_hits)
 

@@ -3,27 +3,36 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import AsyncIterator
+import hmac
+import struct
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import FormData, UploadFile
-from starlette.formparsers import MultiPartException
+from starlette.formparsers import MultiPartException, MultiPartParser
 
+from perfcho.api.stable.client_ip import resolve_client_ip
 from perfcho.api.stable.dependencies import StableServicesDependency
-from perfcho.api.stable.score_submission import ParsedStableScore, decrypt_stable_score
+from perfcho.api.stable.score_submission import (
+    ParsedStableScore,
+    decrypt_stable_score,
+    verify_stable_online_checksum,
+)
 from perfcho.modules.common import (
     Actor,
+    ApplicationError,
     ClientContext,
     CommandMeta,
-    IdempotencyConflict,
     ObjectStorage,
     ObjectUnavailable,
 )
 from perfcho.modules.content import BeatmapNotFound, BeatmapRevisionView, ContentQueryService
-from perfcho.modules.identity import IdentityService, InvalidCredentials, StableWebPrincipal
+from perfcho.modules.identity import InvalidCredentials, StableWebPrincipal
+from perfcho.modules.realtime import RealtimeSessionFenced, RealtimeSessionNotFound
 from perfcho.modules.scoring import (
     AcceptScore,
     BeatmapReference,
@@ -35,8 +44,6 @@ from perfcho.modules.scoring import (
     ReplayQueryService,
     ReplayService,
     Ruleset,
-    ScoreboardUnavailable,
-    ScoreRejected,
     ScoringService,
     StagedReplayManifest,
 )
@@ -47,6 +54,10 @@ router = APIRouter(include_in_schema=False, default_response_class=Response)
 
 _RULESETS = (Ruleset.OSU, Ruleset.TAIKO, Ruleset.FRUITS, Ruleset.MANIA)
 _RULESET_IDS = {ruleset.value: index for index, ruleset in enumerate(_RULESETS)}
+_MIN_STABLE_REPLAY_BYTES = 24
+_MAX_STABLE_ELAPSED_MS = 7 * 24 * 60 * 60 * 1000
+_MAX_STABLE_SUBMISSION_AGE = timedelta(days=30)
+_MAX_STABLE_CLOCK_SKEW = timedelta(minutes=5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,11 +128,7 @@ async def _replay_authentication(
     username: Annotated[str, Query(alias="u", min_length=1, max_length=64)],
     password_token: Annotated[str, Query(alias="h", min_length=32, max_length=32)],
 ) -> _ReplayAuthentication:
-    try:
-        principal = await services.identity.verify_stable_web(username, password_token)
-    except InvalidCredentials:
-        principal = None
-    return _ReplayAuthentication(principal)
+    return _ReplayAuthentication(await _verify_online_web_principal(services, username, password_token))
 
 
 async def _leaderboard_authentication(
@@ -129,11 +136,7 @@ async def _leaderboard_authentication(
     username: Annotated[str, Query(alias="us", min_length=1, max_length=64)],
     password_token: Annotated[str, Query(alias="ha", min_length=32, max_length=32)],
 ) -> _ReplayAuthentication:
-    try:
-        principal = await services.identity.verify_stable_web(username, password_token)
-    except InvalidCredentials:
-        principal = None
-    return _ReplayAuthentication(principal)
+    return _ReplayAuthentication(await _verify_online_web_principal(services, username, password_token))
 
 
 @router.post("/web/osu-submit-modular-selector.php")
@@ -157,16 +160,29 @@ async def submit_score(
             score_time_ms=form.score_time_ms,
             supported_build=services.settings.stable_build,
         )
+        _validate_submission_evidence(form, parsed)
     except HTTPException, MultiPartException, ValueError:
         return Response(b"error: no")
 
-    principal = await _authenticate_submission(services.identity, parsed, form.password_token)
+    principal = await _authenticate_submission(services, parsed, form.password_token)
     if principal is None:
         return Response(b"error: pass")
+    try:
+        verify_stable_online_checksum(
+            parsed,
+            osu_version=form.osu_version,
+            storyboard_hash=form.storyboard_hash,
+            username=principal.current_name,
+        )
+    except ValueError:
+        return Response(b"error: no")
     try:
         beatmap = await content_query.lookup_md5(parsed.beatmap_md5)
     except BeatmapNotFound:
         return Response(b"error: beatmap")
+    received_at = services.clock.now()
+    if not received_at - _MAX_STABLE_SUBMISSION_AGE <= parsed.attempt.ended_at <= received_at + _MAX_STABLE_CLOCK_SKEW:
+        return Response(b"error: no")
 
     try:
         replay_content = await _read_replay(form.replay, services.settings.stable_replay_max_bytes)
@@ -186,21 +202,24 @@ async def submit_score(
     except ObjectUnavailable:
         return Response(b"")
 
-    request_digest = hashlib.sha256(
-        form.encrypted_score.encode() + b"\0" + form.encrypted_client_hash.encode() + b"\0" + replay_digest
-    ).digest()
+    request_digest = _submission_digest(form, replay_digest)
     request_id = services.id_generator.new()
     online_checksum = parsed.score.online_checksum
     if online_checksum is None:
         return Response(b"error: no")
     attestation = replace(
         parsed.attestation,
-        checksum=request_digest,
+        checksum=online_checksum,
         client_integrity_digest=hashlib.sha256(parsed.client_hash.encode()).digest(),
         evidence={
             **dict(parsed.attestation.evidence),
-            "updated_beatmap_hash": form.updated_beatmap_hash,
-            "storyboard_hash": form.storyboard_hash,
+            "online_checksum": "verified",
+            "updated_beatmap_hash": "verified",
+            "storyboard_hash": "format_valid_authoritative_match_pending"
+            if form.storyboard_hash is not None
+            else "not_supplied",
+            "client_hash": "format_valid_authoritative_session_match_pending",
+            "unique_ids": "format_valid_authoritative_session_match_pending",
             "unique_ids_digest": hashlib.sha256(form.unique_ids.encode()).hexdigest(),
         },
     )
@@ -214,10 +233,10 @@ async def submit_score(
                 family="stable",
                 version=services.settings.stable_build,
                 variant=None,
-                ip_address=_client_ip(request),
+                ip_address=resolve_client_ip(request, services.settings.trusted_proxy_cidrs),
                 user_agent=request.headers.get("user-agent"),
             ),
-            received_at=services.clock.now(),
+            received_at=received_at,
         ),
         beatmap=BeatmapReference(md5=parsed.beatmap_md5),
         ruleset=parsed.ruleset,
@@ -233,17 +252,21 @@ async def submit_score(
             client_version=services.settings.stable_build,
         ),
         attestation=attestation,
-        multiplayer=(
-            await services.multiplayer.resolve_submission_context(principal.account_id, beatmap.revision_id)
-            if services.multiplayer is not None
-            else None
-        ),
+        multiplayer=None,
     )
     try:
+        if services.multiplayer is not None:
+            command = replace(
+                command,
+                multiplayer=await services.multiplayer.resolve_submission_context(
+                    principal.account_id,
+                    beatmap.revision_id,
+                ),
+            )
         result = await scoring.accept(command)
     except BeatmapRevisionNotFound:
         return Response(b"error: beatmap")
-    except IdempotencyConflict, ScoreRejected, ScoreboardUnavailable:
+    except ApplicationError, ValueError:
         return Response(b"error: no")
     if result.outcome.value != "passed":
         return Response(b"error: no")
@@ -352,7 +375,7 @@ async def get_scores(
             friend_account_ids=friend_ids,
         )
     )
-    rating = await content_query.get_rating(beatmap.external_beatmapset_id, principal.account_id)
+    rating = await content_query.get_rating(beatmap.beatmap_id, principal.account_id)
     average_rating = rating.average if rating.average is not None else 0
     lines = [
         (
@@ -373,9 +396,27 @@ async def _submission_form(request: Request, maximum: int) -> _SubmissionForm:
     if content_length is not None and (
         not content_length.isascii() or not content_length.isdigit() or int(content_length) > maximum
     ):
-        raise ValueError("Stable score submission is too large")
-    form = await request.form(max_files=2, max_fields=32, max_part_size=maximum)
+        raise MultiPartException("Stable score submission is too large")
+    if request.headers.get("content-type", "").partition(";")[0].strip().casefold() != "multipart/form-data":
+        raise MultiPartException("Stable score submission must be multipart")
+    parser = MultiPartParser(
+        request.headers,
+        _limited_multipart_stream(request, maximum),
+        max_files=2,
+        max_fields=32,
+        max_part_size=maximum,
+    )
+    form = await parser.parse()
     return _parse_submission_form(form)
+
+
+async def _limited_multipart_stream(request: Request, maximum: int) -> AsyncGenerator[bytes]:
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > maximum:
+            raise MultiPartException("Stable score submission is too large")
+        yield chunk
 
 
 def _parse_submission_form(form: FormData) -> _SubmissionForm:
@@ -388,8 +429,8 @@ def _parse_submission_form(form: FormData) -> _SubmissionForm:
         encrypted_score=encrypted_score,
         replay=replay,
         exited=_form_boolean(form, "x"),
-        fail_time_ms=_form_integer(form, "ft"),
-        score_time_ms=_form_integer(form, "st"),
+        fail_time_ms=_form_integer(form, "ft", maximum=_MAX_STABLE_ELAPSED_MS),
+        score_time_ms=_form_integer(form, "st", maximum=_MAX_STABLE_ELAPSED_MS),
         password_token=_form_text(form, "pass", maximum=32),
         osu_version=_form_text(form, "osuver", maximum=16),
         encrypted_client_hash=_form_text(form, "s", maximum=16_384),
@@ -416,11 +457,14 @@ def _optional_form_text(form: FormData, key: str, *, maximum: int) -> str | None
     return value
 
 
-def _form_integer(form: FormData, key: str) -> int:
+def _form_integer(form: FormData, key: str, *, maximum: int) -> int:
     value = _form_text(form, key, maximum=20)
     if not value.isascii() or not value.isdigit():
         raise ValueError(f"Stable score field {key} is invalid")
-    return int(value)
+    result = int(value)
+    if result > maximum:
+        raise ValueError(f"Stable score field {key} is outside its supported range")
+    return result
 
 
 def _form_boolean(form: FormData, key: str) -> bool:
@@ -433,13 +477,25 @@ def _form_boolean(form: FormData, key: str) -> bool:
 
 
 async def _authenticate_submission(
-    identity: IdentityService,
+    services: StableServicesDependency,
     parsed: ParsedStableScore,
     password_token: str,
 ) -> StableWebPrincipal | None:
+    return await _verify_online_web_principal(services, parsed.username, password_token)
+
+
+async def _verify_online_web_principal(
+    services: StableServicesDependency,
+    username: str,
+    password_token: str,
+) -> StableWebPrincipal | None:
     try:
-        return await identity.verify_stable_web(parsed.username, password_token)
-    except InvalidCredentials:
+        principal = await services.identity.verify_stable_web(username, password_token)
+        realtime = await services.realtime.resolve_session(principal.session_id, at=services.clock.now())
+        if realtime.account_id != principal.account_id:
+            raise RealtimeSessionFenced("Stable Web principal does not own the realtime session")
+        return principal
+    except InvalidCredentials, RealtimeSessionNotFound, RealtimeSessionFenced:
         return None
 
 
@@ -447,14 +503,60 @@ async def _read_replay(upload: UploadFile, maximum: int) -> bytes:
     content = await upload.read(maximum + 1)
     if len(content) > maximum:
         raise ValueError("Stable replay exceeds the configured limit")
+    if len(content) < _MIN_STABLE_REPLAY_BYTES:
+        raise ValueError("Stable replay does not contain its minimum structure")
     return content
 
 
-def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Real-IP")
-    if forwarded:
-        return forwarded
-    return request.client.host if request.client is not None else "127.0.0.1"
+def _validate_submission_evidence(form: _SubmissionForm, parsed: ParsedStableScore) -> None:
+    updated_beatmap_hash = _md5_bytes(form.updated_beatmap_hash, "bmk")
+    if not hmac.compare_digest(updated_beatmap_hash, parsed.beatmap_md5):
+        raise ValueError("Stable updated beatmap hash does not match the score")
+    if form.storyboard_hash is not None:
+        _md5_bytes(form.storyboard_hash, "sbk")
+    identifiers = form.unique_ids.split("|")
+    if len(identifiers) != 2 or any(
+        not value or len(value) > 1024 or not all(character.isprintable() for character in value)
+        for value in identifiers
+    ):
+        raise ValueError("Stable unique client identifiers are invalid")
+
+
+def _md5_bytes(value: str, field_name: str) -> bytes:
+    if len(value) != 32:
+        raise ValueError(f"Stable score field {field_name} is not an MD5")
+    try:
+        digest = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(f"Stable score field {field_name} is not an MD5") from error
+    if len(digest) != 16:
+        raise ValueError(f"Stable score field {field_name} is not an MD5")
+    return digest
+
+
+def _submission_digest(form: _SubmissionForm, replay_digest: bytes) -> bytes:
+    fields = (
+        ("score", form.encrypted_score.encode()),
+        ("replay_sha256", replay_digest),
+        ("x", str(int(form.exited)).encode()),
+        ("ft", str(form.fail_time_ms).encode()),
+        ("st", str(form.score_time_ms).encode()),
+        ("pass", form.password_token.encode()),
+        ("osuver", form.osu_version.encode()),
+        ("s", form.encrypted_client_hash.encode()),
+        ("iv", form.iv.encode()),
+        ("bmk", form.updated_beatmap_hash.encode()),
+        ("sbk", (form.storyboard_hash or "").encode()),
+        ("c1", form.unique_ids.encode()),
+    )
+    digest = hashlib.sha256()
+    for name, value in fields:
+        encoded_name = name.encode()
+        digest.update(struct.pack(">H", len(encoded_name)))
+        digest.update(encoded_name)
+        digest.update(struct.pack(">Q", len(value)))
+        digest.update(value)
+    return digest.digest()
 
 
 def _submission_chart(score_id: int, beatmap: BeatmapRevisionView, parsed: ParsedStableScore) -> str:

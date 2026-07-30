@@ -41,7 +41,7 @@ Run the process roles separately:
 
 ```bash
 uv run uvicorn perfcho.main:asgi_app --host 127.0.0.1 --port 8000
-uv run taskiq worker perfcho.infra.taskiq:broker perfcho.tasks.outbox --ack-type when_executed
+uv run taskiq worker perfcho.infra.taskiq:broker perfcho.tasks.outbox perfcho.tasks.performance --ack-type when_executed
 uv run python -m perfcho.infra.outbox
 ```
 
@@ -76,6 +76,13 @@ uv run pytest
 TEST_DATABASE_URL=postgresql+asyncpg://perfcho:perfcho@127.0.0.1:55432/perfcho_test uv run pytest -m postgres
 ```
 
+## Bancho Migration
+
+The offline bancho.py v5.2.2 MySQL and asset migration is available through
+`python -m tools.bancho_migration`. Run `preflight` before `apply`; the operational prerequisites, exclusions, override
+format, recovery rules, and verification procedure are documented in
+[the migration runbook](.agent-space/docs/bancho-migration.md).
+
 ## Structure
 
 ```text
@@ -84,8 +91,10 @@ src/perfcho/infra/db/
   enums.py                Stable cross-domain values
   mixins.py               ID and timestamp policies
   models/                 Domain-separated models with English purpose docstrings
+  projectors/             Idempotent outbox consumers and projection checkpoints
 src/perfcho/infra/outbox.py  PostgreSQL delivery ledger and Taskiq relay
 src/perfcho/infra/taskiq.py  Redis Stream broker and worker lifecycle
+src/perfcho/tasks/outbox.py  Taskiq dispatch task and explicit consumer registration
 .agent-space/docs/        Chinese architecture, operations, and business contracts
 tests/                    Infrastructure and domain contract tests
 ```

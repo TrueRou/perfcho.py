@@ -243,6 +243,35 @@ class ContentSyncState(TimestampMixin, DbBase):
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
+class BeatmapsetSyncProjection(TimestampMixin, DbBase):
+    """Projects the latest completed synchronization result for a beatmapset."""
+
+    __tablename__ = "beatmapset_sync_projections"
+    __table_args__ = (
+        CheckConstraint(
+            "created_revision_count >= 0 AND unchanged_revision_count >= 0 AND removed_beatmap_count >= 0",
+            name="nonnegative_counts",
+        ),
+        CheckConstraint("source_position > 0", name="positive_source_position"),
+        UniqueConstraint("source_event_id"),
+        Index("ix_beatmapset_sync_projections_position", "source_position"),
+        {"schema": "content"},
+    )
+
+    beatmapset_id: Mapped[int] = mapped_column(
+        ForeignKey("content.beatmapsets.id", ondelete="CASCADE"), primary_key=True
+    )
+    external_beatmapset_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_revision_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    unchanged_revision_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    removed_beatmap_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_event_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("events.outbox_events.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_position: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class BeatmapsetFavourite(CreatedAtMixin, DbBase):
     """Records beatmapsets favourited by accounts."""
 
@@ -259,12 +288,12 @@ class BeatmapsetFavourite(CreatedAtMixin, DbBase):
 
 
 class RatingVote(BigIntIdentityMixin, TimestampMixin, DbBase):
-    """Records account ratings for beatmapsets or specific beatmap revisions."""
+    """Records account ratings for beatmapsets or logical beatmaps."""
 
     __tablename__ = "rating_votes"
     __table_args__ = (
         CheckConstraint("rating BETWEEN 1 AND 10", name="rating_range"),
-        CheckConstraint("num_nonnulls(beatmapset_id, beatmap_revision_id) = 1", name="single_target"),
+        CheckConstraint("num_nonnulls(beatmapset_id, beatmap_id) = 1", name="single_target"),
         Index(
             "uq_rating_votes_set_account",
             "account_id",
@@ -273,22 +302,20 @@ class RatingVote(BigIntIdentityMixin, TimestampMixin, DbBase):
             postgresql_where=text("beatmapset_id IS NOT NULL"),
         ),
         Index(
-            "uq_rating_votes_revision_account",
+            "uq_rating_votes_beatmap_account",
             "account_id",
-            "beatmap_revision_id",
+            "beatmap_id",
             unique=True,
-            postgresql_where=text("beatmap_revision_id IS NOT NULL"),
+            postgresql_where=text("beatmap_id IS NOT NULL"),
         ),
         Index("ix_rating_votes_set_rating", "beatmapset_id", "rating"),
-        Index("ix_rating_votes_revision_rating", "beatmap_revision_id", "rating"),
+        Index("ix_rating_votes_beatmap_rating", "beatmap_id", "rating"),
         {"schema": "content"},
     )
 
     account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
     beatmapset_id: Mapped[int | None] = mapped_column(ForeignKey("content.beatmapsets.id", ondelete="RESTRICT"))
-    beatmap_revision_id: Mapped[int | None] = mapped_column(
-        ForeignKey("content.beatmap_revisions.id", ondelete="RESTRICT")
-    )
+    beatmap_id: Mapped[int | None] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="RESTRICT"))
     rating: Mapped[int] = mapped_column(SmallInteger, nullable=False)
 
 

@@ -9,6 +9,10 @@ from perfcho.modules.realtime.models import (
     MailboxPacket,
     PresenceSnapshot,
     RealtimeSession,
+    SessionFence,
+    SpectatorAttachment,
+    SpectatorFramePublish,
+    SpectatorFrameWindow,
     SpectatorRelation,
 )
 
@@ -23,6 +27,7 @@ class RealtimeRepository(Protocol):
         session_id: uuid.UUID,
         account_id: int,
         expires_at: datetime,
+        durable_expires_at: datetime,
     ) -> RealtimeSession:
         """Open a new revision and fence any prior lifecycle for the session."""
         ...
@@ -57,8 +62,8 @@ class RealtimeRepository(Protocol):
         """Return a bounded online presence snapshot ordered by account ID."""
         ...
 
-    async def clear_presence(self, account_id: int, *, expected_revision: int) -> bool:
-        """Remove presence only when the stored revision matches."""
+    async def clear_presence(self, account_id: int, *, expected_fence: SessionFence) -> bool:
+        """Remove presence only when its full stored session epoch matches."""
         ...
 
     async def set_presence_filter(
@@ -120,6 +125,7 @@ class RealtimeRepository(Protocol):
         account_id: int,
         payload: bytes,
         *,
+        recipient_fence: SessionFence,
         expires_at: datetime,
     ) -> MailboxPacket:
         """Append an immutable packet or raise MailboxOverflow at the bound."""
@@ -129,6 +135,7 @@ class RealtimeRepository(Protocol):
         self,
         account_id: int,
         *,
+        recipient_fence: SessionFence,
         lease_id: uuid.UUID,
         limit: int,
         expires_at: datetime,
@@ -136,11 +143,24 @@ class RealtimeRepository(Protocol):
         """Acquire an exclusive bounded poll lease and return ordered packets."""
         ...
 
-    async def ack_mailbox(self, account_id: int, *, lease_id: uuid.UUID, through_sequence: int) -> None:
+    async def ack_mailbox(
+        self,
+        account_id: int,
+        *,
+        recipient_fence: SessionFence,
+        lease_id: uuid.UUID,
+        through_sequence: int,
+    ) -> None:
         """Delete leased packets through an acknowledged sequence."""
         ...
 
-    async def release_mailbox(self, account_id: int, *, lease_id: uuid.UUID) -> None:
+    async def release_mailbox(
+        self,
+        account_id: int,
+        *,
+        recipient_fence: SessionFence,
+        lease_id: uuid.UUID,
+    ) -> None:
         """Release a poll lease without acknowledging its packets."""
         ...
 
@@ -149,9 +169,13 @@ class RealtimeRepository(Protocol):
         host_account_id: int,
         spectator_account_id: int,
         *,
+        relation_id: uuid.UUID,
+        host_fence: SessionFence,
+        spectator_fence: SessionFence,
         expires_at: datetime,
-    ) -> SpectatorRelation:
-        """Attach a spectator to an online host and return the relation revision."""
+        history_limit: int,
+    ) -> SpectatorAttachment:
+        """Atomically attach and return the history-to-live handoff snapshot."""
         ...
 
     async def detach_spectator(
@@ -159,42 +183,54 @@ class RealtimeRepository(Protocol):
         host_account_id: int,
         spectator_account_id: int,
         *,
+        relation_id: uuid.UUID,
         expected_revision: int,
-    ) -> None:
-        """Remove a spectator relation only when its revision remains current."""
+        host_fence: SessionFence,
+        spectator_fence: SessionFence,
+    ) -> bool:
+        """Remove only the exact relation and return whether it was detached."""
         ...
 
     async def get_spectator_relation(
         self,
         spectator_account_id: int,
         *,
+        spectator_fence: SessionFence,
         at: datetime,
     ) -> SpectatorRelation | None:
         """Resolve one live spectator relation."""
         ...
 
-    async def list_spectators(self, host_account_id: int, *, at: datetime) -> frozenset[int]:
-        """Return live spectator account IDs for one host."""
+    async def list_spectators(
+        self,
+        host_account_id: int,
+        *,
+        host_fence: SessionFence,
+        at: datetime,
+    ) -> tuple[SpectatorRelation, ...]:
+        """Return live, fully fenced relations for one host."""
         ...
 
     async def publish_spectator_frame(
         self,
         host_account_id: int,
         *,
+        host_fence: SessionFence,
         sequence: int,
         payload: bytes,
         expires_at: datetime,
-    ) -> MailboxPacket:
-        """Publish one bounded immutable host frame or raise InvalidFrame."""
+    ) -> SpectatorFramePublish:
+        """Roll history and atomically queue one live frame to fenced viewers."""
         ...
 
     async def read_spectator_frames(
         self,
         host_account_id: int,
         *,
-        after_sequence: int,
+        host_fence: SessionFence,
+        after_cursor: int | None,
         limit: int,
         at: datetime,
-    ) -> tuple[MailboxPacket, ...]:
-        """Read ordered live host frames strictly after a sequence."""
+    ) -> SpectatorFrameWindow:
+        """Read a latest window or frames strictly after an internal cursor."""
         ...

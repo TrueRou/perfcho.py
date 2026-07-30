@@ -17,6 +17,8 @@ SQLAlchemy Metadata 是应用内数据库结构契约。API、Relay、Taskiq 任
 
 `create_all()` 不会修改已存在的列、约束或索引。涉及现有结构的模型变更仍需制定显式 SQL 发布与回滚方案，不能把自动建表当作结构演进工具。
 
+Multi-PP 基线新增 `calculation_formulas`、`calculation_formula_scoreboards`、`performance_calculation_jobs`，并修改 `calculation_releases`、`score_performances`、`ranking_policies`。已有开发数据库必须删除并重建 Scoring Schema，或在发布前编写对应 ALTER/数据回填 SQL；仅重启应用不会升级这些旧表。Formula/Release 当前不由 Bootstrap 伪造，部署必须使用真实 Calculator 制品 SHA-256 和配置摘要登记后才能产生 Job。
+
 ## 集成验证
 
 ```bash
@@ -31,7 +33,7 @@ PostgreSQL 标记测试会清空测试 Schema，调用应用数据库引擎两�
 
 ```bash
 uv run uvicorn perfcho.main:asgi_app --host 127.0.0.1 --port 8000
-uv run taskiq worker perfcho.infra.taskiq:broker perfcho.tasks.outbox --ack-type when_executed
+uv run taskiq worker perfcho.infra.taskiq:broker perfcho.tasks.outbox perfcho.tasks.performance --ack-type when_executed
 uv run python -m perfcho.infra.outbox
 ```
 

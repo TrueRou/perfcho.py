@@ -3,6 +3,7 @@
 from perfcho.modules.community.errors import (
     AccountSilenced,
     ChannelAccessDenied,
+    ChannelMembershipUnavailable,
     ChannelNotFound,
     CommunityInputRejected,
     DirectMessageBlocked,
@@ -10,31 +11,37 @@ from perfcho.modules.community.errors import (
     MessageIdempotencyConflict,
     MessageNotFound,
     PrivateMessageRejected,
+    TargetAccountSilenced,
 )
 from perfcho.modules.community.models import (
     ActiveSilence,
     ChannelMembershipResult,
     ChannelPermissions,
+    ConversationReadCursor,
     DirectConversationResult,
     MessageResult,
     OfflineDirectMessage,
+    OfflineDirectMessagePage,
     ReadCursorResult,
     StableChannel,
 )
-from perfcho.modules.community.ports import ActiveSilencePolicy, CommunityRepository
+from perfcho.modules.community.ports import ActiveChannelMembershipQuery, ActiveSilencePolicy, CommunityRepository
 from perfcho.modules.community.services import CommunityService
 
 __all__ = (
     "AccountSilenced",
+    "ActiveChannelMembershipQuery",
     "ActiveSilence",
     "ActiveSilencePolicy",
     "ChannelAccessDenied",
     "ChannelMembershipResult",
+    "ChannelMembershipUnavailable",
     "ChannelNotFound",
     "ChannelPermissions",
     "CommunityInputRejected",
     "CommunityRepository",
     "CommunityService",
+    "ConversationReadCursor",
     "DirectConversationResult",
     "DirectMessageBlocked",
     "MembershipRejected",
@@ -42,7 +49,9 @@ __all__ = (
     "MessageNotFound",
     "MessageResult",
     "OfflineDirectMessage",
+    "OfflineDirectMessagePage",
     "PrivateMessageRejected",
     "ReadCursorResult",
     "StableChannel",
+    "TargetAccountSilenced",
 )

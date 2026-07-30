@@ -4,12 +4,16 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import lru_cache
 
+import bcrypt
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from argon2.low_level import Type
 
 _STABLE_PASSWORD_TOKEN = re.compile(r"[0-9a-f]{32}")
+_DUMMY_PASSWORD_TOKEN = "0" * 32
+_DUMMY_PASSWORD_MISMATCH = "1" * 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +128,36 @@ def verify_password(
         PasswordVerificationStatus.MATCH,
         needs_rehash=hasher.check_needs_rehash(password_hash.verifier),
     )
+
+
+def verify_legacy_bcrypt_md5(preverification: str, verifier: str) -> PasswordVerification:
+    """Verify a legacy bancho.py bcrypt hash of a Stable MD5 password token."""
+    try:
+        token = validate_stable_password_token(preverification)
+        matched = bcrypt.checkpw(token.encode("ascii"), verifier.encode("ascii"))
+    except TypeError, UnicodeError, ValueError:
+        return PasswordVerification(PasswordVerificationStatus.MISMATCH)
+    return PasswordVerification(
+        PasswordVerificationStatus.MATCH if matched else PasswordVerificationStatus.MISMATCH,
+    )
+
+
+def verify_dummy_password(*, pepper: PasswordPepper, policy: Argon2Policy) -> PasswordVerification:
+    """Spend one current-policy Argon2 verification without authenticating an account."""
+    verification = verify_password(
+        _DUMMY_PASSWORD_MISMATCH,
+        _dummy_password_hash(pepper, policy),
+        pepper=pepper,
+        policy=policy,
+    )
+    if verification.verified:
+        raise RuntimeError("dummy password verifier unexpectedly matched")
+    return verification
+
+
+@lru_cache(maxsize=16)
+def _dummy_password_hash(pepper: PasswordPepper, policy: Argon2Policy) -> PasswordHash:
+    return hash_password(_DUMMY_PASSWORD_TOKEN, pepper=pepper, policy=policy)
 
 
 def _append_pepper(token: str, pepper: PasswordPepper) -> bytes:

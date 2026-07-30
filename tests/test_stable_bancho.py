@@ -5,6 +5,7 @@ from typing import cast
 import httpx
 import pytest
 from fastapi import FastAPI
+from pydantic import ValidationError
 
 from perfcho.api.stable import router
 from perfcho.api.stable.dependencies import get_stable_services
@@ -13,6 +14,7 @@ from perfcho.composition import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService, StablePrivilege
 from perfcho.modules.common import Clock, IdGenerator
+from perfcho.modules.community import CommunityService, OfflineDirectMessage, StableChannel
 from perfcho.modules.identity import IdentityService, ResolvedStableSession, StableLogin, StableSessionResult
 from perfcho.modules.realtime import (
     MailboxBatch,
@@ -20,14 +22,21 @@ from perfcho.modules.realtime import (
     PresenceSnapshot,
     RealtimeRepository,
     RealtimeSession,
+    SessionFence,
 )
+from perfcho.modules.social import SocialService
 from perfcho.realtime.stable import (
     ClientPacket,
     LoginFailureReason,
     PacketReader,
     ServerPacket,
+    UserPresence,
+    UserStats,
     build_packet,
+    user_presence,
+    user_stats,
 )
+from perfcho.realtime.stable.dispatcher import StableRuntimeContext
 
 NOW = datetime(2026, 7, 29, tzinfo=UTC)
 
@@ -47,6 +56,8 @@ class FakeIdentity:
         self.login_command = None
         self.session_id = uuid.uuid7()
         self.device_id = uuid.uuid7()
+        self.touch_calls = 0
+        self.close_calls: list[tuple[str, str]] = []
 
     async def login_stable(self, command: StableLogin) -> StableSessionResult:
         self.login_command = command
@@ -75,6 +86,13 @@ class FakeIdentity:
             expires_at=NOW + timedelta(hours=1),
         )
 
+    async def touch_stable_session(self, raw_token: str) -> ResolvedStableSession:
+        self.touch_calls += 1
+        return await self.resolve_stable_session(raw_token)
+
+    async def close_stable_session(self, raw_token: str, *, reason: str = "client_closed") -> None:
+        self.close_calls.append((raw_token, reason))
+
 
 class FakeAuthorization:
     async def get_stable_privileges(self, account_id: int) -> StablePrivilege:
@@ -87,6 +105,16 @@ class FakeRealtime:
         self.session: RealtimeSession | None = None
         self.presence: PresenceSnapshot | None = None
         self.mailbox: list[MailboxPacket] = []
+        self.online_presences: dict[int, PresenceSnapshot] = {}
+        self.channel_members: dict[int, set[int]] = {}
+        self.enqueued: list[tuple[int, bytes, SessionFence]] = []
+        self.fenced: list[SessionFence] = []
+        self.lease_fences: list[SessionFence] = []
+        self.active_lease = False
+        self.lease_conflict = False
+        self.fail_set_presence = False
+        self.open_calls = 0
+        self.durable_expires_at: datetime | None = None
 
     async def open_session(
         self,
@@ -94,7 +122,10 @@ class FakeRealtime:
         session_id: uuid.UUID,
         account_id: int,
         expires_at: datetime,
+        durable_expires_at: datetime,
     ) -> RealtimeSession:
+        self.open_calls += 1
+        self.durable_expires_at = durable_expires_at
         self.session = RealtimeSession(session_id, account_id, 1, expires_at)
         return self.session
 
@@ -120,35 +151,135 @@ class FakeRealtime:
 
     async def set_presence(self, snapshot: PresenceSnapshot, *, session_id: uuid.UUID) -> None:
         assert self.session is not None and session_id == self.session.session_id
+        if self.fail_set_presence:
+            raise RuntimeError("presence bootstrap failed")
         self.presence = snapshot
+        self.online_presences[snapshot.account_id] = snapshot
 
     async def get_presence(self, account_id: int, *, at: datetime) -> PresenceSnapshot | None:
         del at
-        return self.presence if self.presence is not None and self.presence.account_id == account_id else None
+        return self.online_presences.get(account_id)
+
+    async def list_presences(self, *, at: datetime, limit: int) -> tuple[PresenceSnapshot, ...]:
+        del at
+        return tuple(self.online_presences[key] for key in sorted(self.online_presences))[:limit]
+
+    async def join_channel(
+        self,
+        channel_id: int,
+        *,
+        session_id: uuid.UUID,
+        expected_revision: int,
+    ) -> None:
+        assert self.session is not None
+        assert (session_id, expected_revision) == (self.session.session_id, self.session.revision)
+        self.channel_members.setdefault(channel_id, set()).add(self.session.account_id)
+
+    async def list_channel_members(self, channel_id: int) -> frozenset[int]:
+        return frozenset(self.channel_members.get(channel_id, set()))
+
+    async def enqueue_mailbox(
+        self,
+        account_id: int,
+        payload: bytes,
+        *,
+        recipient_fence: SessionFence,
+        expires_at: datetime,
+    ) -> MailboxPacket:
+        del expires_at
+        self.enqueued.append((account_id, payload, recipient_fence))
+        return MailboxPacket(len(self.enqueued), payload)
 
     async def lease_mailbox(
         self,
         account_id: int,
         *,
+        recipient_fence: SessionFence,
         lease_id: uuid.UUID,
         limit: int,
         expires_at: datetime,
     ) -> MailboxBatch:
         del account_id, limit
+        if self.lease_conflict:
+            from perfcho.modules.realtime import PollLeaseConflict
+
+            raise PollLeaseConflict()
+        self.lease_fences.append(recipient_fence)
+        self.active_lease = True
         return MailboxBatch(lease_id, tuple(self.mailbox), expires_at)
 
     async def ack_mailbox(
         self,
         account_id: int,
         *,
+        recipient_fence: SessionFence,
         lease_id: uuid.UUID,
         through_sequence: int,
     ) -> None:
         del account_id, lease_id
+        assert self.session is not None
+        assert recipient_fence == self.session.fence
         self.mailbox = [packet for packet in self.mailbox if packet.sequence > through_sequence]
+        self.active_lease = False
 
-    async def release_mailbox(self, account_id: int, *, lease_id: uuid.UUID) -> None:
+    async def release_mailbox(
+        self,
+        account_id: int,
+        *,
+        recipient_fence: SessionFence,
+        lease_id: uuid.UUID,
+    ) -> None:
         del account_id, lease_id
+        assert self.session is not None
+        assert recipient_fence == self.session.fence
+        self.active_lease = False
+
+    async def fence_session(self, session_id: uuid.UUID, *, expected_revision: int) -> None:
+        assert self.session is not None
+        assert (session_id, expected_revision) == (self.session.session_id, self.session.revision)
+        self.fenced.append(self.session.fence)
+        self.online_presences.pop(self.session.account_id, None)
+        self.session = None
+
+
+class FakeSocial:
+    async def list_friends(self, account_id: int) -> tuple[object, ...]:
+        assert account_id == 3
+        return ()
+
+
+class FakeCommunity:
+    def __init__(self) -> None:
+        self.policy: str | None = None
+        self.silence_seconds = 91
+        self.channels = (
+            StableChannel(7, "#general", "General", True, 2000, True, False),
+            StableChannel(8, "#announcements", "News", False, 2000, False, False),
+            StableChannel(9, "#lobby", "Lobby", True, 2000, True, False),
+        )
+        self.offline_messages = (OfflineDirectMessage(10, 20, 8, "online", uuid.uuid7(), "older message", False, NOW),)
+        self.realtime: FakeRealtime | None = None
+
+    async def set_private_message_policy(self, account_id: int, policy: str) -> str:
+        assert account_id == 3
+        self.policy = policy
+        return policy
+
+    async def list_public_channels(self, account_id: int) -> tuple[StableChannel, ...]:
+        assert account_id == 3
+        return self.channels
+
+    async def list_unread_offline_direct_messages(self, account_id: int) -> tuple[OfflineDirectMessage, ...]:
+        assert account_id == 3
+        return self.offline_messages
+
+    async def get_global_silence_remaining_seconds(self, account_id: int) -> int:
+        assert account_id == 3
+        return self.silence_seconds
+
+    async def get_channel_member_count(self, account_id: int, channel_id: int) -> int:
+        assert account_id == 3 and self.realtime is not None
+        return len(await self.realtime.list_channel_members(channel_id)) + 3
 
 
 def stable_services() -> tuple[StableServices, FakeIdentity, FakeRealtime]:
@@ -164,6 +295,14 @@ def stable_services() -> tuple[StableServices, FakeIdentity, FakeRealtime]:
         settings=config,
     )
     return services, identity, realtime
+
+
+def configure_community(services: StableServices, realtime: FakeRealtime) -> FakeCommunity:
+    community = FakeCommunity()
+    community.realtime = realtime
+    object.__setattr__(services, "community", cast(CommunityService, community))
+    object.__setattr__(services, "social", cast(SocialService, FakeSocial()))
+    return community
 
 
 def login_body(*, build: str = "b20260711.1") -> bytes:
@@ -207,6 +346,12 @@ async def test_successful_login_has_ordered_binary_bootstrap() -> None:
     ]
     assert identity.login_command is not None
     assert realtime.presence is not None
+    assert realtime.presence.session_id == identity.session_id
+    assert realtime.durable_expires_at == NOW + timedelta(hours=1)
+    privilege_packet = next(packet for packet in packets if packet.packet_type is ServerPacket.PRIVILEGES)
+    assert privilege_packet.payload.read_i32() == StablePrivilege.PLAYER | StablePrivilege.SUPPORTER
+    own_presence = next(packet for packet in packets if packet.packet_type is ServerPacket.USER_PRESENCE)
+    assert own_presence.payload.read_user_presence().privileges == StablePrivilege.PLAYER
 
 
 @pytest.mark.asyncio
@@ -233,6 +378,7 @@ async def test_authenticated_ping_poll_drains_mailbox() -> None:
         session_id=identity.session_id,
         account_id=3,
         expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
     )
     realtime.mailbox.append(MailboxPacket(1, build_packet(ServerPacket.NOTIFICATION, b"\x00")))
     app = FastAPI()
@@ -251,6 +397,8 @@ async def test_authenticated_ping_poll_drains_mailbox() -> None:
         ServerPacket.NOTIFICATION,
     ]
     assert realtime.mailbox == []
+    assert identity.touch_calls == 1
+    assert realtime.lease_fences == [SessionFence(identity.session_id, 1)]
 
 
 @pytest.mark.asyncio
@@ -260,6 +408,7 @@ async def test_invalid_token_and_malformed_packet_request_reconnect() -> None:
         session_id=identity.session_id,
         account_id=3,
         expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
     )
     app = FastAPI()
     app.include_router(router)
@@ -273,3 +422,193 @@ async def test_invalid_token_and_malformed_packet_request_reconnect() -> None:
 
     assert list(PacketReader(expired.content, packet_enum=ServerPacket))[-1].packet_type is ServerPacket.RESTART
     assert list(PacketReader(malformed.content, packet_enum=ServerPacket))[-1].packet_type is ServerPacket.RESTART
+    assert not realtime.active_lease
+
+
+@pytest.mark.asyncio
+async def test_login_bootstrap_failure_closes_durable_session_and_fences_realtime() -> None:
+    services, identity, realtime = stable_services()
+    realtime.fail_set_presence = True
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        with pytest.raises(RuntimeError, match="presence bootstrap failed"):
+            await client.post("/", content=login_body(), headers={"User-Agent": "osu!"})
+
+    assert identity.close_calls == [("stable-token-value", "bootstrap_failed")]
+    assert realtime.fenced == [SessionFence(identity.session_id, 1)]
+    assert realtime.session is None
+
+
+@pytest.mark.asyncio
+async def test_poll_with_lost_redis_epoch_closes_durable_session_and_restarts() -> None:
+    services, identity, realtime = stable_services()
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    assert list(PacketReader(response.content, packet_enum=ServerPacket))[-1].packet_type is ServerPacket.RESTART
+    assert identity.close_calls == [("stable-token-value", "realtime_state_lost")]
+    assert realtime.open_calls == 0
+    assert identity.touch_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_poll_acquires_fenced_mailbox_lease_before_dispatch_and_conflict_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    bancho_module = importlib.import_module("perfcho.api.stable.router.bancho")
+    services, identity, realtime = stable_services()
+    await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    dispatched = False
+
+    async def checked_dispatch(
+        body: bytes,
+        context: StableRuntimeContext,
+        dispatched_services: StableServices,
+    ) -> bytes:
+        nonlocal dispatched
+        del body, context
+        assert dispatched_services is services
+        assert realtime.active_lease
+        dispatched = True
+        return build_packet(ServerPacket.PONG)
+
+    monkeypatch.setattr(bancho_module, "dispatch_packets", checked_dispatch)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+        realtime.lease_conflict = True
+        conflict = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    assert dispatched
+    assert [packet.packet_type for packet in PacketReader(response.content, packet_enum=ServerPacket)] == [
+        ServerPacket.PONG
+    ]
+    assert conflict.content == b""
+
+
+@pytest.mark.asyncio
+async def test_login_bootstraps_online_users_channels_silence_and_timestamped_mail() -> None:
+    services, identity, realtime = stable_services()
+    other_session_id = uuid.uuid7()
+    other_payload = user_presence(UserPresence(8, "online", 0, 1, 1, 0, 0.0, 0.0, 50)) + user_stats(
+        UserStats(8, 0, "", "", 0, 0, 0, 0, 0.0, 0, 0, 50, 0)
+    )
+    realtime.online_presences[8] = PresenceSnapshot(
+        8,
+        4,
+        other_payload,
+        NOW + timedelta(minutes=5),
+        other_session_id,
+    )
+    community = configure_community(services, realtime)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post("/", content=login_body(), headers={"User-Agent": "osu!"})
+
+    packets = list(PacketReader(response.content, packet_enum=ServerPacket))
+    channels = [packet.payload.read_channel() for packet in packets if packet.packet_type is ServerPacket.CHANNEL_INFO]
+    presences = [
+        packet.payload.read_user_presence() for packet in packets if packet.packet_type is ServerPacket.USER_PRESENCE
+    ]
+    silence = next(packet for packet in packets if packet.packet_type is ServerPacket.SILENCE_END)
+    offline = next(packet for packet in packets if packet.packet_type is ServerPacket.SEND_MESSAGE)
+
+    assert len(channels) == 1
+    assert (channels[0].name, channels[0].topic, channels[0].player_count) == ("#general", "General", 4)
+    assert [presence.user_id for presence in presences] == [8, 3]
+    assert presences[0].privileges == StablePrivilege.PLAYER
+    assert silence.payload.read_i32() == 91
+    assert offline.payload.read_message().text == "[Wed Jul 29 @ 00:00AM] older message"
+    assert community.policy == "friends"
+    assert realtime.channel_members == {7: {3}}
+    assert realtime.presence is not None
+    assert realtime.enqueued == [(8, realtime.presence.payload, SessionFence(other_session_id, 4))]
+
+
+@pytest.mark.asyncio
+async def test_login_capacity_closes_new_durable_session_before_presence_truncation() -> None:
+    services, identity, realtime = stable_services()
+    object.__setattr__(services, "settings", Settings(stable_presence_batch_size=1))
+    other_session_id = uuid.uuid7()
+    realtime.online_presences[8] = PresenceSnapshot(
+        8,
+        1,
+        user_presence(UserPresence(8, "online", 0, 1, 1, 0, 0.0, 0.0, 0)),
+        NOW + timedelta(minutes=5),
+        other_session_id,
+    )
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post("/", content=login_body(), headers={"User-Agent": "osu!"})
+
+    assert response.headers["cho-token"] == "server-full"
+    assert identity.close_calls == [("stable-token-value", "bootstrap_failed")]
+    assert realtime.open_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("peer", "header", "expected"),
+    [
+        ("10.2.3.4", "203.0.113.9", "203.0.113.9"),
+        ("10.2.3.4", "203.0.113.9, 198.51.100.2", "10.2.3.4"),
+        ("192.0.2.8", "203.0.113.9", "192.0.2.8"),
+    ],
+)
+async def test_proxy_headers_require_a_trusted_peer_and_one_strict_ip(peer: str, header: str, expected: str) -> None:
+    services, identity, _ = stable_services()
+    object.__setattr__(services, "settings", Settings(trusted_proxy_cidrs=["10.0.0.0/8"]))
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    transport = httpx.ASGITransport(app=app, client=(peer, 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://c.test") as client:
+        await client.post(
+            "/",
+            content=login_body(),
+            headers={"User-Agent": "osu!", "CF-Connecting-IP": header},
+        )
+
+    assert identity.login_command is not None
+    assert identity.login_command.ip_address == expected
+    assert identity.login_command.meta.client.ip_address == expected
+
+
+def test_trusted_proxy_configuration_rejects_non_network_cidrs() -> None:
+    with pytest.raises(ValidationError, match="invalid trusted proxy CIDR"):
+        Settings(trusted_proxy_cidrs=["10.0.0.1/8"])

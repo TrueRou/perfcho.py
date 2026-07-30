@@ -16,10 +16,10 @@ class StablePrivilege(IntFlag):
 
     NONE = 0
     PLAYER = 1
+    MODERATOR = 2
     SUPPORTER = 4
-    MODERATOR = 8
+    OWNER = 8
     DEVELOPER = 16
-    OWNER = 32
 
 
 def project_stable_privileges(authorization: EffectiveAuthorization) -> StablePrivilege:

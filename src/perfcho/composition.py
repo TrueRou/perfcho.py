@@ -19,7 +19,10 @@ from perfcho.infra.db.repositories.community import (
 )
 from perfcho.infra.db.repositories.content import SqlAlchemyContentRepository
 from perfcho.infra.db.repositories.identity import SqlAlchemyIdentityRepository
-from perfcho.infra.db.repositories.multiplayer import SqlAlchemyMultiplayerRepository
+from perfcho.infra.db.repositories.multiplayer import (
+    SqlAlchemyMultiplayerAccessPolicy,
+    SqlAlchemyMultiplayerRepository,
+)
 from perfcho.infra.db.repositories.scoring import (
     SqlAlchemyAccountSubmissionValidator,
     SqlAlchemyMultiplayerSubmissionValidator,
@@ -30,7 +33,6 @@ from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
 from perfcho.infra.redis.multiplayer import RedisMultiplayerStateRepository
 from perfcho.infra.redis.realtime import RedisRealtimeRepository
 from perfcho.infra.s3 import S3ObjectStorage
-from perfcho.infra.scoring import DeferredPerformanceCalculator
 from perfcho.infra.security.password import Argon2Policy, PasswordPepper
 from perfcho.infra.settings import Settings, settings
 from perfcho.modules.authorization import AuthorizationQueryService
@@ -40,7 +42,13 @@ from perfcho.modules.content import ContentQueryService, ContentService
 from perfcho.modules.identity import IdentityService
 from perfcho.modules.multiplayer import MultiplayerService
 from perfcho.modules.realtime import RealtimeRepository
-from perfcho.modules.scoring import RankingQueryService, ReplayQueryService, ReplayService, ScoringService
+from perfcho.modules.scoring import (
+    PerformanceQueryService,
+    RankingQueryService,
+    ReplayQueryService,
+    ReplayService,
+    ScoringService,
+)
 from perfcho.modules.social import SocialService
 
 
@@ -88,6 +96,10 @@ def _multiplayer_repository(session: object) -> SqlAlchemyMultiplayerRepository:
     return SqlAlchemyMultiplayerRepository(cast(AsyncSession, session))
 
 
+def _multiplayer_access_policy(session: object) -> SqlAlchemyMultiplayerAccessPolicy:
+    return SqlAlchemyMultiplayerAccessPolicy(cast(AsyncSession, session))
+
+
 class SystemClock:
     """Return the current UTC instant."""
 
@@ -120,6 +132,7 @@ class StableServices:
     community: CommunityService | None = None
     object_storage: ObjectStorage | None = None
     scoring: ScoringService | None = None
+    performance_query: PerformanceQueryService | None = None
     replay_query: ReplayQueryService | None = None
     replay: ReplayService | None = None
     ranking_query: RankingQueryService | None = None
@@ -151,10 +164,11 @@ async def compose_stable_services(
             memory_cost_kib=config.argon2_memory_cost_kib,
             parallelism=config.argon2_parallelism,
         ),
-        config.match_password_hmac_key.get_secret_value().encode(),
+        config.token_hmac_key.get_secret_value().encode(),
         config.device_hmac_key.get_secret_value().encode(),
         application_clock,
         application_ids,
+        stable_session_stale_grace=timedelta(seconds=config.stable_session_stale_grace_seconds),
     )
     realtime = RedisRealtimeRepository(
         redis,
@@ -166,6 +180,8 @@ async def compose_stable_services(
         max_packet_bytes=config.redis_mailbox_max_bytes,
         max_frame_count=config.redis_spectator_max_frames,
         max_frame_bytes=config.redis_spectator_max_bytes,
+        max_channels_per_session=config.redis_realtime_max_channels_per_session,
+        max_spectators_per_host=config.redis_spectator_max_viewers,
     )
     uow_factory = SqlAlchemyUnitOfWorkFactory(session_factory)
     content_query = ContentQueryService(uow_factory, _content_repository)
@@ -178,6 +194,7 @@ async def compose_stable_services(
         _silence_policy,
         _outbox_writer,
         application_clock,
+        realtime,
     )
     scoring = ScoringService(
         uow_factory,
@@ -185,7 +202,6 @@ async def compose_stable_services(
         _outbox_writer,
         _account_submission_validator,
         _multiplayer_submission_validator,
-        DeferredPerformanceCalculator(),
         application_clock,
         application_ids,
     )
@@ -199,7 +215,9 @@ async def compose_stable_services(
             max_rooms=config.redis_multiplayer_max_rooms,
         ),
         application_clock,
-        config.token_hmac_key.get_secret_value().encode(),
+        config.match_password_hmac_key.get_secret_value().encode(),
+        access_policy_factory=_multiplayer_access_policy,
+        admission_key=config.token_hmac_key.get_secret_value().encode(),
         state_lifetime=timedelta(seconds=config.redis_multiplayer_ttl_seconds),
     )
 
@@ -220,6 +238,7 @@ async def compose_stable_services(
             community=community,
             object_storage=S3ObjectStorage.from_settings(config),
             scoring=scoring,
+            performance_query=PerformanceQueryService(uow_factory, _scoring_repository),
             replay_query=ReplayQueryService(uow_factory, _scoring_repository),
             replay=ReplayService(uow_factory, _scoring_repository),
             ranking_query=RankingQueryService(uow_factory, _scoring_repository),

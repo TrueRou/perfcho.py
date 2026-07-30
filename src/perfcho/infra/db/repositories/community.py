@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import case, func, literal, or_, select, update
+from sqlalchemy import and_, case, func, literal, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -25,6 +25,7 @@ from perfcho.infra.db.models.social import Block, Follow, TeamMembership
 from perfcho.modules.community.models import (
     ActiveSilence,
     ChannelRecord,
+    ConversationReadCursor,
     DirectConversationResult,
     DirectMessageContext,
     MessageResult,
@@ -336,43 +337,45 @@ class SqlAlchemyCommunityRepository:
         self,
         account_id: int,
         *,
+        after_message_id: int | None,
         limit: int,
     ) -> tuple[OfflineDirectMessage, ...]:
         """List unread incoming direct messages in ascending order with sender names."""
-        rows = (
-            await self._session.execute(
-                select(
-                    Message.id,
-                    Message.channel_id,
-                    Message.sender_account_id,
-                    AccountName.display_name,
-                    Message.client_message_id,
-                    Message.content,
-                    Message.is_action,
-                    Message.created_at,
-                )
-                .join(DirectConversation, DirectConversation.channel_id == Message.channel_id)
-                .join(
-                    AccountName,
-                    (AccountName.account_id == Message.sender_account_id) & AccountName.ended_at.is_(None),
-                )
-                .outerjoin(
-                    ChannelUserState,
-                    (ChannelUserState.channel_id == Message.channel_id) & (ChannelUserState.account_id == account_id),
-                )
-                .where(
-                    or_(
-                        DirectConversation.low_account_id == account_id,
-                        DirectConversation.high_account_id == account_id,
-                    ),
-                    Message.sender_account_id != account_id,
-                    Message.deleted_at.is_(None),
-                    Message.id > func.coalesce(ChannelUserState.last_read_message_id, 0),
-                )
-                .order_by(Message.id)
-                .limit(limit)
+        statement = (
+            select(
+                Message.id,
+                Message.channel_id,
+                Message.sender_account_id,
+                AccountName.display_name,
+                Message.client_message_id,
+                Message.content,
+                Message.is_action,
+                Message.created_at,
             )
-        ).all()
+            .join(DirectConversation, DirectConversation.channel_id == Message.channel_id)
+            .join(
+                AccountName,
+                (AccountName.account_id == Message.sender_account_id) & AccountName.ended_at.is_(None),
+            )
+            .outerjoin(
+                ChannelUserState,
+                (ChannelUserState.channel_id == Message.channel_id) & (ChannelUserState.account_id == account_id),
+            )
+            .where(
+                or_(
+                    DirectConversation.low_account_id == account_id,
+                    DirectConversation.high_account_id == account_id,
+                ),
+                Message.sender_account_id != account_id,
+                Message.deleted_at.is_(None),
+                Message.id > func.coalesce(ChannelUserState.last_read_message_id, 0),
+            )
+            .order_by(Message.id)
+            .limit(limit)
+        )
+        if after_message_id is not None:
+            statement = statement.where(Message.id > after_message_id)
+        rows = (await self._session.execute(statement)).all()
         return tuple(
             OfflineDirectMessage(
                 message_id=row.id,
@@ -385,6 +388,114 @@ class SqlAlchemyCommunityRepository:
                 created_at=row.created_at,
             )
             for row in rows
+        )
+
+    async def get_direct_conversation_read_cursor(
+        self,
+        account_id: int,
+        other_account_id: int,
+    ) -> ConversationReadCursor | None:
+        """Return the latest undeleted message sent by one direct-conversation peer."""
+        low_account_id, high_account_id = sorted((account_id, other_account_id))
+        row = (
+            await self._session.execute(
+                select(DirectConversation.channel_id, func.max(Message.id).label("message_id"))
+                .join(Message, Message.channel_id == DirectConversation.channel_id)
+                .where(
+                    DirectConversation.low_account_id == low_account_id,
+                    DirectConversation.high_account_id == high_account_id,
+                    Message.sender_account_id == other_account_id,
+                    Message.deleted_at.is_(None),
+                )
+                .group_by(DirectConversation.channel_id)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return ConversationReadCursor(row.channel_id, row.message_id)
+
+    async def list_valid_direct_read_cursors(
+        self,
+        account_id: int,
+        cursors: tuple[ConversationReadCursor, ...],
+    ) -> frozenset[ConversationReadCursor]:
+        """Validate direct-conversation ownership and message positions in one query."""
+        if not cursors:
+            return frozenset()
+        positions = tuple((cursor.channel_id, cursor.message_id) for cursor in cursors)
+        rows = (
+            await self._session.execute(
+                select(Message.channel_id, Message.id)
+                .join(DirectConversation, DirectConversation.channel_id == Message.channel_id)
+                .where(
+                    tuple_(Message.channel_id, Message.id).in_(positions),
+                    or_(
+                        DirectConversation.low_account_id == account_id,
+                        DirectConversation.high_account_id == account_id,
+                    ),
+                    Message.deleted_at.is_(None),
+                )
+            )
+        ).all()
+        return frozenset(ConversationReadCursor(row.channel_id, row.id) for row in rows)
+
+    async def advance_read_cursors(
+        self,
+        account_id: int,
+        cursors: tuple[ConversationReadCursor, ...],
+        *,
+        now: datetime,
+    ) -> tuple[ReadCursorResult, ...]:
+        """Advance one cursor per direct conversation with a batch upsert."""
+        if not cursors:
+            return ()
+        insert_statement = insert(ChannelUserState).values(
+            [
+                {
+                    "channel_id": cursor.channel_id,
+                    "account_id": account_id,
+                    "last_read_message_id": cursor.message_id,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                for cursor in cursors
+            ]
+        )
+        advanced_rows = (
+            await self._session.execute(
+                insert_statement.on_conflict_do_update(
+                    index_elements=(ChannelUserState.channel_id, ChannelUserState.account_id),
+                    set_={
+                        "last_read_message_id": insert_statement.excluded.last_read_message_id,
+                        "updated_at": now,
+                    },
+                    where=or_(
+                        ChannelUserState.last_read_message_id.is_(None),
+                        ChannelUserState.last_read_message_id < insert_statement.excluded.last_read_message_id,
+                    ),
+                ).returning(ChannelUserState.channel_id, ChannelUserState.last_read_message_id)
+            )
+        ).all()
+        advanced_channel_ids = frozenset(row.channel_id for row in advanced_rows)
+        current_rows = (
+            await self._session.execute(
+                select(ChannelUserState.channel_id, ChannelUserState.last_read_message_id).where(
+                    ChannelUserState.account_id == account_id,
+                    ChannelUserState.channel_id.in_(tuple(cursor.channel_id for cursor in cursors)),
+                )
+            )
+        ).all()
+        current_by_channel = {row.channel_id: row.last_read_message_id for row in current_rows}
+        if len(current_by_channel) != len(cursors) or any(value is None for value in current_by_channel.values()):
+            raise RuntimeError("one or more direct-message read cursors disappeared during batch update")
+        return tuple(
+            ReadCursorResult(
+                cursor.channel_id,
+                account_id,
+                current_by_channel[cursor.channel_id],
+                cursor.channel_id in advanced_channel_ids,
+            )
+            for cursor in cursors
         )
 
     async def join_membership(self, channel_id: int, account_id: int, *, now: datetime) -> bool:
@@ -426,20 +537,27 @@ class SqlAlchemyActiveSilencePolicy:
         self,
         account_id: int,
         *,
-        channel_id: int,
+        channel_id: int | None,
         at: datetime,
     ) -> ActiveSilence | None:
         """Return the strongest active global or matching channel silence."""
+        scope = (
+            and_(Sanction.kind == SanctionKind.SILENCE, Sanction.channel_id.is_(None))
+            if channel_id is None
+            else or_(
+                and_(Sanction.kind == SanctionKind.SILENCE, Sanction.channel_id.is_(None)),
+                and_(Sanction.kind == SanctionKind.CHANNEL_MUTE, Sanction.channel_id == channel_id),
+            )
+        )
         row = (
             await self._session.execute(
                 select(Sanction.subject_account_id, Sanction.reason, Sanction.ends_at, Sanction.channel_id)
                 .where(
                     Sanction.subject_account_id == account_id,
-                    Sanction.kind.in_((SanctionKind.SILENCE, SanctionKind.CHANNEL_MUTE)),
+                    scope,
                     Sanction.revoked_at.is_(None),
                     Sanction.starts_at <= at,
                     or_(Sanction.ends_at.is_(None), Sanction.ends_at > at),
-                    or_(Sanction.channel_id.is_(None), Sanction.channel_id == channel_id),
                 )
                 .order_by(Sanction.channel_id.asc().nulls_first(), Sanction.ends_at.desc().nulls_first())
                 .limit(1)

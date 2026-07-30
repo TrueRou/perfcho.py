@@ -28,11 +28,13 @@ from perfcho.realtime.stable import (
     MultiplayerMatch,
     PacketReader,
     PacketWriter,
+    ScoreFrame,
     ServerPacket,
     UserPresence,
     UserStats,
 )
 from perfcho.realtime.stable.dispatcher import StableRuntimeContext, dispatch_packets
+from perfcho.realtime.stable.multiplayer import _settings_from_wire
 
 NOW = datetime(2026, 7, 29, 12, tzinfo=UTC)
 EXPIRY = NOW + timedelta(minutes=5)
@@ -52,12 +54,17 @@ class FakeMultiplayer:
     def __init__(self, state: RoomState) -> None:
         self.state = state
         self.created: CreateRoom | None = None
+        self.durable_find_calls = 0
 
     async def create_room(self, command: CreateRoom) -> RoomState:
         self.created = command
         return self.state
 
     async def find_room_for_account(self, account_id: int) -> RoomState | None:
+        self.durable_find_calls += 1
+        return self.state if self.state.slot_for(account_id) is not None else None
+
+    async def get_realtime_room_for_account(self, account_id: int) -> RoomState | None:
         return self.state if self.state.slot_for(account_id) is not None else None
 
     async def set_slot_status(self, public_id: int, account_id: int, status: SlotStatus) -> RoomState:
@@ -114,6 +121,8 @@ def client_packet(packet_type: ClientPacket, write: object | None = None) -> byt
     with writer.packet(packet_type):
         if isinstance(write, MultiplayerMatch):
             writer.write_multiplayer_match(write)
+        elif isinstance(write, ScoreFrame):
+            writer.write_score_frame(write)
     return writer.to_bytes()
 
 
@@ -158,3 +167,31 @@ async def test_ready_updates_slot_and_returns_hidden_password_match_state() -> N
     match = packet.payload.read_multiplayer_match()
     assert match.slot_statuses[0] == 8
     assert match.password == ""
+
+
+def test_map_change_sentinel_is_preserved_in_canonical_settings() -> None:
+    converted = _settings_from_wire(MultiplayerMatch(name="Room", beatmap_id=-1))
+    assert converted.external_beatmap_id == -1
+
+
+@pytest.mark.asyncio
+async def test_score_frame_hot_path_uses_only_cached_room_state() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+    round_id = uuid.uuid7()
+    multiplayer.state = replace(
+        multiplayer.state,
+        in_progress=True,
+        round_id=round_id,
+        round_participant_account_ids=(10,),
+        slots=(replace(multiplayer.state.slots[0], status=SlotStatus.PLAYING), *multiplayer.state.slots[1:]),
+    )
+    frame = ScoreFrame(100, 0, 1, 2, 3, 4, 5, 6, 1000, 10, 5, False, 200, 0, False)
+
+    response = await dispatch_packets(
+        client_packet(ClientPacket.MATCH_SCORE_UPDATE, frame),
+        context(),
+        services(multiplayer),
+    )
+
+    assert response == b""
+    assert multiplayer.durable_find_calls == 0

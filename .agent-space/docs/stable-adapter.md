@@ -10,7 +10,7 @@
 - Bancho Protocol Version：`19`。
 - Bancho 使用 `POST /`，`User-Agent` 必须为 `osu!`。
 - 无 `osu-token` Header 时执行登录；有 Token 时执行二进制 Poll。
-- Web 路由使用 Stable 用户名和 MD5 Password Token，通过 `IdentityService.verify_stable_web()` 统一验证。
+- Web 路由使用 Stable 用户名和 MD5 Password Token，通过 `IdentityService.verify_stable_web()` 统一验证，并要求匹配的 Redis Realtime Session Epoch 在线。
 - 二进制 Body、Multipart、Replay、Packet、String、List 和 Frame Bundle 均有明确上限。
 - 每个 Packet 已按长度隔离，未知或尚未支持的 Packet 会安全跳过，不会让当前 Poll 失去帧同步。
 
@@ -37,6 +37,8 @@
 3. 顺序处理本次请求中的客户端 Packet。
 4. 刷新 Session/Presence 有效期，但不超过持久会话到期时间。
 5. 领取 Mailbox 批次，与本次请求产生的响应一起返回并确认。
+
+Poll 在处理客户端 Packet 前获取 fenced Mailbox Lease，避免并发 Poll 在业务副作用完成后才发生冲突。所有本地响应受 `stable_max_response_bytes` 约束。
 
 ## 3. 客户端 Packet 支持
 
@@ -70,8 +72,9 @@
 
 | 方法与路径 | 状态 | 用途 |
 | --- | --- | --- |
-| `GET /web/osu-getfriends.php` | 已接线 | 返回当前账户的好友 ID |
-| `POST /web/osu-getbeatmapinfo.php` | 已接线 | 按文件名和 Beatmap ID 批量返回 Song Select 信息 |
+| `GET /web/osu-getfriends.php` | 已接线 | 返回系统账户与当前账户的好友 ID |
+| `GET /web/osu-markasread.php` | 已接线 | 按私信对象推进权威 Conversation Read Cursor |
+| `POST /web/osu-getbeatmapinfo.php` | 已接线 | 按文件名和 Beatmap ID 批量返回 Song Select 信息与真实 Vanilla 最佳投影 Grade |
 | `GET /web/osu-search.php` | 已接线 | 从本地内容索引执行 Direct 搜索和分页 |
 | `GET /web/osu-search-set.php` | 已接线 | 按 Set ID、Beatmap ID 或 MD5 返回单个 Direct Set |
 | `GET /web/osu-getfavourites.php` | 已接线 | 返回公开收藏的 Beatmapset ID |
@@ -80,7 +83,7 @@
 | `GET /web/bancho_connect.php` | 已接线 | 接受客户端连接探针，不创建会话 |
 | `GET /web/check-updates.php` | 已接线 | 接受受支持 Stream 的更新探针，当前返回空响应 |
 | `GET /web/maps/{map_filename}` | 已接线 | 从 S3 流式返回当前 `.osu`，不可用时重定向上游 |
-| `GET /d/{beatmapset_selector}` | 已接线 | 重定向官方 Beatmapset 下载，支持 `n` 无视频后缀 |
+| `GET /d/{beatmapset_selector}` | 已接线 | 重定向可配置的公开 Beatmapset 上游，支持 `n` 无视频后缀 |
 | `POST /web/osu-submit-modular-selector.php` | 已接线 | 解密、验证、暂存 Replay 并原子接受 Stable 成绩 |
 | `GET /web/osu-getreplay.php` | 已接线 | 流式返回 Replay 并幂等记录非 Owner 查看事实 |
 | `GET /web/osu-osz2-getscores.php` | 已接线 | 返回本地 Ranking Projection 的排行榜 |
@@ -90,9 +93,9 @@
 - Beatmap Query 支持 External Beatmap ID、MD5、文件名和 Beatmapset ID。
 - Direct 搜索只查询本地已同步内容，不会在请求内调用官方 API。
 - `Newest`、`Top+Rated`、`Most+Played` 当前被当作空搜索词，不代表对应排序投影已经实现。
-- Direct Beatmapset 下载当前重定向到上游，不缓存 `.osz`。
+- Direct Beatmapset 下载当前重定向到可配置上游，不缓存 `.osz`；遗留官方默认值会在 Router 中转换为无需请求内官方认证的公开 NeriNyan 下载端点。
 - `.osu` 文件读取支持本地对象存储；缺失时重定向到配置的上游 URL。
-- 收藏和评分写入 PostgreSQL；评分范围固定为 1 到 10。
+- 收藏和评分写入 PostgreSQL；评分范围固定为 1 到 10，Stable MD5 评分绑定逻辑 Beatmap，不再错误绑定整个 Beatmapset 或某个可替换 Revision。
 
 ## 6. 成绩提交语义
 
@@ -103,8 +106,9 @@
 - 用户名、MD5 Password Token 和 Submission 用户一致性。
 - Beatmap MD5 对应当前不可变 Revision。
 - Ruleset、Variant、Legacy Mod Bit 和 Mod 组合。
-- Hit Statistic、Combo、Accuracy、Grade、Pass/Fail 与结束时间。
-- Stable Online Checksum、请求摘要和幂等冲突。
+- Hit Statistic、普通榜 Combo/FC、Accuracy、Grade、Pass/Fail、可证明对象数边界与有界结束时间。
+- 按 bancho.py 公式重算并常量时间比较的 Stable Online Checksum；公式使用认证后的当前用户名、提交的客户端 Hash 与 Storyboard Hash。
+- `bmk` 与提交谱面 MD5 一致、`sbk` MD5 格式、`c1` 双设备分量、客户端 Build Marker、Replay 24 字节最小结构、请求摘要和幂等冲突。
 - 已同步谱面的 Round Start 会冻结 Playlist/Scoreboard/Mod Policy/Slot/Team/Mods 并签发 Multiplayer Attempt；Stable 路由解析最近有效 Context，`ScoringService` 在成绩事务中消费。
 - 未同步或未知谱面允许进行非排名联机，但不会伪造 Round Attempt。
 
@@ -122,6 +126,8 @@
 
 Replay 二进制先在事务外按 SHA-256 写入对象存储。数据库失败时可能留下无引用对象，后续应由对象存储对账/GC 清理；不能在数据库事务里执行 S3 I/O。
 
+Attestation 整体仍保持 `pending`：当前接口无法权威比较提交的 Client Hash/`c1` 与登录设备事实，也没有权威 Storyboard 内容摘要或完整 Replay Frame/反作弊分析。Evidence 只把实际完成的格式、谱面 Hash 和 Online Checksum 子校验标为 verified，不能把请求摘要冒充客户端 Checksum。
+
 ### 6.3 排行榜
 
 Stable `leaderboard_type` 当前支持：
@@ -134,7 +140,7 @@ Stable `leaderboard_type` 当前支持：
 
 编辑器请求返回空排行但保留谱面头信息。谱面不存在、文件名存在但 MD5 过期、Set ID 不匹配和非法 Mod 组合均映射为 Stable 约定响应。
 
-真实 PP 尚未计算。Ranking 当前以已持久化且符合 Eligibility 的可用排序字段工作，不能将 Deferred PP 解释为最终 Performance 结果。
+Vanilla Policy 以 Total Score 排名，并明确允许 Ranked、Approved、Qualified 与 Loved。Relax/Autopilot Policy 只允许 Ranked/Approved 且以指定 Calculation Release 的 PP 排名；PP 缺失时 Eligibility 为 `performance_pending`，不会静默回退为 Total Score。真实 PP Release 尚未配置时 RX/AP 排行为空，这不能解释为最终 Performance 结果。
 
 ## 7. Social、Community 与 Spectator
 
@@ -153,8 +159,8 @@ Stable Friend 对应单向 Follow。添加和删除具有自然幂等语义；Fr
 
 - Redis 保存 Host 与 Spectator 关系，不写 PostgreSQL。
 - Relation 使用 Session Revision/Fence，旧 Session 不能覆盖新 Session。
-- Frame 按单调 Sequence 写入有界历史；乱序或无效 Frame 会被拒绝。
-- 新 Spectator 加入时会收到当前保留历史，并通知 Host 和 Fellow Spectator。
+- Frame 使用 Session Epoch 内部 Cursor 写入滚动有界历史，接受 Stable u16 Sequence 回绕；无效 Frame 会被拒绝。
+- 新 Spectator 通过原子 History-to-Live Handoff 收到当前最新保留窗口，并通知 Host 和 Fellow Spectator。
 - Host 下线或 TTL 到期后关系允许自然失效。
 
 ### 7.4 Multiplayer
@@ -162,7 +168,7 @@ Stable Friend 对应单向 Follow。添加和删除具有自然幂等语义；Fr
 - PostgreSQL 保存 Room、Session、Participant/Presence、Host、Round、Attempt 和有序 Event；Redis 保存 16 Slot 高频投影。
 - Stable Public Match ID 限制为 1 到 32767，结束后允许复用；Active Room 使用部分唯一索引。
 - Match Password 使用独立 HMAC Key、随机 Salt 和常量时间比较；Redis 只保存 `requires_password`。
-- Redis CAS 失败不会回退 PostgreSQL；后续房间解析按 Durable Version 和 Presence 集合修复投影。
+- Redis CAS 使用 Room/Session Epoch Fence。PostgreSQL 已提交而 Redis 不可用时返回 Durable Recovery Snapshot，后续房间解析按持久 Version、Round 和 Presence 集合修复投影。
 
 ## 8. 协议适配规则
 

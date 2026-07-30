@@ -49,3 +49,9 @@ class MatchStateRejected(MultiplayerError):
     """Reject a transition that is invalid for the current match state."""
 
     code = "match_state_rejected"
+
+
+class MatchProjectionUnavailable(MultiplayerError):
+    """Report that an ephemeral mutation must wait for projection recovery."""
+
+    code = "match_projection_unavailable"

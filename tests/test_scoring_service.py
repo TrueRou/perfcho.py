@@ -1,5 +1,6 @@
 import hashlib
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import TracebackType
@@ -11,11 +12,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.enums import BeatmapStatus as DbBeatmapStatus
+from perfcho.infra.db.enums import CalculationKind as DbCalculationKind
 from perfcho.infra.db.enums import Ruleset as DbRuleset
 from perfcho.infra.db.models.content import Beatmap, BeatmapRevision, Beatmapset
 from perfcho.infra.db.models.events import OutboxEvent
 from perfcho.infra.db.models.scoring import (
+    CalculationFormula,
+    CalculationFormulaScoreboard,
+    CalculationRelease,
     LeaderboardEntry,
+    PerformanceCalculationJob,
     PlayAttempt,
     Replay,
     Score,
@@ -32,12 +38,12 @@ from perfcho.infra.db.repositories.scoring import (
     SqlAlchemyScoringRepository,
 )
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
-from perfcho.infra.scoring import DeferredPerformanceCalculator
 from perfcho.modules.common import Actor, ClientContext, Clock, CommandMeta, IdGenerator, PendingEvent
 from perfcho.modules.scoring import (
     AcceptedScoreResult,
     AcceptScore,
     BeatmapReference,
+    CanonicalMod,
     ClientFamily,
     HitStatistic,
     PlayAttemptSubmission,
@@ -46,6 +52,7 @@ from perfcho.modules.scoring import (
     ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
+    ScoreRejected,
     ScoreSubmission,
     ScoringService,
     StagedReplayManifest,
@@ -57,13 +64,12 @@ from perfcho.modules.scoring.models import (
     BeatmapRevisionInfo,
     ModSetInfo,
     NormalizedModSet,
-    PerformanceCalculationInput,
-    PerformanceResult,
     PlayAttemptRecord,
     ScoreAcceptanceRecord,
     ScoreboardInfo,
 )
 from perfcho.modules.scoring.ports import ScoringRepository
+from perfcho.modules.scoring.validation import validate_score
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 
@@ -140,8 +146,11 @@ class FakeRepository:
             record.scoreboard.scoreboard_id,
             record.mod_set.mod_set_id,
             record.score.outcome,
-            record.performance,
         )
+
+    async def schedule_performance_calculations(self, **kwargs: object) -> tuple[uuid.UUID, ...]:
+        self.calls.append("schedule-performance")
+        return ()
 
     async def complete_acceptance(self, idempotency_key: str, result: AcceptedScoreResult) -> None:
         self.calls.append("complete")
@@ -163,16 +172,6 @@ class FakeMultiplayerValidator:
 
     async def bind_score(self, *args: object, **kwargs: object) -> None:
         raise AssertionError("single-player submission must not bind multiplayer")
-
-
-class FakeCalculator:
-    def __init__(self, calls: list[str]) -> None:
-        self.calls = calls
-
-    async def calculate(self, calculation: PerformanceCalculationInput) -> PerformanceResult | None:
-        self.calls.append("calculate")
-        assert calculation.revision.revision_id == 20
-        return None
 
 
 class FakeOutbox:
@@ -232,7 +231,6 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
     calls: list[str] = []
     repository = FakeRepository(calls)
     account = FakeAccountValidator(calls)
-    calculator = FakeCalculator(calls)
     outbox = FakeOutbox(calls)
     units: list[FakeUnitOfWork] = []
 
@@ -247,7 +245,6 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
         lambda session: outbox,
         lambda session: account,
         lambda session: FakeMultiplayerValidator(),
-        calculator,
         cast(Clock, FixedClock()),
         cast(IdGenerator, FakeIds()),
     )
@@ -263,8 +260,8 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
         "scoreboard",
         "mod-set",
         "attempt",
-        "calculate",
         "score",
+        "schedule-performance",
         "outbox",
         "complete",
         "commit",
@@ -275,6 +272,36 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
     assert repository.record.validated.total_hits == 10
     assert outbox.events[0].event_type == "score.accepted.v1"
     assert outbox.events[0].payload["country_code"] == "JP"
+
+
+def test_score_validation_enforces_object_count_and_vanilla_combo_bounds() -> None:
+    submitted = command()
+    revision = BeatmapRevisionInfo(10, 20, Ruleset.OSU, "ranked", 10, 10)
+
+    with pytest.raises(ScoreRejected, match="hit count"):
+        validate_score(
+            Ruleset.OSU,
+            (),
+            submitted.attempt,
+            replace(
+                submitted.score,
+                hits=(
+                    HitStatistic("great", 9),
+                    HitStatistic("ok", 0),
+                    HitStatistic("meh", 0),
+                    HitStatistic("miss", 0),
+                ),
+            ),
+            revision,
+        )
+    with pytest.raises(ScoreRejected, match="combo exceeds"):
+        validate_score(
+            Ruleset.OSU,
+            (),
+            submitted.attempt,
+            replace(submitted.score, max_combo=11, perfect=False),
+            revision,
+        )
 
 
 @pytest.mark.postgres
@@ -331,6 +358,45 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                     is_current=True,
                 )
             )
+            difficulty_formula = CalculationFormula(
+                code="official-difficulty",
+                name="Official Difficulty",
+                kind=DbCalculationKind.DIFFICULTY,
+                calculator="osu-lazer-dotnet",
+                enabled=True,
+            )
+            performance_formula = CalculationFormula(
+                code="official",
+                name="Official Performance",
+                kind=DbCalculationKind.PERFORMANCE,
+                calculator="osu-lazer-dotnet",
+                enabled=True,
+            )
+            session.add_all((difficulty_formula, performance_formula))
+            await session.flush()
+            difficulty_release = CalculationRelease(
+                formula_id=difficulty_formula.id,
+                ruleset=DbRuleset.OSU,
+                version="2026.07.1-difficulty",
+                artifact_digest=b"d" * 32,
+                configuration={},
+                configuration_digest=b"e" * 32,
+                active=True,
+            )
+            session.add(difficulty_release)
+            await session.flush()
+            performance_release = CalculationRelease(
+                formula_id=performance_formula.id,
+                ruleset=DbRuleset.OSU,
+                version="2026.07.1",
+                artifact_digest=b"p" * 32,
+                configuration={},
+                configuration_digest=b"q" * 32,
+                difficulty_release_id=difficulty_release.id,
+                active=True,
+            )
+            session.add(performance_release)
+            session.add(CalculationFormulaScoreboard(formula_id=performance_formula.id, scoreboard_id=1))
 
         uow_factory = SqlAlchemyUnitOfWorkFactory(session_factory)
         service = ScoringService(
@@ -339,28 +405,62 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             lambda session: SqlAlchemyOutboxWriter(cast(AsyncSession, session)),
             lambda session: SqlAlchemyAccountSubmissionValidator(cast(AsyncSession, session)),
             lambda session: SqlAlchemyMultiplayerSubmissionValidator(cast(AsyncSession, session)),
-            DeferredPerformanceCalculator(),
             cast(Clock, FixedClock()),
             cast(IdGenerator, FakeIds()),
         )
-        submitted = command()
+        submitted = replace(
+            command(),
+            mods=(CanonicalMod("HD"),),
+            score=replace(command().score, grade=ScoreGrade.XH),
+        )
         first = await service.accept(submitted)
         replayed = await service.accept(submitted)
+        shared_replay = replace(
+            submitted,
+            meta=replace(
+                submitted.meta,
+                request_id=uuid.uuid7(),
+                idempotency_key="score:test:shared-replay",
+                request_digest=hashlib.sha256(b"score:shared-replay").digest(),
+            ),
+            attempt=replace(submitted.attempt, idempotency_key="attempt:test:shared-replay"),
+            mods=(CanonicalMod("HD", {"test_setting": 1}),),
+            score=replace(submitted.score, online_checksum=b"p" * 16),
+        )
+        await service.accept(shared_replay)
 
         async with session_factory.begin() as session:
-            event = (
-                await session.scalars(select(OutboxEvent).where(OutboxEvent.event_type == "score.accepted.v1"))
-            ).one()
-            await project_accepted_score(session, event, "scoreboard:1")
+            events = (
+                await session.scalars(
+                    select(OutboxEvent)
+                    .where(OutboxEvent.event_type == "score.accepted.v1")
+                    .order_by(OutboxEvent.position)
+                )
+            ).all()
+            for event in events:
+                await project_accepted_score(session, event, "scoreboard:1")
+            exact_mods = await SqlAlchemyScoringRepository(session).get_leaderboard(
+                beatmap_id=first.beatmap_id,
+                ruleset=Ruleset.OSU,
+                variant=ScoreboardVariant.VANILLA,
+                leaderboard_type=2,
+                legacy_mod_bits=1 << 3,
+                requester_account_id=1,
+                friend_account_ids=(),
+                limit=50,
+            )
 
         assert replayed == first
+        assert len(exact_mods.scores) == 1
         async with session_factory() as session:
-            assert await session.scalar(select(func.count()).select_from(PlayAttempt)) == 1
-            assert await session.scalar(select(func.count()).select_from(Score)) == 1
-            assert await session.scalar(select(func.count()).select_from(ScoreHitStatistic)) == 4
-            assert await session.scalar(select(func.count()).select_from(Replay)) == 1
-            assert await session.scalar(select(func.count()).select_from(DbScoreAttestation)) == 1
-            assert await session.scalar(select(func.count()).select_from(OutboxEvent)) == 1
-            assert await session.scalar(select(func.count()).select_from(LeaderboardEntry)) == 2
+            assert await session.scalar(select(func.count()).select_from(PlayAttempt)) == 2
+            assert await session.scalar(select(func.count()).select_from(Score)) == 2
+            assert await session.scalar(select(func.count()).select_from(ScoreHitStatistic)) == 8
+            assert await session.scalar(select(func.count()).select_from(Replay)) == 2
+            assert await session.scalar(select(func.count()).select_from(DbScoreAttestation)) == 2
+            assert await session.scalar(select(func.count()).select_from(PerformanceCalculationJob)) == 2
+            assert set(await session.scalars(select(PerformanceCalculationJob.release_id))) == {performance_release.id}
+            assert await session.scalar(select(func.count()).select_from(OutboxEvent)) == 2
+            assert await session.scalar(select(func.count()).select_from(LeaderboardEntry)) == 3
     finally:
         await engine.dispose()

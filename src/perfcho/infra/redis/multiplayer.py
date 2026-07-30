@@ -18,6 +18,7 @@ from perfcho.modules.multiplayer import (
     MatchPermissionDenied,
     MatchStateRejected,
     MultiplayerStateRepository,
+    ProjectionStatus,
     RoomRecord,
     RoomSettings,
     RoomSlot,
@@ -28,50 +29,76 @@ from perfcho.modules.multiplayer import (
 )
 from perfcho.modules.scoring.models import CanonicalMod, Ruleset, ScoreboardVariant
 
-_CAS_SCRIPT = """-- perfcho:multiplayer-cas:v1
+_CAS_SCRIPT = """-- perfcho:multiplayer-cas:v2
 local current = redis.call('GET', KEYS[1])
 local expected = tonumber(ARGV[1])
+local expected_session = ARGV[2]
+local incoming_session = ARGV[3]
+local owner = ARGV[6]
 if expected == -1 then
-    if current then return {'EXISTS'} end
+    if current then
+        local decoded = cjson.decode(current)
+        if decoded.session_id == incoming_session then return {'EXISTS'} end
+        if decoded.session_id >= incoming_session then return {'EPOCH_FENCED'} end
+        local old_owner = tostring(decoded.public_id) .. '|' .. decoded.session_id
+        for _, slot in ipairs(decoded.slots) do
+            if slot.account_id then
+                local account_key = ARGV[8] .. tostring(slot.account_id)
+                if redis.call('GET', account_key) == old_owner then redis.call('DEL', account_key) end
+            end
+        end
+    end
 else
     if not current then return {'NOT_FOUND'} end
     local decoded = cjson.decode(current)
+    if decoded.session_id ~= expected_session or incoming_session ~= expected_session then return {'EPOCH_FENCED'} end
     if tonumber(decoded.state_revision) ~= expected then return {'FENCED'} end
 end
 
-local old_count = tonumber(ARGV[5])
-local new_count = tonumber(ARGV[6])
+local old_count = tonumber(ARGV[9])
+local new_count = tonumber(ARGV[10])
 for index = 1, new_count do
-    local account_key = KEYS[3 + old_count + index]
+    local account_key = KEYS[2 + old_count + index]
     local occupied = redis.call('GET', account_key)
-    if occupied and occupied ~= ARGV[4] then return {'ACCOUNT_CONFLICT'} end
+    if occupied and occupied ~= owner then
+        local separator = string.find(occupied, '|', 1, true)
+        local occupied_public = separator and string.sub(occupied, 1, separator - 1) or occupied
+        local occupied_session = separator and string.sub(occupied, separator + 1) or occupied
+        if occupied_public ~= tostring(ARGV[7]) or occupied_session >= incoming_session then
+            return {'ACCOUNT_CONFLICT'}
+        end
+    end
 end
 
 for index = 1, old_count do
-    local account_key = KEYS[3 + index]
-    if redis.call('GET', account_key) == ARGV[4] then redis.call('DEL', account_key) end
+    local account_key = KEYS[2 + index]
+    if redis.call('GET', account_key) == owner then redis.call('DEL', account_key) end
 end
-redis.call('SET', KEYS[1], ARGV[2], 'PXAT', ARGV[3])
-redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+redis.call('SET', KEYS[1], ARGV[4], 'PXAT', ARGV[5])
+redis.call('ZADD', KEYS[2], ARGV[5], ARGV[7])
 for index = 1, new_count do
-    redis.call('SET', KEYS[3 + old_count + index], ARGV[4], 'PXAT', ARGV[3])
+    redis.call('SET', KEYS[2 + old_count + index], owner, 'PXAT', ARGV[5])
 end
+local latest = redis.call('ZREVRANGE', KEYS[2], 0, 0, 'WITHSCORES')
+if #latest > 0 then redis.call('PEXPIREAT', KEYS[2], latest[2]) end
 return {'OK'}
 """
 
-_REMOVE_SCRIPT = """-- perfcho:multiplayer-remove:v1
+_REMOVE_SCRIPT = """-- perfcho:multiplayer-remove:v2
 local current = redis.call('GET', KEYS[1])
 if not current then
-    redis.call('ZREM', KEYS[2], ARGV[2])
     return {'OK'}
 end
 local decoded = cjson.decode(current)
+if decoded.session_id ~= ARGV[2] then return {'EPOCH_FENCED'} end
 if tonumber(decoded.state_revision) ~= tonumber(ARGV[1]) then return {'FENCED'} end
 redis.call('DEL', KEYS[1])
-redis.call('ZREM', KEYS[2], ARGV[2])
+redis.call('ZREM', KEYS[2], ARGV[3])
 for index = 3, #KEYS do
-    if redis.call('GET', KEYS[index]) == ARGV[2] then redis.call('DEL', KEYS[index]) end
+    if redis.call('GET', KEYS[index]) == ARGV[4] then redis.call('DEL', KEYS[index]) end
 end
+local latest = redis.call('ZREVRANGE', KEYS[2], 0, 0, 'WITHSCORES')
+if #latest > 0 then redis.call('PEXPIREAT', KEYS[2], latest[2]) end
 return {'OK'}
 """
 
@@ -99,7 +126,7 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
         if not 1 <= cas_attempts <= 32:
             raise ValueError("cas_attempts must be between 1 and 32")
         self._redis = redis
-        self._base = f"{prefix.rstrip(':')}:v1:multiplayer"
+        self._base = f"{prefix.rstrip(':')}:v2:multiplayer"
         self._ttl = timedelta(seconds=seconds)
         self._max_rooms = max_rooms
         self._cas_attempts = cas_attempts
@@ -127,7 +154,11 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
             raise RuntimeError("stored room state does not match its Redis key")
         if state.expires_at <= at:
             with suppress(MatchConcurrencyConflict):
-                await self.remove(public_id, expected_state_revision=state.state_revision)
+                await self.remove(
+                    public_id,
+                    expected_state_revision=state.state_revision,
+                    expected_session_id=state.room.session_id,
+                )
             return None
         return state
 
@@ -137,11 +168,13 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
         if raw is None:
             return None
         try:
-            public_id = int(_text(raw))
-        except ValueError as error:
+            public_id_text, session_id_text = _text(raw).split("|", 1)
+            public_id = int(public_id_text)
+            session_id = uuid.UUID(session_id_text)
+        except (ValueError, TypeError) as error:
             raise RuntimeError("stored multiplayer account index is invalid") from error
         state = await self.get(public_id, at=at)
-        if state is None or state.slot_for(account_id) is None:
+        if state is None or state.room.session_id != session_id or state.slot_for(account_id) is None:
             await self._redis.delete(self._account_key(account_id))
             return None
         return state
@@ -170,24 +203,46 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
                 states.append(state)
         return tuple(states)
 
-    async def replace(self, state: RoomState, *, expected_state_revision: int) -> RoomState:
+    async def replace(
+        self,
+        state: RoomState,
+        *,
+        expected_state_revision: int,
+        expected_session_id: uuid.UUID,
+    ) -> RoomState:
         """Replace a state and its account indexes at one expected revision."""
         current = await self.get(state.room.public_id, at=datetime.now(state.expires_at.tzinfo))
         if current is None:
             raise MatchNotFound("room has no live projection")
-        return await self._write(state, expected=expected_state_revision, previous_accounts=_accounts(current))
+        return await self._write(
+            state,
+            expected=expected_state_revision,
+            expected_session_id=expected_session_id,
+            previous_accounts=_accounts(current),
+        )
 
-    async def remove(self, public_id: int, *, expected_state_revision: int) -> None:
+    async def remove(
+        self,
+        public_id: int,
+        *,
+        expected_state_revision: int,
+        expected_session_id: uuid.UUID,
+    ) -> None:
         """Atomically remove a room and all account indexes owned by it."""
         current_raw = await self._redis.get(self._room_key(public_id))
         accounts = _accounts(_decode_state(_bytes(current_raw))) if current_raw is not None else ()
         result = await self._remove(
             keys=[self._room_key(public_id), self._rooms_key, *(self._account_key(item) for item in accounts)],
-            args=[expected_state_revision, public_id],
+            args=[
+                expected_state_revision,
+                str(expected_session_id),
+                public_id,
+                _owner(public_id, expected_session_id),
+            ],
             client=self._redis,
         )
         status = _script_status(result)
-        if status == "FENCED":
+        if status in {"FENCED", "EPOCH_FENCED"}:
             raise MatchConcurrencyConflict("room state revision changed")
         if status != "OK":
             raise RuntimeError(f"unexpected multiplayer remove status: {status}")
@@ -221,7 +276,11 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
         if current is None:
             return None
         if durable_room is None:
-            await self.remove(public_id, expected_state_revision=current.state_revision)
+            await self.remove(
+                public_id,
+                expected_state_revision=current.state_revision,
+                expected_session_id=current.room.session_id,
+            )
             return None
 
         def mutation(state: RoomState) -> RoomState:
@@ -362,6 +421,7 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
                 return await self._write(
                     updated,
                     expected=current.state_revision,
+                    expected_session_id=current.room.session_id,
                     previous_accounts=_accounts(current),
                 )
             except MatchConcurrencyConflict:
@@ -373,31 +433,42 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
         state: RoomState,
         *,
         expected: int,
+        expected_session_id: uuid.UUID | None = None,
         previous_accounts: Iterable[int],
     ) -> RoomState:
         old_accounts = tuple(previous_accounts)
         new_accounts = _accounts(state)
-        payload = _encode_state(replace(state, room=_public_room(state.room)))
+        sanitized = replace(
+            state,
+            room=_public_room(state.room),
+            projection_status=ProjectionStatus.LIVE,
+        )
+        payload = _encode_state(sanitized)
+        expected_epoch = expected_session_id or state.room.session_id
+        owner = _owner(state.room.public_id, state.room.session_id)
         result = await self._cas(
             keys=[
                 self._room_key(state.room.public_id),
                 self._rooms_key,
-                "unused",
                 *(self._account_key(item) for item in old_accounts),
                 *(self._account_key(item) for item in new_accounts),
             ],
             args=[
                 expected,
+                str(expected_epoch),
+                str(state.room.session_id),
                 payload,
                 _milliseconds(state.expires_at),
+                owner,
                 state.room.public_id,
+                f"{self._base}:account:",
                 len(old_accounts),
                 len(new_accounts),
             ],
             client=self._redis,
         )
         status = _script_status(result)
-        if status in {"EXISTS", "FENCED"}:
+        if status in {"EXISTS", "FENCED", "EPOCH_FENCED"}:
             raise MatchConcurrencyConflict("room state revision changed")
         if status == "NOT_FOUND":
             raise MatchNotFound("room has no live projection")
@@ -467,6 +538,7 @@ def _encode_state(state: RoomState) -> bytes:
         ],
         "in_progress": state.in_progress,
         "round_id": str(state.round_id) if state.round_id is not None else None,
+        "round_participant_account_ids": list(state.round_participant_account_ids),
         "expires_at": state.expires_at.isoformat(),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -519,6 +591,8 @@ def _decode_state(payload: bytes) -> RoomState:
             slots=slots,
             in_progress=value["in_progress"],
             round_id=uuid.UUID(value["round_id"]) if value["round_id"] else None,
+            round_participant_account_ids=tuple(value["round_participant_account_ids"]),
+            projection_status=ProjectionStatus.LIVE,
             expires_at=datetime.fromisoformat(value["expires_at"]),
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -543,6 +617,10 @@ def _milliseconds(value: datetime) -> int:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("datetime must be timezone-aware")
     return int(value.timestamp() * 1000)
+
+
+def _owner(public_id: int, session_id: uuid.UUID) -> str:
+    return f"{public_id}|{session_id}"
 
 
 def _bytes(value: object) -> bytes:

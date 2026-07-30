@@ -6,6 +6,7 @@ from typing import Protocol
 
 from perfcho.modules.common.ports import UnitOfWork
 from perfcho.modules.multiplayer.models import (
+    DurableRoomSnapshot,
     RoomRecord,
     RoomSettings,
     RoomState,
@@ -32,6 +33,7 @@ class MultiplayerRepository(Protocol):
         *,
         command_id: uuid.UUID,
         actor_account_id: int,
+        connection_session_id: uuid.UUID,
         settings: RoomSettings,
         capacity: int,
         password_salt: str | None,
@@ -49,11 +51,31 @@ class MultiplayerRepository(Protocol):
         """Resolve the account's current active room."""
         ...
 
+    async def list_active_rooms(self, *, limit: int) -> tuple[RoomRecord, ...]:
+        """List active durable rooms for lobby projection recovery."""
+        ...
+
+    async def load_snapshot(self, room: RoomRecord) -> DurableRoomSnapshot:
+        """Load active presences and any active frozen round for recovery."""
+        ...
+
+    async def find_command_room(self, command_id: uuid.UUID) -> RoomRecord | None:
+        """Resolve an active room previously mutated by an idempotent command."""
+        ...
+
     async def list_participant_account_ids(self, room: RoomRecord) -> tuple[int, ...]:
         """List current participant accounts in deterministic join order."""
         ...
 
-    async def join_room(self, room: RoomRecord, *, command_id: uuid.UUID, account_id: int, now: datetime) -> RoomRecord:
+    async def join_room(
+        self,
+        room: RoomRecord,
+        *,
+        command_id: uuid.UUID,
+        account_id: int,
+        connection_session_id: uuid.UUID,
+        now: datetime,
+    ) -> RoomRecord:
         """Persist participant admission and one open session presence."""
         ...
 
@@ -63,6 +85,8 @@ class MultiplayerRepository(Protocol):
         *,
         command_id: uuid.UUID,
         account_id: int,
+        connection_session_id: uuid.UUID | None,
+        reason: str,
         now: datetime,
     ) -> RoomRecord | None:
         """Close a presence, transfer host, or close an empty room."""
@@ -161,6 +185,22 @@ class MultiplayerRepositoryFactory(Protocol):
         ...
 
 
+class MultiplayerAccessPolicy(Protocol):
+    """Enforce canonical multiplayer permissions and account restrictions."""
+
+    async def require(self, account_id: int, permissions: tuple[str, ...], *, at: datetime) -> None:
+        """Raise a domain error unless every permission is currently effective."""
+        ...
+
+
+class MultiplayerAccessPolicyFactory(Protocol):
+    """Bind multiplayer access policy evaluation to one transaction resource."""
+
+    def __call__(self, session: object) -> MultiplayerAccessPolicy:
+        """Return a transaction-bound policy evaluator."""
+        ...
+
+
 class MultiplayerStateRepository(Protocol):
     """Coordinate expiring room projections with compare-and-set semantics."""
 
@@ -180,11 +220,23 @@ class MultiplayerStateRepository(Protocol):
         """Return bounded active public-room projections."""
         ...
 
-    async def replace(self, state: RoomState, *, expected_state_revision: int) -> RoomState:
+    async def replace(
+        self,
+        state: RoomState,
+        *,
+        expected_state_revision: int,
+        expected_session_id: uuid.UUID,
+    ) -> RoomState:
         """Replace one state only at the expected revision."""
         ...
 
-    async def remove(self, public_id: int, *, expected_state_revision: int) -> None:
+    async def remove(
+        self,
+        public_id: int,
+        *,
+        expected_state_revision: int,
+        expected_session_id: uuid.UUID,
+    ) -> None:
         """Remove one state and its account indexes at the expected revision."""
         ...
 

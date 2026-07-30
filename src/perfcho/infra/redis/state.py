@@ -5,11 +5,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from perfcho.modules.realtime import MAX_SEQUENCE, PresenceSnapshot
+from perfcho.modules.realtime import MAX_SEQUENCE, PresenceSnapshot, SpectatorFrame
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-_PRESENCE_HEADER = struct.Struct(">QQQ")
+_PRESENCE_HEADER = struct.Struct(">QQQ16s")
 _SEQUENCE_WIDTH = len(str(MAX_SEQUENCE))
+_FRAME_SEQUENCE_WIDTH = 5
 
 
 def datetime_to_milliseconds(value: datetime) -> int:
@@ -39,11 +40,14 @@ def duration_to_milliseconds(value: timedelta | int | float, *, name: str) -> in
     return milliseconds
 
 
-def encode_presence(snapshot: PresenceSnapshot) -> bytes:
+def encode_presence(snapshot: PresenceSnapshot, *, session_id: uuid.UUID | None = None) -> bytes:
     """Pack presence metadata ahead of an arbitrary binary payload."""
     expires_ms = datetime_to_milliseconds(snapshot.expires_at)
+    owner = session_id or snapshot.session_id
+    if owner is None:
+        raise ValueError("presence session_id is required for Redis storage")
     try:
-        header = _PRESENCE_HEADER.pack(snapshot.account_id, snapshot.revision, expires_ms)
+        header = _PRESENCE_HEADER.pack(snapshot.account_id, snapshot.revision, expires_ms, owner.bytes)
     except struct.error as error:
         raise ValueError("presence metadata exceeds the Redis encoding range") from error
     return header + snapshot.payload
@@ -53,12 +57,13 @@ def decode_presence(value: bytes) -> PresenceSnapshot:
     """Decode a packed presence snapshot without interpreting its payload."""
     if len(value) < _PRESENCE_HEADER.size:
         raise ValueError("stored presence is truncated")
-    account_id, revision, expires_ms = _PRESENCE_HEADER.unpack_from(value)
+    account_id, revision, expires_ms, session_bytes = _PRESENCE_HEADER.unpack_from(value)
     return PresenceSnapshot(
         account_id=account_id,
         revision=revision,
         payload=value[_PRESENCE_HEADER.size :],
         expires_at=datetime_from_milliseconds(expires_ms),
+        session_id=uuid.UUID(bytes=session_bytes),
     )
 
 
@@ -100,6 +105,34 @@ def decode_ordered_payload(value: bytes) -> OrderedPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class OrderedFrame:
+    """Represent one decoded cursor-ordered spectator frame."""
+
+    frame: SpectatorFrame
+    expires_ms: int
+
+
+def decode_ordered_frame(value: bytes) -> OrderedFrame:
+    """Decode an internal cursor, expiry, Stable u16 sequence, and payload."""
+    try:
+        raw_cursor, raw_expiry, raw_sequence, payload = value.split(b":", 3)
+        cursor = int(raw_cursor)
+        expires_ms = int(raw_expiry)
+        sequence = int(raw_sequence)
+    except (ValueError, TypeError) as error:
+        raise ValueError("stored spectator frame has an invalid header") from error
+    if (
+        raw_cursor.decode("ascii") != sequence_token(cursor)
+        or len(raw_sequence) != _FRAME_SEQUENCE_WIDTH
+        or raw_sequence != f"{sequence:0{_FRAME_SEQUENCE_WIDTH}d}".encode()
+        or not 0 <= sequence <= 0xFFFF
+        or expires_ms < 0
+    ):
+        raise ValueError("stored spectator frame has an invalid header")
+    return OrderedFrame(SpectatorFrame(cursor, sequence, payload), expires_ms)
+
+
+@dataclass(frozen=True, slots=True)
 class RealtimeKeys:
     """Build only version-one keys below an injected deployment prefix."""
 
@@ -114,7 +147,7 @@ class RealtimeKeys:
     @property
     def base(self) -> str:
         """Return the immutable schema-version key prefix."""
-        return f"{self.prefix}:v1"
+        return f"{self.prefix}:v2"
 
     @property
     def session_prefix(self) -> str:
@@ -124,6 +157,18 @@ class RealtimeKeys:
     def session(self, session_id: uuid.UUID) -> str:
         """Return a fenced session key."""
         return f"{self.session_prefix}{session_id}"
+
+    def account_session(self, account_id: int) -> str:
+        """Return the current realtime epoch for one account."""
+        return f"{self.base}:account:{account_id}:session"
+
+    def session_channels(self, session_id: uuid.UUID) -> str:
+        """Return the channel IDs owned by one exact session lifecycle."""
+        return f"{self.base}:session:{session_id}:channels"
+
+    def session_revision(self, session_id: uuid.UUID) -> str:
+        """Return a durable-lifetime monotonic revision counter for a session ID."""
+        return f"{self.base}:session:{session_id}:revision"
 
     def presence(self, account_id: int) -> str:
         """Return an account presence key."""
@@ -162,6 +207,10 @@ class RealtimeKeys:
         """Return an account's exclusive mailbox lease key."""
         return f"{self.base}:mailbox:{account_id}:lease"
 
+    def spectator_relation_revision(self, spectator_account_id: int) -> str:
+        """Return a session-lifetime monotonic relation revision counter."""
+        return f"{self.base}:spectator:viewer:{spectator_account_id}:revision"
+
     def spectator_relation(self, spectator_account_id: int) -> str:
         """Return a spectator-to-host relation key."""
         return f"{self.base}:spectator:viewer:{spectator_account_id}:host"
@@ -179,5 +228,5 @@ class RealtimeKeys:
         return f"{self.base}:spectator:host:{host_account_id}:frame-bytes"
 
     def spectator_frame_sequence(self, host_account_id: int) -> str:
-        """Return a host's latest spectator frame sequence key."""
-        return f"{self.base}:spectator:host:{host_account_id}:frame-sequence"
+        """Return a host epoch's cursor and latest Stable sequence state."""
+        return f"{self.base}:spectator:host:{host_account_id}:frame-state"

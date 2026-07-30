@@ -1,8 +1,9 @@
 """Load validated process configuration from environment variables."""
 
+from ipaddress import ip_network
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +16,7 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, ge=1, le=65535)
     app_debug: bool = Field(default=False)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(default="INFO")
+    trusted_proxy_cidrs: list[str] = Field(default_factory=list)
 
     database_url: str = Field(default="postgresql+asyncpg://perfcho:perfcho@127.0.0.1:55432/perfcho")
     database_pool_size: int = Field(default=20, ge=1)
@@ -37,15 +39,19 @@ class Settings(BaseSettings):
     redis_mailbox_ttl_seconds: int = Field(default=600, ge=60)
     redis_mailbox_max_packets: int = Field(default=4096, ge=128)
     redis_mailbox_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
+    redis_realtime_max_channels_per_session: int = Field(default=256, ge=1, le=4096)
     redis_spectator_max_frames: int = Field(default=4096, ge=1)
     redis_spectator_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
+    redis_spectator_max_viewers: int = Field(default=4096, ge=1, le=32768)
     redis_multiplayer_ttl_seconds: int = Field(default=12 * 60 * 60, ge=300)
     redis_multiplayer_max_rooms: int = Field(default=4096, ge=1, le=32767)
 
     stable_build: str = Field(default="b20260711.1", min_length=1, max_length=64)
     stable_protocol_version: int = Field(default=19, ge=1)
     stable_max_body_bytes: int = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024)
+    stable_max_response_bytes: int = Field(default=1024 * 1024, ge=7, le=16 * 1024 * 1024)
     stable_session_lifetime_seconds: int = Field(default=12 * 60 * 60, ge=60)
+    stable_session_stale_grace_seconds: int = Field(default=120, ge=30, le=30 * 60)
     stable_mailbox_batch_size: int = Field(default=256, ge=1, le=4096)
     stable_mailbox_lease_seconds: int = Field(default=10, ge=1, le=60)
     stable_welcome_notification: str = Field(default="Welcome to perfcho.py.", max_length=1024)
@@ -90,7 +96,27 @@ class Settings(BaseSettings):
     outbox_lease_seconds: int = Field(default=300, ge=30)
     outbox_max_attempts: int = Field(default=10, ge=1)
 
+    performance_calculator_urls: dict[str, str] = Field(default_factory=dict)
+    performance_http_timeout_seconds: float = Field(default=30.0, gt=0)
+    performance_calculation_batch_size: int = Field(default=32, ge=1, le=1000)
+    performance_calculation_lease_seconds: int = Field(default=300, ge=30)
+    performance_calculation_max_attempts: int = Field(default=5, ge=1)
+    performance_calculation_max_retry_seconds: int = Field(default=300, ge=1)
+    performance_beatmap_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+
     cors_origins: list[str] = Field(default=["http://localhost:3000", "http://localhost:5173"])
+
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def validate_trusted_proxy_cidrs(cls, values: list[str]) -> list[str]:
+        """Require canonical strict IPv4 or IPv6 proxy networks."""
+        normalized: list[str] = []
+        for value in values:
+            try:
+                normalized.append(str(ip_network(value, strict=True)))
+            except ValueError as error:
+                raise ValueError(f"invalid trusted proxy CIDR: {value}") from error
+        return normalized
 
 
 settings = Settings()

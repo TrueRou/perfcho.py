@@ -45,6 +45,14 @@ class PairRelationship:
         """Return whether either account currently blocks the other."""
         return self.low_blocks_high or self.high_blocks_low
 
+    def blocks(self, actor_account_id: int, target_account_id: int) -> bool:
+        """Return one directional block from the canonical pair facts."""
+        if (actor_account_id, target_account_id) == (self.low_account_id, self.high_account_id):
+            return self.low_blocks_high
+        if (actor_account_id, target_account_id) == (self.high_account_id, self.low_account_id):
+            return self.high_blocks_low
+        raise ValueError("accounts do not belong to the relationship")
+
 
 @dataclass(frozen=True, slots=True)
 class AccountIdentityView:

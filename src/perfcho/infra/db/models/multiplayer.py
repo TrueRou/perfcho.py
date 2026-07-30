@@ -144,6 +144,7 @@ class SessionPresence(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     session_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     room_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     account_id: Mapped[int] = mapped_column(nullable=False)
+    connection_session_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     join_number: Mapped[int] = mapped_column(Integer, nullable=False)
     left_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     leave_reason: Mapped[str | None] = mapped_column(String(32))
@@ -170,6 +171,13 @@ class SessionPresence(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
             unique=True,
             postgresql_where=text("left_at IS NULL"),
         ),
+        Index(
+            "uq_session_presences_account_current",
+            "account_id",
+            unique=True,
+            postgresql_where=text("left_at IS NULL"),
+        ),
+        Index("ix_session_presences_connection", "connection_session_id", "account_id"),
         Index("ix_session_presences_account", "account_id", "created_at"),
         {"schema": "multiplayer"},
     )
@@ -320,12 +328,18 @@ class Round(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __table_args__ = (
         CheckConstraint("round_number > 0", name="positive_round_number"),
         CheckConstraint(
-            "num_nonnulls(playlist_revision_id, tournament_pool_item_id) = 1",
-            name="single_source",
+            "num_nonnulls(playlist_revision_id, tournament_pool_item_id) <= 1",
+            name="at_most_one_source",
         ),
         CheckConstraint("ended_at IS NULL OR started_at IS NULL OR ended_at > started_at", name="valid_period"),
         UniqueConstraint("session_id", "round_number"),
         Index("ix_rounds_session_status", "session_id", "status"),
+        Index(
+            "uq_rounds_session_active",
+            "session_id",
+            unique=True,
+            postgresql_where=text("status = 'in_progress'"),
+        ),
         Index("ix_rounds_playlist_revision", "playlist_revision_id"),
         {"schema": "multiplayer"},
     )
@@ -353,6 +367,7 @@ class RoundParticipant(DbBase):
     __tablename__ = "round_participants"
     __table_args__ = (
         CheckConstraint("slot_number IS NULL OR slot_number BETWEEN 0 AND 15", name="slot_range"),
+        CheckConstraint("team_number BETWEEN 0 AND 2", name="team_range"),
         Index(
             "uq_round_participants_slot",
             "round_id",
@@ -372,7 +387,7 @@ class RoundParticipant(DbBase):
         ForeignKey("multiplayer.session_presences.id", ondelete="SET NULL")
     )
     slot_number: Mapped[int | None] = mapped_column(SmallInteger)
-    team_number: Mapped[int | None] = mapped_column(SmallInteger)
+    team_number: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default="0")
     mod_set_id: Mapped[int] = mapped_column(ForeignKey("scoring.mod_sets.id", ondelete="RESTRICT"), nullable=False)
 
 

@@ -15,6 +15,7 @@ from perfcho.infra.outbox import write_outbox_event
 from perfcho.infra.settings import settings
 from perfcho.infra.taskiq import broker
 from perfcho.tasks.outbox import dispatch_outbox_delivery
+from perfcho.tasks.performance import calculate_performance
 
 
 def test_redis_state_and_taskiq_use_separate_logical_databases() -> None:
@@ -30,6 +31,7 @@ def test_taskiq_uses_stream_broker_without_result_storage() -> None:
     assert broker.consumer_id == "0-0"
     assert broker.maxlen == settings.taskiq_stream_max_length
     assert dispatch_outbox_delivery.task_name in broker.get_all_tasks()
+    assert calculate_performance.task_name in broker.get_all_tasks()
 
 
 @pytest.mark.postgres

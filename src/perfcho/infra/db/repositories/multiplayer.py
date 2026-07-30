@@ -4,14 +4,16 @@ import secrets
 import uuid
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.advisory_lock import acquire_transaction_lock
 from perfcho.infra.db.enums import (
     AttemptStatus,
     RoomStatus,
+    SanctionKind,
     SessionStatus,
 )
 from perfcho.infra.db.enums import (
@@ -21,6 +23,7 @@ from perfcho.infra.db.enums import (
     ScoreboardVariant as DbScoreboardVariant,
 )
 from perfcho.infra.db.models.content import Beatmap, BeatmapRevision
+from perfcho.infra.db.models.moderation import Sanction
 from perfcho.infra.db.models.multiplayer import (
     MultiplayerAttempt,
     MultiplayerEvent,
@@ -34,12 +37,15 @@ from perfcho.infra.db.models.multiplayer import (
     SessionPresence,
 )
 from perfcho.infra.db.models.scoring import ModSet, RankingPolicy, Scoreboard
+from perfcho.infra.db.repositories.authorization import SqlAlchemyAuthorizationRepository
 from perfcho.modules.multiplayer import (
+    DurableRoomSnapshot,
     MatchAlreadyJoined,
     MatchConcurrencyConflict,
     MatchFull,
     MatchNotFound,
     MatchPermissionDenied,
+    MatchStateRejected,
     RoomRecord,
     RoomSettings,
     RoundParticipantSelection,
@@ -48,6 +54,38 @@ from perfcho.modules.multiplayer import (
 )
 from perfcho.modules.scoring.models import CanonicalMod, MultiplayerSubmissionContext, Ruleset, ScoreboardVariant
 from perfcho.modules.scoring.mods import canonical_json_digest, normalize_mods
+
+_ACTIVE_PRESENCE_CONSTRAINT = "uq_session_presences_account_current"
+_ACTIVE_ROUND_CONSTRAINT = "uq_rounds_session_active"
+_ROUND_ATTEMPT_LIFETIME = timedelta(hours=2)
+_ROUND_SUBMISSION_GRACE = timedelta(minutes=2)
+
+
+class SqlAlchemyMultiplayerAccessPolicy:
+    """Evaluate multiplayer permissions and global restrictions transactionally."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        """Bind policy reads to the command transaction."""
+        self._session = session
+
+    async def require(self, account_id: int, permissions: tuple[str, ...], *, at: datetime) -> None:
+        """Reject missing permissions and active account restrictions."""
+        authorization = await SqlAlchemyAuthorizationRepository(self._session).get_effective(account_id, at=at)
+        if any(not authorization.allows(permission) for permission in permissions):
+            raise MatchPermissionDenied("account lacks a required multiplayer permission")
+        restricted = await self._session.scalar(
+            select(Sanction.id)
+            .where(
+                Sanction.subject_account_id == account_id,
+                Sanction.kind == SanctionKind.RESTRICTION,
+                Sanction.revoked_at.is_(None),
+                Sanction.starts_at <= at,
+                or_(Sanction.ends_at.is_(None), Sanction.ends_at > at),
+            )
+            .limit(1)
+        )
+        if restricted is not None:
+            raise MatchPermissionDenied("restricted accounts cannot use multiplayer")
 
 
 class SqlAlchemyMultiplayerRepository:
@@ -62,6 +100,7 @@ class SqlAlchemyMultiplayerRepository:
         *,
         command_id: uuid.UUID,
         actor_account_id: int,
+        connection_session_id: uuid.UUID,
         settings: RoomSettings,
         capacity: int,
         password_salt: str | None,
@@ -69,13 +108,16 @@ class SqlAlchemyMultiplayerRepository:
         now: datetime,
     ) -> RoomRecord:
         """Create room, session, host admission, presence, and first event."""
-        replay = await self._room_for_command(command_id)
+        replay = await self.find_command_room(command_id)
         if replay is not None:
             return replay
         if await self.find_room_for_account(actor_account_id) is not None:
             raise MatchAlreadyJoined("account already has an active multiplayer presence")
 
         await acquire_transaction_lock(self._session, "stable-multiplayer-public-id")
+        replay = await self.find_command_room(command_id)
+        if replay is not None:
+            return replay
         active_ids = set(
             (
                 await self._session.scalars(
@@ -133,6 +175,7 @@ class SqlAlchemyMultiplayerRepository:
                     session_id=session.id,
                     room_id=room.id,
                     account_id=actor_account_id,
+                    connection_session_id=connection_session_id,
                     join_number=1,
                 ),
             )
@@ -145,7 +188,10 @@ class SqlAlchemyMultiplayerRepository:
             event_type="multiplayer.room-created.v1",
             payload={"public_id": room.public_id, "capacity": capacity},
         )
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as error:
+            raise _map_integrity_error(error) from error
         return _record(room, session)
 
     async def get_room(self, public_id: int, *, for_update: bool = False) -> RoomRecord | None:
@@ -190,6 +236,65 @@ class SqlAlchemyMultiplayerRepository:
         ).one_or_none()
         return _record(row[0], row[1]) if row is not None else None
 
+    async def list_active_rooms(self, *, limit: int) -> tuple[RoomRecord, ...]:
+        """List active rooms in stable public-ID order for lobby recovery."""
+        rows = (
+            await self._session.execute(
+                select(Room, MultiplayerSession)
+                .join(MultiplayerSession, MultiplayerSession.room_id == Room.id)
+                .where(
+                    Room.status.in_((RoomStatus.OPEN, RoomStatus.STARTED)),
+                    MultiplayerSession.status == SessionStatus.ACTIVE,
+                )
+                .order_by(Room.public_id)
+                .limit(limit)
+            )
+        ).all()
+        return tuple(_record(room, session) for room, session in rows)
+
+    async def load_snapshot(self, room: RoomRecord) -> DurableRoomSnapshot:
+        """Load active presences and a frozen active round for Redis recovery."""
+        durable = await self.get_room(room.public_id)
+        if durable is None or durable.session_id != room.session_id:
+            raise MatchNotFound("room is not active")
+        account_ids = await self.list_participant_account_ids(durable)
+        active_round = (
+            await self._session.execute(
+                select(Round)
+                .where(Round.session_id == durable.session_id, Round.status == "in_progress")
+                .order_by(Round.round_number.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if active_round is None:
+            return DurableRoomSnapshot(durable, account_ids)
+        rows = (
+            await self._session.execute(
+                select(RoundParticipant, ModSet.canonical)
+                .join(ModSet, ModSet.id == RoundParticipant.mod_set_id)
+                .where(
+                    RoundParticipant.round_id == active_round.id,
+                    RoundParticipant.account_id.in_(account_ids),
+                )
+                .order_by(RoundParticipant.slot_number, RoundParticipant.account_id)
+            )
+        ).all()
+        participants = tuple(
+            RoundParticipantSelection(
+                participant.account_id,
+                participant.slot_number,
+                participant.team_number,
+                _mods_from_json(canonical),
+            )
+            for participant, canonical in rows
+            if participant.slot_number is not None
+        )
+        return DurableRoomSnapshot(durable, account_ids, active_round.id, participants)
+
+    async def find_command_room(self, command_id: uuid.UUID) -> RoomRecord | None:
+        """Resolve the active room already mutated by a command ID."""
+        return await self._room_for_command(command_id)
+
     async def list_participant_account_ids(self, room: RoomRecord) -> tuple[int, ...]:
         """List current presences in deterministic join order with host first."""
         accounts = tuple(
@@ -208,11 +313,22 @@ class SqlAlchemyMultiplayerRepository:
             return accounts
         return (room.host_account_id, *(account for account in accounts if account != room.host_account_id))
 
-    async def join_room(self, room: RoomRecord, *, command_id: uuid.UUID, account_id: int, now: datetime) -> RoomRecord:
+    async def join_room(
+        self,
+        room: RoomRecord,
+        *,
+        command_id: uuid.UUID,
+        account_id: int,
+        connection_session_id: uuid.UUID,
+        now: datetime,
+    ) -> RoomRecord:
         """Admit an account and append exactly one active presence."""
         durable = await self.get_room(room.public_id, for_update=True)
         if durable is None:
             raise MatchNotFound("room is not active")
+        if await self._command_applied(command_id):
+            return durable
+        db_room, session = await self._entities(durable.public_id)
         current_room = await self.find_room_for_account(account_id)
         if current_room is not None:
             if current_room.public_id == room.public_id:
@@ -251,16 +367,14 @@ class SqlAlchemyMultiplayerRepository:
             )
             or 0
         ) + 1
-        self._session.add(
-            SessionPresence(
-                id=uuid.uuid7(),
-                session_id=durable.session_id,
-                room_id=durable.room_id,
-                account_id=account_id,
-                join_number=join_number,
-            )
+        presence = SessionPresence(
+            id=uuid.uuid7(),
+            session_id=durable.session_id,
+            room_id=durable.room_id,
+            account_id=account_id,
+            connection_session_id=connection_session_id,
+            join_number=join_number,
         )
-        db_room, session = await self._entities(durable.public_id)
         session.version += 1
         await self._append_event(
             db_room,
@@ -270,7 +384,11 @@ class SqlAlchemyMultiplayerRepository:
             event_type="multiplayer.participant-joined.v1",
             payload={"account_id": account_id, "join_number": join_number},
         )
-        await self._session.flush()
+        self._session.add(presence)
+        try:
+            await self._session.flush()
+        except IntegrityError as error:
+            raise _map_integrity_error(error) from error
         return _record(db_room, session)
 
     async def leave_room(
@@ -279,25 +397,32 @@ class SqlAlchemyMultiplayerRepository:
         *,
         command_id: uuid.UUID,
         account_id: int,
+        connection_session_id: uuid.UUID | None,
+        reason: str,
         now: datetime,
     ) -> RoomRecord | None:
         """Close current presence and transfer host or close an empty room."""
         db_room, session = await self._entities(room.public_id)
-        presence = (
-            await self._session.execute(
-                select(SessionPresence)
-                .where(
-                    SessionPresence.session_id == session.id,
-                    SessionPresence.account_id == account_id,
-                    SessionPresence.left_at.is_(None),
-                )
-                .with_for_update()
+        if await self._command_applied(command_id):
+            return _record(db_room, session)
+        presence_statement = (
+            select(SessionPresence)
+            .where(
+                SessionPresence.session_id == session.id,
+                SessionPresence.account_id == account_id,
+                SessionPresence.left_at.is_(None),
             )
-        ).scalar_one_or_none()
+            .with_for_update()
+        )
+        if connection_session_id is not None:
+            presence_statement = presence_statement.where(
+                SessionPresence.connection_session_id == connection_session_id
+            )
+        presence = (await self._session.execute(presence_statement)).scalar_one_or_none()
         if presence is None:
             return _record(db_room, session)
         presence.left_at = now
-        presence.leave_reason = "client_parted"
+        presence.leave_reason = reason
         participant = await self._session.get(RoomParticipant, {"room_id": db_room.id, "account_id": account_id})
         if participant is not None:
             participant.last_activity_at = now
@@ -321,6 +446,7 @@ class SqlAlchemyMultiplayerRepository:
             session.host_account_id = remaining[0] if remaining else None
         closing = not remaining
         if closing:
+            await self._finish_active_round(session, aborted=True, now=now)
             room_start = db_room.starts_at or session.created_at
             end_at = max(now, room_start + timedelta(microseconds=1))
             if session.created_at is not None:
@@ -351,6 +477,8 @@ class SqlAlchemyMultiplayerRepository:
     ) -> RoomRecord:
         """Close a target presence and record the host-authorized removal."""
         db_room, session = await self._entities(room.public_id)
+        if await self._command_applied(command_id):
+            return _record(db_room, session)
         _require_host_version(room, session, actor_account_id)
         if target_account_id == actor_account_id:
             raise MatchPermissionDenied("the host cannot kick itself")
@@ -399,7 +527,11 @@ class SqlAlchemyMultiplayerRepository:
         """Replace durable room settings and increment the session version."""
         del now
         db_room, session = await self._entities(room.public_id)
+        if await self._command_applied(command_id):
+            return _record(db_room, session)
         _require_host_version(room, session, actor_account_id)
+        if await self._active_round_id(session.id) is not None:
+            raise MatchStateRejected("room settings cannot change during an active round")
         db_room.name = settings.name
         db_room.configuration = _settings_json(settings)
         session.team_mode = settings.team_mode.value
@@ -428,6 +560,8 @@ class SqlAlchemyMultiplayerRepository:
         """Transfer host to a currently present account."""
         del now
         db_room, session = await self._entities(room.public_id)
+        if await self._command_applied(command_id):
+            return _record(db_room, session)
         _require_host_version(room, session, actor_account_id)
         target = await self._session.scalar(
             select(SessionPresence.id).where(
@@ -464,6 +598,8 @@ class SqlAlchemyMultiplayerRepository:
         """Replace password proof fields without persisting plaintext."""
         del now
         db_room, session = await self._entities(room.public_id)
+        if await self._command_applied(command_id):
+            return _record(db_room, session)
         _require_host_version(room, session, actor_account_id)
         db_room.password_prefix = password_salt
         db_room.password_verifier = password_verifier
@@ -488,15 +624,18 @@ class SqlAlchemyMultiplayerRepository:
         participants: tuple[RoundParticipantSelection, ...],
         now: datetime,
     ) -> tuple[RoomRecord, uuid.UUID | None]:
-        """Freeze known content dimensions or append an explicitly unranked start."""
+        """Freeze a round and issue score attempts when content is known."""
         db_room, session = await self._entities(room.public_id)
+        if await self._command_applied(command_id):
+            return _record(db_room, session), await self._active_round_id(session.id)
         _require_host_version(room, session, actor_account_id)
-        frozen_round = await self._create_known_content_round(
-            db_room,
-            session,
-            participants=participants,
-            now=now,
-        )
+        if await self._active_round_id(session.id) is not None:
+            raise MatchStateRejected("session already has an active round")
+        try:
+            frozen_round = await self._create_round(db_room, session, participants=participants, now=now)
+            await self._session.flush()
+        except IntegrityError as error:
+            raise _map_integrity_error(error) from error
         session.version += 1
         await self._append_event(
             db_room,
@@ -507,12 +646,12 @@ class SqlAlchemyMultiplayerRepository:
             payload={
                 "account_ids": [participant.account_id for participant in participants],
                 "settings": dict(db_room.configuration),
-                "round_id": str(frozen_round.id) if frozen_round is not None else None,
-                "ranked_context": frozen_round is not None,
+                "round_id": str(frozen_round.id),
+                "ranked_context": frozen_round.playlist_revision_id is not None,
             },
         )
         await self._session.flush()
-        return _record(db_room, session), frozen_round.id if frozen_round is not None else None
+        return _record(db_room, session), frozen_round.id
 
     async def complete_round(
         self,
@@ -526,13 +665,13 @@ class SqlAlchemyMultiplayerRepository:
     ) -> RoomRecord:
         """Append completion for the current Stable round."""
         db_room, session = await self._entities(room.public_id)
+        if await self._command_applied(command_id):
+            return _record(db_room, session)
         _require_version(room, session)
-        if round_id is not None:
-            frozen_round = await self._session.get(Round, round_id, with_for_update=True)
-            if frozen_round is not None and frozen_round.ended_at is None:
-                frozen_round.status = "aborted" if aborted else "completed"
-                started_at = frozen_round.started_at or frozen_round.created_at
-                frozen_round.ended_at = max(now, started_at + timedelta(microseconds=1))
+        active_round_id = await self._active_round_id(session.id)
+        if active_round_id is None or (round_id is not None and active_round_id != round_id):
+            raise MatchStateRejected("session has no matching active round")
+        await self._finish_active_round(session, round_id=active_round_id, aborted=aborted, now=now)
         session.version += 1
         await self._append_event(
             db_room,
@@ -557,12 +696,17 @@ class SqlAlchemyMultiplayerRepository:
             await self._session.execute(
                 select(MultiplayerAttempt.id, MultiplayerAttempt.token_digest)
                 .join(Round, Round.id == MultiplayerAttempt.round_id)
+                .join(MultiplayerSession, MultiplayerSession.id == Round.session_id)
                 .join(PlaylistRevision, PlaylistRevision.id == Round.playlist_revision_id)
                 .where(
                     MultiplayerAttempt.account_id == account_id,
                     MultiplayerAttempt.status.in_((AttemptStatus.ISSUED, AttemptStatus.STARTED)),
                     MultiplayerAttempt.expires_at > at,
                     MultiplayerAttempt.score_id.is_(None),
+                    Round.status.in_(("in_progress", "completed", "aborted")),
+                    MultiplayerSession.status.in_(
+                        (SessionStatus.ACTIVE, SessionStatus.COMPLETED, SessionStatus.ABORTED)
+                    ),
                     PlaylistRevision.beatmap_revision_id == beatmap_revision_id,
                 )
                 .order_by(MultiplayerAttempt.created_at.desc())
@@ -571,30 +715,15 @@ class SqlAlchemyMultiplayerRepository:
         ).one_or_none()
         return MultiplayerSubmissionContext(row.id, row.token_digest) if row is not None else None
 
-    async def _create_known_content_round(
+    async def _create_round(
         self,
         room: Room,
         session: MultiplayerSession,
         *,
         participants: tuple[RoundParticipantSelection, ...],
         now: datetime,
-    ) -> Round | None:
+    ) -> Round:
         settings = _settings(room, session)
-        if settings.external_beatmap_id < 1:
-            return None
-        revision_statement = (
-            select(BeatmapRevision)
-            .join(Beatmap, Beatmap.id == BeatmapRevision.beatmap_id)
-            .where(
-                Beatmap.external_id == settings.external_beatmap_id,
-                BeatmapRevision.is_current.is_(True),
-            )
-        )
-        if settings.beatmap_md5 is not None:
-            revision_statement = revision_statement.where(BeatmapRevision.md5 == settings.beatmap_md5)
-        beatmap_revision = (await self._session.execute(revision_statement.limit(1))).scalar_one_or_none()
-        if beatmap_revision is None:
-            return None
         scoreboard = (
             await self._session.execute(
                 select(Scoreboard).where(
@@ -605,17 +734,7 @@ class SqlAlchemyMultiplayerRepository:
             )
         ).scalar_one_or_none()
         if scoreboard is None:
-            return None
-        ranking_policy = (
-            await self._session.execute(
-                select(RankingPolicy).where(
-                    RankingPolicy.scoreboard_id == scoreboard.id,
-                    RankingPolicy.active.is_(True),
-                )
-            )
-        ).scalar_one_or_none()
-        if ranking_policy is None:
-            return None
+            raise MatchStateRejected("room ruleset has no active scoreboard")
         normalized = normalize_mods(settings.ruleset, settings.variant, settings.mods)
         mod_statement = (
             insert(ModSet)
@@ -632,6 +751,30 @@ class SqlAlchemyMultiplayerRepository:
             .returning(ModSet.id)
         )
         mod_set_id = (await self._session.execute(mod_statement)).scalar_one()
+        beatmap_revision: BeatmapRevision | None = None
+        if settings.external_beatmap_id > 0:
+            revision_statement = (
+                select(BeatmapRevision)
+                .join(Beatmap, Beatmap.id == BeatmapRevision.beatmap_id)
+                .where(
+                    Beatmap.external_id == settings.external_beatmap_id,
+                    BeatmapRevision.is_current.is_(True),
+                )
+            )
+            if settings.beatmap_md5 is not None:
+                revision_statement = revision_statement.where(BeatmapRevision.md5 == settings.beatmap_md5)
+            beatmap_revision = (await self._session.execute(revision_statement.limit(1))).scalar_one_or_none()
+        ranking_policy = None
+        if beatmap_revision is not None:
+            ranking_policy = (
+                await self._session.execute(
+                    select(RankingPolicy).where(
+                        RankingPolicy.scoreboard_id == scoreboard.id,
+                        RankingPolicy.active.is_(True),
+                        RankingPolicy.is_default.is_(True),
+                    )
+                )
+            ).scalar_one_or_none()
         item = (
             await self._session.execute(
                 select(PlaylistItem).where(PlaylistItem.room_id == room.id, PlaylistItem.client_item_id == 1)
@@ -643,15 +786,17 @@ class SqlAlchemyMultiplayerRepository:
             await self._session.flush()
         configuration = _settings_json(settings)
         digest = canonical_json_digest(configuration)
-        playlist_revision = (
-            await self._session.execute(
-                select(PlaylistRevision).where(
-                    PlaylistRevision.item_id == item.id,
-                    PlaylistRevision.configuration_digest == digest,
+        playlist_revision: PlaylistRevision | None = None
+        if beatmap_revision is not None and ranking_policy is not None:
+            playlist_revision = (
+                await self._session.execute(
+                    select(PlaylistRevision).where(
+                        PlaylistRevision.item_id == item.id,
+                        PlaylistRevision.configuration_digest == digest,
+                    )
                 )
-            )
-        ).scalar_one_or_none()
-        if playlist_revision is None:
+            ).scalar_one_or_none()
+        if beatmap_revision is not None and ranking_policy is not None and playlist_revision is None:
             await self._session.execute(
                 update(PlaylistRevision)
                 .where(
@@ -684,7 +829,7 @@ class SqlAlchemyMultiplayerRepository:
             )
             self._session.add(playlist_revision)
             await self._session.flush()
-        elif not playlist_revision.is_current:
+        elif playlist_revision is not None and not playlist_revision.is_current:
             await self._session.execute(
                 update(PlaylistRevision)
                 .where(PlaylistRevision.item_id == item.id, PlaylistRevision.is_current.is_(True))
@@ -701,7 +846,7 @@ class SqlAlchemyMultiplayerRepository:
             id=uuid.uuid7(),
             session_id=session.id,
             round_number=round_number,
-            playlist_revision_id=playlist_revision.id,
+            playlist_revision_id=playlist_revision.id if playlist_revision is not None else None,
             status="in_progress",
             configuration=configuration,
             configuration_digest=digest,
@@ -709,6 +854,17 @@ class SqlAlchemyMultiplayerRepository:
         )
         self._session.add(frozen_round)
         await self._session.flush()
+        presences = {
+            account_id: presence_id
+            for account_id, presence_id in (
+                await self._session.execute(
+                    select(SessionPresence.account_id, SessionPresence.id).where(
+                        SessionPresence.session_id == session.id,
+                        SessionPresence.left_at.is_(None),
+                    )
+                )
+            ).all()
+        }
         for participant in participants:
             participant_mods = settings.mods
             if settings.free_mods:
@@ -735,10 +891,15 @@ class SqlAlchemyMultiplayerRepository:
                     RoundParticipant(
                         round_id=frozen_round.id,
                         account_id=participant.account_id,
+                        presence_id=presences.get(participant.account_id),
                         slot_number=participant.slot_position,
-                        team_number=participant.team or None,
+                        team_number=participant.team,
                         mod_set_id=participant_mod_set_id,
                     ),
+                )
+            )
+            if playlist_revision is not None:
+                self._session.add(
                     MultiplayerAttempt(
                         id=uuid.uuid7(),
                         account_id=participant.account_id,
@@ -746,11 +907,43 @@ class SqlAlchemyMultiplayerRepository:
                         token_digest=secrets.token_bytes(32),
                         attempt_number=1,
                         status=AttemptStatus.ISSUED,
-                        expires_at=now + timedelta(hours=6),
-                    ),
+                        expires_at=now + _ROUND_ATTEMPT_LIFETIME,
+                    )
                 )
-            )
         return frozen_round
+
+    async def _active_round_id(self, session_id: uuid.UUID) -> uuid.UUID | None:
+        return await self._session.scalar(
+            select(Round.id).where(Round.session_id == session_id, Round.status == "in_progress").limit(1)
+        )
+
+    async def _finish_active_round(
+        self,
+        session: MultiplayerSession,
+        *,
+        aborted: bool,
+        now: datetime,
+        round_id: uuid.UUID | None = None,
+    ) -> None:
+        selected_round_id = round_id or await self._active_round_id(session.id)
+        if selected_round_id is None:
+            return
+        frozen_round = await self._session.get(Round, selected_round_id, with_for_update=True)
+        if frozen_round is None or frozen_round.session_id != session.id or frozen_round.status != "in_progress":
+            return
+        started_at = frozen_round.started_at or frozen_round.created_at
+        ended_at = max(now, started_at + timedelta(microseconds=1))
+        frozen_round.status = "aborted" if aborted else "completed"
+        frozen_round.ended_at = ended_at
+        await self._session.execute(
+            update(MultiplayerAttempt)
+            .where(
+                MultiplayerAttempt.round_id == frozen_round.id,
+                MultiplayerAttempt.status.in_((AttemptStatus.ISSUED, AttemptStatus.STARTED)),
+                MultiplayerAttempt.score_id.is_(None),
+            )
+            .values(expires_at=ended_at + _ROUND_SUBMISSION_GRACE)
+        )
 
     async def _entities(self, public_id: int) -> tuple[Room, MultiplayerSession]:
         row = (
@@ -778,6 +971,12 @@ class SqlAlchemyMultiplayerRepository:
             .where(MultiplayerEvent.command_id == command_id)
         )
         return await self.get_room(public_id) if public_id is not None else None
+
+    async def _command_applied(self, command_id: uuid.UUID) -> bool:
+        return (
+            await self._session.scalar(select(MultiplayerEvent.id).where(MultiplayerEvent.command_id == command_id))
+            is not None
+        )
 
     async def _append_event(
         self,
@@ -897,3 +1096,41 @@ def _json_int(value: object, *, default: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int | str):
         raise ValueError("stored multiplayer integer is invalid")
     return int(value)
+
+
+def _mods_from_json(value: object) -> tuple[CanonicalMod, ...]:
+    if not isinstance(value, list):
+        raise RuntimeError("stored multiplayer mod set is invalid")
+    mods: list[CanonicalMod] = []
+    for item in value:
+        if not isinstance(item, dict) or not isinstance(item.get("acronym"), str):
+            raise RuntimeError("stored multiplayer mod is invalid")
+        settings = item.get("settings", {})
+        if not isinstance(settings, dict):
+            raise RuntimeError("stored multiplayer mod settings are invalid")
+        mods.append(CanonicalMod(item["acronym"], settings))
+    return tuple(mods)
+
+
+def _map_integrity_error(error: IntegrityError) -> MatchAlreadyJoined | MatchStateRejected | MatchConcurrencyConflict:
+    constraint_name = _integrity_constraint_name(error)
+    message = str(error).lower()
+    if constraint_name == _ACTIVE_PRESENCE_CONSTRAINT or _ACTIVE_PRESENCE_CONSTRAINT in message:
+        return MatchAlreadyJoined("account already has an active multiplayer presence")
+    if constraint_name == _ACTIVE_ROUND_CONSTRAINT or _ACTIVE_ROUND_CONSTRAINT in message:
+        return MatchStateRejected("session already has an active round")
+    return MatchConcurrencyConflict("concurrent multiplayer write conflicted")
+
+
+def _integrity_constraint_name(error: IntegrityError) -> str | None:
+    for candidate in (error.orig, getattr(error.orig, "__cause__", None)):
+        if candidate is None:
+            continue
+        constraint_name = getattr(candidate, "constraint_name", None)
+        if isinstance(constraint_name, str):
+            return constraint_name
+        diagnostic = getattr(candidate, "diag", None)
+        constraint_name = getattr(diagnostic, "constraint_name", None)
+        if isinstance(constraint_name, str):
+            return constraint_name
+    return None

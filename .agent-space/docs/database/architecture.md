@@ -69,6 +69,8 @@ PostgreSQL 是 Stable 与 Lazer 协议适配器共用的持久事实存储。客
 - 成绩与尝试的账户、谱面修订、Scoreboard 和 Mod Set 由复合外键保持一致。
 - Accuracy 使用 `[0, 1]` 比例，Stable 百分比在协议边界转换。
 - PP 和星数必须标记生成它们的 Calculation Release。
+- Formula 唯一绑定 Calculator Code 并声明适用 Scoreboard；Release 按 Formula 和 Ruleset 单活，Performance Release 必须固定 Difficulty Release。
+- 每个 `(score_id, release_id)` 最多一个 Calculation Job 与一个 Score Performance；不同 Formula 和历史 Release 的值允许并存。
 - 排行榜记录按策略、谱面、范围、Mod Filter 和账户唯一；动态排名不写回成绩事实。
 - 一个有序账户对只能对应一个私信频道；已读状态使用每账户频道游标。
 - 关注和屏蔽不能指向自己；创建屏蔽关系的业务事务需要删除冲突的关注关系。
@@ -87,6 +89,8 @@ PostgreSQL 是 Stable 与 Lazer 协议适配器共用的持久事实存储。客
 所有协议请求在中心 API 或实时网关完成认证和规范化，随后直接调用应用服务。所有状态由中心进程产生，不接受外部状态导入。并发控制使用 PostgreSQL 唯一约束、行锁和聚合版本；协议重试幂等键保存在对应领域表中。
 
 业务事务只写 PostgreSQL 事实、Outbox Event 和 Delivery。提交后由独立 Relay 投递 Taskiq；Worker 通过 Delivery 主键和领域约束处理至少一次消息。PostgreSQL 与 Redis 都是中心应用的启动依赖；Relay 在 Redis 恢复后根据未完成 Delivery 继续投递。
+
+Calculation Job 同样由 PostgreSQL 持久状态恢复，但与 Outbox Delivery 分表管理，因为外部 Calculator I/O 不能发生在 Outbox Consumer 事务中。Calculator 不连接中心 PostgreSQL/S3，也不领取任务；它只接受带 Release 指纹、Input Digest 和 `.osu` 内容的纯计算请求，中心 Worker 验证响应并拥有最终写权限。
 
 ## Stable 与 Lazer 映射
 

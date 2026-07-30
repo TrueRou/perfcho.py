@@ -27,19 +27,22 @@ from perfcho.infra.db.mixins import BigIntIdentityMixin, CreatedAtMixin, Timesta
 
 
 class PasswordCredential(TimestampMixin, DbBase):
-    """Stores the current versioned Argon2id password verifier for an account."""
+    """Stores the current password verifier for an account."""
 
     __tablename__ = "password_credentials"
     __table_args__ = (
-        CheckConstraint("algorithm = 'argon2id'", name="argon2id_only"),
-        CheckConstraint("pepper_version > 0", name="positive_pepper_version"),
+        CheckConstraint(
+            "(algorithm = 'argon2id' AND pepper_version IS NOT NULL AND pepper_version > 0) OR "
+            "(algorithm = 'bcrypt_md5' AND pepper_version IS NULL)",
+            name="algorithm_pepper_consistency",
+        ),
         {"schema": "iam"},
     )
 
     account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), primary_key=True)
     verifier: Mapped[str] = mapped_column(String(512), nullable=False)
     algorithm: Mapped[str] = mapped_column(String(16), nullable=False, default="argon2id", server_default="argon2id")
-    pepper_version: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    pepper_version: Mapped[int | None] = mapped_column(SmallInteger)
     password_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     must_change: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
@@ -168,6 +171,10 @@ class AuthSession(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     __tablename__ = "auth_sessions"
     __table_args__ = (
         CheckConstraint("expires_at > created_at", name="valid_period"),
+        CheckConstraint(
+            "last_activity_at >= created_at AND last_activity_at <= expires_at",
+            name="activity_period",
+        ),
         CheckConstraint("session_class IN ('normal', 'tourney')", name="session_class_values"),
         CheckConstraint(
             "session_class <> 'tourney' OR client_family = 'stable'",
@@ -201,6 +208,7 @@ class AuthSession(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     ip_address: Mapped[str] = mapped_column(INET, nullable=False)
     user_agent: Mapped[str | None] = mapped_column(String(512))
     mfa_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

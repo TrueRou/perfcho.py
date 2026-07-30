@@ -11,6 +11,7 @@ from perfcho.modules.scoring.models import (
     AccountStatsView,
     AccountSubmissionContext,
     AttemptClaim,
+    BeatmapGradeView,
     BeatmapReference,
     BeatmapRevisionInfo,
     LeaderboardPage,
@@ -18,13 +19,16 @@ from perfcho.modules.scoring.models import (
     MultiplayerSubmissionContext,
     NormalizedModSet,
     PerformanceCalculationInput,
+    PerformanceCompletion,
     PerformanceResult,
     PlayAttemptRecord,
+    PlayAttemptSubmission,
     ReplayReference,
     Ruleset,
     ScoreAcceptanceRecord,
     ScoreboardInfo,
     ScoreboardVariant,
+    ScorePerformanceView,
 )
 
 
@@ -68,11 +72,26 @@ class ScoringRepository(Protocol):
         ...
 
     async def insert_score(self, record: ScoreAcceptanceRecord) -> AcceptedScoreResult:
-        """Insert score, hits, replay, attestation, and optional PP facts."""
+        """Insert score, hits, replay, and attestation facts."""
+        ...
+
+    async def schedule_performance_calculations(
+        self,
+        *,
+        score_id: int,
+        scoreboard_id: int,
+        ruleset: Ruleset,
+        now: datetime,
+    ) -> tuple[uuid.UUID, ...]:
+        """Create one durable job for every enabled active formula release."""
         ...
 
     async def complete_acceptance(self, idempotency_key: str, result: AcceptedScoreResult) -> None:
         """Attach the non-secret accepted result to its command receipt."""
+        ...
+
+    async def get_score_performances(self, score_id: int) -> tuple[ScorePerformanceView, ...]:
+        """Return every persisted Formula release result for one score."""
         ...
 
     async def get_replay(self, score_id: int) -> ReplayReference | None:
@@ -114,6 +133,14 @@ class ScoringRepository(Protocol):
         """Aggregate Stable-facing account statistics without calculating PP."""
         ...
 
+    async def get_beatmap_grades(
+        self,
+        account_id: int,
+        beatmap_ids: tuple[int, ...],
+    ) -> tuple[BeatmapGradeView, ...]:
+        """Return projected vanilla personal-best grades for logical beatmaps."""
+        ...
+
 
 class AccountSubmissionValidator(Protocol):
     """Validate authoritative account lifecycle and scoring sanctions."""
@@ -134,6 +161,7 @@ class MultiplayerSubmissionValidator(Protocol):
         revision: BeatmapRevisionInfo,
         scoreboard: ScoreboardInfo,
         mod_set: ModSetInfo,
+        attempt: PlayAttemptSubmission,
         at: datetime,
     ) -> None:
         """Lock and validate one unconsumed context against score dimensions."""
@@ -152,10 +180,50 @@ class MultiplayerSubmissionValidator(Protocol):
 
 
 class PerformanceCalculator(Protocol):
-    """Calculate PP through an explicitly injected, versioned engine."""
+    """Calculate difficulty and PP through a versioned external engine."""
 
-    async def calculate(self, calculation: PerformanceCalculationInput) -> PerformanceResult | None:
-        """Return a release-owned result, or defer calculation by returning none."""
+    async def calculate(self, calculation: PerformanceCalculationInput, beatmap_content: bytes) -> PerformanceResult:
+        """Return deterministic output for one immutable calculation input."""
+        ...
+
+
+class PerformanceCalculationRepository(Protocol):
+    """Coordinate short transaction phases around external calculation I/O."""
+
+    async def start(
+        self,
+        job_id: uuid.UUID,
+        lease_token: uuid.UUID,
+        *,
+        now: datetime,
+    ) -> PerformanceCalculationInput | None:
+        """Fence and materialize one leased immutable calculation input."""
+        ...
+
+    async def complete(
+        self,
+        calculation: PerformanceCalculationInput,
+        lease_token: uuid.UUID,
+        result: PerformanceResult,
+        *,
+        output_digest: bytes,
+        now: datetime,
+    ) -> PerformanceCompletion | None:
+        """Persist one idempotent result if the caller still owns the lease."""
+        ...
+
+    async def fail(
+        self,
+        job_id: uuid.UUID,
+        lease_token: uuid.UUID,
+        *,
+        error: str,
+        retry_at: datetime,
+        dead: bool,
+        consume_attempt: bool,
+        now: datetime,
+    ) -> None:
+        """Release or dead-letter a failed fenced job."""
         ...
 
 
@@ -172,6 +240,14 @@ class ScoringRepositoryFactory(Protocol):
 
     def __call__(self, session: object) -> ScoringRepository:
         """Return a transaction-bound repository."""
+        ...
+
+
+class PerformanceCalculationRepositoryFactory(Protocol):
+    """Bind calculation persistence to one caller-owned transaction."""
+
+    def __call__(self, session: object) -> PerformanceCalculationRepository:
+        """Return a transaction-bound calculation repository."""
         ...
 
 

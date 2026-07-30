@@ -9,6 +9,8 @@ from perfcho.infra.security.password import (
     hash_password,
     preverify_lazer_password,
     validate_stable_password_token,
+    verify_dummy_password,
+    verify_legacy_bcrypt_md5,
     verify_password,
 )
 from perfcho.infra.security.tokens import (
@@ -35,6 +37,8 @@ __all__ = (
     "normalize_stable_name",
     "preverify_lazer_password",
     "validate_stable_password_token",
+    "verify_dummy_password",
     "verify_hmac_sha256_digest",
+    "verify_legacy_bcrypt_md5",
     "verify_password",
 )

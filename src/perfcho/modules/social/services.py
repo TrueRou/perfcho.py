@@ -56,7 +56,7 @@ class SocialService:
         *,
         remark: str | None = None,
     ) -> FollowRecord:
-        """Create an outgoing friend follow unless either account blocks the other."""
+        """Create a follow after clearing only the actor's block; preserve target blocks."""
         _validate_pair(actor_account_id, target_account_id)
         if remark is not None and len(remark) > 64:
             raise SocialRelationRejected("friend remark exceeds 64 characters")
@@ -67,8 +67,23 @@ class SocialService:
             await repository.acquire_pair_lock(actor_account_id, target_account_id)
             await _require_accounts(repository, actor_account_id, target_account_id)
             pair = await repository.get_pair_relationship(actor_account_id, target_account_id)
-            if pair.blocked:
-                raise SocialInteractionBlocked("the social interaction is blocked")
+            if pair.blocks(target_account_id, actor_account_id):
+                raise SocialInteractionBlocked("the target account blocks this social interaction")
+            if pair.blocks(actor_account_id, target_account_id):
+                removed = await repository.delete_block(actor_account_id, target_account_id)
+                if not removed:
+                    raise RuntimeError("the actor's block disappeared under the account-pair lock")
+                await self._outbox_writer_factory(uow.session).append(
+                    PendingEvent(
+                        aggregate_type="social_pair",
+                        aggregate_id=f"{low_account_id}:{high_account_id}",
+                        event_type="social.account-unblocked.v1",
+                        schema_version=1,
+                        payload={"actor_account_id": actor_account_id, "target_account_id": target_account_id},
+                        consumers=_SOCIAL_CONSUMERS,
+                        partition_key=f"social-pair:{low_account_id}:{high_account_id}",
+                    )
+                )
             previous = await repository.get_follow(actor_account_id, target_account_id)
             if previous is not None and previous.remark == remark:
                 await uow.commit()
@@ -236,6 +251,27 @@ class SocialService:
         _validate_account_id(account_id)
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).list_blocks(account_id)
+
+    async def filter_message_recipients(
+        self,
+        sender_account_id: int,
+        recipient_account_ids: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """Remove recipients who currently block the sender using one batch query."""
+        _validate_account_id(sender_account_id)
+        if not isinstance(recipient_account_ids, tuple):
+            raise SocialRelationRejected("recipient account IDs must be a tuple")
+        recipients = tuple(dict.fromkeys(recipient_account_ids))
+        for recipient_account_id in recipients:
+            _validate_account_id(recipient_account_id)
+        if not recipients:
+            return ()
+        async with self._uow_factory() as uow:
+            blocked_recipient_ids = await self._repository_factory(uow.session).list_blocking_account_ids(
+                sender_account_id,
+                recipients,
+            )
+        return tuple(account_id for account_id in recipients if account_id not in blocked_recipient_ids)
 
     async def list_achievements(
         self,

@@ -9,6 +9,7 @@ from perfcho.modules.common.ports import OutboxWriter, UnitOfWork
 from perfcho.modules.community.models import (
     ActiveSilence,
     ChannelRecord,
+    ConversationReadCursor,
     DirectConversationResult,
     DirectMessageContext,
     MessageResult,
@@ -33,10 +34,22 @@ class ActiveSilencePolicy(Protocol):
         self,
         account_id: int,
         *,
-        channel_id: int,
+        channel_id: int | None,
         at: datetime,
     ) -> ActiveSilence | None:
         """Return a global or matching channel silence when active."""
+        ...
+
+
+class ActiveChannelMembershipQuery(Protocol):
+    """Query current protocol-independent channel membership state."""
+
+    async def is_active_member(self, channel_id: int, account_id: int, *, at: datetime) -> bool:
+        """Return whether an account currently occupies a channel."""
+        ...
+
+    async def count_active_members(self, channel_id: int, *, at: datetime) -> int:
+        """Return the current active member count for join/part updates."""
         ...
 
 
@@ -118,9 +131,36 @@ class CommunityRepository(Protocol):
         self,
         account_id: int,
         *,
+        after_message_id: int | None,
         limit: int,
     ) -> tuple[OfflineDirectMessage, ...]:
         """List unread incoming direct messages in ascending message order."""
+        ...
+
+    async def get_direct_conversation_read_cursor(
+        self,
+        account_id: int,
+        other_account_id: int,
+    ) -> ConversationReadCursor | None:
+        """Return the latest incoming message position for one direct-conversation pair."""
+        ...
+
+    async def list_valid_direct_read_cursors(
+        self,
+        account_id: int,
+        cursors: tuple[ConversationReadCursor, ...],
+    ) -> frozenset[ConversationReadCursor]:
+        """Validate direct-conversation ownership and message positions in one query."""
+        ...
+
+    async def advance_read_cursors(
+        self,
+        account_id: int,
+        cursors: tuple[ConversationReadCursor, ...],
+        *,
+        now: datetime,
+    ) -> tuple[ReadCursorResult, ...]:
+        """Advance multiple per-conversation cursors monotonically in one batch."""
         ...
 
     async def set_private_message_policy(self, account_id: int, policy: str, *, now: datetime) -> str:

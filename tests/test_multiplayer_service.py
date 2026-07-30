@@ -12,11 +12,15 @@ from perfcho.modules.common.ports import Clock
 from perfcho.modules.multiplayer import (
     ChangeHost,
     CreateRoom,
+    DurableRoomSnapshot,
+    JoinRoom,
     MatchPasswordRejected,
     MatchPermissionDenied,
+    MultiplayerAccessPolicy,
     MultiplayerRepository,
     MultiplayerService,
     MultiplayerStateRepository,
+    ProjectionStatus,
     RoomRecord,
     RoomSettings,
     RoomSlot,
@@ -25,7 +29,8 @@ from perfcho.modules.multiplayer import (
     TeamMode,
     WinCondition,
 )
-from perfcho.modules.scoring import Ruleset, ScoreboardVariant
+from perfcho.modules.multiplayer.services import _settings_transition
+from perfcho.modules.scoring import CanonicalMod, Ruleset, ScoreboardVariant
 
 NOW = datetime(2026, 7, 29, 12, tzinfo=UTC)
 
@@ -60,6 +65,7 @@ class FakeRepository:
         self.room: RoomRecord | None = None
         self.accounts: tuple[int, ...] = ()
         self.created_password: tuple[str | None, str | None] | None = None
+        self.command_rooms: dict[uuid.UUID, RoomRecord] = {}
 
     async def create_room(self, **values: object) -> RoomRecord:
         actor = cast(int, values["actor_account_id"])
@@ -81,7 +87,14 @@ class FakeRepository:
             verifier,
         )
         self.accounts = (actor,)
+        self.command_rooms[cast(uuid.UUID, values["command_id"])] = self.room
         return self.room
+
+    async def find_command_room(self, command_id: uuid.UUID) -> RoomRecord | None:
+        return self.command_rooms.get(command_id)
+
+    async def load_snapshot(self, room: RoomRecord) -> DurableRoomSnapshot:
+        return DurableRoomSnapshot(room, self.accounts)
 
     async def find_room_for_account(self, account_id: int) -> RoomRecord | None:
         return self.room if self.room is not None and account_id in self.accounts else None
@@ -95,11 +108,12 @@ class FakeRepository:
         return self.room if self.room is not None and self.room.public_id == public_id else None
 
     async def join_room(self, room: RoomRecord, *, account_id: int, **values: object) -> RoomRecord:
-        del values
+        command_id = cast(uuid.UUID, values["command_id"])
         if account_id not in self.accounts:
             self.accounts += (account_id,)
             room = replace(room, version=room.version + 1)
             self.room = room
+        self.command_rooms[command_id] = room
         return room
 
     async def change_host(
@@ -109,9 +123,14 @@ class FakeRepository:
         target_account_id: int,
         **values: object,
     ) -> RoomRecord:
-        del values
         self.room = replace(room, version=room.version + 1, host_account_id=target_account_id)
+        self.command_rooms[cast(uuid.UUID, values["command_id"])] = self.room
         return self.room
+
+
+class AllowMultiplayer:
+    async def require(self, account_id: int, permissions: tuple[str, ...], *, at: datetime) -> None:
+        assert account_id > 0 and permissions and at == NOW
 
 
 class FakeState:
@@ -130,8 +149,15 @@ class FakeState:
         del at
         return self.state if self.state is not None and self.state.slot_for(account_id) is not None else None
 
-    async def replace(self, state: RoomState, *, expected_state_revision: int) -> RoomState:
+    async def replace(
+        self,
+        state: RoomState,
+        *,
+        expected_state_revision: int,
+        expected_session_id: uuid.UUID,
+    ) -> RoomState:
         assert self.state is not None and self.state.state_revision == expected_state_revision
+        assert self.state.room.session_id == expected_session_id
         self.state = replace(state, room=replace(state.room, password_salt=None, password_verifier=None))
         return self.state
 
@@ -176,13 +202,19 @@ def meta(account_id: int, label: str) -> CommandMeta:
     )
 
 
-def service(repository: FakeRepository, state: FakeState) -> MultiplayerService:
+def service(
+    repository: FakeRepository,
+    state: FakeState,
+    *,
+    access_policy: object | None = None,
+) -> MultiplayerService:
     return MultiplayerService(
         FakeUnitOfWork,
         lambda session: cast(MultiplayerRepository, repository),
         cast(MultiplayerStateRepository, state),
         cast(Clock, FixedClock()),
         b"room-password-key",
+        access_policy_factory=lambda session: cast(MultiplayerAccessPolicy, access_policy or AllowMultiplayer()),
         state_lifetime=timedelta(hours=1),
     )
 
@@ -248,3 +280,93 @@ async def test_only_current_host_can_transfer_host() -> None:
 
     with pytest.raises(MatchPermissionDenied):
         await multiplayer.change_host(ChangeHost(meta(11, "host"), 7, 1, 11))
+
+
+@pytest.mark.asyncio
+async def test_committed_create_returns_durable_snapshot_when_redis_is_down() -> None:
+    repository = FakeRepository()
+    state = FakeState()
+
+    async def unavailable(value: RoomState) -> RoomState:
+        del value
+        raise ConnectionError("redis unavailable")
+
+    state.create = unavailable  # type: ignore[method-assign]
+
+    created = await service(repository, state).create_room(CreateRoom(meta(10, "create"), settings()))
+
+    assert created.projection_status is ProjectionStatus.DURABLE_RECOVERY
+    assert created.slot_for(10) is not None
+
+
+@pytest.mark.asyncio
+async def test_admission_token_is_bound_to_room_session_and_recipient() -> None:
+    repository = FakeRepository()
+    state = FakeState()
+    multiplayer = service(repository, state)
+    await multiplayer.create_room(CreateRoom(meta(10, "create"), settings(), "secret"))
+
+    token = await multiplayer.issue_admission_token(7, inviter_account_id=10, recipient_account_id=11)
+
+    assert "secret" not in token
+    with pytest.raises(MatchPasswordRejected):
+        await multiplayer.join_room(JoinRoom(meta(12, "join-wrong-recipient"), 7, token))
+    joined = await multiplayer.join_room(JoinRoom(meta(11, "join-token"), 7, token))
+    assert joined.slot_for(11) is not None
+
+
+@pytest.mark.asyncio
+async def test_same_idempotency_key_replays_create_without_new_room() -> None:
+    repository = FakeRepository()
+    multiplayer = service(repository, FakeState())
+    command = CreateRoom(meta(10, "same-create"), settings())
+
+    first = await multiplayer.create_room(command)
+    replayed = await multiplayer.create_room(command)
+
+    assert replayed.room.room_id == first.room.room_id
+    assert len(repository.command_rooms) == 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_service_enforces_host_permission_before_create() -> None:
+    class DenyMultiplayer:
+        async def require(self, account_id: int, permissions: tuple[str, ...], *, at: datetime) -> None:
+            del account_id, permissions, at
+            raise MatchPermissionDenied("restricted")
+
+    repository = FakeRepository()
+    multiplayer = service(repository, FakeState(), access_policy=DenyMultiplayer())
+
+    with pytest.raises(MatchPermissionDenied):
+        await multiplayer.create_room(CreateRoom(meta(10, "denied-create"), settings()))
+    assert repository.room is None
+
+
+def test_stable_settings_transition_migrates_free_mods_and_team_defaults() -> None:
+    room = RoomRecord(
+        uuid.uuid7(),
+        7,
+        uuid.uuid7(),
+        1,
+        10,
+        10,
+        2,
+        replace(settings(), mods=(CanonicalMod("HD"), CanonicalMod("DT"))),
+    )
+    current = RoomState(
+        room,
+        1,
+        (RoomSlot(0, SlotStatus.NOT_READY, 10), RoomSlot(1, SlotStatus.NOT_READY, 11)),
+        False,
+        NOW + timedelta(hours=1),
+    )
+
+    transitioned, slots = _settings_transition(
+        current,
+        replace(room.settings, free_mods=True, team_mode=TeamMode.TEAM_VS),
+    )
+
+    assert tuple(mod.acronym for mod in transitioned.mods) == ("DT",)
+    assert all(tuple(mod.acronym for mod in slot.mods) == ("HD",) for slot in slots)
+    assert tuple(slot.team for slot in slots) == (1, 1)

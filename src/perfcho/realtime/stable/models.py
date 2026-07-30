@@ -142,6 +142,21 @@ class LoginFailureReason(IntEnum):
     REQUIRES_VERIFICATION = -8
 
 
+@unique
+class ReplayAction(IntEnum):
+    """Actions carried by Stable spectator replay bundles."""
+
+    STANDARD = 0
+    NEW_SONG = 1
+    SKIP = 2
+    COMPLETION = 3
+    FAIL = 4
+    PAUSE = 5
+    UNPAUSE = 6
+    SONG_SELECT = 7
+    WATCHING_OTHER = 8
+
+
 @dataclass(frozen=True, slots=True)
 class Message:
     """Stable chat message payload."""
@@ -171,6 +186,13 @@ class ClientStatus:
     mods: int
     mode: int
     beatmap_id: int
+
+    def __post_init__(self) -> None:
+        """Reject values outside the Stable action and ruleset inventories."""
+        if isinstance(self.action, bool) or not isinstance(self.action, int) or not 0 <= self.action <= 13:
+            raise ValueError("Stable client action must be between 0 and 13")
+        if isinstance(self.mode, bool) or not isinstance(self.mode, int) or not 0 <= self.mode <= 3:
+            raise ValueError("Stable client mode must be between 0 and 3")
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,7 +298,17 @@ class ReplayFrameBundle:
 
     frames: tuple[ReplayFrame, ...]
     score_frame: ScoreFrame
-    action: int
+    action: ReplayAction
     extra: int
     sequence: int
     raw_data: memoryview
+
+    def __post_init__(self) -> None:
+        """Normalize and validate the bounded spectator action inventory."""
+        if isinstance(self.action, bool):
+            raise ValueError("replay action must be between 0 and 8")
+        try:
+            action = ReplayAction(self.action)
+        except (TypeError, ValueError) as error:
+            raise ValueError("replay action must be between 0 and 8") from error
+        object.__setattr__(self, "action", action)

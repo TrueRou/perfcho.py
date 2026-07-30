@@ -124,18 +124,24 @@ Lazer Attempt Token 只应返回给对应账户，数据库只保存 Digest。St
 
 ### 3.1 当前阻塞
 
-`rosu-pp-py==4.0.2` 在当前 Python 3.14t 平台没有 Wheel，源码构建连续超时。当前 `DeferredPerformanceCalculator` 是明确的延迟计算策略，不允许使用随意公式或零值伪装真实 PP。
+`rosu-pp-py==4.0.2` 在当前 Python 3.14t 平台没有 Wheel，源码构建连续超时。中心应用已经不依赖 Python 绑定，支持按 Formula 调用独立 C#/Rust HTTP Calculator；当前阻塞改为发布真实 Calculator 制品、登记不可变 Formula/Release 并完成跨引擎金样本验证。
 
-### 3.2 目标设计
+### 3.2 已实现基础
 
-- 选择支持 Python 3.14t 的 rosu 绑定、独立受控计算进程或可复现的内部封装。
-- 每次算法和 Beatmap Difficulty 计算绑定不可变 `CalculationRelease`。
-- Difficulty Key 至少包含 Beatmap Revision、Ruleset、Variant、Mods 和 Release。
-- PP Key 至少包含 Score、Difficulty Attribute 和 Release。
-- Worker 写 `BeatmapDifficultyAttribute` 与 `ScorePerformance`，再触发 Ranking/Stats 投影。
-- Release 切换不覆盖旧结果；新结果并存，当前 Policy 指向生效 Release。
+- `CalculationFormula` 表达可选择的 PP/Difficulty 系统，Calculator Code 映射部署时 HTTP URL；一个 Calculator 可承载多个 Formula。
+- `CalculationRelease` 绑定 Formula、Ruleset、版本、Artifact/Configuration Digest；Performance Release 固定依赖 Difficulty Release。
+- 成绩事务创建每个活动 Formula Release 的持久 Job；Worker 使用 Lease/Fencing、输入/输出摘要和有界重试。
+- `ScorePerformance` 按 `(score_id, release_id)` 保留多 Formula 及历史 Release 结果，不覆盖旧值。
+- Worker 原子写 Difficulty、PP 和完成 Outbox Event，再触发全部活动 Ranking Policy；Stable 只读取 Default Policy。
 
-### 3.3 Ranking 补全
+### 3.3 尚缺发布与运维
+
+- 实现并部署 osu!lazer C# 与自研 Rust Calculator 的 `/v1/performance/calculate` 合同。
+- 增加 Formula/Release 管理 Command，使用真实 OCI/Binary SHA-256 发布和切换 Release；禁止 `latest`。
+- 建立官方金样本、C#/Rust 差异阈值、超时率、Pending Age、Dead Job 和非确定输出告警。
+- Release 切换需要批量 Backfill 新 Job、覆盖率校验、Ranking Projection Generation 重建后再切 Policy。
+
+### 3.4 Ranking 补全
 
 - 全量 Rebuild：从权威 Score 和 Eligibility 重建 LeaderboardEntry。
 - Eligibility 反转：封禁、谱面状态、Policy 或 Attestation 变化时删除/替换最佳成绩。
@@ -162,21 +168,18 @@ Rebuild 必须写入新 Projection Generation，完成后原子切换，不能�
 - Replay 先写对象后写数据库，失败会产生孤儿对象，必须纳入同一 GC。
 - 删除只能以数据库引用快照和安全保留窗口为依据，不能只按对象创建时间。
 
-## 5. Outbox Consumer 补全
+## 5. Outbox Consumer 后续
 
-只有存在真实副作用时才实现 Consumer：
+Account、Identity、Content、Social、Achievement、Community 和 Ranking Consumer 已实现并由 Taskiq Worker 显式注册。当前副作用限定在 PostgreSQL：Activity、Notification/Recipient/Dispatch Intent、Beatmapset Sync Projection、Channel Read Projection、Eligibility 和 Leaderboard；Worker 不重复写 Stable Redis Mailbox。
 
-| Consumer | 预期职责 | 完成条件 |
-| --- | --- | --- |
-| `account-projection.v1` | 账户搜索/公开资料基础投影 | 有查询入口和幂等 Upsert |
-| `identity-projection.v1` | Session/在线审计衍生事实 | 明确不与 Redis Presence 重复事实中心 |
-| `content-projection.v1` | Direct 搜索、统计或缓存失效 | 可从 Content Revision 重建 |
-| `social-projection.v1` | 好友/关注衍生计数或缓存 | Follow 事实仍以 PostgreSQL 为准 |
-| `achievement-projection.v1` | Achievement 展示/通知 | 有真实规则和通知目标 |
-| `community-projection.v1` | 频道/会话读取模型 | 有消费它的 Query |
-| `community-message.v1` | 在线或外部消息投递 | 持久 Message 已提交，投递可重试且幂等 |
+后续仍需：
 
-如果某事件没有必要的异步副作用，应删除无效 Delivery 设计，而不是注册空 Consumer。
+- 为 Activity、Notification、Channel Read 和 Beatmapset Sync Projection 增加 Canonical Query、Lazer API 与游标分页。
+- 实现邮件/Push `NotificationDispatch` Sender，使用独立租约、幂等 Provider Key 与有界重试；外部 I/O 不能放进 Outbox Consumer 数据库事务。
+- 为所有可重建投影提供 Generation 化全量 Rebuild、指定 Partition Replay 和权威事实对账。
+- 设计事件 Retention 前先处理 Projection 对 `events.outbox_events` 的来源引用。
+
+如果后续事件没有必要的异步副作用，应删除无效 Delivery 设计，而不是注册只推进 Checkpoint 的空 Consumer。
 
 ## 6. Lazer Adapter
 

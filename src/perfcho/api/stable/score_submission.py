@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import binascii
+import hashlib
+import hmac
 import re
 from base64 import b64decode
 from dataclasses import dataclass
@@ -28,6 +30,10 @@ from perfcho.modules.scoring.mods import parse_legacy_mods
 _OSU_VERSION = re.compile(r"^\d{8}$")
 _INTEGER = re.compile(r"^-?\d{1,20}$")
 _RULESETS = {0: Ruleset.OSU, 1: Ruleset.TAIKO, 2: Ruleset.FRUITS, 3: Ruleset.MANIA}
+_RULESET_IDS = {ruleset: identifier for identifier, ruleset in _RULESETS.items()}
+_MAX_ELAPSED_MS = 7 * 24 * 60 * 60 * 1000
+_MAX_INT32 = 2_147_483_647
+_MAX_INT64 = 9_223_372_036_854_775_807
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +49,7 @@ class ParsedStableScore:
     score: ScoreSubmission
     attestation: ScoreAttestation
     client_hash: str
+    legacy_mod_bits: int
 
 
 def decrypt_stable_score(
@@ -59,10 +66,12 @@ def decrypt_stable_score(
     """Decrypt one bounded Rijndael payload and normalize its canonical score facts."""
     if not _OSU_VERSION.fullmatch(osu_version):
         raise ValueError("osu version must contain eight digits")
-    if osu_version not in supported_build:
+    if not supported_build.startswith(f"b{osu_version}"):
         raise ValueError("score was submitted by an unsupported Stable build")
     if fail_time_ms < 0 or score_time_ms < 0:
         raise ValueError("Stable score timing values must not be negative")
+    if fail_time_ms > _MAX_ELAPSED_MS or score_time_ms > _MAX_ELAPSED_MS:
+        raise ValueError("Stable score timing values are too large")
     if max(len(score_data_b64), len(client_hash_b64), len(iv_b64)) > 16_384:
         raise ValueError("encrypted Stable score fields are too large")
     try:
@@ -79,7 +88,7 @@ def decrypt_stable_score(
         client_hash = cipher.decrypt(encrypted_client_hash).decode("utf-8")
     except (binascii.Error, IndexError, UnicodeError, ValueError) as error:
         raise ValueError("Stable score encryption is invalid") from error
-    if len(fields) != 18 or not client_hash or len(client_hash) > 512:
+    if len(fields) != 18 or not _valid_client_value(client_hash, maximum=512):
         raise ValueError("decrypted Stable score payload is invalid")
 
     beatmap_md5 = _hex_digest(fields[0], 16, "beatmap MD5")
@@ -87,17 +96,17 @@ def decrypt_stable_score(
     if not username or len(username) > 64:
         raise ValueError("Stable score username is invalid")
     online_checksum = _hex_digest(fields[2], 16, "online checksum")
-    n300, n100, n50, ngeki, nkatu, nmiss = (_integer(field) for field in fields[3:9])
-    total_score = _integer(fields[9])
-    max_combo = _integer(fields[10])
+    n300, n100, n50, ngeki, nkatu, nmiss = (_integer(field, maximum=_MAX_INT32) for field in fields[3:9])
+    total_score = _integer(fields[9], maximum=_MAX_INT64)
+    max_combo = _integer(fields[10], maximum=_MAX_INT32)
     perfect = _boolean(fields[11])
     try:
         grade = ScoreGrade(fields[12].upper())
     except ValueError as error:
         raise ValueError("Stable score grade is invalid") from error
-    legacy_mods = _integer(fields[13])
+    legacy_mods = _integer(fields[13], maximum=_MAX_INT32)
     passed = _boolean(fields[14])
-    mode = _integer(fields[15])
+    mode = _integer(fields[15], maximum=max(_RULESETS))
     if mode not in _RULESETS:
         raise ValueError("Stable score ruleset is invalid")
     ruleset = _RULESETS[mode]
@@ -106,9 +115,16 @@ def decrypt_stable_score(
         ended_at = datetime.strptime(fields[16], "%y%m%d%H%M%S").replace(tzinfo=UTC)
     except ValueError as error:
         raise ValueError("Stable score timestamp is invalid") from error
+    if fields[17].rstrip(" ") != supported_build:
+        raise ValueError("Stable score client build marker is invalid")
     client_flags = fields[17].count(" ") & ~4
     outcome = ScoreOutcome.PASSED if passed else ScoreOutcome.ABANDONED if exited else ScoreOutcome.FAILED
+    if passed and (exited or score_time_ms == 0 or fail_time_ms != 0):
+        raise ValueError("passed Stable score timing fields are inconsistent")
+    if not passed and fail_time_ms == 0:
+        raise ValueError("failed Stable score timing fields are inconsistent")
     progress = _progress(outcome, fail_time_ms, score_time_ms)
+    elapsed_ms = score_time_ms if outcome is ScoreOutcome.PASSED else fail_time_ms
     hits = _hit_statistics(ruleset, n300, n100, n50, ngeki, nkatu, nmiss)
     accuracy = _accuracy(ruleset, hits, mods)
     return ParsedStableScore(
@@ -119,7 +135,7 @@ def decrypt_stable_score(
         mods=mods,
         attempt=PlayAttemptSubmission(
             idempotency_key=f"stable:{online_checksum.hex()}",
-            started_at=ended_at - timedelta(milliseconds=score_time_ms),
+            started_at=ended_at - timedelta(milliseconds=elapsed_ms),
             ended_at=ended_at,
             progress=progress,
             client_metadata={
@@ -148,15 +164,60 @@ def decrypt_stable_score(
             evidence={"osu_version": osu_version},
         ),
         client_hash=client_hash,
+        legacy_mod_bits=legacy_mods,
     )
 
 
-def _integer(value: str) -> int:
+def stable_online_checksum(
+    parsed: ParsedStableScore,
+    *,
+    osu_version: str,
+    client_hash: str,
+    storyboard_hash: str | None,
+    username: str | None = None,
+) -> bytes:
+    """Recompute the Stable online checksum using bancho.py's field order."""
+    values = {statistic.hit_result: statistic.actual for statistic in parsed.score.hits}
+    n300, n100, n50, ngeki, nkatu, nmiss = _legacy_hit_counts(parsed.ruleset, values)
+    score = parsed.score
+    payload = (
+        f"chickenmcnuggets{n100 + n300}o15{n50}{ngeki}smustard{nkatu}{nmiss}uu"
+        f"{parsed.beatmap_md5.hex()}{score.max_combo}{score.perfect}{username or parsed.username}{score.total_score}"
+        f"{score.grade.value}{parsed.legacy_mod_bits}Q{score.outcome is ScoreOutcome.PASSED}"
+        f"{_RULESET_IDS[parsed.ruleset]}{osu_version}{parsed.attempt.ended_at:%y%m%d%H%M%S}"
+        f"{client_hash}{storyboard_hash or ''}"
+    )
+    return hashlib.md5(payload.encode(), usedforsecurity=False).digest()
+
+
+def verify_stable_online_checksum(
+    parsed: ParsedStableScore,
+    *,
+    osu_version: str,
+    storyboard_hash: str | None,
+    username: str | None = None,
+) -> None:
+    """Reject a Stable online checksum mismatch with constant-time comparison."""
+    supplied = parsed.score.online_checksum
+    if supplied is None:
+        raise ValueError("Stable online checksum is missing")
+    expected = stable_online_checksum(
+        parsed,
+        osu_version=osu_version,
+        client_hash=parsed.client_hash,
+        storyboard_hash=storyboard_hash,
+        username=username,
+    )
+    if not hmac.compare_digest(supplied, expected):
+        raise ValueError("Stable online checksum does not match the submitted score")
+
+
+def _integer(value: str, *, maximum: int = _MAX_INT64) -> int:
     if not _INTEGER.fullmatch(value):
         raise ValueError("Stable score integer field is invalid")
     result = int(value)
-    if result < 0:
-        raise ValueError("Stable score integer field must not be negative")
+    if result < 0 or result > maximum:
+        raise ValueError("Stable score integer field is outside its supported range")
     return result
 
 
@@ -178,6 +239,34 @@ def _hex_digest(value: str, size: int, field_name: str) -> bytes:
     if len(result) != size:
         raise ValueError(f"Stable score {field_name} is invalid")
     return result
+
+
+def _valid_client_value(value: str, *, maximum: int) -> bool:
+    return bool(value) and len(value) <= maximum and all(character.isprintable() for character in value)
+
+
+def _legacy_hit_counts(ruleset: Ruleset, values: dict[str, int]) -> tuple[int, int, int, int, int, int]:
+    if ruleset is Ruleset.OSU:
+        return values["great"], values["ok"], values["meh"], 0, 0, values["miss"]
+    if ruleset is Ruleset.TAIKO:
+        return values["great"], values["ok"], 0, 0, 0, values["miss"]
+    if ruleset is Ruleset.FRUITS:
+        return (
+            values["great"],
+            values["large_tick_hit"],
+            values["small_tick_hit"],
+            values["large_tick_miss"],
+            values["small_tick_miss"],
+            values["miss"],
+        )
+    return (
+        values["great"],
+        values["ok"],
+        values["meh"],
+        values["perfect"],
+        values["good"],
+        values["miss"],
+    )
 
 
 def _progress(outcome: ScoreOutcome, fail_time_ms: int, score_time_ms: int) -> Decimal:

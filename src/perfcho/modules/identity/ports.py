@@ -28,12 +28,35 @@ class IdentityRepository(Protocol):
         """Re-read current account, auth version, name, and password facts."""
         ...
 
+    async def upgrade_legacy_credential(
+        self,
+        *,
+        account_id: int,
+        expected_verifier: str,
+        expected_password_changed_at: datetime,
+        password_verifier: str,
+        pepper_version: int,
+        password_changed_at: datetime,
+    ) -> bool:
+        """Conditionally replace an exact legacy credential with current Argon2id."""
+        ...
+
     async def acquire_stable_session_lock(self, account_id: int) -> None:
         """Serialize normal Stable session transitions for one account."""
         ...
 
     async def find_open_stable_session(self, account_id: int) -> OpenStableSession | None:
         """Return the account's unclosed normal Stable session, including stale rows."""
+        ...
+
+    async def find_stable_web_candidate(
+        self,
+        identifier_kind: str,
+        identifier_key: str,
+        *,
+        at: datetime,
+    ) -> tuple[CredentialSnapshot, OpenStableSession] | None:
+        """Return credentials only when the account has an active Stable session."""
         ...
 
     async def get_or_create_device(
@@ -88,6 +111,10 @@ class IdentityRepository(Protocol):
 
     async def resolve_stable_session(self, token_digest: bytes, *, at: datetime) -> ResolvedStableSession | None:
         """Resolve a digest only when token, session, account, and name are active."""
+        ...
+
+    async def touch_stable_session(self, token_digest: bytes, *, at: datetime) -> ResolvedStableSession | None:
+        """Resolve and monotonically advance one active Stable session under a row lock."""
         ...
 
     async def get_stable_session_account_id(self, session_id: uuid.UUID) -> int | None:

@@ -6,7 +6,12 @@ from typing import Annotated, cast
 from taskiq import Context, TaskiqDepends
 
 from perfcho.infra.db.engine import DbSessionFactory
+from perfcho.infra.db.projectors import account as account_projector  # noqa: F401
+from perfcho.infra.db.projectors import community as community_projector  # noqa: F401
+from perfcho.infra.db.projectors import content as content_projector  # noqa: F401
+from perfcho.infra.db.projectors import identity as identity_projector  # noqa: F401
 from perfcho.infra.db.projectors import ranking as ranking_projector  # noqa: F401
+from perfcho.infra.db.projectors import social as social_projector  # noqa: F401
 from perfcho.infra.outbox import process_delivery
 from perfcho.infra.taskiq import broker
 

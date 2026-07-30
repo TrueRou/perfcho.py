@@ -65,12 +65,12 @@ class ContentRepository(Protocol):
         """Set the account favourite state."""
         ...
 
-    async def get_rating(self, beatmapset_id: int, account_id: int | None) -> RatingSummary:
-        """Return aggregate and optional account rating."""
+    async def get_rating(self, beatmap_id: int, account_id: int | None) -> RatingSummary:
+        """Return aggregate and optional account rating for one logical beatmap."""
         ...
 
-    async def rate(self, account_id: int, beatmapset_id: int, rating: int) -> RatingSummary:
-        """Upsert an account rating."""
+    async def rate(self, account_id: int, beatmap_id: int, rating: int) -> RatingSummary:
+        """Upsert an account rating for one logical beatmap."""
         ...
 
     async def synchronize_beatmapset(

@@ -8,6 +8,7 @@ import pytest
 
 from perfcho.modules.common.errors import InputRejected, ResourceConflict, ResourceNotFound
 from perfcho.modules.realtime import (
+    MAX_FRAME_SEQUENCE,
     MAX_REVISION,
     MAX_SEQUENCE,
     InvalidFrame,
@@ -20,12 +21,31 @@ from perfcho.modules.realtime import (
     RealtimeSession,
     RealtimeSessionFenced,
     RealtimeSessionNotFound,
+    SessionFence,
+    SpectatorAttachment,
+    SpectatorFrame,
+    SpectatorFramePublish,
+    SpectatorFrameWindow,
     SpectatorHostOffline,
     SpectatorRelation,
 )
 
 INSTANT = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 EXPIRY = INSTANT + timedelta(minutes=5)
+HOST_FENCE = SessionFence(uuid.uuid7(), 2)
+SPECTATOR_FENCE = SessionFence(uuid.uuid7(), 3)
+
+
+def relation(revision: int = 1, expiry: datetime = EXPIRY) -> SpectatorRelation:
+    return SpectatorRelation(
+        42,
+        43,
+        uuid.uuid7(),
+        revision,
+        HOST_FENCE,
+        SPECTATOR_FENCE,
+        expiry,
+    )
 
 
 def test_realtime_values_are_frozen_and_slotted() -> None:
@@ -34,6 +54,7 @@ def test_realtime_values_are_frozen_and_slotted() -> None:
     assert not hasattr(session, "__dict__")
     with pytest.raises(FrozenInstanceError):
         session.__setattr__("revision", 2)
+    assert session.fence == SessionFence(session.session_id, 1)
 
 
 @pytest.mark.parametrize("account_id", [0, -1, True])
@@ -49,7 +70,7 @@ def test_revisions_are_bounded(revision: int) -> None:
     with pytest.raises(ValueError, match="revision must be between"):
         PresenceSnapshot(42, revision, b"presence", EXPIRY)
     with pytest.raises(ValueError, match="revision must be between"):
-        SpectatorRelation(42, 43, revision, EXPIRY)
+        relation(revision)
 
 
 @pytest.mark.parametrize(
@@ -58,7 +79,7 @@ def test_revisions_are_bounded(revision: int) -> None:
         lambda expiry: RealtimeSession(uuid.uuid7(), 42, 0, expiry),
         lambda expiry: PresenceSnapshot(42, 0, b"presence", expiry),
         lambda expiry: MailboxBatch(uuid.uuid7(), (), expiry),
-        lambda expiry: SpectatorRelation(42, 43, 0, expiry),
+        lambda expiry: relation(expiry=expiry),
     ],
 )
 def test_expiries_must_be_timezone_aware(factory: Callable[[datetime], object]) -> None:
@@ -91,6 +112,25 @@ def test_mailbox_sequence_is_bounded(sequence: int) -> None:
         MailboxPacket(sequence, b"packet")
 
 
+def test_spectator_frame_supports_zero_and_full_u16_sequence_range() -> None:
+    assert SpectatorFrame(1, 0, b"zero").sequence == 0
+    assert SpectatorFrame(2, MAX_FRAME_SEQUENCE, b"max").sequence == MAX_FRAME_SEQUENCE
+    with pytest.raises(ValueError, match="sequence must be between"):
+        SpectatorFrame(3, MAX_FRAME_SEQUENCE + 1, b"overflow")
+
+
+def test_frame_windows_and_attachment_results_are_frozen() -> None:
+    frame = SpectatorFrame(7, 0, b"frame")
+    window = SpectatorFrameWindow((frame,), 7, 7, False)
+    attached = SpectatorAttachment(relation(), window)
+    published = SpectatorFramePublish(frame, (43, 44))
+
+    assert attached.history.frames == (frame,)
+    assert published.recipient_account_ids == (43, 44)
+    with pytest.raises(ValueError, match="both be present"):
+        SpectatorFrameWindow((), None, 1, False)
+
+
 @pytest.mark.parametrize(
     ("host_account_id", "spectator_account_id", "message"),
     [(0, 2, "host_account_id"), (1, 0, "spectator_account_id"), (1, 1, "itself")],
@@ -101,7 +141,15 @@ def test_spectator_relation_requires_distinct_positive_accounts(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        SpectatorRelation(host_account_id, spectator_account_id, 0, EXPIRY)
+        SpectatorRelation(
+            host_account_id,
+            spectator_account_id,
+            uuid.uuid7(),
+            0,
+            HOST_FENCE,
+            SPECTATOR_FENCE,
+            EXPIRY,
+        )
 
 
 def test_repository_protocol_covers_the_realtime_state_lifecycle() -> None:

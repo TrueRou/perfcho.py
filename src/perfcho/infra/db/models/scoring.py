@@ -20,6 +20,7 @@ from sqlalchemy import (
     Numeric,
     SmallInteger,
     String,
+    Text,
     UniqueConstraint,
     text,
 )
@@ -29,6 +30,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from perfcho.infra.db.base import DbBase
 from perfcho.infra.db.enums import (
     AttemptStatus,
+    CalculationJobStatus,
+    CalculationKind,
     ClientFamily,
     Ruleset,
     ScoreboardVariant,
@@ -95,16 +98,62 @@ class ModPolicy(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
 
 
+class CalculationFormula(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
+    """Names one user-visible calculation system and its calculator family."""
+
+    __tablename__ = "calculation_formulas"
+    __table_args__ = (
+        UniqueConstraint("code"),
+        Index("ix_calculation_formulas_kind_enabled", "kind", "enabled"),
+        {"schema": "scoring"},
+    )
+
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    kind: Mapped[CalculationKind] = mapped_column(
+        enum_type(CalculationKind, "calculation_formula_kind", 16), nullable=False
+    )
+    calculator: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+
+class CalculationFormulaScoreboard(DbBase):
+    """Select the canonical scoreboards to which one Formula applies."""
+
+    __tablename__ = "calculation_formula_scoreboards"
+    __table_args__ = (
+        Index("ix_calculation_formula_scoreboards_board", "scoreboard_id", "formula_id"),
+        {"schema": "scoring"},
+    )
+
+    formula_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("scoring.calculation_formulas.id", ondelete="CASCADE"), primary_key=True
+    )
+    scoreboard_id: Mapped[int] = mapped_column(
+        ForeignKey("scoring.scoreboards.id", ondelete="CASCADE"), primary_key=True
+    )
+
+
 class CalculationRelease(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
-    """Defines reproducible difficulty and performance calculation releases."""
+    """Pins one formula to an immutable calculator artifact and configuration."""
 
     __tablename__ = "calculation_releases"
     __table_args__ = (
-        UniqueConstraint("kind", "ruleset", "engine", "artifact_digest"),
-        Index("ix_calculation_releases_active", "kind", "ruleset", "active"),
+        CheckConstraint("octet_length(artifact_digest) = 32", name="artifact_digest_length"),
+        CheckConstraint("octet_length(configuration_digest) = 32", name="configuration_digest_length"),
+        UniqueConstraint("formula_id", "ruleset", "version", name="uq_calculation_releases_formula_version"),
+        UniqueConstraint(
+            "formula_id",
+            "ruleset",
+            "artifact_digest",
+            "configuration_digest",
+            name="uq_calculation_releases_formula_artifact_configuration",
+        ),
+        Index("ix_calculation_releases_active", "formula_id", "ruleset", "active"),
         Index(
-            "uq_calculation_releases_active_kind_ruleset",
-            "kind",
+            "uq_calculation_releases_active_formula_ruleset",
+            "formula_id",
             "ruleset",
             unique=True,
             postgresql_where=text("active"),
@@ -112,12 +161,17 @@ class CalculationRelease(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
         {"schema": "scoring"},
     )
 
-    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    formula_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("scoring.calculation_formulas.id", ondelete="RESTRICT"), nullable=False
+    )
     ruleset: Mapped[Ruleset] = mapped_column(enum_type(Ruleset, "calculation_ruleset", 16), nullable=False)
-    engine: Mapped[str] = mapped_column(String(64), nullable=False)
     version: Mapped[str] = mapped_column(String(64), nullable=False)
     artifact_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
     configuration: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    configuration_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    difficulty_release_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("scoring.calculation_releases.id", ondelete="RESTRICT")
+    )
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
 
@@ -332,6 +386,8 @@ class ScorePerformance(CreatedAtMixin, DbBase):
     __tablename__ = "score_performances"
     __table_args__ = (
         CheckConstraint("pp >= 0", name="nonnegative_pp"),
+        CheckConstraint("octet_length(input_digest) = 32", name="input_digest_length"),
+        CheckConstraint("octet_length(output_digest) = 32", name="output_digest_length"),
         Index("ix_score_performances_release_pp", "release_id", "pp"),
         {"schema": "scoring"},
     )
@@ -340,10 +396,68 @@ class ScorePerformance(CreatedAtMixin, DbBase):
     release_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("scoring.calculation_releases.id", ondelete="RESTRICT"), primary_key=True
     )
+    difficulty_attribute_id: Mapped[int] = mapped_column(
+        ForeignKey("scoring.beatmap_difficulty_attributes.id", ondelete="RESTRICT"), nullable=False
+    )
     pp: Mapped[Decimal] = mapped_column(Numeric(12, 5), nullable=False)
     breakdown: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    input_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
+    output_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
 
     score: Mapped[Score] = relationship(back_populates="performances", lazy="raise")
+
+
+class PerformanceCalculationJob(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
+    """Tracks durable at-least-once execution for one score and formula release."""
+
+    __tablename__ = "performance_calculation_jobs"
+    __table_args__ = (
+        CheckConstraint("attempt_count >= 0 AND enqueue_count >= 0", name="nonnegative_attempt_counts"),
+        CheckConstraint("input_digest IS NULL OR octet_length(input_digest) = 32", name="input_digest_length"),
+        CheckConstraint("output_digest IS NULL OR octet_length(output_digest) = 32", name="output_digest_length"),
+        CheckConstraint(
+            "status != 'running' OR "
+            "(lease_owner IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="running_lease_required",
+        ),
+        CheckConstraint("status != 'succeeded' OR completed_at IS NOT NULL", name="succeeded_completion_required"),
+        CheckConstraint("status != 'dead' OR dead_lettered_at IS NOT NULL", name="dead_letter_required"),
+        UniqueConstraint("score_id", "release_id"),
+        Index(
+            "ix_performance_calculation_jobs_due",
+            "available_at",
+            "lease_expires_at",
+            "created_at",
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
+        Index("ix_performance_calculation_jobs_release", "release_id", "status"),
+        Index("ix_performance_calculation_jobs_broker_task", "broker_task_id"),
+        {"schema": "scoring"},
+    )
+
+    score_id: Mapped[int] = mapped_column(ForeignKey("scoring.scores.id", ondelete="CASCADE"), nullable=False)
+    release_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("scoring.calculation_releases.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[CalculationJobStatus] = mapped_column(
+        enum_type(CalculationJobStatus, "performance_calculation_job_status", 16),
+        nullable=False,
+        default=CalculationJobStatus.PENDING,
+        server_default=CalculationJobStatus.PENDING.value,
+    )
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    enqueue_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_token: Mapped[uuid.UUID | None] = mapped_column()
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    broker_task_id: Mapped[str | None] = mapped_column(String(128))
+    input_digest: Mapped[bytes | None] = mapped_column(LargeBinary(32))
+    output_digest: Mapped[bytes | None] = mapped_column(LargeBinary(32))
+    last_error: Mapped[str | None] = mapped_column(Text)
 
 
 class RankingPolicy(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
@@ -354,10 +468,16 @@ class RankingPolicy(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
         UniqueConstraint("code", "version"),
         Index("ix_ranking_policies_active", "scoreboard_id", "active"),
         Index(
-            "uq_ranking_policies_active_scoreboard",
-            "scoreboard_id",
+            "uq_ranking_policies_active_code",
+            "code",
             unique=True,
             postgresql_where=text("active"),
+        ),
+        Index(
+            "uq_ranking_policies_default_scoreboard",
+            "scoreboard_id",
+            unique=True,
+            postgresql_where=text("active AND is_default"),
         ),
         {"schema": "scoring"},
     )
@@ -376,6 +496,7 @@ class RankingPolicy(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
         ForeignKey("scoring.calculation_releases.id", ondelete="RESTRICT")
     )
     configuration: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
 
@@ -455,8 +576,8 @@ class LeaderboardEntry(BigIntIdentityMixin, TimestampMixin, DbBase):
     country_code: Mapped[str | None] = mapped_column(String(2))
     scope: Mapped[str] = mapped_column(String(16), nullable=False, default="overall", server_default="overall")
     filter_mod_set_id: Mapped[int | None] = mapped_column(ForeignKey("scoring.mod_sets.id", ondelete="RESTRICT"))
-    metric_value: Mapped[Decimal] = mapped_column(Numeric(20, 5), nullable=False)
-    tie_break_value: Mapped[Decimal] = mapped_column(Numeric(20, 5), nullable=False)
+    metric_value: Mapped[Decimal] = mapped_column(Numeric(30, 5), nullable=False)
+    tie_break_value: Mapped[Decimal] = mapped_column(Numeric(30, 5), nullable=False)
 
 
 class Replay(CreatedAtMixin, DbBase):
@@ -465,8 +586,6 @@ class Replay(CreatedAtMixin, DbBase):
     __tablename__ = "replays"
     __table_args__ = (
         CheckConstraint("size_bytes >= 0", name="nonnegative_size"),
-        UniqueConstraint("sha256"),
-        UniqueConstraint("storage_key"),
         Index("ix_replays_state_created", "state", "created_at"),
         {"schema": "scoring"},
     )

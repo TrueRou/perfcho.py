@@ -1,6 +1,7 @@
 """Project accepted score events into eligibility and leaderboard entries."""
 
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -12,52 +13,106 @@ from perfcho.infra.db.models.core import Account
 from perfcho.infra.db.models.events import OutboxEvent
 from perfcho.infra.db.models.scoring import (
     LeaderboardEntry,
+    ModPolicy,
+    ModSet,
     RankingPolicy,
     Score,
     ScoreEligibility,
     ScorePerformance,
 )
+from perfcho.infra.db.projectors.common import advance_checkpoint, payload_integer, require_event_context
 from perfcho.infra.outbox import register_consumer
 
+_CONSUMER = "ranking-projector.v1"
 
-@register_consumer("ranking-projector.v1", ("score.accepted.v1",))
+
+@register_consumer(_CONSUMER, ("score.accepted.v1", "score.performance-calculated.v1"))
 async def project_accepted_score(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project one accepted score under the active versioned ranking policy."""
-    del partition_key
-    score_id = _payload_integer(event.payload, "score_id")
+    score_id = payload_integer(event.payload, "score_id")
+    scoreboard_id = payload_integer(event.payload, "scoreboard_id")
+    require_event_context(
+        event,
+        partition_key,
+        aggregate_type="score",
+        aggregate_id=str(score_id),
+        expected_partition_key=f"scoreboard:{scoreboard_id}",
+    )
     row = (
         await session.execute(
-            select(Score, Beatmap.status, Account.country_code)
+            select(Score, Beatmap.status, Account.country_code, ModSet.canonical)
             .join(Beatmap, Beatmap.id == Score.beatmap_id)
             .join(Account, Account.id == Score.account_id)
+            .join(ModSet, ModSet.id == Score.mod_set_id)
             .where(Score.id == score_id)
         )
     ).one_or_none()
     if row is None:
         raise RuntimeError("accepted score event references a missing score")
-    score, beatmap_status, country_code = row
-    policy = (
-        await session.execute(
-            select(RankingPolicy)
-            .where(RankingPolicy.scoreboard_id == score.scoreboard_id, RankingPolicy.active.is_(True))
-            .with_for_update(read=True)
+    score, beatmap_status, country_code, canonical_mods = row
+    if score.scoreboard_id != scoreboard_id:
+        raise RuntimeError("score event scoreboard does not match the authoritative score")
+    policy_rows = list(
+        (
+            await session.execute(
+                select(RankingPolicy, ModPolicy.rules)
+                .join(ModPolicy, ModPolicy.id == RankingPolicy.mod_policy_id)
+                .where(RankingPolicy.scoreboard_id == score.scoreboard_id, RankingPolicy.active.is_(True))
+                .with_for_update(read=True)
+            )
+        ).all()
+    )
+    mod_acronyms = {
+        acronym
+        for item in canonical_mods
+        if isinstance(item, dict) and isinstance((acronym := item.get("acronym")), str)
+    }
+    if len(mod_acronyms) != len(canonical_mods):
+        raise RuntimeError("score mod set contains invalid canonical entries")
+    for policy, mod_rules in policy_rows:
+        await _project_policy(
+            session,
+            score,
+            beatmap_status.value,
+            country_code,
+            policy,
+            mod_acronyms,
+            mod_rules,
         )
-    ).scalar_one_or_none()
-    if policy is None:
-        return
+    await advance_checkpoint(session, event, projector=_CONSUMER, partition_key=partition_key)
 
+
+async def _project_policy(
+    session: AsyncSession,
+    score: Score,
+    beatmap_status: str,
+    country_code: str | None,
+    policy: RankingPolicy,
+    mod_acronyms: set[str],
+    mod_rules: dict[str, object],
+) -> None:
+    """Project one score under one explicit policy and Formula release."""
     configured_statuses = policy.configuration.get("eligible_beatmap_statuses", [])
     eligible_statuses = (
         {value for value in configured_statuses if isinstance(value, str)}
         if isinstance(configured_statuses, list)
         else set()
     )
-    eligible = score.outcome.value == "passed" and beatmap_status.value in eligible_statuses
+    policy_eligible = (
+        score.outcome.value == "passed"
+        and beatmap_status in eligible_statuses
+        and _mods_are_eligible(mod_acronyms, mod_rules)
+    )
     metric_value = await _metric_value(session, score, policy)
-    if metric_value is None:
-        eligible = False
+    eligible = policy_eligible and metric_value is not None
     state = "eligible" if eligible else "ineligible"
-    reason = None if eligible else "policy_requirements"
+    reason = (
+        None
+        if eligible
+        else "performance_pending"
+        if policy_eligible and policy.metric == "pp"
+        else "policy_requirements"
+    )
     await session.execute(
         insert(ScoreEligibility)
         .values(
@@ -102,6 +157,20 @@ async def project_accepted_score(session: AsyncSession, event: OutboxEvent, part
     )
 
 
+def _mods_are_eligible(acronyms: set[str], rules: dict[str, object]) -> bool:
+    allowed = _rule_acronyms(rules, "allowed_acronyms")
+    required = _rule_acronyms(rules, "required_acronyms")
+    forbidden = _rule_acronyms(rules, "forbidden_acronyms")
+    return acronyms <= allowed and required <= acronyms and acronyms.isdisjoint(forbidden)
+
+
+def _rule_acronyms(rules: dict[str, object], key: str) -> set[str]:
+    values = rules.get(key)
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise RuntimeError(f"ranking mod policy field {key} must be a string list")
+    return set(values)
+
+
 async def _metric_value(
     session: AsyncSession,
     score: Score,
@@ -111,7 +180,9 @@ async def _metric_value(
         return Decimal(score.total_score)
     if policy.metric == "classic_score":
         return Decimal(score.classic_score)
-    if policy.metric == "pp" and policy.calculation_release_id is not None:
+    if policy.metric == "pp":
+        if policy.calculation_release_id is None:
+            return None
         return await session.scalar(
             select(ScorePerformance.pp).where(
                 ScorePerformance.score_id == score.id,
@@ -123,7 +194,10 @@ async def _metric_value(
 
 def _tie_break_value(score: Score, tie_breaker: str) -> Decimal:
     if tie_breaker == "ended_at":
-        return Decimal(int(score.ended_at.timestamp() * 1_000_000))
+        ended_at = score.ended_at.astimezone(UTC)
+        elapsed = ended_at - datetime(1970, 1, 1, tzinfo=UTC)
+        microseconds = (elapsed.days * 86_400 + elapsed.seconds) * 1_000_000 + elapsed.microseconds
+        return Decimal(microseconds)
     if tie_breaker == "classic_score":
         return Decimal(score.classic_score)
     if tie_breaker == "total_score":
@@ -185,10 +259,3 @@ async def _upsert_entry(
             ),
         )
     )
-
-
-def _payload_integer(payload: dict[str, object], key: str) -> int:
-    value = payload.get(key)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RuntimeError(f"event payload field {key} must be an integer")
-    return value

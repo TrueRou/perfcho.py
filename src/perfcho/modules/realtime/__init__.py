@@ -9,17 +9,24 @@ from perfcho.modules.realtime.errors import (
     SpectatorHostOffline,
 )
 from perfcho.modules.realtime.models import (
+    MAX_FRAME_SEQUENCE,
     MAX_REVISION,
     MAX_SEQUENCE,
     MailboxBatch,
     MailboxPacket,
     PresenceSnapshot,
     RealtimeSession,
+    SessionFence,
+    SpectatorAttachment,
+    SpectatorFrame,
+    SpectatorFramePublish,
+    SpectatorFrameWindow,
     SpectatorRelation,
 )
 from perfcho.modules.realtime.ports import RealtimeRepository
 
 __all__ = (
+    "MAX_FRAME_SEQUENCE",
     "MAX_REVISION",
     "MAX_SEQUENCE",
     "InvalidFrame",
@@ -32,6 +39,11 @@ __all__ = (
     "RealtimeSession",
     "RealtimeSessionFenced",
     "RealtimeSessionNotFound",
+    "SessionFence",
+    "SpectatorAttachment",
+    "SpectatorFrame",
+    "SpectatorFramePublish",
+    "SpectatorFrameWindow",
     "SpectatorHostOffline",
     "SpectatorRelation",
 )

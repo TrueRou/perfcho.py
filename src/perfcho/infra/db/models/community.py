@@ -150,6 +150,30 @@ class ChannelUserState(TimestampMixin, DbBase):
     notification_level: Mapped[str] = mapped_column(String(16), nullable=False, default="all", server_default="all")
 
 
+class ChannelReadProjection(TimestampMixin, DbBase):
+    """Projects channel membership size and latest durable message for ordered reads."""
+
+    __tablename__ = "channel_read_projections"
+    __table_args__ = (
+        CheckConstraint("active_member_count >= 0", name="nonnegative_member_count"),
+        CheckConstraint("source_position > 0", name="positive_source_position"),
+        UniqueConstraint("source_event_id"),
+        Index("ix_channel_read_projections_latest", "latest_message_at", "channel_id"),
+        Index("ix_channel_read_projections_position", "source_position"),
+        {"schema": "community"},
+    )
+
+    channel_id: Mapped[int] = mapped_column(ForeignKey("community.channels.id", ondelete="CASCADE"), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    active_member_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    latest_message_id: Mapped[int | None] = mapped_column(ForeignKey("community.messages.id", ondelete="SET NULL"))
+    latest_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_event_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("events.outbox_events.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_position: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class MessageRevision(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     """Records message edits, retractions, and administrative deletion history."""
 

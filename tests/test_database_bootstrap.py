@@ -15,6 +15,7 @@ from perfcho.infra.db.bootstrap import (
     STABLE_PROTOCOL_VERSION,
     _bootstrap_uuid,
     _mod_policy_rules,
+    _repair_schema,
     bootstrap_database,
     canonical_json_digest,
 )
@@ -99,6 +100,28 @@ def test_bootstrap_models_expose_every_conflict_key() -> None:
     assert ServerSetting.__table__.c.key.primary_key
 
 
+@pytest.mark.asyncio
+async def test_schema_repair_covers_stable_session_and_multiplayer_upgrades() -> None:
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        async def execute(self, statement: object) -> None:
+            self.statements.append(str(statement))
+
+    session = RecordingSession()
+    await _repair_schema(session)  # type: ignore[arg-type]
+    sql = "\n".join(session.statements)
+
+    assert "iam.auth_sessions ADD COLUMN IF NOT EXISTS last_activity_at" in sql
+    assert "ck_auth_sessions_activity_period" in sql
+    assert "connection_session_id UUID" in sql
+    assert "uq_session_presences_account_current" in sql
+    assert "schema_repair_duplicate" in sql
+    assert "ck_rounds_at_most_one_source" in sql
+    assert "uq_rounds_session_active" in sql
+
+
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_database_url: str) -> None:
@@ -163,6 +186,19 @@ async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_databa
 
             policies = (await session.scalars(select(RankingPolicy))).all()
             assert all(policy.id.version == 5 and policy.mod_policy_id.version == 5 for policy in policies)
+            vanilla_policies = [policy for policy in policies if policy.scoreboard_id <= 4]
+            assistance_policies = [policy for policy in policies if policy.scoreboard_id > 4]
+            assert all(policy.metric == "total_score" for policy in vanilla_policies)
+            assert all(
+                policy.configuration["eligible_beatmap_statuses"] == ["ranked", "approved", "qualified", "loved"]
+                for policy in vanilla_policies
+            )
+            assert all(policy.metric == "pp" for policy in assistance_policies)
+            assert all(
+                policy.configuration["eligible_beatmap_statuses"] == ["ranked", "approved"]
+                and policy.configuration["performance_required"] is True
+                for policy in assistance_policies
+            )
             assert not await session.scalar(
                 select(func.count())
                 .select_from(AccountRoleGrant)

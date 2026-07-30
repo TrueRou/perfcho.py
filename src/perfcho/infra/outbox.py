@@ -279,6 +279,8 @@ async def relay_once(session_factory: DbSessionFactory, owner: str) -> int:
 
 async def run_relay() -> None:
     """Poll PostgreSQL continuously and relay deliveries to Taskiq."""
+    from perfcho.infra.calculations import relay_calculations_once
+
     owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
     db_engine = await infra_db.create_engine()
     session_factory = infra_db.create_session_factory(db_engine)
@@ -287,6 +289,7 @@ async def run_relay() -> None:
         await broker.startup()
         while True:
             claimed = await relay_once(session_factory, owner)
+            claimed += await relay_calculations_once(session_factory, owner)
             if claimed == 0:
                 await asyncio.sleep(settings.outbox_poll_interval)
     finally:

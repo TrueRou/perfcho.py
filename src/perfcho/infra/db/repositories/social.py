@@ -277,6 +277,22 @@ class SqlAlchemySocialRepository:
         ).all()
         return tuple(BlockView(row.target_account_id, row.display_name, row.reason, row.created_at) for row in rows)
 
+    async def list_blocking_account_ids(
+        self,
+        target_account_id: int,
+        actor_account_ids: tuple[int, ...],
+    ) -> frozenset[int]:
+        """Return candidate recipients who block the message sender in one query."""
+        if not actor_account_ids:
+            return frozenset()
+        identifiers = await self._session.scalars(
+            select(Block.actor_account_id).where(
+                Block.target_account_id == target_account_id,
+                Block.actor_account_id.in_(actor_account_ids),
+            )
+        )
+        return frozenset(identifiers)
+
     async def list_achievements(
         self,
         *,

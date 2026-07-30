@@ -15,6 +15,7 @@ from perfcho.composition import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage, StoredObject
+from perfcho.modules.community import CommunityService
 from perfcho.modules.content import (
     BeatmapRevisionView,
     BeatmapsetView,
@@ -26,19 +27,37 @@ from perfcho.modules.content import (
     RatingSummary,
 )
 from perfcho.modules.identity import IdentityService, InvalidCredentials, StableWebPrincipal
-from perfcho.modules.realtime import RealtimeRepository
-from perfcho.modules.social import FollowView, SocialService
+from perfcho.modules.realtime import RealtimeRepository, RealtimeSession, RealtimeSessionNotFound
+from perfcho.modules.scoring import BeatmapGradeView, RankingQueryService, Ruleset, ScoreGrade
+from perfcho.modules.social import AccountIdentityView, FollowView, SocialService
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 PASSWORD_MD5 = "a" * 32
 BEATMAP_MD5 = "b" * 32
+SESSION_ID = uuid.uuid5(uuid.NAMESPACE_URL, "perfcho:test:stable-web-session")
+
+
+class FixedClock:
+    def now(self) -> datetime:
+        return NOW
 
 
 class FakeIdentity:
     async def verify_stable_web(self, identifier: str, password_token: str) -> StableWebPrincipal:
         if identifier != "player" or password_token != PASSWORD_MD5:
             raise InvalidCredentials()
-        return StableWebPrincipal(3, "player", uuid.uuid7(), NOW + timedelta(hours=1))
+        return StableWebPrincipal(3, "player", SESSION_ID, NOW + timedelta(hours=1))
+
+
+class FakeRealtime:
+    def __init__(self) -> None:
+        self.online = True
+
+    async def resolve_session(self, session_id: uuid.UUID, *, at: datetime) -> RealtimeSession:
+        assert session_id == SESSION_ID and at == NOW
+        if not self.online:
+            raise RealtimeSessionNotFound()
+        return RealtimeSession(SESSION_ID, 3, 1, NOW + timedelta(minutes=5))
 
 
 class FakeContentQuery:
@@ -80,9 +99,9 @@ class FakeContentQuery:
         assert account_id == 3
         return (200, 300)
 
-    async def get_rating(self, beatmapset_id: int, account_id: int | None = None) -> RatingSummary:
-        assert beatmapset_id == 200 and account_id == 3
-        return RatingSummary(200, Decimal("8.25"), 4, self.account_rating)
+    async def get_rating(self, beatmap_id: int, account_id: int | None = None) -> RatingSummary:
+        assert beatmap_id == 10 and account_id == 3
+        return RatingSummary(10, Decimal("8.25"), 4, self.account_rating)
 
 
 class FakeContent:
@@ -100,9 +119,19 @@ class FakeContent:
         self.favourite_calls.append((account_id, beatmapset_id))
         return FavouriteResult(account_id, beatmapset_id, True, True)
 
-    async def rate(self, account_id: int, beatmapset_id: int, rating: int) -> RatingSummary:
-        self.rating_calls.append((account_id, beatmapset_id, rating))
-        return RatingSummary(beatmapset_id, Decimal("8.50"), 5, rating)
+    async def rate(self, account_id: int, beatmap_id: int, rating: int) -> RatingSummary:
+        self.rating_calls.append((account_id, beatmap_id, rating))
+        return RatingSummary(beatmap_id, Decimal("8.50"), 5, rating)
+
+
+class FakeRankingQuery:
+    async def get_beatmap_grades(
+        self,
+        account_id: int,
+        beatmap_ids: tuple[int, ...],
+    ) -> tuple[BeatmapGradeView, ...]:
+        assert account_id == 3 and beatmap_ids == (10,)
+        return (BeatmapGradeView(10, Ruleset.OSU, ScoreGrade.S),)
 
 
 class FakeSocial:
@@ -112,6 +141,18 @@ class FakeSocial:
             FollowView(7, "friend-one", None, NOW, True),
             FollowView(9, "friend-two", "mapper", NOW, False),
         )
+
+    async def resolve_account_by_name(self, display_name: str) -> AccountIdentityView:
+        assert display_name == "friend-two"
+        return AccountIdentityView(9, "friend-two")
+
+
+class FakeCommunity:
+    def __init__(self) -> None:
+        self.mark_read_calls: list[tuple[int, int]] = []
+
+    async def mark_direct_conversation_read(self, account_id: int, other_account_id: int) -> None:
+        self.mark_read_calls.append((account_id, other_account_id))
 
 
 class FakeObjectStream:
@@ -172,7 +213,7 @@ def beatmap() -> BeatmapRevisionView:
     )
 
 
-def stable_services() -> tuple[StableServices, FakeContentQuery, FakeContent]:
+def stable_services() -> tuple[StableServices, FakeContentQuery, FakeContent, FakeCommunity]:
     map_view = beatmap()
     set_view = BeatmapsetView(
         beatmapset_id=20,
@@ -188,19 +229,22 @@ def stable_services() -> tuple[StableServices, FakeContentQuery, FakeContent]:
     )
     content_query = FakeContentQuery(map_view, set_view)
     content = FakeContent()
+    community = FakeCommunity()
     services = StableServices(
         identity=cast(IdentityService, FakeIdentity()),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=cast(RealtimeRepository, object()),
-        clock=cast(Clock, object()),
+        realtime=cast(RealtimeRepository, FakeRealtime()),
+        clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, object()),
         settings=Settings(),
         content_query=cast(ContentQueryService, content_query),
         content=cast(ContentService, content),
         social=cast(SocialService, FakeSocial()),
+        community=cast(CommunityService, community),
         object_storage=cast(ObjectStorage, FakeObjectStorage()),
+        ranking_query=cast(RankingQueryService, FakeRankingQuery()),
     )
-    return services, content_query, content
+    return services, content_query, content, community
 
 
 def stable_app(services: StableServices) -> FastAPI:
@@ -210,13 +254,26 @@ def stable_app(services: StableServices) -> FastAPI:
     return app
 
 
+@pytest.mark.asyncio
+async def test_web_credentials_require_the_matching_realtime_epoch() -> None:
+    services, _, _, _ = stable_services()
+    realtime = cast(FakeRealtime, services.realtime)
+    realtime.online = False
+    app = stable_app(services)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.get("/web/osu-getfriends.php", params=auth_params())
+
+    assert response.status_code == 401
+
+
 def auth_params(*, password_name: str = "h") -> dict[str, str]:
     return {"u": "player", password_name: PASSWORD_MD5}
 
 
 @pytest.mark.asyncio
 async def test_friends_and_beatmap_info_use_online_web_credentials() -> None:
-    services, _, _ = stable_services()
+    services, _, _, _ = stable_services()
     app = stable_app(services)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
         friends = await client.get("/web/osu-getfriends.php", params=auth_params())
@@ -233,18 +290,39 @@ async def test_friends_and_beatmap_info_use_online_web_credentials() -> None:
             params={"u": "player", "h": "0" * 32},
         )
 
-    assert friends.text == "7\n9"
+    assert friends.text == "1\n7\n9"
     assert info.text.splitlines() == [
-        f"0|100|200|{BEATMAP_MD5}|1|N|N|N|N",
-        f"1|100|200|{BEATMAP_MD5}|1|N|N|N|N",
+        f"0|100|200|{BEATMAP_MD5}|1|S|N|N|N",
+        f"1|100|200|{BEATMAP_MD5}|1|S|N|N|N",
     ]
     assert invalid.status_code == 401
     assert invalid.content == b""
 
 
 @pytest.mark.asyncio
+async def test_mark_as_read_resolves_target_and_advances_authoritative_conversation_cursor() -> None:
+    services, _, _, community = stable_services()
+    app = stable_app(services)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.get(
+            "/web/osu-markasread.php",
+            params={**auth_params(), "channel": "friend-two"},
+        )
+        invalid = await client.get(
+            "/web/osu-markasread.php",
+            params={"u": "player", "h": "0" * 32, "channel": "friend-two"},
+        )
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert community.mark_read_calls == [(3, 9)]
+    assert invalid.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_direct_search_serializes_stable_fourteen_field_contract() -> None:
-    services, content_query, _ = stable_services()
+    services, content_query, _, _ = stable_services()
     app = stable_app(services)
     params = {**auth_params(), "r": "0", "q": "test", "m": "0", "p": "2"}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
@@ -267,7 +345,7 @@ async def test_direct_search_serializes_stable_fourteen_field_contract() -> None
 
 @pytest.mark.asyncio
 async def test_direct_set_favourites_and_rating_handshake() -> None:
-    services, _, content = stable_services()
+    services, _, content, _ = stable_services()
     app = stable_app(services)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
         direct_set = await client.get(
@@ -294,12 +372,12 @@ async def test_direct_set_favourites_and_rating_handshake() -> None:
     assert can_rate.text == "ok"
     assert rated.text == "alreadyvoted\n8.50"
     assert content.favourite_calls == [(3, 200)]
-    assert content.rating_calls == [(3, 200, 9)]
+    assert content.rating_calls == [(3, 10, 9)]
 
 
 @pytest.mark.asyncio
 async def test_probes_and_direct_download_redirect() -> None:
-    services, _, _ = stable_services()
+    services, _, _, _ = stable_services()
     app = stable_app(services)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -318,7 +396,7 @@ async def test_probes_and_direct_download_redirect() -> None:
     assert connect.content == b""
     assert update.content == b""
     assert download.status_code == 302
-    assert download.headers["location"] == "https://osu.ppy.sh/beatmapsets/200/download"
-    assert no_video_download.headers["location"] == "https://osu.ppy.sh/beatmapsets/200/download?noVideo=1"
+    assert download.headers["location"] == "https://api.nerinyan.moe/d/200"
+    assert no_video_download.headers["location"] == "https://api.nerinyan.moe/d/200?nv=1"
     assert map_file.content == b"osu file v1"
     assert map_file.headers["content-type"] == "application/x-osu-beatmap"
