@@ -10,13 +10,16 @@ from fastapi import APIRouter, Header, Request, Response
 from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
 from perfcho.api.stable.canonize.login import StableLoginParseError, parse_stable_login
 from perfcho.api.stable.dependencies import StableServicesDependency
+from perfcho.api.stable.dispatcher import StableRuntimeContext, account_stats, dispatch_packets, realtime_expiry
 from perfcho.infra.composition import StableServices
 from perfcho.modules.authorization import StablePrivilege
 from perfcho.modules.common import ClientContext, CommandMeta
 from perfcho.modules.identity import InvalidCredentials, InvalidStableSession, StableLogin, StableSessionAlreadyActive
 from perfcho.modules.realtime import (
     MailboxOverflow,
+    MailboxPacket,
     PollLeaseConflict,
+    PresenceCapacityReached,
     PresenceSnapshot,
     RealtimeSession,
     RealtimeSessionFenced,
@@ -46,20 +49,10 @@ from perfcho.modules.realtime.stable import (
     user_stats,
 )
 from perfcho.modules.realtime.stable.countries import stable_country_id
-from perfcho.modules.realtime.stable.dispatcher import (
-    StableRuntimeContext,
-    account_stats,
-    dispatch_packets,
-    realtime_expiry,
-)
 
 router = APIRouter()
 
 _BINARY_MEDIA_TYPE = "application/octet-stream"
-
-
-class _PresenceCapacityReached(Exception):
-    """Signal that a login cannot join without truncating presence broadcasts."""
 
 
 @router.post("/", response_class=Response)
@@ -137,7 +130,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             limit=services.settings.stable_presence_batch_size,
         )
         if len(online_presences) >= services.settings.stable_presence_batch_size:
-            raise _PresenceCapacityReached
+            raise PresenceCapacityReached
 
         stable_privileges = await services.authorization.get_stable_privileges(result.account_id)
         if services.community is not None:
@@ -211,6 +204,15 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
                 session_id=result.session_id,
             ),
             session_id=result.session_id,
+            capacity=services.settings.stable_presence_batch_size,
+        )
+        online_presences = tuple(
+            snapshot
+            for snapshot in await services.realtime.list_presences(
+                at=now,
+                limit=services.settings.stable_presence_batch_size,
+            )
+            if snapshot.account_id != result.account_id
         )
         for snapshot in online_presences:
             with suppress(MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound):
@@ -250,7 +252,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             )
         )
         return _binary_response(payload, token=result.raw_token)
-    except _PresenceCapacityReached:
+    except PresenceCapacityReached:
         await _compensate_failed_login(result.raw_token, realtime, services)
         return _binary_response(
             login_reply(LoginFailureReason.ERROR) + notification("The server has reached its online capacity."),
@@ -309,8 +311,9 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
                     session_id=identity.session_id,
                 ),
                 session_id=identity.session_id,
+                capacity=services.settings.stable_presence_batch_size,
             )
-    except RealtimeSessionNotFound, RealtimeSessionFenced:
+    except RealtimeSessionNotFound, RealtimeSessionFenced, PresenceCapacityReached:
         return await _realtime_lost(raw_token, services)
 
     lease_id = services.id_generator.new()
@@ -350,14 +353,18 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
         await _release_mailbox(identity.account_id, realtime, lease_id, services)
         raise
 
-    mailbox_output = b"".join(packet.payload for packet in batch.packets)
+    mailbox_packets = _mailbox_packets_within_budget(
+        batch.packets,
+        services.settings.stable_max_response_bytes - len(local_output),
+    )
+    mailbox_output = b"".join(packet.payload for packet in mailbox_packets)
     try:
-        if batch.packets:
+        if mailbox_packets:
             await services.realtime.ack_mailbox(
                 identity.account_id,
                 recipient_fence=realtime.fence,
                 lease_id=lease_id,
-                through_sequence=batch.packets[-1].sequence,
+                through_sequence=mailbox_packets[-1].sequence,
             )
         else:
             await services.realtime.release_mailbox(
@@ -422,6 +429,20 @@ def _presence_projection(snapshot: PresenceSnapshot) -> bytes:
 def _offline_message_text(created_at: datetime, content: str) -> str:
     timestamp = created_at.astimezone(UTC)
     return f"[{timestamp:%a %b %d @ %H:%M%p}] {content}"
+
+
+def _mailbox_packets_within_budget(
+    packets: tuple[MailboxPacket, ...],
+    remaining_bytes: int,
+) -> tuple[MailboxPacket, ...]:
+    selected: list[MailboxPacket] = []
+    used = 0
+    for packet in packets:
+        if used + len(packet.payload) > remaining_bytes:
+            break
+        selected.append(packet)
+        used += len(packet.payload)
+    return tuple(selected)
 
 
 async def _compensate_failed_login(

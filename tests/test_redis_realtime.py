@@ -20,6 +20,8 @@ from perfcho.infra.redis.state import (
 from perfcho.modules.realtime import (
     InvalidFrame,
     MailboxOverflow,
+    PresenceCapacityReached,
+    PresenceSnapshot,
     RealtimeRepository,
     RealtimeSessionFenced,
     RealtimeSessionNotFound,
@@ -183,6 +185,24 @@ async def test_session_open_and_heartbeat_carry_all_owned_state(repository_doubl
 
 
 @pytest.mark.asyncio
+async def test_presence_claim_passes_capacity_to_atomic_script_and_maps_overflow(
+    repository_double: RepositoryDouble,
+) -> None:
+    repository = repository_double.repository
+    session_id = uuid.uuid7()
+    snapshot = PresenceSnapshot(42, 1, b"presence", PRESENCE_EXPIRY, session_id)
+    set_presence = repository_double.scripts["set-presence"]
+    set_presence.return_value = [b"CAPACITY"]
+
+    with pytest.raises(PresenceCapacityReached):
+        await repository.set_presence(snapshot, session_id=session_id, capacity=17)
+
+    call = set_presence.await_args
+    assert call is not None
+    assert call.kwargs["args"][-1] == 17
+
+
+@pytest.mark.asyncio
 async def test_mailbox_enqueue_and_lease_require_recipient_epoch(repository_double: RepositoryDouble) -> None:
     repository = repository_double.repository
     fence = SessionFence(uuid.uuid7(), 3)
@@ -307,6 +327,40 @@ async def _open(
         durable_expires_at=now + timedelta(minutes=2),
     )
     return session_id, session.fence
+
+
+@pytest.mark.skipif(not os.getenv("TEST_REDIS_URL"), reason="TEST_REDIS_URL is not configured")
+@pytest.mark.asyncio
+async def test_real_redis_presence_capacity_is_atomic() -> None:
+    redis = Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=False)
+    repository = RedisRealtimeRepository(
+        redis,
+        prefix=f"tests:realtime-capacity:{uuid.uuid4()}",
+        session_ttl=timedelta(seconds=30),
+        presence_ttl=timedelta(seconds=30),
+        mailbox_ttl=timedelta(seconds=30),
+        max_packet_count=8,
+        max_packet_bytes=64,
+        max_frame_count=2,
+        max_frame_bytes=12,
+    )
+    now = datetime.now(UTC)
+    try:
+        _, first = await _open(repository, 42, now)
+        _, second = await _open(repository, 43, now)
+        await repository.set_presence(
+            PresenceSnapshot(42, first.revision, b"first", now + timedelta(seconds=12), first.session_id),
+            session_id=first.session_id,
+            capacity=1,
+        )
+        with pytest.raises(PresenceCapacityReached):
+            await repository.set_presence(
+                PresenceSnapshot(43, second.revision, b"second", now + timedelta(seconds=12), second.session_id),
+                session_id=second.session_id,
+                capacity=1,
+            )
+    finally:
+        await redis.aclose()
 
 
 @pytest.mark.skipif(not os.getenv("TEST_REDIS_URL"), reason="TEST_REDIS_URL is not configured")

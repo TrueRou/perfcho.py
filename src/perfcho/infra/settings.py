@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     token_hmac_key: SecretStr = Field(default=SecretStr("perfcho-development-token-hmac-key"))
     device_hmac_key: SecretStr = Field(default=SecretStr("perfcho-development-device-hmac-key"))
     match_password_hmac_key: SecretStr = Field(default=SecretStr("perfcho-development-match-password-hmac-key"))
+    admission_hmac_key: SecretStr = Field(default=SecretStr("perfcho-development-admission-hmac-key"))
 
     redis_state_url: str = Field(default="redis://127.0.0.1:56379/0")
     redis_state_prefix: str = Field(default="perfcho:state")

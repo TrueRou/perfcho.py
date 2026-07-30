@@ -5,6 +5,8 @@ from typing import cast
 
 import pytest
 
+from perfcho.api.stable.dispatcher import StableRuntimeContext, dispatch_packets
+from perfcho.api.stable.multiplayer import _settings_from_wire
 from perfcho.infra.composition import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
@@ -32,8 +34,6 @@ from perfcho.modules.realtime.stable import (
     UserPresence,
     UserStats,
 )
-from perfcho.modules.realtime.stable.dispatcher import StableRuntimeContext, dispatch_packets
-from perfcho.modules.realtime.stable.multiplayer import _settings_from_wire
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant
 
 NOW = datetime(2026, 7, 29, 12, tzinfo=UTC)

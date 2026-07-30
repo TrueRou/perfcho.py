@@ -42,6 +42,7 @@ def test_multiplayer_partial_unique_indexes_cover_global_presence_and_active_rou
     assert str(presence_indexes["uq_session_presences_account_current"].dialect_options["postgresql"]["where"])
     assert round_indexes["uq_rounds_session_active"].unique
     assert str(round_indexes["uq_rounds_session_active"].dialect_options["postgresql"]["where"])
+    assert Room.__table__.c.public_id_epoch.identity is not None
 
 
 def settings() -> RoomSettings:
@@ -95,29 +96,30 @@ async def test_postgres_multiplayer_lifecycle_and_known_map_attempts(postgres_da
             )
             session.add(beatmap)
             await session.flush()
-            session.add(
-                BeatmapRevision(
-                    beatmap_id=beatmap.id,
-                    md5=b"m" * 16,
-                    sha256=b"s" * 32,
-                    file_name="Artist - Title (Creator) [Hard].osu",
-                    file_name_key="artist - title (creator) [hard].osu",
-                    source_updated_at=NOW,
-                    total_length_ms=60_000,
-                    drain_length_ms=55_000,
-                    bpm=Decimal(180),
-                    circle_size=Decimal(4),
-                    overall_difficulty=Decimal(8),
-                    approach_rate=Decimal(9),
-                    health_drain=Decimal(6),
-                    object_count=100,
-                    circle_count=80,
-                    slider_count=20,
-                    spinner_count=0,
-                    max_combo=120,
-                    is_current=True,
-                )
+            beatmap_revision = BeatmapRevision(
+                beatmap_id=beatmap.id,
+                md5=b"m" * 16,
+                sha256=b"s" * 32,
+                file_name="Artist - Title (Creator) [Hard].osu",
+                file_name_key="artist - title (creator) [hard].osu",
+                source_updated_at=NOW,
+                total_length_ms=60_000,
+                drain_length_ms=55_000,
+                bpm=Decimal(180),
+                circle_size=Decimal(4),
+                overall_difficulty=Decimal(8),
+                approach_rate=Decimal(9),
+                health_drain=Decimal(6),
+                object_count=100,
+                circle_count=80,
+                slider_count=20,
+                spinner_count=0,
+                max_combo=120,
+                is_current=True,
             )
+            session.add(beatmap_revision)
+            await session.flush()
+            beatmap_revision_id = beatmap_revision.id
 
         async with session_factory.begin() as session:
             repository = SqlAlchemyMultiplayerRepository(session)
@@ -171,6 +173,39 @@ async def test_postgres_multiplayer_lifecycle_and_known_map_attempts(postgres_da
                 aborted=False,
                 now=NOW,
             )
+            first_attempt_id = await session.scalar(
+                select(MultiplayerAttempt.id).where(
+                    MultiplayerAttempt.round_id == round_id,
+                    MultiplayerAttempt.account_id == 1,
+                )
+            )
+            rematch, rematch_id = await repository.start_round(
+                completed,
+                command_id=uuid.uuid7(),
+                actor_account_id=1,
+                participants=(
+                    RoundParticipantSelection(1, 0, 0),
+                    RoundParticipantSelection(2, 1, 0),
+                ),
+                now=NOW + timedelta(seconds=30),
+            )
+            context = await repository.resolve_submission_context(
+                1,
+                beatmap_revision_id,
+                started_at=NOW,
+                ended_at=NOW + timedelta(microseconds=1),
+                at=NOW + timedelta(seconds=30),
+            )
+            assert context is not None and context.attempt_id == first_attempt_id
+            assert rematch_id is not None
+            completed = await repository.complete_round(
+                rematch,
+                command_id=uuid.uuid7(),
+                actor_account_id=1,
+                round_id=rematch_id,
+                aborted=False,
+                now=NOW + timedelta(seconds=31),
+            )
             left = await repository.leave_room(
                 completed,
                 command_id=uuid.uuid7(),
@@ -185,13 +220,14 @@ async def test_postgres_multiplayer_lifecycle_and_known_map_attempts(postgres_da
             assert await session.scalar(select(func.count()).select_from(Room)) == 1
             assert await session.scalar(select(func.count()).select_from(MultiplayerSession)) == 1
             assert await session.scalar(select(func.count()).select_from(SessionPresence)) == 2
-            assert await session.scalar(select(func.count()).select_from(MultiplayerAttempt)) == 2
-            assert await session.scalar(select(func.count()).select_from(MultiplayerEvent)) == 5
+            assert await session.scalar(select(func.count()).select_from(MultiplayerAttempt)) == 4
+            assert await session.scalar(select(func.count()).select_from(MultiplayerEvent)) == 7
             room_row = (await session.execute(select(Room))).scalar_one()
             assert room_row.public_id == 1
+            assert room_row.public_id_epoch > 0
             attempts = tuple((await session.scalars(select(MultiplayerAttempt))).all())
             assert all(
-                attempt.expires_at <= NOW.replace(microsecond=0) + timedelta(minutes=2, seconds=1)
+                attempt.expires_at <= NOW.replace(microsecond=0) + timedelta(minutes=2, seconds=32)
                 for attempt in attempts
             )
     finally:

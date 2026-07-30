@@ -1,6 +1,6 @@
 # 当前实现总览
 
-最后更新：2026-07-29。本文描述当前代码事实，不把后续计划写成已完成能力。
+最后更新：2026-07-30。本文描述当前代码事实，不把后续计划写成已完成能力。
 
 ## 1. 项目目标与边界
 
@@ -56,7 +56,7 @@ HTTP/Bancho/Lazer/Worker Adapter
 - `/`：健康/欢迎响应。
 - `/v1`：当前只保留基础版本化 JSON API 结构。
 - Stable 无版本前缀 Router：Cho 承载 Bancho 登录与 Poll，Web 统一承载内容、成绩、Replay 和排行榜端点。
-- `api/stable/normalize` 负责登录与成绩上传的 Stable Wire 输入解析和规范化。
+- `api/stable/canonize` 负责登录与成绩上传的 Stable Wire 输入解析和规范化；`api/stable/dispatcher.py` 与 `api/stable/multiplayer.py` 负责 Packet 到 Canonical Service 的协议适配。
 
 `compose_stable_services()` 为每个 Stable 请求构造应用服务。当前实际接线：
 
@@ -117,7 +117,7 @@ Performance Relay 独立领取 `PerformanceCalculationJob`，不会因 Outbox Re
 | `scoring` | 部分接线 | Canonical Score、Mod 规范化、校验、Attempt/Score/Hit/Replay/Attestation、中性后续任务调度端口、Replay View、Ranking Query、Stable 基础统计 Query | Stable 全链路和 Multiplayer Attempt 消费已接线；重建与完整统计投影未完成 |
 | `performance` | 已接线 | Formula/Release、持久计算 Job、Lease/Fencing、版本化 HTTP Calculator、Input/Output Digest、Multi-PP Query 与完成事件 | 尚未发布真实 C#/Rust Formula Release、Backfill 和管理 Command |
 | `realtime` | 已接线 | Redis Session、Presence Index/Filter、Away、Mailbox、Spectator Relation、Frame History、Fence | 没有跨进程 Pub/Sub；即时扇出使用有界 Mailbox |
-| `multiplayer` | 已接线 | Canonical Command/Query、SQL Repository、Redis CAS Projection、Room/Slot/Host/Password、Round/Attempt、Stable Lobby/Match Dispatcher | 未做 Tourney/Matchmaking；真实并发集成覆盖仍需在 PostgreSQL/Redis 环境执行 |
+| `multiplayer` | 已接线 | Canonical Command/Query、SQL Repository、数据库 Public ID Epoch、Redis CAS Projection、Room/Slot/Host/Password、Round/Attempt、Stable Lobby/Match Dispatcher | 未做 Tourney/Matchmaking；START 与最后一次 Slot Mod CAS 的严格跨存储线性化仍需专门 Reservation/Fence |
 
 ## 5. 持久化实现
 
@@ -204,7 +204,7 @@ Mailbox Overflow 不可无限扩容。Spectator 通知投递会抑制单个接�
 当前共享工作树完整验证：
 
 - 无外部服务环境：`260 passed, 15 skipped`
-- 启用本地真实 PostgreSQL 与 Redis：`275 passed`
+- 启用本地真实 PostgreSQL 与 Redis：`288 passed`
 - Consumer 与生产者定向测试：`33 passed, 3 skipped`
 - Consumer 真实 PostgreSQL 全链路：`2 passed`
 - `uv run ruff format .` 通过
@@ -212,7 +212,7 @@ Mailbox Overflow 不可无限扩容。Spectator 通知投递会抑制单个接�
 - Python `compileall` 通过
 - `git diff --check` 通过
 
-默认跳过用例依赖真实 PostgreSQL 或 Redis。通过 `TEST_DATABASE_URL` 和 `TEST_REDIS_URL` 启用后，本次已执行全部 275 个用例且无跳过。
+默认跳过用例依赖真实 PostgreSQL 或 Redis。通过 `TEST_DATABASE_URL` 和 `TEST_REDIS_URL` 启用后，本次已执行全部 288 个用例且无跳过。
 
 ## 9. 当前已知限制
 

@@ -38,7 +38,7 @@
 4. 刷新 Session/Presence 有效期，但不超过持久会话到期时间。
 5. 领取 Mailbox 批次，与本次请求产生的响应一起返回并确认。
 
-Poll 在处理客户端 Packet 前获取 fenced Mailbox Lease，避免并发 Poll 在业务副作用完成后才发生冲突。所有本地响应受 `stable_max_response_bytes` 约束。
+Poll 在处理客户端 Packet 前获取 fenced Mailbox Lease，避免并发 Poll 在业务副作用完成后才发生冲突。最终响应把本地输出和 Mailbox 一起计入 `stable_max_response_bytes`，只确认实际返回的完整 Mailbox 项，超出预算的后缀保留到后续 Poll。
 
 ## 3. 客户端 Packet 支持
 
@@ -168,7 +168,8 @@ Stable Friend 对应单向 Follow。添加和删除具有自然幂等语义；Fr
 - PostgreSQL 保存 Room、Session、Participant/Presence、Host、Round、Attempt 和有序 Event；Redis 保存 16 Slot 高频投影。
 - Stable Public Match ID 限制为 1 到 32767，结束后允许复用；Active Room 使用部分唯一索引。
 - Match Password 使用独立 HMAC Key、随机 Salt 和常量时间比较；Redis 只保存 `requires_password`。
-- Redis CAS 使用 Room/Session Epoch Fence。PostgreSQL 已提交而 Redis 不可用时返回 Durable Recovery Snapshot，后续房间解析按持久 Version、Round 和 Presence 集合修复投影。
+- PostgreSQL 为每个 Room 分配全局单调 `public_id_epoch`；Redis CAS 同时使用 Public ID Epoch、Room/Session Identity 和 State Revision Fence，Public ID 复用不依赖跨进程 UUID 顺序。PostgreSQL 已提交而 Redis 不可用时返回 Durable Recovery Snapshot，后续房间解析按持久 Version、Round 和 Presence 集合修复投影。
+- Round 期间拒绝个人 Free Mod 变更；成绩提交按 Play Attempt 的开始/结束时间选择同图 Rematch 中正确的冻结 Attempt，再由 Scoring 事务执行最终校验和单次消费。
 
 ## 8. 协议适配规则
 

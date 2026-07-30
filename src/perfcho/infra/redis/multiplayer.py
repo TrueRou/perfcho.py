@@ -34,16 +34,22 @@ local current = redis.call('GET', KEYS[1])
 local expected = tonumber(ARGV[1])
 local expected_session = ARGV[2]
 local incoming_session = ARGV[3]
-local owner = ARGV[6]
+local incoming_epoch = tonumber(ARGV[4])
+local owner = ARGV[7]
+local previous_owner = owner
+if not incoming_epoch or incoming_epoch < 1 then return {'INVALID_EPOCH'} end
 if expected == -1 then
     if current then
         local decoded = cjson.decode(current)
-        if decoded.session_id == incoming_session then return {'EXISTS'} end
-        if decoded.session_id >= incoming_session then return {'EPOCH_FENCED'} end
-        local old_owner = tostring(decoded.public_id) .. '|' .. decoded.session_id
+        local current_epoch = tonumber(decoded.public_id_epoch)
+        if not current_epoch then return {'INVALID_EPOCH'} end
+        if decoded.session_id == incoming_session and current_epoch == incoming_epoch then return {'EXISTS'} end
+        if current_epoch >= incoming_epoch then return {'EPOCH_FENCED'} end
+        local old_owner = tostring(decoded.public_id) .. '|' .. tostring(current_epoch) .. '|' .. decoded.session_id
+        previous_owner = old_owner
         for _, slot in ipairs(decoded.slots) do
             if slot.account_id then
-                local account_key = ARGV[8] .. tostring(slot.account_id)
+                local account_key = ARGV[9] .. tostring(slot.account_id)
                 if redis.call('GET', account_key) == old_owner then redis.call('DEL', account_key) end
             end
         end
@@ -51,20 +57,27 @@ if expected == -1 then
 else
     if not current then return {'NOT_FOUND'} end
     local decoded = cjson.decode(current)
-    if decoded.session_id ~= expected_session or incoming_session ~= expected_session then return {'EPOCH_FENCED'} end
+    local current_epoch = tonumber(decoded.public_id_epoch)
+    if not current_epoch then return {'INVALID_EPOCH'} end
+    previous_owner = tostring(decoded.public_id) .. '|' .. tostring(current_epoch) .. '|' .. decoded.session_id
+    if decoded.session_id ~= expected_session or current_epoch > incoming_epoch
+        or (current_epoch == incoming_epoch and incoming_session ~= expected_session) then
+        return {'EPOCH_FENCED'}
+    end
     if tonumber(decoded.state_revision) ~= expected then return {'FENCED'} end
 end
 
-local old_count = tonumber(ARGV[9])
-local new_count = tonumber(ARGV[10])
+local old_count = tonumber(ARGV[10])
+local new_count = tonumber(ARGV[11])
 for index = 1, new_count do
     local account_key = KEYS[2 + old_count + index]
     local occupied = redis.call('GET', account_key)
     if occupied and occupied ~= owner then
-        local separator = string.find(occupied, '|', 1, true)
-        local occupied_public = separator and string.sub(occupied, 1, separator - 1) or occupied
-        local occupied_session = separator and string.sub(occupied, separator + 1) or occupied
-        if occupied_public ~= tostring(ARGV[7]) or occupied_session >= incoming_session then
+        local first = string.find(occupied, '|', 1, true)
+        local second = first and string.find(occupied, '|', first + 1, true)
+        local occupied_public = first and string.sub(occupied, 1, first - 1) or occupied
+        local occupied_epoch = second and tonumber(string.sub(occupied, first + 1, second - 1)) or nil
+        if occupied_public ~= tostring(ARGV[8]) or not occupied_epoch or occupied_epoch >= incoming_epoch then
             return {'ACCOUNT_CONFLICT'}
         end
     end
@@ -72,12 +85,12 @@ end
 
 for index = 1, old_count do
     local account_key = KEYS[2 + index]
-    if redis.call('GET', account_key) == owner then redis.call('DEL', account_key) end
+    if redis.call('GET', account_key) == previous_owner then redis.call('DEL', account_key) end
 end
-redis.call('SET', KEYS[1], ARGV[4], 'PXAT', ARGV[5])
-redis.call('ZADD', KEYS[2], ARGV[5], ARGV[7])
+redis.call('SET', KEYS[1], ARGV[5], 'PXAT', ARGV[6])
+redis.call('ZADD', KEYS[2], ARGV[6], ARGV[8])
 for index = 1, new_count do
-    redis.call('SET', KEYS[2 + old_count + index], owner, 'PXAT', ARGV[5])
+    redis.call('SET', KEYS[2 + old_count + index], owner, 'PXAT', ARGV[6])
 end
 local latest = redis.call('ZREVRANGE', KEYS[2], 0, 0, 'WITHSCORES')
 if #latest > 0 then redis.call('PEXPIREAT', KEYS[2], latest[2]) end
@@ -168,13 +181,19 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
         if raw is None:
             return None
         try:
-            public_id_text, session_id_text = _text(raw).split("|", 1)
+            public_id_text, epoch_text, session_id_text = _text(raw).split("|", 2)
             public_id = int(public_id_text)
+            public_id_epoch = int(epoch_text)
             session_id = uuid.UUID(session_id_text)
         except (ValueError, TypeError) as error:
             raise RuntimeError("stored multiplayer account index is invalid") from error
         state = await self.get(public_id, at=at)
-        if state is None or state.room.session_id != session_id or state.slot_for(account_id) is None:
+        if (
+            state is None
+            or state.room.public_id_epoch != public_id_epoch
+            or state.room.session_id != session_id
+            or state.slot_for(account_id) is None
+        ):
             await self._redis.delete(self._account_key(account_id))
             return None
         return state
@@ -230,14 +249,15 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
     ) -> None:
         """Atomically remove a room and all account indexes owned by it."""
         current_raw = await self._redis.get(self._room_key(public_id))
-        accounts = _accounts(_decode_state(_bytes(current_raw))) if current_raw is not None else ()
+        current = _decode_state(_bytes(current_raw)) if current_raw is not None else None
+        accounts = _accounts(current) if current is not None else ()
         result = await self._remove(
             keys=[self._room_key(public_id), self._rooms_key, *(self._account_key(item) for item in accounts)],
             args=[
                 expected_state_revision,
                 str(expected_session_id),
                 public_id,
-                _owner(public_id, expected_session_id),
+                _owner(public_id, current.room.public_id_epoch, expected_session_id) if current is not None else "",
             ],
             client=self._redis,
         )
@@ -445,7 +465,7 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
         )
         payload = _encode_state(sanitized)
         expected_epoch = expected_session_id or state.room.session_id
-        owner = _owner(state.room.public_id, state.room.session_id)
+        owner = _owner(state.room.public_id, state.room.public_id_epoch, state.room.session_id)
         result = await self._cas(
             keys=[
                 self._room_key(state.room.public_id),
@@ -457,6 +477,7 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
                 expected,
                 str(expected_epoch),
                 str(state.room.session_id),
+                state.room.public_id_epoch,
                 payload,
                 _milliseconds(state.expires_at),
                 owner,
@@ -504,6 +525,7 @@ def _encode_state(state: RoomState) -> bytes:
         "room_id": str(room.room_id),
         "public_id": room.public_id,
         "session_id": str(room.session_id),
+        "public_id_epoch": room.public_id_epoch,
         "version": room.version,
         "creator_account_id": room.creator_account_id,
         "host_account_id": room.host_account_id,
@@ -571,6 +593,7 @@ def _decode_state(payload: bytes) -> RoomState:
             capacity=value["capacity"],
             settings=settings,
             requires_password=value["requires_password"],
+            public_id_epoch=value["public_id_epoch"],
         )
         slots = tuple(
             RoomSlot(
@@ -619,8 +642,8 @@ def _milliseconds(value: datetime) -> int:
     return int(value.timestamp() * 1000)
 
 
-def _owner(public_id: int, session_id: uuid.UUID) -> str:
-    return f"{public_id}|{session_id}"
+def _owner(public_id: int, public_id_epoch: int, session_id: uuid.UUID) -> str:
+    return f"{public_id}|{public_id_epoch}|{session_id}"
 
 
 def _bytes(value: object) -> bytes:

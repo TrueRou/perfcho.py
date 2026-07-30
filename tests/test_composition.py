@@ -10,15 +10,17 @@ from perfcho.infra.settings import Settings
 
 
 @pytest.mark.asyncio
-async def test_stable_composition_wires_independent_token_and_match_password_keys() -> None:
+async def test_stable_composition_wires_independent_security_keys() -> None:
     pytest.importorskip("perfcho.infra.redis.realtime", reason="realtime adapter is being changed in parallel")
     from perfcho.infra import composition
 
     token_key = "composition-token-hmac-key"
     match_password_key = "composition-match-password-hmac-key"
+    admission_key = "composition-admission-hmac-key"
     config = Settings(
         token_hmac_key=SecretStr(token_key),
         match_password_hmac_key=SecretStr(match_password_key),
+        admission_hmac_key=SecretStr(admission_key),
         stable_session_stale_grace_seconds=180,
         redis_realtime_max_channels_per_session=17,
         redis_spectator_max_viewers=23,
@@ -31,8 +33,10 @@ async def test_stable_composition_wires_independent_token_and_match_password_key
             assert services.identity._stable_session_stale_grace == timedelta(seconds=180)
             assert services.multiplayer is not None
             assert services.multiplayer._password_key == match_password_key.encode()
-            assert services.multiplayer._admission_key == token_key.encode()
+            assert services.multiplayer._admission_key == admission_key.encode()
             assert services.identity._token_hmac_key != services.multiplayer._password_key
+            assert services.identity._token_hmac_key != services.multiplayer._admission_key
+            assert services.multiplayer._password_key != services.multiplayer._admission_key
             assert services.community is not None
             assert services.community._active_memberships is services.realtime
             assert isinstance(services.realtime, RedisRealtimeRepository)

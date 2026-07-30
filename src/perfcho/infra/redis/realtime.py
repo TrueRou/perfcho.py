@@ -26,6 +26,7 @@ from perfcho.modules.realtime import (
     MailboxOverflow,
     MailboxPacket,
     PollLeaseConflict,
+    PresenceCapacityReached,
     PresenceSnapshot,
     RealtimeRepository,
     RealtimeSession,
@@ -168,6 +169,10 @@ class RedisRealtimeRepository(RealtimeRepository):
             raise OverflowError("realtime revision is exhausted")
         if status == "LIMIT":
             raise ValueError("realtime owned-state limit was reached")
+        if status == "CAPACITY":
+            raise PresenceCapacityReached("realtime presence capacity was reached")
+        if status == "INVALID_CAPACITY":
+            raise ValueError("presence capacity is invalid")
         if status != "OK":
             raise RuntimeError(f"unexpected realtime session script status: {status}")
 
@@ -311,11 +316,21 @@ class RedisRealtimeRepository(RealtimeRepository):
         )
         self._raise_session_status(_text(result[0]))
 
-    async def set_presence(self, snapshot: PresenceSnapshot, *, session_id: uuid.UUID) -> None:
-        """Atomically publish presence owned by the exact current session epoch."""
+    async def set_presence(
+        self,
+        snapshot: PresenceSnapshot,
+        *,
+        session_id: uuid.UUID,
+        capacity: int | None = None,
+    ) -> None:
+        """Atomically publish presence and optionally claim bounded online capacity."""
         if not isinstance(snapshot, PresenceSnapshot):
             raise TypeError("snapshot must be a PresenceSnapshot")
         _uuid("session_id", session_id)
+        if capacity is not None:
+            _positive_integer("capacity", capacity)
+            if capacity > 8192:
+                raise ValueError("presence capacity exceeds 8192")
         if snapshot.session_id is not None and snapshot.session_id != session_id:
             raise RealtimeSessionFenced("presence owner does not match session_id")
         result = await self._run(
@@ -333,6 +348,7 @@ class RedisRealtimeRepository(RealtimeRepository):
                 datetime_to_milliseconds(snapshot.expires_at),
                 self._presence_ttl_ms,
                 snapshot.payload,
+                capacity or 0,
             ],
         )
         self._raise_session_status(_text(result[0]))

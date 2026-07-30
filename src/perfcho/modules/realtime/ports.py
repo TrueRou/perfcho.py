@@ -50,8 +50,14 @@ class RealtimeRepository(Protocol):
         """Expire a session and its owned state only when its revision is current."""
         ...
 
-    async def set_presence(self, snapshot: PresenceSnapshot, *, session_id: uuid.UUID) -> None:
-        """Replace an account presence snapshot from its current session."""
+    async def set_presence(
+        self,
+        snapshot: PresenceSnapshot,
+        *,
+        session_id: uuid.UUID,
+        capacity: int | None = None,
+    ) -> None:
+        """Replace presence, optionally claiming a slot in a bounded online index."""
         ...
 
     async def get_presence(self, account_id: int, *, at: datetime) -> PresenceSnapshot | None:

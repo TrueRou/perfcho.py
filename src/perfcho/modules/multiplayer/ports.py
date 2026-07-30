@@ -171,9 +171,11 @@ class MultiplayerRepository(Protocol):
         account_id: int,
         beatmap_revision_id: int,
         *,
+        started_at: datetime,
+        ended_at: datetime,
         at: datetime,
     ) -> MultiplayerSubmissionContext | None:
-        """Resolve the latest unconsumed frozen attempt for a Stable submission."""
+        """Resolve an unconsumed attempt whose round contains the submitted play."""
         ...
 
 

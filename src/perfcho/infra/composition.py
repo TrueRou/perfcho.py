@@ -228,7 +228,7 @@ async def compose_stable_services(
         application_clock,
         config.match_password_hmac_key.get_secret_value().encode(),
         access_policy_factory=_multiplayer_access_policy,
-        admission_key=config.token_hmac_key.get_secret_value().encode(),
+        admission_key=config.admission_hmac_key.get_secret_value().encode(),
         state_lifetime=timedelta(seconds=config.redis_multiplayer_ttl_seconds),
     )
 

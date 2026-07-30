@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from perfcho.api.stable import router
 from perfcho.api.stable.canonize.login import StableLoginParseError, parse_stable_login
 from perfcho.api.stable.dependencies import get_stable_services
+from perfcho.api.stable.dispatcher import StableRuntimeContext
 from perfcho.infra.composition import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService, StablePrivilege
@@ -19,6 +20,7 @@ from perfcho.modules.identity import IdentityService, ResolvedStableSession, Sta
 from perfcho.modules.realtime import (
     MailboxBatch,
     MailboxPacket,
+    PresenceCapacityReached,
     PresenceSnapshot,
     RealtimeRepository,
     RealtimeSession,
@@ -35,7 +37,6 @@ from perfcho.modules.realtime.stable import (
     user_presence,
     user_stats,
 )
-from perfcho.modules.realtime.stable.dispatcher import StableRuntimeContext
 from perfcho.modules.social import SocialService
 
 NOW = datetime(2026, 7, 29, tzinfo=UTC)
@@ -113,6 +114,7 @@ class FakeRealtime:
         self.active_lease = False
         self.lease_conflict = False
         self.fail_set_presence = False
+        self.fail_presence_capacity = False
         self.open_calls = 0
         self.durable_expires_at: datetime | None = None
 
@@ -149,10 +151,18 @@ class FakeRealtime:
         self.session = RealtimeSession(session_id, self.session.account_id, expected_revision, expires_at)
         return self.session
 
-    async def set_presence(self, snapshot: PresenceSnapshot, *, session_id: uuid.UUID) -> None:
+    async def set_presence(
+        self,
+        snapshot: PresenceSnapshot,
+        *,
+        session_id: uuid.UUID,
+        capacity: int | None = None,
+    ) -> None:
         assert self.session is not None and session_id == self.session.session_id
         if self.fail_set_presence:
             raise RuntimeError("presence bootstrap failed")
+        if self.fail_presence_capacity and capacity is not None:
+            raise PresenceCapacityReached
         self.presence = snapshot
         self.online_presences[snapshot.account_id] = snapshot
 
@@ -402,6 +412,43 @@ async def test_authenticated_ping_poll_drains_mailbox() -> None:
 
 
 @pytest.mark.asyncio
+async def test_poll_response_budget_defers_mailbox_packets_without_acknowledging_them() -> None:
+    services, identity, realtime = stable_services()
+    object.__setattr__(services, "settings", Settings(stable_max_response_bytes=7))
+    await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    realtime.mailbox.append(MailboxPacket(1, build_packet(ServerPacket.PONG)))
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        full = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+        drained = await client.post(
+            "/",
+            content=b"",
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    assert len(full.content) == services.settings.stable_max_response_bytes
+    assert [packet.packet_type for packet in PacketReader(full.content, packet_enum=ServerPacket)] == [
+        ServerPacket.PONG
+    ]
+    assert [packet.packet_type for packet in PacketReader(drained.content, packet_enum=ServerPacket)] == [
+        ServerPacket.PONG
+    ]
+    assert realtime.mailbox == []
+
+
+@pytest.mark.asyncio
 async def test_invalid_token_and_malformed_packet_request_reconnect() -> None:
     services, identity, realtime = stable_services()
     await realtime.open_session(
@@ -578,6 +625,24 @@ async def test_login_capacity_closes_new_durable_session_before_presence_truncat
     assert response.headers["cho-token"] == "server-full"
     assert identity.close_calls == [("stable-token-value", "bootstrap_failed")]
     assert realtime.open_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_login_atomic_presence_claim_compensates_a_capacity_race() -> None:
+    services, identity, realtime = stable_services()
+    object.__setattr__(services, "settings", Settings(stable_presence_batch_size=1))
+    realtime.fail_presence_capacity = True
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post("/", content=login_body(), headers={"User-Agent": "osu!"})
+
+    assert response.headers["cho-token"] == "server-full"
+    assert identity.close_calls == [("stable-token-value", "bootstrap_failed")]
+    assert realtime.open_calls == 1
+    assert realtime.fenced == [SessionFence(identity.session_id, 1)]
 
 
 @pytest.mark.asyncio

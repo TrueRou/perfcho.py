@@ -33,7 +33,7 @@
 ## 验证状态
 
 - Consumer 与生产者定向测试：`33 passed, 3 skipped`；Consumer 真实 PostgreSQL 全链路：`2 passed`。
-- 当前全量无外部依赖测试：`260 passed, 15 skipped`；启用本地真实 PostgreSQL 与 Redis 后：`275 passed`。
+- 当前全量无外部依赖测试：`270 passed, 18 skipped`；启用本地真实 PostgreSQL 与 Redis 后：`288 passed`。
 - Ruff format/check 和 Python compileall 通过。
 - 迁移工具单元与 PostgreSQL 全领域夹具：`11 passed`，覆盖账户、社交、私信、内容、成绩、Replay、Ranking、成就和赛事图池。
 - PostgreSQL、Redis 和 MinIO 的真实集成用例由 `TEST_DATABASE_URL`、`TEST_REDIS_URL` 和对应对象存储环境启用；未配置时显式跳过。
@@ -45,7 +45,7 @@
 - Lazer OAuth/API 适配器；对外协议仍复用 Lazer-first Canonical 命令面。
 - Ranking 全量重建、Eligibility 反转、Country Rank、Grade Count 和失败进度 Projector。
 - Activity/Notification 与 Channel/Content Projection 的 Query API、全量重建和外部邮件/Push Sender。
-- Multiplayer 并发、恢复和 Public ID Epoch Fence 已在真实 PostgreSQL/Redis 环境验证；Tourney 和 Matchmaking 不在当前范围。
+- Multiplayer 并发、恢复、数据库分配的 Public ID Epoch Fence 和同图 Rematch Attempt 选择已在真实 PostgreSQL/Redis 环境验证；Tourney 和 Matchmaking 不在当前范围。
 - Moderation、对账与运维工具；反作弊只保留 Port，不实现检测器。
 
 ## 最近实现基线

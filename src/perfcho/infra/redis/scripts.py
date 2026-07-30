@@ -399,6 +399,16 @@ if not expiry or expiry <= now or expiry > session_expiry
     or expiry - now > tonumber(ARGV[5]) then
     return {'INVALID_EXPIRY'}
 end
+local capacity = tonumber(ARGV[7])
+if not capacity or capacity < 0 then return {'INVALID_CAPACITY'} end
+if capacity > 0 then
+    redis.call('ZREMRANGEBYSCORE', KEYS[4], 0, now)
+    local already_indexed = redis.call('ZSCORE', KEYS[4], ARGV[1])
+    if not already_indexed and redis.call('ZCARD', KEYS[4]) >= capacity then
+        refresh_expiring_index(KEYS[4])
+        return {'CAPACITY'}
+    end
+end
 redis.call('HSET', KEYS[3], 'account_id', ARGV[1], 'session_id', ARGV[2],
     'revision', ARGV[3], 'expires_at', ARGV[4], 'payload', ARGV[6])
 redis.call('PEXPIREAT', KEYS[3], expiry)

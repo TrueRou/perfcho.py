@@ -689,9 +689,11 @@ class SqlAlchemyMultiplayerRepository:
         account_id: int,
         beatmap_revision_id: int,
         *,
+        started_at: datetime,
+        ended_at: datetime,
         at: datetime,
     ) -> MultiplayerSubmissionContext | None:
-        """Resolve the newest usable attempt with matching frozen content."""
+        """Resolve the attempt whose frozen round contains the submitted play."""
         row = (
             await self._session.execute(
                 select(MultiplayerAttempt.id, MultiplayerAttempt.token_digest)
@@ -708,8 +710,11 @@ class SqlAlchemyMultiplayerRepository:
                         (SessionStatus.ACTIVE, SessionStatus.COMPLETED, SessionStatus.ABORTED)
                     ),
                     PlaylistRevision.beatmap_revision_id == beatmap_revision_id,
+                    Round.started_at.is_not(None),
+                    Round.started_at <= started_at,
+                    or_(Round.ended_at.is_(None), Round.ended_at >= ended_at),
                 )
-                .order_by(MultiplayerAttempt.created_at.desc())
+                .order_by(Round.started_at.desc(), MultiplayerAttempt.created_at.desc())
                 .limit(1)
             )
         ).one_or_none()
@@ -1076,6 +1081,7 @@ def _record(room: Room, session: MultiplayerSession) -> RoomRecord:
         requires_password=room.password_verifier is not None,
         password_salt=room.password_prefix,
         password_verifier=room.password_verifier,
+        public_id_epoch=room.public_id_epoch,
     )
 
 

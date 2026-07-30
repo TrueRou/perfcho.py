@@ -6,6 +6,13 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from perfcho.api.stable.multiplayer import (
+    MULTIPLAYER_PACKETS,
+    _broadcast_lobby,
+    _broadcast_state,
+    _enqueue,
+    dispatch_multiplayer_packet,
+)
 from perfcho.infra.composition import StableServices
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
 from perfcho.modules.common.errors import ApplicationError
@@ -65,13 +72,6 @@ from perfcho.modules.realtime.stable.models import (
     ServerPacket,
     UserPresence,
     UserStats,
-)
-from perfcho.modules.realtime.stable.multiplayer import (
-    MULTIPLAYER_PACKETS,
-    _broadcast_lobby,
-    _broadcast_state,
-    _enqueue,
-    dispatch_multiplayer_packet,
 )
 from perfcho.modules.scoring import Ruleset
 from perfcho.modules.scoring.mods import LEGACY_MOD_BITS, parse_legacy_mods

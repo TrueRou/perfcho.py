@@ -16,6 +16,7 @@ from perfcho.modules.multiplayer import (
     JoinRoom,
     MatchPasswordRejected,
     MatchPermissionDenied,
+    MatchStateRejected,
     MultiplayerAccessPolicy,
     MultiplayerRepository,
     MultiplayerService,
@@ -25,6 +26,7 @@ from perfcho.modules.multiplayer import (
     RoomSettings,
     RoomSlot,
     RoomState,
+    RoundParticipantSelection,
     SlotStatus,
     TeamMode,
     WinCondition,
@@ -66,6 +68,9 @@ class FakeRepository:
         self.accounts: tuple[int, ...] = ()
         self.created_password: tuple[str | None, str | None] | None = None
         self.command_rooms: dict[uuid.UUID, RoomRecord] = {}
+        self.submission_query: tuple[int, int, datetime, datetime, datetime] | None = None
+        self.round_id: uuid.UUID | None = None
+        self.round_participants: tuple[RoundParticipantSelection, ...] = ()
 
     async def create_room(self, **values: object) -> RoomRecord:
         actor = cast(int, values["actor_account_id"])
@@ -94,7 +99,7 @@ class FakeRepository:
         return self.command_rooms.get(command_id)
 
     async def load_snapshot(self, room: RoomRecord) -> DurableRoomSnapshot:
-        return DurableRoomSnapshot(room, self.accounts)
+        return DurableRoomSnapshot(room, self.accounts, self.round_id, self.round_participants)
 
     async def find_room_for_account(self, account_id: int) -> RoomRecord | None:
         return self.room if self.room is not None and account_id in self.accounts else None
@@ -126,6 +131,18 @@ class FakeRepository:
         self.room = replace(room, version=room.version + 1, host_account_id=target_account_id)
         self.command_rooms[cast(uuid.UUID, values["command_id"])] = self.room
         return self.room
+
+    async def resolve_submission_context(
+        self,
+        account_id: int,
+        beatmap_revision_id: int,
+        *,
+        started_at: datetime,
+        ended_at: datetime,
+        at: datetime,
+    ) -> None:
+        self.submission_query = (account_id, beatmap_revision_id, started_at, ended_at, at)
+        return None
 
 
 class AllowMultiplayer:
@@ -341,6 +358,47 @@ async def test_canonical_service_enforces_host_permission_before_create() -> Non
     with pytest.raises(MatchPermissionDenied):
         await multiplayer.create_room(CreateRoom(meta(10, "denied-create"), settings()))
     assert repository.room is None
+
+
+@pytest.mark.asyncio
+async def test_submission_context_preserves_gameplay_interval_for_rematch_selection() -> None:
+    repository = FakeRepository()
+    multiplayer = service(repository, FakeState())
+    started_at = NOW - timedelta(minutes=2)
+    ended_at = NOW - timedelta(minutes=1)
+
+    assert (
+        await multiplayer.resolve_submission_context(
+            10,
+            20,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+        is None
+    )
+    assert repository.submission_query == (10, 20, started_at, ended_at, NOW)
+
+
+@pytest.mark.asyncio
+async def test_personal_free_mods_cannot_change_during_an_active_round() -> None:
+    repository = FakeRepository()
+    state = FakeState()
+    multiplayer = service(repository, state)
+    created = await multiplayer.create_room(
+        CreateRoom(meta(10, "create-free-mod"), replace(settings(), free_mods=True))
+    )
+    round_id = uuid.uuid7()
+    repository.round_id = round_id
+    repository.round_participants = (RoundParticipantSelection(10, 0, 0),)
+    state.state = replace(
+        created,
+        in_progress=True,
+        round_id=round_id,
+        round_participant_account_ids=(10,),
+    )
+
+    with pytest.raises(MatchStateRejected, match="active round"):
+        await multiplayer.set_slot_mods(7, 10, (CanonicalMod("HD"),))
 
 
 def test_stable_settings_transition_migrates_free_mods_and_team_defaults() -> None:

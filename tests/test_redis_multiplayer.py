@@ -29,6 +29,7 @@ def state(
     public_id: int = 9,
     host_account_id: int = 10,
     session_id: uuid.UUID | None = None,
+    public_id_epoch: int = 1,
     at: datetime = NOW,
 ) -> RoomState:
     settings = RoomSettings(
@@ -53,6 +54,7 @@ def state(
         True,
         "salt",
         "verifier",
+        public_id_epoch,
     )
     return RoomState(
         room,
@@ -82,7 +84,7 @@ async def test_create_uses_atomic_cas_and_strips_password_proof() -> None:
     assert created.room.password_verifier is None
     call = scripts[0].await_args
     assert call is not None
-    payload = call.kwargs["args"][3]
+    payload = call.kwargs["args"][4]
     assert b"verifier" not in payload and b"salt" not in payload
     assert call.kwargs["keys"][-1] == "tests:v2:multiplayer:account:10"
 
@@ -111,11 +113,22 @@ async def test_real_redis_fences_reused_public_id_and_expires_lobby_index() -> N
     repository = RedisMultiplayerStateRepository(redis, prefix=prefix, state_ttl=30, max_rooms=4)
     try:
         now = datetime.now(UTC)
-        old = await repository.create(state(session_id=uuid.uuid7(), at=now))
-        replacement = state(session_id=uuid.uuid7(), at=now)
-        current = await repository.create(replacement)
+        old = await repository.create(state(session_id=uuid.UUID(int=2**128 - 1), public_id_epoch=1, at=now))
+        replacement = state(
+            host_account_id=20,
+            session_id=uuid.UUID(int=1),
+            public_id_epoch=2,
+            at=now,
+        )
+        current = await repository.replace(
+            replacement,
+            expected_state_revision=old.state_revision,
+            expected_session_id=old.room.session_id,
+        )
 
         assert current.room.session_id == replacement.room.session_id
+        assert await repository.find_for_account(10, at=now) is None
+        assert (await repository.find_for_account(20, at=now)) == current
         assert await redis.pttl(f"{prefix}:v2:multiplayer:rooms") > 0
         with pytest.raises(MatchConcurrencyConflict):
             await repository.replace(
@@ -123,6 +136,8 @@ async def test_real_redis_fences_reused_public_id_and_expires_lobby_index() -> N
                 expected_state_revision=old.state_revision,
                 expected_session_id=old.room.session_id,
             )
+        with pytest.raises(MatchConcurrencyConflict):
+            await repository.create(old)
     finally:
         await redis.aclose()
 

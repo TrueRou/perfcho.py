@@ -635,6 +635,7 @@ async def submit_score(
     replay_digest = hashlib.sha256(replay_content).digest()
     storage_key = f"replays/stable/{principal.account_id}/{replay_digest.hex()}.osr"
     try:
+        # Content-addressed upload precedes the database transaction; reconciliation removes orphaned objects.
         stored = await object_storage.put(
             storage_key,
             replay_content,
@@ -686,6 +687,8 @@ async def submit_score(
                 multiplayer=await services.multiplayer.resolve_submission_context(
                     principal.account_id,
                     beatmap.revision_id,
+                    started_at=parsed.attempt.started_at,
+                    ended_at=parsed.attempt.ended_at,
                 ),
             )
         result = await scoring.accept(command)

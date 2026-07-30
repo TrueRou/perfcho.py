@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 
+from perfcho.api.stable.dispatcher import StableRuntimeContext, dispatch_packets
 from perfcho.infra.composition import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
@@ -34,7 +35,6 @@ from perfcho.modules.realtime.stable import (
     user_stats,
 )
 from perfcho.modules.realtime.stable.countries import stable_country_id
-from perfcho.modules.realtime.stable.dispatcher import StableRuntimeContext, dispatch_packets
 from perfcho.modules.scoring.mods import LEGACY_MOD_BITS
 from perfcho.modules.social import AccountIdentityView, SocialInteractionBlocked, SocialService
 
@@ -216,8 +216,15 @@ class FakeRealtime:
         self.enqueued.append((account_id, payload))
         return MailboxPacket(len(self.enqueued), payload)
 
-    async def set_presence(self, snapshot: PresenceSnapshot, *, session_id: uuid.UUID) -> None:
+    async def set_presence(
+        self,
+        snapshot: PresenceSnapshot,
+        *,
+        session_id: uuid.UUID,
+        capacity: int | None = None,
+    ) -> None:
         assert snapshot.session_id == session_id
+        del capacity
         self.stored_presence = snapshot
         self.presences[snapshot.account_id] = snapshot
 

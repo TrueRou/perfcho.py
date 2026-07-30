@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 
+from perfcho.api.stable.dispatcher import StableRuntimeContext, dispatch_packets
 from perfcho.infra.composition import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
@@ -32,7 +33,6 @@ from perfcho.modules.realtime.stable import (
     ServerPacket,
     build_packet,
 )
-from perfcho.modules.realtime.stable.dispatcher import StableRuntimeContext, dispatch_packets
 from perfcho.modules.realtime.stable.models import UserPresence, UserStats
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)

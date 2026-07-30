@@ -18,7 +18,8 @@
 4. [Multi-PP 与 Calculator 对接](performance-calculation.md)：Formula/Release 方法论、异步计算语义和 C#/Rust HTTP 合同。
 5. [剩余设计与交付路线](remaining-design.md)：Multiplayer 后续验证、PP、Lazer 和投影体系的实施顺序。
 6. [实现进度](implementation-progress.md)：适合快速检查的简表和最近验证结果。
-7. [Stable 实现复核与修复记录](stable-review-2026-07-29.md)：2026-07-29 复核发现、修复位置、测试与残余边界。
+7. [Stable 实现复核与修复记录](stable-review-2026-07-29.md)：2026-07-29 首轮复核发现、修复位置、测试与残余边界。
+8. [Stable 二次复核与修复记录](stable-review-2026-07-30.md)：2026-07-30 对 subagent 结论的代码核验、实际修复和误报排除。
 
 ## 深入设计
 

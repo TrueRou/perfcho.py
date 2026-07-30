@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    Identity,
     Index,
     Integer,
     LargeBinary,
@@ -58,6 +59,7 @@ class Room(Uuid7PrimaryKeyMixin, TimestampMixin, DbBase):
     )
 
     public_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    public_id_epoch: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False, unique=True)
     creator_account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
     channel_id: Mapped[int | None] = mapped_column(ForeignKey("community.channels.id", ondelete="SET NULL"))
     name: Mapped[str] = mapped_column(String(255), nullable=False)

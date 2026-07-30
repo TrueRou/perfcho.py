@@ -27,6 +27,12 @@ class MailboxOverflow(ResourceConflict):
     code = "mailbox_overflow"
 
 
+class PresenceCapacityReached(ResourceConflict):
+    """Reject a presence claim when the bounded online index is full."""
+
+    code = "presence_capacity_reached"
+
+
 class SpectatorHostOffline(ResourceConflict):
     """Reject attachment or frame work while the requested host is offline."""
 

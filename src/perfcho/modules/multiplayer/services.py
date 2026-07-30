@@ -518,14 +518,23 @@ class MultiplayerService:
         self,
         account_id: int,
         beatmap_revision_id: int,
+        *,
+        started_at: datetime,
+        ended_at: datetime,
     ) -> MultiplayerSubmissionContext | None:
         """Resolve an authoritative Stable multiplayer attempt when one exists."""
         if account_id < 1 or beatmap_revision_id < 1:
             raise ValueError("submission context identifiers must be positive")
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            raise ValueError("submission started_at must be timezone-aware")
+        if ended_at.tzinfo is None or ended_at.utcoffset() is None or ended_at < started_at:
+            raise ValueError("submission ended_at must be aware and not precede started_at")
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).resolve_submission_context(
                 account_id,
                 beatmap_revision_id,
+                started_at=started_at,
+                ended_at=ended_at,
                 at=self._clock.now(),
             )
 
@@ -568,6 +577,8 @@ class MultiplayerService:
         state = await self._require_live_state(public_id)
         if not state.room.settings.free_mods:
             raise MatchStateRejected("personal mods require Free Mod mode")
+        if state.in_progress:
+            raise MatchStateRejected("personal mods cannot change during an active round")
         try:
             normalized = normalize_mods(state.room.settings.ruleset, state.room.settings.variant, mods).mods
         except ScoreRejected as error:

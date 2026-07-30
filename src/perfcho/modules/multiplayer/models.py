@@ -138,12 +138,14 @@ class RoomRecord:
     requires_password: bool = False
     password_salt: str | None = field(default=None, repr=False)
     password_verifier: str | None = field(default=None, repr=False)
+    public_id_epoch: int = 1
 
     def __post_init__(self) -> None:
         """Validate identifiers, version, capacity, and password fields."""
         _positive("public_id", self.public_id)
         _positive("creator_account_id", self.creator_account_id)
         _positive("host_account_id", self.host_account_id)
+        _positive("public_id_epoch", self.public_id_epoch)
         if self.version < 0:
             raise ValueError("version must be non-negative")
         if not 1 <= self.capacity <= MAX_ROOM_CAPACITY:
