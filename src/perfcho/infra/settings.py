@@ -1,9 +1,10 @@
 """Load validated process configuration from environment variables."""
 
 from ipaddress import ip_network
-from typing import Literal
+from math import ceil
+from typing import Literal, Self
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -72,6 +73,7 @@ class Settings(BaseSettings):
     stable_presence_batch_size: int = Field(default=2048, ge=1, le=8192)
 
     s3_endpoint_url: str = Field(default="http://127.0.0.1:59000")
+    s3_presign_endpoint_url: str | None = Field(default=None)
     s3_region: str = Field(default="us-east-1")
     s3_access_key: SecretStr = Field(default=SecretStr("perfcho"))
     s3_secret_key: SecretStr = Field(default=SecretStr("perfcho-development"))
@@ -91,18 +93,19 @@ class Settings(BaseSettings):
     taskiq_consumer_group: str = Field(default="perfcho:workers")
     taskiq_stream_max_length: int = Field(default=100_000, ge=1000)
 
-    outbox_batch_size: int = Field(default=100, ge=1, le=1000)
-    outbox_poll_interval: float = Field(default=1.0, gt=0)
-    outbox_lease_seconds: int = Field(default=300, ge=30)
-    outbox_max_attempts: int = Field(default=10, ge=1)
+    durable_relay_poll_interval_seconds: float = Field(default=1.0, gt=0)
+    outbox_delivery_batch_size: int = Field(default=100, ge=1, le=1000)
+    outbox_delivery_lease_seconds: int = Field(default=300, ge=30)
+    outbox_delivery_max_attempts: int = Field(default=10, ge=1)
+    outbox_delivery_max_retry_seconds: int = Field(default=300, ge=1)
 
     performance_calculator_urls: dict[str, str] = Field(default_factory=dict)
     performance_http_timeout_seconds: float = Field(default=30.0, gt=0)
+    performance_beatmap_url_expiry_seconds: int = Field(default=600, ge=30, le=3600)
     performance_calculation_batch_size: int = Field(default=32, ge=1, le=1000)
     performance_calculation_lease_seconds: int = Field(default=300, ge=30)
     performance_calculation_max_attempts: int = Field(default=5, ge=1)
     performance_calculation_max_retry_seconds: int = Field(default=300, ge=1)
-    performance_beatmap_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
 
     cors_origins: list[str] = Field(default=["http://localhost:3000", "http://localhost:5173"])
 
@@ -117,6 +120,16 @@ class Settings(BaseSettings):
             except ValueError as error:
                 raise ValueError(f"invalid trusted proxy CIDR: {value}") from error
         return normalized
+
+    @model_validator(mode="after")
+    def validate_performance_timing(self) -> Self:
+        """Keep execution leases and signed URLs beyond the HTTP timeout window."""
+        minimum_window = ceil(self.performance_http_timeout_seconds) + 30
+        if self.performance_calculation_lease_seconds < minimum_window:
+            raise ValueError("performance calculation lease must exceed the HTTP timeout by at least 30 seconds")
+        if self.performance_beatmap_url_expiry_seconds < minimum_window:
+            raise ValueError("performance Beatmap URL expiry must exceed the HTTP timeout by at least 30 seconds")
+        return self
 
 
 settings = Settings()

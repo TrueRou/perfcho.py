@@ -11,7 +11,7 @@ from fastapi import FastAPI
 
 from perfcho.api.stable import router
 from perfcho.api.stable.dependencies import get_stable_services
-from perfcho.composition import StableServices
+from perfcho.infra.composition import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage, StoredObject

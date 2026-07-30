@@ -177,6 +177,15 @@ class CalculationKind(StrEnum):
     PERFORMANCE = "performance"
 
 
+class OutboxDeliveryStatus(StrEnum):
+    """Describe one durable outbox delivery lifecycle."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    DEAD = "dead"
+
+
 class CalculationJobStatus(StrEnum):
     """Describe one durable asynchronous calculation lifecycle."""
 

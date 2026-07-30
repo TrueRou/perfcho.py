@@ -11,7 +11,6 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.base import DbSessionFactory
-from perfcho.infra.db.repositories.account import SqlAlchemyOutboxWriter
 from perfcho.infra.db.repositories.authorization import SqlAlchemyAuthorizationRepository
 from perfcho.infra.db.repositories.community import (
     SqlAlchemyActiveSilencePolicy,
@@ -23,6 +22,9 @@ from perfcho.infra.db.repositories.multiplayer import (
     SqlAlchemyMultiplayerAccessPolicy,
     SqlAlchemyMultiplayerRepository,
 )
+from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
+from perfcho.infra.db.repositories.performance.query import SqlAlchemyPerformanceQueryRepository
+from perfcho.infra.db.repositories.performance.scheduling import SqlAlchemyPerformanceJobScheduler
 from perfcho.infra.db.repositories.scoring import (
     SqlAlchemyAccountSubmissionValidator,
     SqlAlchemyMultiplayerSubmissionValidator,
@@ -32,18 +34,18 @@ from perfcho.infra.db.repositories.social import SqlAlchemySocialRepository
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
 from perfcho.infra.redis.multiplayer import RedisMultiplayerStateRepository
 from perfcho.infra.redis.realtime import RedisRealtimeRepository
-from perfcho.infra.s3 import S3ObjectStorage
 from perfcho.infra.security.password import Argon2Policy, PasswordPepper
 from perfcho.infra.settings import Settings, settings
+from perfcho.infra.storage import S3ObjectStorage
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage
 from perfcho.modules.community import CommunityService
 from perfcho.modules.content import ContentQueryService, ContentService
 from perfcho.modules.identity import IdentityService
 from perfcho.modules.multiplayer import MultiplayerService
+from perfcho.modules.performance.services import PerformanceQueryService
 from perfcho.modules.realtime import RealtimeRepository
 from perfcho.modules.scoring import (
-    PerformanceQueryService,
     RankingQueryService,
     ReplayQueryService,
     ReplayService,
@@ -82,6 +84,14 @@ def _outbox_writer(session: object) -> SqlAlchemyOutboxWriter:
 
 def _scoring_repository(session: object) -> SqlAlchemyScoringRepository:
     return SqlAlchemyScoringRepository(cast(AsyncSession, session))
+
+
+def _performance_job_scheduler(session: object) -> SqlAlchemyPerformanceJobScheduler:
+    return SqlAlchemyPerformanceJobScheduler(cast(AsyncSession, session))
+
+
+def _performance_query_repository(session: object) -> SqlAlchemyPerformanceQueryRepository:
+    return SqlAlchemyPerformanceQueryRepository(cast(AsyncSession, session))
 
 
 def _account_submission_validator(session: object) -> SqlAlchemyAccountSubmissionValidator:
@@ -202,6 +212,7 @@ async def compose_stable_services(
         _outbox_writer,
         _account_submission_validator,
         _multiplayer_submission_validator,
+        _performance_job_scheduler,
         application_clock,
         application_ids,
     )
@@ -238,7 +249,7 @@ async def compose_stable_services(
             community=community,
             object_storage=S3ObjectStorage.from_settings(config),
             scoring=scoring,
-            performance_query=PerformanceQueryService(uow_factory, _scoring_repository),
+            performance_query=PerformanceQueryService(uow_factory, _performance_query_repository),
             replay_query=ReplayQueryService(uow_factory, _scoring_repository),
             replay=ReplayService(uow_factory, _scoring_repository),
             ranking_query=RankingQueryService(uow_factory, _scoring_repository),

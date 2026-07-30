@@ -4,7 +4,7 @@
 
 ## 1. 项目目标与边界
 
-perfcho.py 是同时面向 osu! Stable 和 Lazer 的中心后端。架构采用单一可信中心和模块化单体，不拆分微服务：API、实时协议、异步任务和 Outbox Relay 是同一应用的不同进程角色，共享业务模型并直接访问 PostgreSQL、Redis 和对象存储。
+perfcho.py 是同时面向 osu! Stable 和 Lazer 的中心后端。架构采用单一可信中心和模块化单体，不拆分微服务：API/实时协议与 Taskiq Worker 是同一应用的不同进程角色，共享业务模型并直接访问 PostgreSQL、Redis 和对象存储；Outbox 与 Calculation Relay 作为 Worker 后台循环运行。
 
 当前优先保证最新 Stable 客户端可用，但业务模型应按 Lazer 的资源结构设计；Stable 是对共享应用命令和查询的兼容适配器，而不是另一套业务实现。
 
@@ -55,7 +55,8 @@ HTTP/Bancho/Lazer/Worker Adapter
 
 - `/`：健康/欢迎响应。
 - `/v1`：当前只保留基础版本化 JSON API 结构。
-- Stable 无版本前缀 Router：Bancho、Web、Scoring。
+- Stable 无版本前缀 Router：Cho 承载 Bancho 登录与 Poll，Web 统一承载内容、成绩、Replay 和排行榜端点。
+- `api/stable/normalize` 负责登录与成绩上传的 Stable Wire 输入解析和规范化。
 
 `compose_stable_services()` 为每个 Stable 请求构造应用服务。当前实际接线：
 
@@ -73,33 +74,34 @@ HTTP/Bancho/Lazer/Worker Adapter
 - `RedisMultiplayerStateRepository`
 - `S3ObjectStorage`
 
-成绩接收事务不调用 Calculator。它会根据 Scoreboard 上启用的 `CalculationFormula` 及其活动 `CalculationRelease`，原子创建 `(score_id, release_id)` 唯一的 `PerformanceCalculationJob`；没有发布 Formula/Release 时只接受可信成绩事实，不伪造 PP。
+成绩接收事务不调用 Calculator。`ScoringService` 只调用中性的事务内后续任务调度端口；Performance PostgreSQL Adapter 根据 Scoreboard 上启用的 `CalculationFormula` 及其活动 `CalculationRelease`，原子创建 `(score_id, release_id)` 唯一的 `PerformanceCalculationJob`。没有发布 Formula/Release 时只接受可信成绩事实，不伪造 PP。
 
-### 3.2 Outbox Relay 与 Worker
+### 3.2 Worker 与持久任务 Relay
 
-Outbox Relay 从 PostgreSQL 领取 `OutboxDelivery`，使用 Lease Owner 和 Fencing Token 防止旧 Worker 完成新租约，再将任务投入 Taskiq Redis Stream。Worker 在独立数据库事务中执行 Consumer，语义为至少一次投递：
+每个 Taskiq Worker 子进程由 `perfcho.worker` 统一组合数据库、HTTP、S3、应用服务与 Consumer Catalog，并运行相互隔离的 Outbox Delivery 与 Performance Job Relay Loop。Outbox Relay 使用 Lease Owner、`SKIP LOCKED` 和 Fencing Token 防止重复领取及旧 Worker 完成新租约，再将任务投入 Taskiq Redis Stream。Worker 在独立数据库事务中执行 Consumer，语义为至少一次投递：
 
 - 同一 `consumer + partition_key` 严格按 Outbox Position 顺序执行。
 - 不同 Partition 可以并行。
 - 失败使用有界退避重试；达到上限后进入 Dead Letter 状态。
+- Dead Delivery 阻塞同 Consumer Partition 的后续事件，不能跳过失败事实推进 Checkpoint。
 - Consumer 必须幂等，不能依赖任务恰好执行一次。
 
 当前实际注册的 Consumer：
 
 | Consumer | 事件 | 实现 |
 | --- | --- | --- |
-| `account-projection.v1` | `account.registered.v1` | 写入公开 Account Activity，不复制邮箱 |
-| `identity-projection.v1` | `identity.session-opened.v1`、`identity.session-closed.v1` | 写入私有 Session Activity，不修改 Redis Presence |
-| `content-projection.v1` | `content.beatmapset-synchronized.v1` | 更新 Beatmapset Sync Projection；有实际变更时生成 Creator Activity/Notification |
-| `social-projection.v1` | Follow/Unfollow/Block/Unblock v1 | 写入私有 Social Activity |
-| `achievement-projection.v1` | `social.achievement-unlocked.v1` | 写入公开 Activity、Notification 和 Recipient |
-| `community-projection.v1` | Direct Conversation 与 Channel Membership v1 | 从权威 Channel/Message 重算 Channel Read Projection |
-| `community-message.v1` | `community.message-sent.v1` | 更新频道摘要；私信生成 Notification、Recipient 和外部 Dispatch Intent |
+| `account-projector.v1` | `account.registered.v1` | 写入公开 Account Activity，不复制邮箱 |
+| `identity-projector.v1` | `identity.session-opened.v1`、`identity.session-closed.v1` | 写入私有 Session Activity，不修改 Redis Presence |
+| `content-projector.v1` | `content.beatmapset-synchronized.v1` | 更新 Beatmapset Sync Projection；有实际变更时生成 Creator Activity/Notification |
+| `social-projector.v1` | Follow/Unfollow/Block/Unblock v1 | 写入私有 Social Activity |
+| `achievement-projector.v1` | `social.achievement-unlocked.v1` | 写入公开 Activity、Notification 和 Recipient |
+| `community-projector.v1` | Direct Conversation 与 Channel Membership v1 | 从权威 Channel/Message 重算 Channel Read Projection |
+| `community-message-projector.v1` | `community.message-sent.v1` | 更新频道摘要；私信生成 Notification、Recipient 和外部 Dispatch Intent |
 | `ranking-projector.v1` | `score.accepted.v1`、`score.performance-calculated.v1` | 按全部活动 Ranking Policy、Mod Policy 与 Calculation Release 更新 Eligibility/Leaderboard |
 
 所有 Consumer 都严格校验 Schema、Aggregate 与 Partition，并在投影事务中单调推进 `ProjectionCheckpoint`。Community Worker 不写 Redis Mailbox，Stable 在线消息仍只由协议适配器提交后同步扇出，避免至少一次任务造成重复消息。
 
-同一个 Relay 还会独立领取 `PerformanceCalculationJob`。Calculation Worker 使用“短事务加载并增加业务 Attempt -> 事务外读取 `.osu` 和调用 HTTP Calculator -> 短事务按 Fencing Token 写 Difficulty/PP/完成事件”三段流程，不在 Outbox Consumer 事务内等待网络。Redis Stream 丢失或 Worker 崩溃后由 PostgreSQL Job Lease 恢复；相同 Release 重算的 Input/Output Digest 不一致会拒绝覆盖。
+Performance Relay 独立领取 `PerformanceCalculationJob`，不会因 Outbox Relay 单次异常而停顿。Calculation Worker 使用“短事务按 Token 单次开始 Attempt、刷新执行 Lease 并固化 Input Digest -> 事务外生成 S3 签名 URL 并调用 HTTP Calculator -> 短事务按有效 Fencing Token/Lease 写 Difficulty、PP 和完成事件”三段流程，不在 Outbox Consumer 事务内等待网络。Revision 必须已经关联 S3 Asset；URL 生成或读取失败按 Job 错误策略重试或结束。Redis Stream 丢失或 Worker 崩溃后由 PostgreSQL Job Lease 恢复；相同 Release 重算的 Input/Output Digest 不一致会拒绝覆盖。
 
 ## 4. 模块能力状态
 
@@ -112,7 +114,8 @@ Outbox Relay 从 PostgreSQL 领取 `OutboxDelivery`，使用 Lease Owner 和 Fen
 | `content` | 部分接线 | ID/MD5/文件名查询、Direct、收藏、评分、不可变 Revision、官方 API Source、S3 文件 | Query/收藏/评分已接线；`ContentSyncService` 和官方 Source 未进入生产任务或管理入口 |
 | `social` | 部分接线 | Follow/Unfollow、Block/Unblock、好友查询、Achievement 事实、Activity/Notification Consumer | Stable 好友增删已接线；Block、Achievement 和 Activity/Notification 查询无协议入口 |
 | `community` | 部分接线 | 频道、公开消息、私信、离线消息、Silence、私信策略、频道摘要与通知 Consumer | Stable 消息已接线；Notification Query 和外部邮件/Push Dispatcher 未实现 |
-| `scoring` | 部分接线 | Canonical Score、Mod 规范化、校验、Attempt/Score/Hit/Replay/Attestation、Formula/Release、持久计算 Job、版本化 HTTP Calculator、Multi-PP Query、Replay View、Ranking Query、Stable 基础统计 Query | Stable 全链路和 Multiplayer Attempt 消费已接线；尚未发布真实 C#/Rust Formula Release，重建与完整统计投影未完成 |
+| `scoring` | 部分接线 | Canonical Score、Mod 规范化、校验、Attempt/Score/Hit/Replay/Attestation、中性后续任务调度端口、Replay View、Ranking Query、Stable 基础统计 Query | Stable 全链路和 Multiplayer Attempt 消费已接线；重建与完整统计投影未完成 |
+| `performance` | 已接线 | Formula/Release、持久计算 Job、Lease/Fencing、版本化 HTTP Calculator、Input/Output Digest、Multi-PP Query 与完成事件 | 尚未发布真实 C#/Rust Formula Release、Backfill 和管理 Command |
 | `realtime` | 已接线 | Redis Session、Presence Index/Filter、Away、Mailbox、Spectator Relation、Frame History、Fence | 没有跨进程 Pub/Sub；即时扇出使用有界 Mailbox |
 | `multiplayer` | 已接线 | Canonical Command/Query、SQL Repository、Redis CAS Projection、Room/Slot/Host/Password、Round/Attempt、Stable Lobby/Match Dispatcher | 未做 Tourney/Matchmaking；真实并发集成覆盖仍需在 PostgreSQL/Redis 环境执行 |
 
@@ -147,13 +150,15 @@ Stable 成绩提交路径：
 3. 验证 Stable Web 凭据、谱面 MD5、客户端字段格式、命中统计、普通 FC/Combo、可证明对象数、Accuracy、Grade、Mods，并按 bancho.py 公式常量时间验证 Online Checksum 和完整事实请求摘要。
 4. 在数据库事务外将 Replay 以 SHA-256 内容寻址写入对象存储。
 5. 在一个事务中写 PlayAttempt、Score、HitStatistic、Replay、Attestation、每个活动 Formula Release 的计算 Job、命令回执和 `score.accepted.v1`。
-6. Calculation Worker 按 Formula 的 Calculator Code 调用配置的 C#/Rust HTTP 引擎，写 `BeatmapDifficultyAttribute`、`ScorePerformance` 与 `score.performance-calculated.v1`。
+6. Calculation Worker 按 Formula 的 Calculator Code 和 S3 签名 URL 调用 C#/Rust HTTP 引擎，成功后写 `BeatmapDifficultyAttribute`、`ScorePerformance` 与 `score.performance-calculated.v1`；Worker 不读取或转发 Beatmap 字节。
 7. Ranking Consumer 对全部活动 Policy 更新符合资格的 Overall/Exact-Mods 最佳成绩投影；Stable Query 只读取每个 Scoreboard 的默认 Policy。
 8. 已同步谱面的 Multiplayer Round 会预先签发 Attempt，Stable 提交按 Account 与 Beatmap Revision 解析并在同一成绩事务中消费。
 
 当前排行榜支持 Top、Exact Mods、Friends 和 Country 过滤；Exact Mods 会合并所有可表示为同一 Stable Bitmask 的 Canonical ModSet。Vanilla 的 Ranked/Approved/Qualified/Loved 使用 Total Score；RX/AP 只接受指定 Release 的 PP，缺失时保持 `performance_pending` 而不回退。Bancho Stats 会查询 Play Count、Total Score、Accuracy、Ranked Score 和 Global Rank；PP/Performance 保持明确的延迟计算状态，不能把零值解释为最终计算结果。
 
 Formula 是对外可选 PP 系统，唯一绑定一个 Calculator Code，但可通过关联表覆盖多个 Scoreboard；Calculator 可以承载多个 Formula。Release 按 `(formula_id, ruleset)` 单活且版本不可变，Performance Release 固定依赖一个 Difficulty Release。同一 Score 可在 `score_performances` 保存任意多个 Formula/历史 Release 结果，`PerformanceQueryService` 返回全部结果，Ranking Policy 始终引用精确 Release。
+
+字段级 Multipart 请求、响应、错误分类、安全边界和 Release 发布步骤见 [Multi-PP Formula 与外部 Calculator 对接规范](performance-calculation.md)。
 
 ## 6. Redis 在线状态
 

@@ -778,7 +778,6 @@ async def _ensure_score_event(
             event_type="score.accepted.v1",
             schema_version=1,
             payload={"score_id": score_id, "scoreboard_id": item.scoreboard_id},
-            available_at=item.ended_at,
             created_at=item.ended_at,
         )
         .on_conflict_do_nothing(index_elements=(OutboxEvent.id,))

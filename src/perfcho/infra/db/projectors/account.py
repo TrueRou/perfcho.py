@@ -12,12 +12,11 @@ from perfcho.infra.db.projectors.common import (
     require_accounts,
     require_event_context,
 )
-from perfcho.infra.outbox import register_consumer
 
-_CONSUMER = "account-projection.v1"
+CONSUMER_NAME = "account-projector.v1"
+EVENT_TYPES = frozenset({"account.registered.v1"})
 
 
-@register_consumer(_CONSUMER, ("account.registered.v1",))
 async def project_account_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project a new account into its public activity history."""
     account_id = payload_integer(event.payload, "account_id")
@@ -43,4 +42,4 @@ async def project_account_event(session: AsyncSession, event: OutboxEvent, parti
             "status": payload_string(event.payload, "status"),
         },
     )
-    await advance_checkpoint(session, event, projector=_CONSUMER, partition_key=partition_key)
+    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)

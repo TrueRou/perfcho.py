@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 from typing import TypedDict
 
 from fastapi import FastAPI
-from loguru import logger
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -16,7 +15,6 @@ from perfcho.infra import logging
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.base import DbSessionFactory
 from perfcho.infra.redis import engine as infra_redis
-from perfcho.infra.settings import settings
 
 
 class AppState(TypedDict):
@@ -30,10 +28,6 @@ class AppState(TypedDict):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
     """Create and dispose process-owned database and Redis clients."""
-    logger.patch(logging.source("", "")).info(
-        "Server starting, listening on: http://{}:{}", settings.app_host, settings.app_port
-    )
-
     db_engine: AsyncEngine | None = None
     redis_engine: Redis | None = None
 
@@ -65,12 +59,10 @@ def init_routes(asgi_app: FastAPI) -> None:
 def create_app() -> FastAPI:
     """Construct an application without starting external resources."""
     logging.init_logger()
-    openapi_url = "/openapi.json" if settings.app_debug else None
     asgi_app = FastAPI(
         title="perfcho.py",
         version="0.1.0",
         lifespan=lifespan,
-        openapi_url=openapi_url,
     )
 
     @asgi_app.get("/")

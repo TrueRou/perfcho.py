@@ -18,6 +18,7 @@ x-app-environment: &app-environment
   MATCH_PASSWORD_HMAC_KEY: ${MATCH_PASSWORD_HMAC_KEY:?MATCH_PASSWORD_HMAC_KEY must be set}
   STABLE_SESSION_STALE_GRACE_SECONDS: ${STABLE_SESSION_STALE_GRACE_SECONDS:-120}
   S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:?S3_ENDPOINT_URL must be set}
+  S3_PRESIGN_ENDPOINT_URL: ${S3_PRESIGN_ENDPOINT_URL:?S3_PRESIGN_ENDPOINT_URL must be set}
   S3_REGION: ${S3_REGION:-us-east-1}
   S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY must be set}
   S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY must be set}
@@ -97,23 +98,12 @@ services:
       retries: 6
       start_period: 15s
 
-  relay:
-    <<: *app
-    command: ["python", "-m", "perfcho.infra.outbox"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
   taskiq:
     <<: *app
     command:
       - taskiq
       - worker
-      - perfcho.infra.taskiq:broker
-      - perfcho.tasks.outbox
-      - perfcho.tasks.performance
+      - perfcho.worker:broker
       - --ack-type
       - when_executed
       - --workers

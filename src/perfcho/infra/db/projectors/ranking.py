@@ -21,12 +21,11 @@ from perfcho.infra.db.models.scoring import (
     ScorePerformance,
 )
 from perfcho.infra.db.projectors.common import advance_checkpoint, payload_integer, require_event_context
-from perfcho.infra.outbox import register_consumer
 
-_CONSUMER = "ranking-projector.v1"
+CONSUMER_NAME = "ranking-projector.v1"
+EVENT_TYPES = frozenset({"score.accepted.v1", "score.performance-calculated.v1"})
 
 
-@register_consumer(_CONSUMER, ("score.accepted.v1", "score.performance-calculated.v1"))
 async def project_accepted_score(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project one accepted score under the active versioned ranking policy."""
     score_id = payload_integer(event.payload, "score_id")
@@ -79,7 +78,7 @@ async def project_accepted_score(session: AsyncSession, event: OutboxEvent, part
             mod_acronyms,
             mod_rules,
         )
-    await advance_checkpoint(session, event, projector=_CONSUMER, partition_key=partition_key)
+    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
 
 
 async def _project_policy(

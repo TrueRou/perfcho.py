@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 from py3rijndael import Pkcs7Padding, RijndaelCbc
 
-from perfcho.api.stable.score_submission import (
+from perfcho.api.stable.canonize.scoring import (
     ParsedStableScore,
     decrypt_stable_score,
     stable_online_checksum,

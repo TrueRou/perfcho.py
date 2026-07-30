@@ -15,7 +15,6 @@ from perfcho.infra.db.bootstrap import (
     STABLE_PROTOCOL_VERSION,
     _bootstrap_uuid,
     _mod_policy_rules,
-    _repair_schema,
     bootstrap_database,
     canonical_json_digest,
 )
@@ -98,28 +97,6 @@ def test_bootstrap_models_expose_every_conflict_key() -> None:
         for constraint in channel_table.constraints
     )
     assert ServerSetting.__table__.c.key.primary_key
-
-
-@pytest.mark.asyncio
-async def test_schema_repair_covers_stable_session_and_multiplayer_upgrades() -> None:
-    class RecordingSession:
-        def __init__(self) -> None:
-            self.statements: list[str] = []
-
-        async def execute(self, statement: object) -> None:
-            self.statements.append(str(statement))
-
-    session = RecordingSession()
-    await _repair_schema(session)  # type: ignore[arg-type]
-    sql = "\n".join(session.statements)
-
-    assert "iam.auth_sessions ADD COLUMN IF NOT EXISTS last_activity_at" in sql
-    assert "ck_auth_sessions_activity_period" in sql
-    assert "connection_session_id UUID" in sql
-    assert "uq_session_presences_account_current" in sql
-    assert "schema_repair_duplicate" in sql
-    assert "ck_rounds_at_most_one_source" in sql
-    assert "uq_rounds_session_active" in sql
 
 
 @pytest.mark.postgres

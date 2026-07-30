@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Protocol
 
-from perfcho.modules.common.ports import OutboxWriter, UnitOfWork
+from perfcho.modules.common.ports import UnitOfWork
 from perfcho.modules.social.models import (
     AccountIdentityView,
     Achievement,
@@ -142,12 +142,4 @@ class SocialRepositoryFactory(Protocol):
 
     def __call__(self, session: object) -> SocialRepository:
         """Return a transaction-bound repository."""
-        ...
-
-
-class SocialOutboxWriterFactory(Protocol):
-    """Bind an outbox writer to the current social transaction."""
-
-    def __call__(self, session: object) -> OutboxWriter:
-        """Return a transaction-bound outbox writer."""
         ...

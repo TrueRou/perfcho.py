@@ -9,7 +9,6 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.advisory_lock import acquire_transaction_lock
 from perfcho.infra.db.enums import (
     AttemptStatus,
     RoomStatus,
@@ -22,6 +21,7 @@ from perfcho.infra.db.enums import (
 from perfcho.infra.db.enums import (
     ScoreboardVariant as DbScoreboardVariant,
 )
+from perfcho.infra.db.locks import acquire_transaction_lock
 from perfcho.infra.db.models.content import Beatmap, BeatmapRevision
 from perfcho.infra.db.models.moderation import Sanction
 from perfcho.infra.db.models.multiplayer import (

@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Protocol
 
-from perfcho.modules.common.ports import OutboxWriter, UnitOfWork
+from perfcho.modules.common.ports import UnitOfWork
 from perfcho.modules.content.models import (
     BeatmapRevisionView,
     BeatmapsetView,
@@ -101,12 +101,4 @@ class ContentRepositoryFactory(Protocol):
 
     def __call__(self, session: object) -> ContentRepository:
         """Return a transaction-bound content repository."""
-        ...
-
-
-class ContentOutboxWriterFactory(Protocol):
-    """Bind an outbox writer to the content synchronization transaction."""
-
-    def __call__(self, session: object) -> OutboxWriter:
-        """Return a transaction-bound outbox writer."""
         ...

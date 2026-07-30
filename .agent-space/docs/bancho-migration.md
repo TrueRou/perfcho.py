@@ -12,7 +12,7 @@
 
 ## 前置条件
 
-1. 停止 bancho、perfcho API、Outbox Relay、Taskiq Worker 及其他写入进程。
+1. 停止 bancho、perfcho API、Taskiq Worker 及其他写入进程；Worker 停止后内部 Relay 同时停止。
 2. 对 MySQL、PostgreSQL 和 S3 做一致备份，并验证恢复步骤。
 3. 确认源 MySQL 用户只有读取权限；`apply` 自身也会开启只读一致性快照。
 4. 初始化 S3 Bucket，并配置 `S3_ENDPOINT_URL`、`S3_REGION`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`、`S3_BUCKET`。

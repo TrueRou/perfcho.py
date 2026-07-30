@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from hashlib import sha256
 from types import TracebackType
 from typing import cast
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
 from sqlalchemy import Index, UniqueConstraint
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from perfcho.infra.db.enums import CalculationJobStatus
 from perfcho.infra.db.models.scoring import (
     CalculationFormula,
     CalculationFormulaScoreboard,
@@ -22,16 +21,21 @@ from perfcho.infra.db.models.scoring import (
     RankingPolicy,
     ScorePerformance,
 )
-from perfcho.infra.scoring import HttpPerformanceCalculator
-from perfcho.modules.common import Clock, ObjectStorage, PendingEvent, StoredObject
-from perfcho.modules.scoring.errors import PerformanceCalculationError
-from perfcho.modules.scoring.models import (
-    ClientFamily,
+from perfcho.infra.db.repositories.performance.job import SqlAlchemyPerformanceJobRepository
+from perfcho.infra.upstream.calculator import HttpPerformanceCalculator
+from perfcho.modules.common import ObjectUrlProvider, PendingEvent
+from perfcho.modules.performance.errors import PerformanceCalculationError
+from perfcho.modules.performance.models import (
     DifficultyCalculationResult,
-    HitStatistic,
     PerformanceCalculationInput,
     PerformanceCompletion,
     PerformanceResult,
+)
+from perfcho.modules.performance.ports import PerformanceCalculationRepository, PerformanceCalculator
+from perfcho.modules.performance.services import PerformanceCalculationService
+from perfcho.modules.scoring.models import (
+    ClientFamily,
+    HitStatistic,
     Ruleset,
     ScoreboardInfo,
     ScoreboardVariant,
@@ -39,8 +43,6 @@ from perfcho.modules.scoring.models import (
     ScoreOutcome,
     ScoreSubmission,
 )
-from perfcho.modules.scoring.ports import PerformanceCalculationRepository, PerformanceCalculator
-from perfcho.modules.scoring.services import PerformanceCalculationService
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 
@@ -79,12 +81,79 @@ def test_formula_and_ranking_active_indexes_allow_parallel_systems() -> None:
 
 
 @pytest.mark.asyncio
+async def test_performance_job_start_is_idempotent_for_one_lease_token() -> None:
+    calculation = _calculation()
+    lease_token = uuid.uuid4()
+    job = PerformanceCalculationJob(
+        id=calculation.job_id,
+        score_id=calculation.score_id,
+        release_id=calculation.release_id,
+        status=CalculationJobStatus.RUNNING,
+        available_at=NOW,
+        attempt_count=1,
+        enqueue_count=1,
+        lease_owner="tests:owner",
+        lease_token=lease_token,
+        lease_expires_at=NOW + timedelta(minutes=5),
+        attempt_started_at=NOW,
+        input_digest=calculation.input_digest,
+    )
+    session = MagicMock(spec=AsyncSession)
+    session.get.return_value = job
+    session.scalar.return_value = NOW + timedelta(seconds=1)
+    repository = SqlAlchemyPerformanceJobRepository(session, execution_lease_seconds=300)
+
+    assert await repository.start(calculation.job_id, lease_token) is None
+    assert job.attempt_count == 1
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_performance_completion_rejects_dimensions_outside_leased_job() -> None:
+    calculation = _calculation()
+    lease_token = uuid.uuid4()
+    job = PerformanceCalculationJob(
+        id=calculation.job_id,
+        score_id=calculation.score_id + 1,
+        release_id=calculation.release_id,
+        status=CalculationJobStatus.RUNNING,
+        available_at=NOW,
+        attempt_count=1,
+        enqueue_count=1,
+        lease_owner="tests:owner",
+        lease_token=lease_token,
+        lease_expires_at=NOW + timedelta(minutes=5),
+        attempt_started_at=NOW,
+        input_digest=calculation.input_digest,
+    )
+    session = MagicMock(spec=AsyncSession)
+    session.get.return_value = job
+    session.scalar.return_value = NOW + timedelta(seconds=1)
+    repository = SqlAlchemyPerformanceJobRepository(session, execution_lease_seconds=300)
+    result = PerformanceResult(
+        Decimal("321.12345"),
+        DifficultyCalculationResult(Decimal("6.54321"), 1234),
+    )
+
+    with pytest.raises(PerformanceCalculationError, match="dimensions") as caught:
+        await repository.complete(
+            calculation,
+            lease_token,
+            result,
+            output_digest=b"o" * 32,
+        )
+    assert not caught.value.retryable
+
+
+@pytest.mark.asyncio
 async def test_http_calculator_routes_by_formula_calculator_and_verifies_release() -> None:
     calculation = _calculation()
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == httpx.URL("http://calculator.test/v1/performance/calculate")
         assert request.headers["content-type"].startswith("multipart/form-data")
+        assert b"http://s3.test/map.osu" in request.content
+        assert b'name="beatmap"' not in request.content
         return httpx.Response(
             200,
             json={
@@ -108,7 +177,10 @@ async def test_http_calculator_routes_by_formula_calculator_and_verifies_release
         result = await HttpPerformanceCalculator(
             client,
             {"osu-lazer-dotnet": "http://calculator.test/"},
-        ).calculate(calculation, b"osu file")
+        ).calculate(
+            calculation,
+            beatmap_url="http://s3.test/map.osu",
+        )
 
     assert result.pp == Decimal("321.12346")
     assert result.difficulty.star_rating == Decimal("6.54322")
@@ -120,14 +192,29 @@ async def test_http_calculator_rejects_missing_formula_endpoint_without_fallback
     async with httpx.AsyncClient() as client:
         calculator = HttpPerformanceCalculator(client, {"perfcho-rust": "http://rust.test"})
         with pytest.raises(PerformanceCalculationError, match="not configured") as caught:
-            await calculator.calculate(_calculation(), b"osu file")
+            await calculator.calculate(
+                _calculation(),
+                beatmap_url="http://s3.test/map.osu",
+            )
+    assert not caught.value.retryable
+
+
+@pytest.mark.asyncio
+async def test_http_calculator_treats_failed_dependency_as_client_error() -> None:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(424))) as client:
+        calculator = HttpPerformanceCalculator(client, {"osu-lazer-dotnet": "http://calculator.test"})
+        with pytest.raises(PerformanceCalculationError, match="HTTP 424") as caught:
+            await calculator.calculate(
+                _calculation(),
+                beatmap_url="http://s3.test/map.osu",
+            )
     assert not caught.value.retryable
 
 
 @pytest.mark.asyncio
 async def test_calculation_service_keeps_external_io_between_short_transactions() -> None:
     calls: list[str] = []
-    calculation = replace(_calculation(), beatmap_sha256=sha256(b"osu file").digest())
+    calculation = _calculation()
     result = PerformanceResult(
         Decimal("321.12345"),
         DifficultyCalculationResult(Decimal("6.54321"), 1234),
@@ -139,10 +226,9 @@ async def test_calculation_service_keeps_external_io_between_short_transactions(
         lambda session: cast(PerformanceCalculationRepository, repository),
         lambda session: outbox,
         cast(PerformanceCalculator, _FakeCalculator(calls, result)),
-        cast(ObjectStorage, _FakeStorage(calls, b"osu file")),
-        cast(Clock, _FixedClock()),
+        cast(ObjectUrlProvider, _FakeUrlProvider(calls)),
         max_attempts=3,
-        max_beatmap_bytes=1024,
+        beatmap_url_expiry_seconds=600,
         max_retry_seconds=30,
     )
 
@@ -153,9 +239,8 @@ async def test_calculation_service_keeps_external_io_between_short_transactions(
         "start",
         "commit",
         "exit",
-        "storage-open",
-        "storage-read",
-        "calculator",
+        "presign",
+        "calculator-url",
         "enter",
         "complete",
         "outbox",
@@ -169,7 +254,7 @@ async def test_calculation_service_keeps_external_io_between_short_transactions(
 @pytest.mark.asyncio
 async def test_calculation_service_dead_letters_nonretryable_engine_errors() -> None:
     calls: list[str] = []
-    calculation = replace(_calculation(), beatmap_sha256=sha256(b"osu file").digest())
+    calculation = _calculation()
     repository = _FakeCalculationRepository(calls, calculation)
     service = PerformanceCalculationService(
         lambda: _FakeUnitOfWork(calls),
@@ -179,10 +264,9 @@ async def test_calculation_service_dead_letters_nonretryable_engine_errors() -> 
             PerformanceCalculator,
             _FakeCalculator(calls, PerformanceCalculationError("unsupported mods", retryable=False)),
         ),
-        cast(ObjectStorage, _FakeStorage(calls, b"osu file")),
-        cast(Clock, _FixedClock()),
+        cast(ObjectUrlProvider, _FakeUrlProvider(calls)),
         max_attempts=3,
-        max_beatmap_bytes=1024,
+        beatmap_url_expiry_seconds=600,
         max_retry_seconds=30,
     )
 
@@ -236,11 +320,6 @@ def _index_columns(index: Index) -> tuple[str, ...]:
     return tuple(column.name for column in index.columns)
 
 
-class _FixedClock:
-    def now(self) -> datetime:
-        return NOW
-
-
 class _FakeUnitOfWork:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
@@ -280,9 +359,8 @@ class _FakeCalculationRepository:
         result: PerformanceResult,
         *,
         output_digest: bytes,
-        now: datetime,
     ) -> PerformanceCompletion:
-        del lease_token, now
+        del lease_token
         self.calls.append("complete")
         return PerformanceCompletion(
             calculation.score_id,
@@ -304,36 +382,29 @@ class _FakeCalculator:
         self.calls = calls
         self.result = result
 
-    async def calculate(self, calculation: PerformanceCalculationInput, beatmap_content: bytes) -> PerformanceResult:
+    async def calculate(
+        self,
+        calculation: PerformanceCalculationInput,
+        *,
+        beatmap_url: str,
+    ) -> PerformanceResult:
         del calculation
-        self.calls.append("calculator")
-        assert beatmap_content == b"osu file"
+        self.calls.append("calculator-url")
+        assert beatmap_url == "http://s3.test/map.osu"
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
 
 
-class _FakeStream:
-    def __init__(self, calls: list[str], content: bytes) -> None:
+class _FakeUrlProvider:
+    def __init__(self, calls: list[str]) -> None:
         self.calls = calls
-        self.content = content
-        self.metadata = StoredObject("beatmaps/test.osu", len(content), "text/plain", None)
 
-    async def iter_chunks(self) -> AsyncIterator[bytes]:
-        self.calls.append("storage-read")
-        yield self.content
-
-
-class _FakeStorage:
-    def __init__(self, calls: list[str], content: bytes) -> None:
-        self.calls = calls
-        self.content = content
-
-    @asynccontextmanager
-    async def open(self, storage_key: str) -> AsyncIterator[_FakeStream]:
+    async def presign_read(self, storage_key: str, *, expires_in_seconds: int) -> str:
         assert storage_key == "beatmaps/test.osu"
-        self.calls.append("storage-open")
-        yield _FakeStream(self.calls, self.content)
+        assert expires_in_seconds == 600
+        self.calls.append("presign")
+        return "http://s3.test/map.osu"
 
 
 class _FakeOutbox:

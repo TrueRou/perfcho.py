@@ -5,7 +5,7 @@ from contextlib import suppress
 from dataclasses import replace
 from typing import Protocol
 
-from perfcho.composition import StableServices
+from perfcho.infra.composition import StableServices
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
 from perfcho.modules.common.errors import ApplicationError
 from perfcho.modules.identity import ResolvedStableSession
@@ -27,9 +27,7 @@ from perfcho.modules.multiplayer import (
     WinCondition,
 )
 from perfcho.modules.realtime import MailboxOverflow, RealtimeSession
-from perfcho.modules.scoring import CanonicalMod, Ruleset, ScoreboardVariant
-from perfcho.modules.scoring.mods import normalize_mods, parse_legacy_mods
-from perfcho.realtime.stable.builders import (
+from perfcho.modules.realtime.stable.builders import (
     dispose_match,
     match_all_players_loaded,
     match_complete,
@@ -46,8 +44,10 @@ from perfcho.realtime.stable.builders import (
     notification,
     update_match,
 )
-from perfcho.realtime.stable.codec import Packet, ProtocolError
-from perfcho.realtime.stable.models import ClientPacket, Message, MultiplayerMatch
+from perfcho.modules.realtime.stable.codec import Packet, ProtocolError
+from perfcho.modules.realtime.stable.models import ClientPacket, Message, MultiplayerMatch
+from perfcho.modules.scoring import CanonicalMod, Ruleset, ScoreboardVariant
+from perfcho.modules.scoring.mods import normalize_mods, parse_legacy_mods
 
 _RULESETS = (Ruleset.OSU, Ruleset.TAIKO, Ruleset.FRUITS, Ruleset.MANIA)
 _TEAM_MODES = (TeamMode.HEAD_TO_HEAD, TeamMode.TAG_COOP, TeamMode.TEAM_VS, TeamMode.TAG_TEAM_VS)
@@ -739,8 +739,8 @@ def _slot_legacy_bits(ruleset: Ruleset, mods: tuple[CanonicalMod, ...]) -> int:
 
 
 def _presence_name(payload: bytes, account_id: int) -> str:
-    from perfcho.realtime.stable.codec import PacketReader
-    from perfcho.realtime.stable.models import ServerPacket
+    from perfcho.modules.realtime.stable.codec import PacketReader
+    from perfcho.modules.realtime.stable.models import ServerPacket
 
     for packet in PacketReader(payload, packet_enum=ServerPacket):
         if packet.packet_type is ServerPacket.USER_PRESENCE:

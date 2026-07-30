@@ -26,7 +26,7 @@ from perfcho.infra.security.tokens import (
 )
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
-from perfcho.modules.common.ports import Clock, IdGenerator
+from perfcho.modules.common.ports import Clock, IdGenerator, OutboxWriterFactory
 from perfcho.modules.identity.errors import InvalidCredentials, InvalidStableSession, StableSessionAlreadyActive
 from perfcho.modules.identity.models import (
     CredentialSnapshot,
@@ -37,13 +37,12 @@ from perfcho.modules.identity.models import (
     StableWebPrincipal,
 )
 from perfcho.modules.identity.ports import (
-    IdentityOutboxWriterFactory,
     IdentityRepository,
     IdentityRepositoryFactory,
     IdentityUnitOfWork,
 )
 
-_IDENTITY_CONSUMERS = ("identity-projection.v1",)
+_IDENTITY_CONSUMERS = ("identity-projector.v1",)
 _STABLE_ACCOUNT_ID_MAX = 2_147_483_647
 _TOKEN_PREFIX_LENGTH = 16
 
@@ -55,7 +54,7 @@ class IdentityService:
         self,
         uow_factory: Callable[[], IdentityUnitOfWork],
         repository_factory: IdentityRepositoryFactory,
-        outbox_writer_factory: IdentityOutboxWriterFactory,
+        outbox_writer_factory: OutboxWriterFactory,
         password_pepper: PasswordPepper,
         argon2_policy: Argon2Policy,
         token_hmac_key: bytes,

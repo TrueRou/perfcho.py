@@ -1,11 +1,13 @@
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db import engine as infra_db
-from perfcho.infra.db.enums import AccountStatus, AccountType, BeatmapStatus, ChannelKind
+from perfcho.infra.db.enums import AccountStatus, AccountType, BeatmapStatus, ChannelKind, OutboxDeliveryStatus
 from perfcho.infra.db.models.community import (
     Channel,
     ChannelReadProjection,
@@ -18,38 +20,184 @@ from perfcho.infra.db.models.community import (
 )
 from perfcho.infra.db.models.content import Beatmapset, BeatmapsetSyncProjection
 from perfcho.infra.db.models.core import Account
-from perfcho.infra.db.models.events import ActivityEvent, OutboxDelivery, ProjectionCheckpoint
+from perfcho.infra.db.models.events import ActivityEvent, OutboxDelivery, OutboxEvent, ProjectionCheckpoint
 from perfcho.infra.db.models.social import AchievementDefinition, AchievementUnlock
-from perfcho.infra.outbox import _consumers, claim_deliveries, process_delivery, write_outbox_event
-from perfcho.tasks import outbox as outbox_tasks  # noqa: F401
+from perfcho.infra.db.projectors.catalog import (
+    DEFAULT_CONSUMER_CATALOG,
+    ConsumerCatalog,
+    ConsumerRegistration,
+)
+from perfcho.infra.db.relays.outbox_delivery import (
+    OutboxDeliveryProcessor,
+    SqlAlchemyOutboxDeliveryRelayStore,
+)
+from perfcho.infra.db.repositories.outbox import append_outbox_event
+from perfcho.infra.settings import settings
+from perfcho.modules.common.models import JsonValue, PendingEvent
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 ACTOR_ACCOUNT_ID = 2001
 RECIPIENT_ACCOUNT_ID = 2002
 EXPECTED_CONSUMERS = {
-    "account-projection.v1": {"account.registered.v1"},
-    "identity-projection.v1": {"identity.session-opened.v1", "identity.session-closed.v1"},
-    "content-projection.v1": {"content.beatmapset-synchronized.v1"},
-    "social-projection.v1": {
+    "account-projector.v1": {"account.registered.v1"},
+    "identity-projector.v1": {"identity.session-opened.v1", "identity.session-closed.v1"},
+    "content-projector.v1": {"content.beatmapset-synchronized.v1"},
+    "social-projector.v1": {
         "social.account-followed.v1",
         "social.account-unfollowed.v1",
         "social.account-blocked.v1",
         "social.account-unblocked.v1",
     },
-    "achievement-projection.v1": {"social.achievement-unlocked.v1"},
-    "community-projection.v1": {
+    "achievement-projector.v1": {"social.achievement-unlocked.v1"},
+    "community-projector.v1": {
         "community.direct-conversation-created.v1",
         "community.channel-member-joined.v1",
         "community.channel-member-left.v1",
     },
-    "community-message.v1": {"community.message-sent.v1"},
+    "community-message-projector.v1": {"community.message-sent.v1"},
     "ranking-projector.v1": {"score.accepted.v1", "score.performance-calculated.v1"},
 }
 
+TEST_CONSUMER = "tests-projector.v1"
+TEST_EVENT_TYPE = "tests.event.v1"
+
+
+async def _complete_test_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+    del session, event, partition_key
+
+
+async def _fail_test_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+    del session, event, partition_key
+    raise RuntimeError("projector failed")
+
+
+async def write_outbox_event(
+    session: AsyncSession,
+    *,
+    aggregate_type: str,
+    aggregate_id: str,
+    event_type: str,
+    schema_version: int,
+    payload: dict[str, JsonValue],
+    consumers: tuple[str, ...],
+    partition_key: str,
+) -> OutboxEvent:
+    return await append_outbox_event(
+        session,
+        PendingEvent(
+            aggregate_type=aggregate_type,
+            aggregate_id=aggregate_id,
+            event_type=event_type,
+            schema_version=schema_version,
+            payload=payload,
+            consumers=consumers,
+            partition_key=partition_key,
+        ),
+    )
+
 
 def test_outbox_task_registers_every_declared_consumer() -> None:
+    assert set(DEFAULT_CONSUMER_CATALOG) == set(EXPECTED_CONSUMERS)
     for name, event_types in EXPECTED_CONSUMERS.items():
-        assert _consumers[name].event_types == event_types
+        assert DEFAULT_CONSUMER_CATALOG[name].event_types == event_types
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_outbox_dead_delivery_blocks_later_partition_events(postgres_database_url: str) -> None:
+    del postgres_database_url
+    db_engine = await infra_db.create_engine()
+    session_factory = infra_db.create_session_factory(db_engine)
+    store = SqlAlchemyOutboxDeliveryRelayStore(
+        session_factory,
+        batch_size=10,
+        lease_seconds=30,
+        max_attempts=1,
+        max_retry_seconds=30,
+    )
+    processor = OutboxDeliveryProcessor(
+        session_factory,
+        ConsumerCatalog((ConsumerRegistration(TEST_CONSUMER, frozenset({TEST_EVENT_TYPE}), _fail_test_event),)),
+        max_attempts=1,
+        max_retry_seconds=30,
+    )
+    try:
+        async with session_factory.begin() as session:
+            first = await append_outbox_event(
+                session,
+                PendingEvent("test", "1", TEST_EVENT_TYPE, 1, {}, (TEST_CONSUMER,), "test:partition"),
+            )
+            second = await append_outbox_event(
+                session,
+                PendingEvent("test", "2", TEST_EVENT_TYPE, 1, {}, (TEST_CONSUMER,), "test:partition"),
+            )
+
+        claims = await store.claim("tests:dead-owner")
+        assert [claim.event_id for claim in claims] == [first.id]
+        with pytest.raises(RuntimeError, match="projector failed"):
+            await processor.execute(claims[0])
+        assert await store.claim("tests:next-owner") == ()
+
+        async with session_factory() as session:
+            first_delivery = await session.get(
+                OutboxDelivery,
+                {"event_id": first.id, "consumer": TEST_CONSUMER},
+            )
+            second_delivery = await session.get(
+                OutboxDelivery,
+                {"event_id": second.id, "consumer": TEST_CONSUMER},
+            )
+            assert first_delivery is not None and first_delivery.status is OutboxDeliveryStatus.DEAD
+            assert second_delivery is not None and second_delivery.status is OutboxDeliveryStatus.PENDING
+    finally:
+        await db_engine.dispose()
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_outbox_stale_token_and_enqueue_failure_do_not_consume_attempt(
+    postgres_database_url: str,
+) -> None:
+    del postgres_database_url
+    db_engine = await infra_db.create_engine()
+    session_factory = infra_db.create_session_factory(db_engine)
+    store = SqlAlchemyOutboxDeliveryRelayStore(
+        session_factory,
+        batch_size=1,
+        lease_seconds=30,
+        max_attempts=3,
+        max_retry_seconds=30,
+    )
+    processor = OutboxDeliveryProcessor(
+        session_factory,
+        ConsumerCatalog((ConsumerRegistration(TEST_CONSUMER, frozenset({TEST_EVENT_TYPE}), _complete_test_event),)),
+        max_attempts=3,
+        max_retry_seconds=30,
+    )
+    try:
+        async with session_factory.begin() as session:
+            event = await append_outbox_event(
+                session,
+                PendingEvent("test", "1", TEST_EVENT_TYPE, 1, {}, (TEST_CONSUMER,), "test:1"),
+            )
+
+        reference = (await store.claim("tests:enqueue-owner"))[0]
+        await processor.execute(replace(reference, delivery_token=uuid.uuid4()))
+        await store.mark_enqueue_failed(reference, "tests:enqueue-owner", RuntimeError("Redis unavailable"))
+
+        async with session_factory() as session:
+            delivery = await session.get(
+                OutboxDelivery,
+                {"event_id": event.id, "consumer": TEST_CONSUMER},
+            )
+            assert delivery is not None
+            assert delivery.status is OutboxDeliveryStatus.PENDING
+            assert delivery.attempt_count == 0
+            assert delivery.enqueue_count == 1
+            assert delivery.delivery_token is None
+            assert delivery.last_error == "RuntimeError: Redis unavailable"
+    finally:
+        await db_engine.dispose()
 
 
 @pytest.mark.postgres
@@ -60,6 +208,19 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
     del postgres_database_url
     db_engine = await infra_db.create_engine()
     session_factory = infra_db.create_session_factory(db_engine)
+    relay_store = SqlAlchemyOutboxDeliveryRelayStore(
+        session_factory,
+        batch_size=settings.outbox_delivery_batch_size,
+        lease_seconds=settings.outbox_delivery_lease_seconds,
+        max_attempts=settings.outbox_delivery_max_attempts,
+        max_retry_seconds=settings.outbox_delivery_max_retry_seconds,
+    )
+    processor = OutboxDeliveryProcessor(
+        session_factory,
+        DEFAULT_CONSUMER_CATALOG,
+        max_attempts=settings.outbox_delivery_max_attempts,
+        max_retry_seconds=settings.outbox_delivery_max_retry_seconds,
+    )
     try:
         async with session_factory.begin() as session:
             session.add_all(
@@ -155,7 +316,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "registered_at": NOW.isoformat(),
                         "request_id": str(uuid.uuid7()),
                     },
-                    consumers=("account-projection.v1",),
+                    consumers=("account-projector.v1",),
                     partition_key=f"account:{ACTOR_ACCOUNT_ID}",
                 ),
                 await write_outbox_event(
@@ -175,7 +336,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "expires_at": NOW.replace(hour=23).isoformat(),
                         "request_id": str(uuid.uuid7()),
                     },
-                    consumers=("identity-projection.v1",),
+                    consumers=("identity-projector.v1",),
                     partition_key=f"account:{ACTOR_ACCOUNT_ID}",
                 ),
                 await write_outbox_event(
@@ -192,7 +353,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "removed_beatmap_count": 0,
                         "source_updated_at": NOW.isoformat(),
                     },
-                    consumers=("content-projection.v1",),
+                    consumers=("content-projector.v1",),
                     partition_key=f"beatmapset:{beatmapset.id}",
                 ),
                 await write_outbox_event(
@@ -207,7 +368,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "mutual": False,
                         "followed_at": NOW.isoformat(),
                     },
-                    consumers=("social-projection.v1",),
+                    consumers=("social-projector.v1",),
                     partition_key=f"social-pair:{ACTOR_ACCOUNT_ID}:{RECIPIENT_ACCOUNT_ID}",
                 ),
                 await write_outbox_event(
@@ -223,7 +384,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "score_id": None,
                         "unlocked_at": NOW.isoformat(),
                     },
-                    consumers=("achievement-projection.v1",),
+                    consumers=("achievement-projector.v1",),
                     partition_key=f"account:{ACTOR_ACCOUNT_ID}",
                 ),
                 await write_outbox_event(
@@ -237,7 +398,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "low_account_id": ACTOR_ACCOUNT_ID,
                         "high_account_id": RECIPIENT_ACCOUNT_ID,
                     },
-                    consumers=("community-projection.v1",),
+                    consumers=("community-projector.v1",),
                     partition_key=f"channel:{channel.id}",
                 ),
                 await write_outbox_event(
@@ -257,29 +418,24 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "reply_to_id": None,
                         "created_at": NOW.isoformat(),
                     },
-                    consumers=("community-message.v1",),
+                    consumers=("community-message-projector.v1",),
                     partition_key=f"channel:{channel.id}",
                 ),
             )
             event_consumers = (
-                "account-projection.v1",
-                "identity-projection.v1",
-                "content-projection.v1",
-                "social-projection.v1",
-                "achievement-projection.v1",
-                "community-projection.v1",
-                "community-message.v1",
+                "account-projector.v1",
+                "identity-projector.v1",
+                "content-projector.v1",
+                "social-projector.v1",
+                "achievement-projector.v1",
+                "community-projector.v1",
+                "community-message-projector.v1",
             )
 
-        claims = await claim_deliveries(session_factory, "tests:consumer-owner")
+        claims = await relay_store.claim("tests:consumer-owner")
         assert {reference.event_id for reference in claims} == {event.id for event in events}
         for reference in claims:
-            await process_delivery(
-                session_factory,
-                reference.event_id,
-                reference.consumer,
-                reference.delivery_token,
-            )
+            await processor.execute(reference)
 
         async with session_factory.begin() as session:
             for event, consumer in zip(events, event_consumers, strict=True):
@@ -288,7 +444,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                     {"event_id": event.id, "consumer": consumer},
                 )
                 assert delivery is not None and delivery.completed_at is not None
-                registration = _consumers[delivery.consumer]
+                registration = DEFAULT_CONSUMER_CATALOG[delivery.consumer]
                 await registration.handler(session, event, delivery.partition_key)
 
         async with session_factory() as session:
@@ -313,22 +469,17 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                 event_type="account.registered.v1",
                 schema_version=1,
                 payload={"account_id": "invalid"},
-                consumers=("account-projection.v1",),
+                consumers=("account-projector.v1",),
                 partition_key=f"account:{ACTOR_ACCOUNT_ID}",
             )
-        invalid_claim = await claim_deliveries(session_factory, "tests:invalid-owner")
+        invalid_claim = await relay_store.claim("tests:invalid-owner")
         assert [reference.event_id for reference in invalid_claim] == [invalid.id]
         with pytest.raises(RuntimeError, match="account_id"):
-            await process_delivery(
-                session_factory,
-                invalid.id,
-                "account-projection.v1",
-                invalid_claim[0].delivery_token,
-            )
+            await processor.execute(invalid_claim[0])
         async with session_factory() as session:
             delivery = await session.get(
                 OutboxDelivery,
-                {"event_id": invalid.id, "consumer": "account-projection.v1"},
+                {"event_id": invalid.id, "consumer": "account-projector.v1"},
             )
             assert delivery is not None
             assert delivery.attempt_count == 1

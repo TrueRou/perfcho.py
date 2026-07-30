@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Protocol
 
 from perfcho.modules.account.models import RegistrationClaim, RegistrationRecord, RegistrationResult
-from perfcho.modules.common.ports import OutboxWriter, UnitOfWork
+from perfcho.modules.common.ports import UnitOfWork
 
 
 class AccountUnitOfWork(UnitOfWork, Protocol):
@@ -56,12 +56,4 @@ class AccountRepositoryFactory(Protocol):
 
     def __call__(self, session: object) -> AccountRepository:
         """Return a repository that never owns the transaction."""
-        ...
-
-
-class AccountOutboxWriterFactory(Protocol):
-    """Bind an outbox writer to a unit of work's transaction resource."""
-
-    def __call__(self, session: object) -> OutboxWriter:
-        """Return an outbox writer that never owns the transaction."""
         ...

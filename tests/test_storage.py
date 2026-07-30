@@ -4,7 +4,7 @@ from types import TracebackType
 
 import pytest
 
-from perfcho.infra.s3 import S3ObjectStorage
+from perfcho.infra.storage import S3ObjectStorage
 
 
 class FakeBody:
@@ -28,6 +28,8 @@ class FakeClient:
         self.put_calls: list[dict[str, object]] = []
         self.get_calls: list[dict[str, object]] = []
         self.delete_calls: list[dict[str, object]] = []
+        self.presign_calls: list[tuple[str, dict[str, object]]] = []
+        self.client_calls: list[tuple[str, dict[str, object]]] = []
 
     async def put_object(self, **kwargs: object) -> Mapping[str, object]:
         self.put_calls.append(kwargs)
@@ -46,6 +48,10 @@ class FakeClient:
     async def delete_object(self, **kwargs: object) -> object:
         self.delete_calls.append(kwargs)
         return {}
+
+    def generate_presigned_url(self, operation: str, **kwargs: object) -> str:
+        self.presign_calls.append((operation, kwargs))
+        return "http://calculator-visible-minio.test/perfcho/beatmaps/200/map.osu?signature=test"
 
 
 class FakeClientContext:
@@ -71,6 +77,7 @@ class FakeSession:
 
     def client(self, service_name: str, **kwargs: object) -> FakeClientContext:
         self.client_calls.append((service_name, kwargs))
+        self.fake_client.client_calls.append((service_name, kwargs))
         return FakeClientContext(self.fake_client)
 
 
@@ -85,6 +92,7 @@ def object_storage(content: bytes = b"abcdefg") -> tuple[S3ObjectStorage, FakeCl
         secret_key="secret",
         addressing_style="path",
         chunk_size=3,
+        presign_endpoint_url="http://calculator-visible-minio.test",
         session=FakeSession(client),
     )
     return storage, client, body
@@ -105,6 +113,7 @@ async def test_s3_put_stream_and_delete_preserve_verified_metadata() -> None:
         chunks = [chunk async for chunk in stream.iter_chunks()]
         opened = stream.metadata
     await storage.delete("beatmaps/200/map.osu")
+    url = await storage.presign_read("beatmaps/200/map.osu", expires_in_seconds=600)
 
     assert stored.sha256 == digest
     assert stored.etag == "put-etag"
@@ -114,6 +123,17 @@ async def test_s3_put_stream_and_delete_preserve_verified_metadata() -> None:
     assert opened.etag == "get-etag"
     assert body.closed
     assert client.delete_calls == [{"Bucket": "perfcho", "Key": "beatmaps/200/map.osu"}]
+    assert url.startswith("http://calculator-visible-minio.test/")
+    assert client.presign_calls == [
+        (
+            "get_object",
+            {
+                "Params": {"Bucket": "perfcho", "Key": "beatmaps/200/map.osu"},
+                "ExpiresIn": 600,
+            },
+        )
+    ]
+    assert client.client_calls[-1][1]["endpoint_url"] == "http://calculator-visible-minio.test"
 
 
 @pytest.mark.asyncio

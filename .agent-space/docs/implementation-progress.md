@@ -1,20 +1,20 @@
 # 实现进度
 
-最后更新：2026-07-29。
+最后更新：2026-07-30。
 
 状态定义见[文档索引](README.md)：已接线、已实现未接线、仅设计必须严格区分。完整事实见[当前实现总览](current-implementation.md)，Stable 路由与 Packet 见[支持矩阵](stable-adapter.md)，后续约束见[剩余设计](remaining-design.md)。
 
 ## 已完成并接线
 
 - 应用内核：协议无关 Actor/Client/Command、显式 Unit of Work、命令回执和 Transactional Outbox。
-- Outbox Consumer：Account/Identity/Content/Social/Achievement/Community/Ranking 全部显式注册，幂等写 Activity、Notification、频道/内容读模型与 Projection Checkpoint。
+- Outbox Consumer：Account/Identity/Content/Social/Achievement/Community/Ranking 通过显式 Consumer Catalog 组合，幂等写 Activity、Notification、频道/内容读模型与 Projection Checkpoint；Dead Delivery 保持分区阻塞。
 - Account/Identity/Authorization：Stable MD5 预验证、Argon2id+Pepper、Stable 单会话、Web 凭据证明和权限位投影。
 - Content：ID/MD5/文件名查询、Direct 搜索、收藏、评分、不可变 Revision 读取、S3 对象存储和 `.osu` 流式读取。
 - Social/Community：关注、屏蔽、频道、公开消息、私信与离线消息规范服务及 SQLAlchemy Repository。
 - Stable Bancho：登录、Bootstrap、Poll、Presence、频道、公开消息、好友和 Mailbox。
 - Stable Web：好友、Beatmap Info、Direct、收藏、评分、更新探针、下载重定向和本地谱面文件。
-- Scoring：Canonical Score、Legacy Mod 规范化、命中/Accuracy/Grade 校验、命令与 Attempt 幂等、Score/Hit/Replay/Attestation 原子写入和账户/多人提交校验。
-- Multi-PP：Formula/Scoreboard、不可变 Difficulty/Performance Release、每 Score/Release 持久 Job、Lease/Fencing、版本化 HTTP Calculator、Input/Output Digest、多结果 Query 与 Performance 完成事件。
+- Scoring：Canonical Score、Legacy Mod 规范化、命中/Accuracy/Grade 校验、命令与 Attempt 幂等、Score/Hit/Replay/Attestation 原子写入、账户/多人提交校验和中性后续任务调度端口。
+- Performance：独立业务模块与适配器，包含 Formula/Scoreboard、不可变 Difficulty/Performance Release、每 Score/Release 持久 Job、独立 Job Relay、单 Token Attempt、Lease/Fencing、版本化 HTTP Calculator、Input/Output Digest、多结果 Query 与完成事件。
 - Stable Scoring：Rijndael modular submission、Replay staging/download、提交 Chart 和 `osu-osz2-getscores.php`。
 - Ranking：成绩接受与 Performance 完成 Consumer、活动 Policy/Mod Policy Eligibility、Overall/Exact-Mods 最佳成绩投影及 Top/Mods/Friends/Country 查询。
 - Spectator：关系 Fence、Join/Leave/Fellow 通知、有界 Frame 历史和 Mailbox 扇出。

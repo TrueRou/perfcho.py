@@ -27,18 +27,19 @@ from perfcho.infra.db.projectors.common import (
     require_accounts,
     require_event_context,
 )
-from perfcho.infra.outbox import register_consumer
 
-_COMMUNITY_CONSUMER = "community-projection.v1"
-_MESSAGE_CONSUMER = "community-message.v1"
-_COMMUNITY_EVENT_TYPES = (
-    "community.direct-conversation-created.v1",
-    "community.channel-member-joined.v1",
-    "community.channel-member-left.v1",
+COMMUNITY_CONSUMER_NAME = "community-projector.v1"
+MESSAGE_CONSUMER_NAME = "community-message-projector.v1"
+COMMUNITY_EVENT_TYPES = frozenset(
+    {
+        "community.direct-conversation-created.v1",
+        "community.channel-member-joined.v1",
+        "community.channel-member-left.v1",
+    }
 )
+MESSAGE_EVENT_TYPES = frozenset({"community.message-sent.v1"})
 
 
-@register_consumer(_COMMUNITY_CONSUMER, _COMMUNITY_EVENT_TYPES)
 async def project_community_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project direct-conversation and durable membership changes."""
     channel_id = payload_integer(event.payload, "channel_id")
@@ -75,10 +76,9 @@ async def project_community_event(session: AsyncSession, event: OutboxEvent, par
             occurred_at=event.created_at,
             snapshot={"channel_id": channel_id},
         )
-    await advance_checkpoint(session, event, projector=_COMMUNITY_CONSUMER, partition_key=partition_key)
+    await advance_checkpoint(session, event, projector=COMMUNITY_CONSUMER_NAME, partition_key=partition_key)
 
 
-@register_consumer(_MESSAGE_CONSUMER, ("community.message-sent.v1",))
 async def project_community_message(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project channel recency and create durable direct-message notification intents."""
     message_id = payload_integer(event.payload, "message_id")
@@ -143,7 +143,7 @@ async def project_community_message(session: AsyncSession, event: OutboxEvent, p
             },
             recipient_account_ids=(recipient_account_id,),
         )
-    await advance_checkpoint(session, event, projector=_MESSAGE_CONSUMER, partition_key=partition_key)
+    await advance_checkpoint(session, event, projector=MESSAGE_CONSUMER_NAME, partition_key=partition_key)
 
 
 async def _upsert_channel_projection(

@@ -13,7 +13,6 @@ from types import MappingProxyType
 from perfcho.modules.common.models import CommandMeta, JsonValue
 
 _MOD_ACRONYM = re.compile(r"^[A-Z0-9]{1,8}$")
-_CALCULATION_QUANTUM = Decimal("0.00001")
 
 
 class Ruleset(StrEnum):
@@ -340,146 +339,6 @@ class ValidatedScore:
 
 
 @dataclass(frozen=True, slots=True)
-class PerformanceCalculationInput:
-    """Provide immutable score, release, and beatmap facts to one calculator."""
-
-    job_id: uuid.UUID
-    score_id: int
-    attempt_count: int
-    formula_id: uuid.UUID
-    formula_code: str
-    calculator: str
-    release_id: uuid.UUID
-    release_version: str
-    artifact_digest: bytes
-    release_configuration: Mapping[str, JsonValue]
-    difficulty_formula_id: uuid.UUID
-    difficulty_formula_code: str
-    difficulty_release_id: uuid.UUID
-    difficulty_release_version: str
-    difficulty_artifact_digest: bytes
-    difficulty_release_configuration: Mapping[str, JsonValue]
-    input_digest: bytes
-    beatmap_revision_id: int
-    beatmap_sha256: bytes
-    beatmap_storage_key: str
-    scoreboard: ScoreboardInfo
-    mod_set_id: int
-    mods: tuple[CanonicalMod, ...]
-    client_family: ClientFamily
-    score: ScoreSubmission
-
-    def __post_init__(self) -> None:
-        """Validate identities, digests, and recursively immutable configuration."""
-        if self.score_id < 1 or self.attempt_count < 1 or self.beatmap_revision_id < 1 or self.mod_set_id < 1:
-            raise ValueError("performance calculation identifiers and attempt count must be positive")
-        if (
-            not self.formula_code
-            or not self.calculator
-            or not self.release_version
-            or not self.difficulty_formula_code
-            or not self.difficulty_release_version
-            or not self.beatmap_storage_key
-        ):
-            raise ValueError("performance calculation release metadata must be non-empty")
-        if (
-            len(self.artifact_digest) != 32
-            or len(self.difficulty_artifact_digest) != 32
-            or len(self.input_digest) != 32
-            or len(self.beatmap_sha256) != 32
-        ):
-            raise ValueError("performance calculation digests must contain 32 bytes")
-        configuration = _freeze_json(dict(self.release_configuration))
-        difficulty_configuration = _freeze_json(dict(self.difficulty_release_configuration))
-        if not isinstance(configuration, Mapping) or not isinstance(difficulty_configuration, Mapping):
-            raise ValueError("release configuration must be a JSON object")
-        object.__setattr__(self, "release_configuration", configuration)
-        object.__setattr__(self, "difficulty_release_configuration", difficulty_configuration)
-        object.__setattr__(self, "mods", tuple(self.mods))
-
-    def digest_payload(self) -> dict[str, object]:
-        """Return algorithm inputs without transport or retry identities."""
-        return {
-            "schema_version": 1,
-            "formula_id": str(self.formula_id),
-            "formula_code": self.formula_code,
-            "calculator": self.calculator,
-            "release_id": str(self.release_id),
-            "release_version": self.release_version,
-            "artifact_digest": self.artifact_digest.hex(),
-            "release_configuration": _thaw_json(self.release_configuration),
-            "difficulty_formula_id": str(self.difficulty_formula_id),
-            "difficulty_formula_code": self.difficulty_formula_code,
-            "difficulty_release_id": str(self.difficulty_release_id),
-            "difficulty_release_version": self.difficulty_release_version,
-            "difficulty_artifact_digest": self.difficulty_artifact_digest.hex(),
-            "difficulty_release_configuration": _thaw_json(self.difficulty_release_configuration),
-            "beatmap_revision_id": self.beatmap_revision_id,
-            "beatmap_sha256": self.beatmap_sha256.hex(),
-            "ruleset": self.scoreboard.ruleset.value,
-            "variant": self.scoreboard.variant.value,
-            "mod_set_id": self.mod_set_id,
-            "mods": [mod.as_json() for mod in self.mods],
-            "client_family": self.client_family.value,
-            "score": {
-                "total_score": self.score.total_score,
-                "classic_score": self.score.classic_score,
-                "accuracy": str(self.score.accuracy),
-                "max_combo": self.score.max_combo,
-                "outcome": self.score.outcome.value,
-                "hits": [
-                    {
-                        "hit_result": statistic.hit_result,
-                        "actual": statistic.actual,
-                        "maximum": statistic.maximum,
-                    }
-                    for statistic in self.score.hits
-                ],
-            },
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class DifficultyCalculationResult:
-    """Describe difficulty attributes returned with one PP calculation."""
-
-    star_rating: Decimal
-    max_combo: int
-    attributes: Mapping[str, JsonValue] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        """Require finite nonnegative difficulty values and immutable details."""
-        star_rating = _decimal(self.star_rating).quantize(_CALCULATION_QUANTUM)
-        if star_rating < 0 or isinstance(self.max_combo, bool) or self.max_combo < 0:
-            raise ValueError("difficulty values must be nonnegative")
-        attributes = _freeze_json(dict(self.attributes))
-        if not isinstance(attributes, Mapping):
-            raise ValueError("difficulty attributes must be a JSON object")
-        object.__setattr__(self, "star_rating", star_rating)
-        object.__setattr__(self, "attributes", attributes)
-
-
-@dataclass(frozen=True, slots=True)
-class PerformanceResult:
-    """Describe deterministic difficulty and PP output from one calculator."""
-
-    pp: Decimal
-    difficulty: DifficultyCalculationResult
-    breakdown: Mapping[str, JsonValue] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        """Require nonnegative finite PP and immutable JSON details."""
-        pp = _decimal(self.pp).quantize(_CALCULATION_QUANTUM)
-        if pp < 0:
-            raise ValueError("performance pp must be nonnegative")
-        breakdown = _freeze_json(dict(self.breakdown))
-        if not isinstance(breakdown, Mapping):
-            raise ValueError("performance breakdown must be a JSON object")
-        object.__setattr__(self, "pp", pp)
-        object.__setattr__(self, "breakdown", breakdown)
-
-
-@dataclass(frozen=True, slots=True)
 class AcceptedScoreResult:
     """Return stable identities from an accepted score transaction."""
 
@@ -530,50 +389,6 @@ class ScoreAcceptanceRecord:
     attestation: ScoreAttestation
     validated: ValidatedScore
     processed_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class PerformanceCompletion:
-    """Return persisted formula identities needed to publish completion."""
-
-    score_id: int
-    scoreboard_id: int
-    formula_id: uuid.UUID
-    formula_code: str
-    release_id: uuid.UUID
-    pp: Decimal
-    output_digest: bytes
-
-
-@dataclass(frozen=True, slots=True)
-class ScorePerformanceView:
-    """Expose one Formula-owned PP result without persistence entities."""
-
-    score_id: int
-    formula_id: uuid.UUID
-    formula_code: str
-    formula_name: str
-    calculator: str
-    release_id: uuid.UUID
-    release_version: str
-    release_active: bool
-    pp: Decimal
-    breakdown: Mapping[str, JsonValue]
-
-    def __post_init__(self) -> None:
-        """Validate bounded display metadata and freeze the result breakdown."""
-        if self.score_id < 1 or not self.formula_code or not self.formula_name or not self.calculator:
-            raise ValueError("score performance identity metadata is invalid")
-        if not self.release_version:
-            raise ValueError("score performance release version is empty")
-        pp = _decimal(self.pp).quantize(_CALCULATION_QUANTUM)
-        if pp < 0:
-            raise ValueError("score performance pp must be nonnegative")
-        breakdown = _freeze_json(dict(self.breakdown))
-        if not isinstance(breakdown, Mapping):
-            raise ValueError("score performance breakdown must be a JSON object")
-        object.__setattr__(self, "pp", pp)
-        object.__setattr__(self, "breakdown", breakdown)
 
 
 @dataclass(frozen=True, slots=True)

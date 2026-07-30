@@ -31,7 +31,7 @@ from perfcho.modules.multiplayer import (
 )
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant
 
-NOW = datetime(2026, 7, 29, 12, tzinfo=UTC)
+NOW = datetime(2099, 7, 29, 12, tzinfo=UTC)
 
 
 def test_multiplayer_partial_unique_indexes_cover_global_presence_and_active_round() -> None:

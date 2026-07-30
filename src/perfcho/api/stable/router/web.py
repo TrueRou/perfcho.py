@@ -2,19 +2,40 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 from urllib.parse import parse_qs, quote
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse, StreamingResponse
+from starlette.formparsers import MultiPartException
 
+from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
+from perfcho.api.stable.canonize.scoring import (
+    ParsedStableScore,
+    decrypt_stable_score,
+    normalize_stable_attestation,
+    parse_stable_submission_form,
+    read_stable_replay,
+    stable_submission_digest,
+    validate_stable_submission_evidence,
+    validate_stable_submission_time,
+    verify_stable_online_checksum,
+)
 from perfcho.api.stable.dependencies import StableServicesDependency
-from perfcho.modules.common import ApplicationError, ObjectStorage, ObjectUnavailable
+from perfcho.modules.common import (
+    Actor,
+    ApplicationError,
+    ClientContext,
+    CommandMeta,
+    ObjectStorage,
+    ObjectUnavailable,
+)
 from perfcho.modules.community import CommunityService
 from perfcho.modules.content import (
     BeatmapNotFound,
@@ -28,10 +49,25 @@ from perfcho.modules.content import (
 )
 from perfcho.modules.identity import InvalidCredentials, StableWebPrincipal
 from perfcho.modules.realtime import RealtimeSessionFenced, RealtimeSessionNotFound
-from perfcho.modules.scoring import RankingQueryService, Ruleset, ScoreGrade
+from perfcho.modules.scoring import (
+    AcceptScore,
+    BeatmapReference,
+    BeatmapRevisionNotFound,
+    LeaderboardPage,
+    LeaderboardScoreView,
+    RankingQueryService,
+    ReplayNotFound,
+    ReplayQueryService,
+    ReplayService,
+    Ruleset,
+    ScoreGrade,
+    ScoringService,
+    StagedReplayManifest,
+)
+from perfcho.modules.scoring.mods import parse_legacy_mods
 from perfcho.modules.social import SocialService
 
-router = APIRouter(include_in_schema=False, default_response_class=Response)
+router = APIRouter(default_response_class=Response)
 
 _BEATMAP_LOOKUP_LIMIT = 512
 _EMPTY_DIRECT_RESULT = b"0"
@@ -47,6 +83,7 @@ _DIRECT_STATUS_FILTERS = {
 }
 _EMPTY_DATETIME = datetime(1970, 1, 1, tzinfo=UTC)
 _GRADE_RULESETS = (Ruleset.OSU, Ruleset.TAIKO, Ruleset.FRUITS, Ruleset.MANIA)
+_RULESET_IDS = {ruleset.value: index for index, ruleset in enumerate(_GRADE_RULESETS)}
 _OFFICIAL_DOWNLOAD_BASE_URL = "https://osu.ppy.sh/beatmapsets"
 _PUBLIC_DOWNLOAD_BASE_URL = "https://api.nerinyan.moe/d"
 
@@ -86,6 +123,30 @@ def _object_storage(services: StableServicesDependency) -> ObjectStorage:
     return services.object_storage
 
 
+def _scoring(services: StableServicesDependency) -> ScoringService:
+    if services.scoring is None:
+        raise RuntimeError("Stable scoring is not configured")
+    return services.scoring
+
+
+def _replay_query(services: StableServicesDependency) -> ReplayQueryService:
+    if services.replay_query is None:
+        raise RuntimeError("Stable replay queries are not configured")
+    return services.replay_query
+
+
+def _replay(services: StableServicesDependency) -> ReplayService:
+    if services.replay is None:
+        raise RuntimeError("Stable replay commands are not configured")
+    return services.replay
+
+
+def _ranking_query(services: StableServicesDependency) -> RankingQueryService:
+    if services.ranking_query is None:
+        raise RuntimeError("Stable ranking queries are not configured")
+    return services.ranking_query
+
+
 async def _authenticate(
     services: StableServicesDependency,
     username: str,
@@ -113,6 +174,14 @@ async def _rating_authentication(
     services: StableServicesDependency,
     username: Annotated[str, Query(alias="u", min_length=1, max_length=64)],
     password_token: Annotated[str, Query(alias="p", min_length=32, max_length=32)],
+) -> _WebAuthentication:
+    return await _authenticate(services, username, password_token)
+
+
+async def _leaderboard_authentication(
+    services: StableServicesDependency,
+    username: Annotated[str, Query(alias="us", min_length=1, max_length=64)],
+    password_token: Annotated[str, Query(alias="ha", min_length=32, max_length=32)],
 ) -> _WebAuthentication:
     return await _authenticate(services, username, password_token)
 
@@ -507,3 +576,284 @@ async def download_beatmapset(
         if no_video:
             target += "?noVideo=1"
     return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
+
+
+@router.post("/web/osu-submit-modular-selector.php")
+async def submit_score(
+    request: Request,
+    services: StableServicesDependency,
+    scoring: Annotated[ScoringService, Depends(_scoring)],
+    content_query: Annotated[ContentQueryService, Depends(_content_query)],
+    object_storage: Annotated[ObjectStorage, Depends(_object_storage)],
+) -> Response:
+    """Decrypt, authenticate, stage, and atomically accept one Stable score."""
+    try:
+        form = await parse_stable_submission_form(request, services.settings.stable_score_submission_max_bytes)
+        parsed = decrypt_stable_score(
+            score_data_b64=form.encrypted_score,
+            client_hash_b64=form.encrypted_client_hash,
+            iv_b64=form.iv,
+            osu_version=form.osu_version,
+            exited=form.exited,
+            fail_time_ms=form.fail_time_ms,
+            score_time_ms=form.score_time_ms,
+            supported_build=services.settings.stable_build,
+        )
+        validate_stable_submission_evidence(form, parsed)
+    except HTTPException, MultiPartException, ValueError:
+        return Response(b"error: no")
+
+    authentication = await _authenticate(services, parsed.username, form.password_token)
+    principal = authentication.principal
+    if principal is None:
+        return Response(b"error: pass")
+    try:
+        verify_stable_online_checksum(
+            parsed,
+            osu_version=form.osu_version,
+            storyboard_hash=form.storyboard_hash,
+            username=principal.current_name,
+        )
+    except ValueError:
+        return Response(b"error: no")
+    try:
+        beatmap = await content_query.lookup_md5(parsed.beatmap_md5)
+    except BeatmapNotFound:
+        return Response(b"error: beatmap")
+    received_at = services.clock.now()
+    try:
+        validate_stable_submission_time(parsed, received_at)
+    except ValueError:
+        return Response(b"error: no")
+
+    try:
+        replay_content = await read_stable_replay(form.replay, services.settings.stable_replay_max_bytes)
+    except ValueError:
+        return Response(b"error: no")
+    finally:
+        await form.replay.close()
+    replay_digest = hashlib.sha256(replay_content).digest()
+    storage_key = f"replays/stable/{principal.account_id}/{replay_digest.hex()}.osr"
+    try:
+        stored = await object_storage.put(
+            storage_key,
+            replay_content,
+            media_type="application/octet-stream",
+            expected_sha256=replay_digest,
+        )
+    except ObjectUnavailable:
+        return Response(b"")
+
+    request_id = services.id_generator.new()
+    online_checksum = parsed.score.online_checksum
+    if online_checksum is None:
+        return Response(b"error: no")
+    command = AcceptScore(
+        meta=CommandMeta(
+            request_id=request_id,
+            idempotency_key=f"stable-score:{principal.account_id}:{online_checksum.hex()}",
+            request_digest=stable_submission_digest(form, replay_digest),
+            actor=Actor(principal.account_id, principal.session_id),
+            client=ClientContext(
+                family="stable",
+                version=services.settings.stable_build,
+                variant=None,
+                ip_address=resolve_client_ip(request, services.settings.trusted_proxy_cidrs),
+                user_agent=request.headers.get("user-agent"),
+            ),
+            received_at=received_at,
+        ),
+        beatmap=BeatmapReference(md5=parsed.beatmap_md5),
+        ruleset=parsed.ruleset,
+        variant=parsed.variant,
+        mods=parsed.mods,
+        attempt=parsed.attempt,
+        score=parsed.score,
+        replay=StagedReplayManifest(
+            format="stable",
+            sha256=replay_digest,
+            size_bytes=stored.size_bytes,
+            storage_key=stored.storage_key,
+            client_version=services.settings.stable_build,
+        ),
+        attestation=normalize_stable_attestation(form, parsed),
+        multiplayer=None,
+    )
+    try:
+        if services.multiplayer is not None:
+            command = replace(
+                command,
+                multiplayer=await services.multiplayer.resolve_submission_context(
+                    principal.account_id,
+                    beatmap.revision_id,
+                ),
+            )
+        result = await scoring.accept(command)
+    except BeatmapRevisionNotFound:
+        return Response(b"error: beatmap")
+    except ApplicationError, ValueError:
+        return Response(b"error: no")
+    if result.outcome.value != "passed":
+        return Response(b"error: no")
+    return Response(_submission_chart(result.score_id, beatmap, parsed))
+
+
+@router.get("/web/osu-getreplay.php")
+async def get_replay(
+    authentication: Annotated[_WebAuthentication, Depends(_web_authentication)],
+    replay_query: Annotated[ReplayQueryService, Depends(_replay_query)],
+    replay_service: Annotated[ReplayService, Depends(_replay)],
+    object_storage: Annotated[ObjectStorage, Depends(_object_storage)],
+    services: StableServicesDependency,
+    mode: Annotated[int, Query(alias="m", ge=0, le=3)],
+    score_id: Annotated[int, Query(alias="c", gt=0)],
+) -> Response:
+    """Stream one ready replay and append an idempotent non-owner view fact."""
+    principal = authentication.principal
+    if principal is None:
+        return Response(b"", status_code=status.HTTP_401_UNAUTHORIZED)
+    try:
+        replay = await replay_query.get(score_id)
+    except ReplayNotFound:
+        return Response(b"", status_code=status.HTTP_404_NOT_FOUND)
+    if _RULESET_IDS[replay.ruleset.value] != mode:
+        return Response(b"", status_code=status.HTTP_404_NOT_FOUND)
+    stream_context = object_storage.open(replay.storage_key)
+    try:
+        object_stream = await stream_context.__aenter__()
+    except ObjectUnavailable:
+        return Response(b"", status_code=status.HTTP_404_NOT_FOUND)
+    await replay_service.record_view(
+        request_id=services.id_generator.new(),
+        replay=replay,
+        viewer_account_id=principal.account_id,
+    )
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in object_stream.iter_chunks():
+                yield chunk
+        finally:
+            await stream_context.__aexit__(None, None, None)
+
+    return StreamingResponse(
+        body(),
+        media_type="application/octet-stream",
+        headers={"Content-Length": str(replay.size_bytes)},
+    )
+
+
+@router.get("/web/osu-osz2-getscores.php")
+async def get_scores(
+    authentication: Annotated[_WebAuthentication, Depends(_leaderboard_authentication)],
+    content_query: Annotated[ContentQueryService, Depends(_content_query)],
+    ranking_query: Annotated[RankingQueryService, Depends(_ranking_query)],
+    social: Annotated[SocialService, Depends(_social)],
+    requesting_from_editor: Annotated[bool, Query(alias="s")],
+    leaderboard_version: Annotated[int, Query(alias="vv", ge=0)],
+    leaderboard_type: Annotated[int, Query(alias="v", ge=0, le=4)],
+    map_md5: Annotated[str, Query(alias="c", min_length=32, max_length=32)],
+    map_filename: Annotated[str, Query(alias="f", min_length=1, max_length=255)],
+    mode: Annotated[int, Query(alias="m", ge=0, le=3)],
+    map_set_id: Annotated[int, Query(alias="i", ge=-1, le=2_147_483_647)],
+    legacy_mod_bits: Annotated[int, Query(alias="mods", ge=0, le=2_147_483_647)],
+    map_package_hash: Annotated[str, Query(alias="h", max_length=512)],
+    legacy_client_flag: Annotated[bool, Query(alias="a")],
+) -> Response:
+    """Return one Stable leaderboard page from ranking projections."""
+    del leaderboard_version, map_package_hash, legacy_client_flag
+    principal = authentication.principal
+    if principal is None:
+        return Response(b"", status_code=status.HTTP_401_UNAUTHORIZED)
+    try:
+        beatmap = await content_query.lookup_md5(map_md5)
+    except BeatmapNotFound:
+        try:
+            await content_query.lookup_filename(map_filename)
+        except BeatmapNotFound:
+            return Response(b"-1|false")
+        return Response(b"1|false")
+    if not beatmap.is_current:
+        return Response(b"1|false")
+    if map_set_id > 0 and map_set_id != beatmap.external_beatmapset_id:
+        return Response(b"-1|false")
+    try:
+        _, variant = parse_legacy_mods(legacy_mod_bits)
+    except ValueError:
+        return Response(b"-1|false")
+    ruleset = _GRADE_RULESETS[mode]
+    if leaderboard_type == 3:
+        friends = await social.list_friends(principal.account_id)
+        friend_ids = tuple(friend.account_id for friend in friends)
+    else:
+        friend_ids = ()
+    page = (
+        LeaderboardPage((), None)
+        if requesting_from_editor
+        else await ranking_query.get_stable_leaderboard(
+            beatmap_id=beatmap.beatmap_id,
+            ruleset=ruleset,
+            variant=variant,
+            leaderboard_type=leaderboard_type,
+            legacy_mod_bits=legacy_mod_bits,
+            requester_account_id=principal.account_id,
+            friend_account_ids=friend_ids,
+        )
+    )
+    rating = await content_query.get_rating(beatmap.beatmap_id, principal.account_id)
+    average_rating = rating.average if rating.average is not None else 0
+    lines = [
+        (
+            f"{_direct_status(beatmap.status)}|false|{beatmap.external_beatmap_id}|"
+            f"{beatmap.external_beatmapset_id}|{len(page.scores)}|0|"
+        ),
+        f"0\n{beatmap.artist} - {beatmap.title} [{beatmap.difficulty_name}]\n{average_rating}",
+        _format_leaderboard_score(page.personal_best) if page.personal_best is not None else "",
+    ]
+    lines.extend(_format_leaderboard_score(score) for score in page.scores)
+    if not page.scores:
+        lines.append("")
+    return Response("\n".join(lines))
+
+
+def _submission_chart(score_id: int, beatmap: BeatmapRevisionView, parsed: ParsedStableScore) -> str:
+    accuracy = format(parsed.score.accuracy * 100, ".2f")
+    return "|".join(
+        (
+            f"beatmapId:{beatmap.external_beatmap_id}",
+            f"beatmapSetId:{beatmap.external_beatmapset_id}",
+            "beatmapPlaycount:0",
+            "beatmapPasscount:0",
+            f"approvedDate:{beatmap.source_updated_at:%Y-%m-%d %H:%M:%S}",
+            "\n",
+            "chartId:beatmap",
+            f"chartUrl:https://osu.ppy.sh/b/{beatmap.external_beatmap_id}",
+            "chartName:Beatmap Ranking",
+            "rankBefore:",
+            "rankAfter:",
+            "rankedScoreBefore:",
+            f"rankedScoreAfter:{parsed.score.total_score}",
+            "totalScoreBefore:",
+            f"totalScoreAfter:{parsed.score.total_score}",
+            "maxComboBefore:",
+            f"maxComboAfter:{parsed.score.max_combo}",
+            "accuracyBefore:",
+            f"accuracyAfter:{accuracy}",
+            "ppBefore:",
+            "ppAfter:",
+            f"onlineScoreId:{score_id}",
+            "\n",
+            "chartId:overall",
+            "chartName:Overall Ranking",
+            "achievements-new:",
+        )
+    )
+
+
+def _format_leaderboard_score(score: LeaderboardScoreView) -> str:
+    return (
+        f"{score.score_id}|{score.display_name}|{round(score.metric_value)}|{score.max_combo}|"
+        f"{score.n50}|{score.n100}|{score.n300}|{score.nmiss}|{score.nkatu}|{score.ngeki}|"
+        f"{int(score.perfect)}|{score.legacy_mod_bits}|{score.account_id}|{score.rank}|"
+        f"{int(score.ended_at.timestamp())}|{int(score.has_replay)}"
+    )

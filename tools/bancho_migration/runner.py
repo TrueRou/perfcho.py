@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from perfcho.infra.s3 import S3ObjectStorage
 from perfcho.infra.settings import settings
+from perfcho.infra.storage import S3ObjectStorage
 from perfcho.modules.common import ObjectUnavailable
 from tools.bancho_migration.config import MigrationConfig
 from tools.bancho_migration.domains.community import migrate_community

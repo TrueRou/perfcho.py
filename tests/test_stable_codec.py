@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from perfcho.realtime.stable import (
+from perfcho.modules.realtime.stable import (
     BodyTooLargeError,
     Channel,
     ClientPacket,

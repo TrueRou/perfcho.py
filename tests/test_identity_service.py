@@ -23,8 +23,9 @@ from perfcho.infra.db.models.iam import (
     Device,
     DeviceIdentifier,
 )
-from perfcho.infra.db.repositories.account import SqlAlchemyAccountRepository, SqlAlchemyOutboxWriter
+from perfcho.infra.db.repositories.account import SqlAlchemyAccountRepository
 from perfcho.infra.db.repositories.identity import SqlAlchemyIdentityRepository
+from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
 from perfcho.infra.security.password import (
     Argon2Policy,

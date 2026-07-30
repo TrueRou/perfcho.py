@@ -13,18 +13,14 @@ from perfcho.infra.security.password import (
 )
 from perfcho.modules.account.errors import EmailUnavailable, NameUnavailable, RegistrationRejected
 from perfcho.modules.account.models import RegisterAccount, RegistrationRecord, RegistrationResult
-from perfcho.modules.account.ports import (
-    AccountOutboxWriterFactory,
-    AccountRepositoryFactory,
-    AccountUnitOfWork,
-)
+from perfcho.modules.account.ports import AccountRepositoryFactory, AccountUnitOfWork
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
-from perfcho.modules.common.ports import Clock
+from perfcho.modules.common.ports import Clock, OutboxWriterFactory
 
 _RECEIPT_SCOPE = "account.register"
 _DEFAULT_RECEIPT_TTL = timedelta(days=1)
-_REGISTRATION_CONSUMERS = ("account-projection.v1",)
+_REGISTRATION_CONSUMERS = ("account-projector.v1",)
 
 
 class AccountService:
@@ -34,7 +30,7 @@ class AccountService:
         self,
         uow_factory: Callable[[], AccountUnitOfWork],
         repository_factory: AccountRepositoryFactory,
-        outbox_writer_factory: AccountOutboxWriterFactory,
+        outbox_writer_factory: OutboxWriterFactory,
         password_pepper: PasswordPepper,
         argon2_policy: Argon2Policy,
         clock: Clock,

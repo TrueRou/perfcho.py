@@ -1,4 +1,4 @@
-"""Call versioned external calculators through one multi-formula HTTP contract."""
+"""Call versioned external Performance calculators through HTTP."""
 
 import json
 from collections.abc import Mapping
@@ -8,8 +8,8 @@ from typing import cast
 import httpx
 
 from perfcho.modules.common.models import JsonValue
-from perfcho.modules.scoring.errors import PerformanceCalculationError
-from perfcho.modules.scoring.models import (
+from perfcho.modules.performance.errors import PerformanceCalculationError
+from perfcho.modules.performance.models import (
     DifficultyCalculationResult,
     PerformanceCalculationInput,
     PerformanceResult,
@@ -24,8 +24,13 @@ class HttpPerformanceCalculator:
         self._client = client
         self._calculator_urls = {code: url.rstrip("/") for code, url in calculator_urls.items() if url.strip()}
 
-    async def calculate(self, calculation: PerformanceCalculationInput, beatmap_content: bytes) -> PerformanceResult:
-        """Send one pure calculation request and verify the engine fingerprint."""
+    async def calculate(
+        self,
+        calculation: PerformanceCalculationInput,
+        *,
+        beatmap_url: str,
+    ) -> PerformanceResult:
+        """Send one pure request containing a short-lived immutable Beatmap URL."""
         base_url = self._calculator_urls.get(calculation.calculator)
         if base_url is None:
             raise PerformanceCalculationError(
@@ -38,6 +43,7 @@ class HttpPerformanceCalculator:
                 "job_id": str(calculation.job_id),
                 "score_id": calculation.score_id,
                 "input_digest": calculation.input_digest.hex(),
+                "beatmap_url": beatmap_url,
             }
         )
         try:
@@ -48,12 +54,7 @@ class HttpPerformanceCalculator:
                         "metadata.json",
                         json.dumps(metadata, sort_keys=True, separators=(",", ":")),
                         "application/json",
-                    ),
-                    "beatmap": (
-                        f"{calculation.beatmap_revision_id}.osu",
-                        beatmap_content,
-                        "text/plain",
-                    ),
+                    )
                 },
             )
         except httpx.HTTPError as error:

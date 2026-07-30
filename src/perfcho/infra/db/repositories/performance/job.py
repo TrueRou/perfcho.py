@@ -1,4 +1,4 @@
-"""Persist phased, fenced multi-formula performance calculations."""
+"""Persist phased, fenced multi-formula Performance job execution."""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ import hashlib
 import json
 import uuid
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import cast
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -30,49 +30,58 @@ from perfcho.infra.db.models.scoring import (
     ScoreHitStatistic,
     ScorePerformance,
 )
-from perfcho.modules.scoring.errors import PerformanceCalculationError
+from perfcho.modules.performance.errors import PerformanceCalculationError
+from perfcho.modules.performance.models import (
+    PerformanceCalculationInput,
+    PerformanceCompletion,
+    PerformanceResult,
+    thaw_json_mapping,
+)
 from perfcho.modules.scoring.models import (
     CanonicalMod,
     ClientFamily,
     HitStatistic,
-    PerformanceCalculationInput,
-    PerformanceCompletion,
-    PerformanceResult,
     Ruleset,
     ScoreboardInfo,
     ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
     ScoreSubmission,
-    thaw_json_mapping,
 )
 
 
-class SqlAlchemyPerformanceCalculationRepository:
-    """Coordinate calculation state without owning transaction boundaries."""
+class SqlAlchemyPerformanceJobRepository:
+    """Execute phased Performance jobs through caller-owned transactions."""
 
-    def __init__(self, session: AsyncSession) -> None:
-        """Bind calculation operations to one caller-owned session."""
+    def __init__(self, session: AsyncSession, *, execution_lease_seconds: int) -> None:
+        """Bind job operations to one caller-owned session."""
+        if execution_lease_seconds < 1:
+            raise ValueError("execution_lease_seconds must be positive")
         self._session = session
+        self._execution_lease_duration = timedelta(seconds=execution_lease_seconds)
 
     async def start(
         self,
         job_id: uuid.UUID,
         lease_token: uuid.UUID,
-        *,
-        now: datetime,
     ) -> PerformanceCalculationInput | None:
-        """Increment the business attempt and materialize immutable engine input."""
+        """Start one execution attempt and materialize immutable engine input."""
         job = await self._session.get(PerformanceCalculationJob, job_id, with_for_update=True)
+        now = await _database_now(self._session)
         if (
             job is None
             or job.status is not CalculationJobStatus.RUNNING
             or job.lease_token != lease_token
+            or job.lease_expires_at is None
+            or job.lease_expires_at <= now
+            or job.attempt_started_at is not None
             or job.completed_at is not None
             or job.dead_lettered_at is not None
         ):
             return None
         job.attempt_count += 1
+        job.attempt_started_at = now
+        job.lease_expires_at = now + self._execution_lease_duration
 
         difficulty_release = aliased(CalculationRelease)
         difficulty_formula = aliased(CalculationFormula)
@@ -214,17 +223,25 @@ class SqlAlchemyPerformanceCalculationRepository:
         result: PerformanceResult,
         *,
         output_digest: bytes,
-        now: datetime,
     ) -> PerformanceCompletion | None:
         """Persist reproducible difficulty and PP output under the current fence."""
         job = await self._session.get(PerformanceCalculationJob, calculation.job_id, with_for_update=True)
+        now = await _database_now(self._session)
         if (
             job is None
             or job.status is not CalculationJobStatus.RUNNING
             or job.lease_token != lease_token
+            or job.lease_expires_at is None
+            or job.lease_expires_at <= now
+            or job.attempt_started_at is None
             or job.input_digest != calculation.input_digest
         ):
             return None
+        if job.score_id != calculation.score_id or job.release_id != calculation.release_id:
+            raise PerformanceCalculationError(
+                "performance completion dimensions do not match the leased job",
+                retryable=False,
+            )
 
         difficulty_id = await self._session.scalar(
             insert(BeatmapDifficultyAttribute)
@@ -303,9 +320,7 @@ class SqlAlchemyPerformanceCalculationRepository:
         job.status = CalculationJobStatus.SUCCEEDED
         job.output_digest = output_digest
         job.completed_at = now
-        job.lease_owner = None
-        job.lease_token = None
-        job.lease_expires_at = None
+        _clear_job_lease(job)
         job.last_error = None
         return PerformanceCompletion(
             score_id=calculation.score_id,
@@ -323,25 +338,31 @@ class SqlAlchemyPerformanceCalculationRepository:
         lease_token: uuid.UUID,
         *,
         error: str,
-        retry_at: datetime,
+        retry_delay: timedelta,
         dead: bool,
         consume_attempt: bool,
-        now: datetime,
     ) -> None:
         """Release or dead-letter a failed job only under its current fence."""
         job = await self._session.get(PerformanceCalculationJob, job_id, with_for_update=True)
-        if job is None or job.status is not CalculationJobStatus.RUNNING or job.lease_token != lease_token:
+        now = await _database_now(self._session)
+        if (
+            job is None
+            or job.status is not CalculationJobStatus.RUNNING
+            or job.lease_token != lease_token
+            or job.lease_expires_at is None
+            or job.lease_expires_at <= now
+        ):
             return
         if consume_attempt:
             job.attempt_count += 1
         job.status = CalculationJobStatus.DEAD if dead else CalculationJobStatus.PENDING
-        job.available_at = retry_at
+        job.available_at = now + retry_delay
         job.dead_lettered_at = now if dead else None
         job.enqueued_at = None
-        job.lease_owner = None
-        job.lease_token = None
-        job.lease_expires_at = None
         job.broker_task_id = None
+        if not dead:
+            job.attempt_started_at = None
+        _clear_job_lease(job)
         job.last_error = error[:4000]
 
 
@@ -362,3 +383,16 @@ def _canonical_mods(value: object) -> tuple[CanonicalMod, ...]:
 def _canonical_digest(value: object) -> bytes:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return hashlib.sha256(encoded).digest()
+
+
+async def _database_now(session: AsyncSession) -> datetime:
+    now = await session.scalar(select(func.clock_timestamp()))
+    if now is None:
+        raise RuntimeError("PostgreSQL did not return a Performance job timestamp")
+    return now
+
+
+def _clear_job_lease(job: PerformanceCalculationJob) -> None:
+    job.lease_owner = None
+    job.lease_token = None
+    job.lease_expires_at = None

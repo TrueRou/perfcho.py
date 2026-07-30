@@ -5,7 +5,7 @@ from typing import cast
 
 import pytest
 
-from perfcho.composition import StableServices
+from perfcho.infra.composition import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator
@@ -22,8 +22,7 @@ from perfcho.modules.multiplayer import (
     WinCondition,
 )
 from perfcho.modules.realtime import RealtimeRepository, RealtimeSession
-from perfcho.modules.scoring import Ruleset, ScoreboardVariant
-from perfcho.realtime.stable import (
+from perfcho.modules.realtime.stable import (
     ClientPacket,
     MultiplayerMatch,
     PacketReader,
@@ -33,8 +32,9 @@ from perfcho.realtime.stable import (
     UserPresence,
     UserStats,
 )
-from perfcho.realtime.stable.dispatcher import StableRuntimeContext, dispatch_packets
-from perfcho.realtime.stable.multiplayer import _settings_from_wire
+from perfcho.modules.realtime.stable.dispatcher import StableRuntimeContext, dispatch_packets
+from perfcho.modules.realtime.stable.multiplayer import _settings_from_wire
+from perfcho.modules.scoring import Ruleset, ScoreboardVariant
 
 NOW = datetime(2026, 7, 29, 12, tzinfo=UTC)
 EXPIRY = NOW + timedelta(minutes=5)

@@ -1,6 +1,6 @@
 # perfcho.py 文档索引
 
-最后更新：2026-07-29。
+最后更新：2026-07-30。
 
 本目录记录项目的架构约束、已经落地的事实、协议适配范围和后续设计。阅读时应区分以下三类状态：
 
@@ -15,14 +15,16 @@
 1. [项目背景](../background.md)：目标、参考资料边界和模块化单体总原则。
 2. [当前实现总览](current-implementation.md)：当前代码有哪些进程、模块、持久化边界和已知限制。
 3. [Stable 适配器支持矩阵](stable-adapter.md)：当前支持的 HTTP 路由、Bancho Packet、状态语义和缺口。
-4. [剩余设计与交付路线](remaining-design.md)：Multiplayer 后续验证、PP、Lazer 和投影体系的实施顺序。
-5. [实现进度](implementation-progress.md)：适合快速检查的简表和最近验证结果。
-6. [Stable 实现复核与修复记录](stable-review-2026-07-29.md)：2026-07-29 复核发现、修复位置、测试与残余边界。
+4. [Multi-PP 与 Calculator 对接](performance-calculation.md)：Formula/Release 方法论、异步计算语义和 C#/Rust HTTP 合同。
+5. [剩余设计与交付路线](remaining-design.md)：Multiplayer 后续验证、PP、Lazer 和投影体系的实施顺序。
+6. [实现进度](implementation-progress.md)：适合快速检查的简表和最近验证结果。
+7. [Stable 实现复核与修复记录](stable-review-2026-07-29.md)：2026-07-29 复核发现、修复位置、测试与残余边界。
 
 ## 深入设计
 
 - [业务层架构](business-layer.md)：Command、Query、Actor、Unit of Work、Outbox 和模块依赖规则。
-- [运行时架构](runtime-architecture.md)：API、Worker、Outbox Relay、PostgreSQL、Redis 和对象存储的进程关系。
+- [运行时架构](runtime-architecture.md)：API、Worker 内 Relay、PostgreSQL、Redis 和对象存储的进程关系。
+- [Performance 计算规范](performance-calculation.md)：多 Formula 数据身份、任务恢复、外部 Calculator 合同、安全和发布流程。
 - [数据库架构](database/architecture.md)：Schema、标识符、不可变事实和数据库设计原则。
 - [数据库关系](database/relationships.md)：核心实体关系和跨 Schema 依赖。
 - [数据库运维](database/operations.md)：Bootstrap、迁移、备份、恢复和维护约束。

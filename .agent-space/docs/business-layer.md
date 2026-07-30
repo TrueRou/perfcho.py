@@ -12,7 +12,8 @@
 | Identity | 密码登录、Stable 登录、OAuth、Refresh、撤销、TOTP、可信设备 | `iam`、`core`、`events` |
 | Authorization | 权限与权益计算、角色授予和撤销、Supporter 过期 | `authz`、`audit`、`events` |
 | Content | 按 ID/MD5 查图、同步谱面集、发布修订、收藏、评分、标签、评论 | `content`、`events` |
-| Scoring | 签发 Attempt、接收两端成绩、校验 Attestation/Replay、计算 PP 和有效性 | `scoring`、`moderation`、`events` |
+| Scoring | 签发 Attempt、接收两端成绩、校验 Attestation/Replay 和调度后续任务 | `scoring`、`moderation`、`events` |
+| Performance | Formula/Release、Difficulty/PP 计算、持久 Job 和多结果查询 | `scoring`、`events` |
 | Ranking | 投影最佳成绩、用户统计、排名历史、失败进度和回放查看 | `scoring`、`events` |
 | Social | 关注、屏蔽、团队成员与成就判断 | `social`、`events` |
 | Community | 频道权限、私信、已读游标、通知扇出和外部投递 | `community`、`moderation`、`events` |
@@ -77,7 +78,7 @@
 ## 异步任务与消息
 
 - Taskiq 使用 Redis Stream Broker，Worker 以 `when_executed` 确认消息，不启用 Result Backend。
-- 请求事务禁止直接调用 `.kiq()`；需要可靠执行的任务必须先写 Transactional Outbox。
+- 请求事务禁止直接调用 `.kiq()`；事件消费使用 Transactional Outbox，像 Performance Calculation 这样拥有领域唯一键和跨外部 I/O 状态机的工作在同一业务事务写专用持久 Job。
 - Relay 使用 `FOR UPDATE SKIP LOCKED` 领取 Delivery，投递成功后记录 Task ID，租约过期或 Redis 丢失时允许重新投递。
 - Worker 按 `(event_id, consumer)` 幂等处理。处理结果、Projection Checkpoint 与 Delivery 完成必须在同一 PostgreSQL 事务提交。
 - 固定周期任务可以由 Taskiq Scheduler 唤醒，但业务游标和可恢复状态保存在 `system.maintenance_states`。

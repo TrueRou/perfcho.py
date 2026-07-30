@@ -8,6 +8,8 @@ the .agent-space/docs kept tracking on the whole progress of the project, check 
 
 Notice: we hope to consider lazer(laser) as baseline of the implementation, and stable is like a adapter layer to the lazer structure, this may give you a reference to implement the features, like design lazer ahead of stable, if user let you to build stable first, you can build stable first, but you should consider the design of lazer in your implementation.
 
+Notice: the project is not deployed yet, so you can refactor the code freely, and you can break the interface if you think it is necessary, and no need to consider backward compatibility, but you should update the test cases accordingly.
+
 ## FastAPI Module and API Style
 
 Use [TrueRou/fastapi-perfectionist-starter](https://github.com/TrueRou/fastapi-perfectionist-starter) as the structural and naming reference for new FastAPI code. The conventions below were verified against commit `2898eb17b31c5a1308059cbe71a6c66bf61c412d` (2026-07-27). Treat it as a code-style reference; this repository's `.agent-space/background.md` and `.agent-space/docs/` remain the architecture authority.

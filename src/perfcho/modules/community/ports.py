@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Protocol
 
 from perfcho.modules.authorization.ports import AuthorizationRepository
-from perfcho.modules.common.ports import OutboxWriter, UnitOfWork
+from perfcho.modules.common.ports import UnitOfWork
 from perfcho.modules.community.models import (
     ActiveSilence,
     ChannelRecord,
@@ -197,12 +197,4 @@ class ActiveSilencePolicyFactory(Protocol):
 
     def __call__(self, session: object) -> ActiveSilencePolicy:
         """Return a transaction-bound silence policy."""
-        ...
-
-
-class CommunityOutboxWriterFactory(Protocol):
-    """Bind an outbox writer to the current community transaction."""
-
-    def __call__(self, session: object) -> OutboxWriter:
-        """Return a transaction-bound outbox writer."""
         ...

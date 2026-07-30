@@ -5,7 +5,7 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 
-from perfcho.composition import StableServices, compose_stable_services
+from perfcho.infra.composition import StableServices, compose_stable_services
 
 
 async def get_stable_services(request: Request) -> AsyncIterator[StableServices]:

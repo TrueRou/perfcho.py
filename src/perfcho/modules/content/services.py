@@ -4,7 +4,7 @@ import hashlib
 from collections.abc import Callable
 
 from perfcho.modules.common.models import PendingEvent
-from perfcho.modules.common.ports import Clock, IdGenerator, ObjectStorage
+from perfcho.modules.common.ports import Clock, IdGenerator, ObjectStorage, OutboxWriterFactory
 from perfcho.modules.content.errors import BeatmapNotFound, BeatmapsetNotFound, ContentInputRejected
 from perfcho.modules.content.models import (
     BeatmapRevisionView,
@@ -17,7 +17,6 @@ from perfcho.modules.content.models import (
     SyncedBeatmapFile,
 )
 from perfcho.modules.content.ports import (
-    ContentOutboxWriterFactory,
     ContentRepositoryFactory,
     ContentUnitOfWork,
     UpstreamContentSource,
@@ -146,7 +145,7 @@ class ContentSyncService:
         self,
         uow_factory: Callable[[], ContentUnitOfWork],
         repository_factory: ContentRepositoryFactory,
-        outbox_writer_factory: ContentOutboxWriterFactory,
+        outbox_writer_factory: OutboxWriterFactory,
         upstream: UpstreamContentSource,
         object_storage: ObjectStorage,
         clock: Clock,
@@ -207,7 +206,7 @@ class ContentSyncService:
                         "removed_beatmap_count": result.removed_beatmap_count,
                         "source_updated_at": snapshot.last_updated_at.isoformat(),
                     },
-                    consumers=("content-projection.v1",),
+                    consumers=("content-projector.v1",),
                     partition_key=f"beatmapset:{result.beatmapset_id}",
                 )
             )

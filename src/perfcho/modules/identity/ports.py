@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Protocol
 
-from perfcho.modules.common.ports import OutboxWriter, UnitOfWork
+from perfcho.modules.common.ports import UnitOfWork
 from perfcho.modules.identity.models import CredentialSnapshot, OpenStableSession, ResolvedStableSession
 
 
@@ -138,12 +138,4 @@ class IdentityRepositoryFactory(Protocol):
 
     def __call__(self, session: object) -> IdentityRepository:
         """Return a repository that never owns the transaction."""
-        ...
-
-
-class IdentityOutboxWriterFactory(Protocol):
-    """Bind an outbox writer to a unit of work transaction."""
-
-    def __call__(self, session: object) -> OutboxWriter:
-        """Return an outbox writer that never owns the transaction."""
         ...

@@ -11,17 +11,8 @@
                 "--host",
                 "127.0.0.1",
                 "--port",
-                "8000"
+                "10727"
             ],
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": true
-        },
-        {
-            "name": "Relay",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "perfcho.infra.outbox",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": true
@@ -33,9 +24,7 @@
             "module": "taskiq",
             "args": [
                 "worker",
-                "perfcho.infra.taskiq:broker",
-                "perfcho.tasks.outbox",
-                "perfcho.tasks.performance",
+                "perfcho.worker:broker",
                 "--ack-type",
                 "when_executed",
                 "--workers",
@@ -52,7 +41,6 @@
             "name": "All Services",
             "configurations": [
                 "FastAPI",
-                "Relay",
                 "Taskiq Worker"
             ],
             "preLaunchTask": "dev: prepare",

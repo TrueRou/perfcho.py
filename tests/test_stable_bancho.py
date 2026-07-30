@@ -8,9 +8,9 @@ from fastapi import FastAPI
 from pydantic import ValidationError
 
 from perfcho.api.stable import router
+from perfcho.api.stable.canonize.login import StableLoginParseError, parse_stable_login
 from perfcho.api.stable.dependencies import get_stable_services
-from perfcho.api.stable.schema import StableLoginParseError, parse_stable_login
-from perfcho.composition import StableServices
+from perfcho.infra.composition import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService, StablePrivilege
 from perfcho.modules.common import Clock, IdGenerator
@@ -24,8 +24,7 @@ from perfcho.modules.realtime import (
     RealtimeSession,
     SessionFence,
 )
-from perfcho.modules.social import SocialService
-from perfcho.realtime.stable import (
+from perfcho.modules.realtime.stable import (
     ClientPacket,
     LoginFailureReason,
     PacketReader,
@@ -36,7 +35,8 @@ from perfcho.realtime.stable import (
     user_presence,
     user_stats,
 )
-from perfcho.realtime.stable.dispatcher import StableRuntimeContext
+from perfcho.modules.realtime.stable.dispatcher import StableRuntimeContext
+from perfcho.modules.social import SocialService
 
 NOW = datetime(2026, 7, 29, tzinfo=UTC)
 
@@ -468,7 +468,7 @@ async def test_poll_acquires_fenced_mailbox_lease_before_dispatch_and_conflict_i
 ) -> None:
     import importlib
 
-    bancho_module = importlib.import_module("perfcho.api.stable.router.bancho")
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
     services, identity, realtime = stable_services()
     await realtime.open_session(
         session_id=identity.session_id,
@@ -490,7 +490,7 @@ async def test_poll_acquires_fenced_mailbox_lease_before_dispatch_and_conflict_i
         dispatched = True
         return build_packet(ServerPacket.PONG)
 
-    monkeypatch.setattr(bancho_module, "dispatch_packets", checked_dispatch)
+    monkeypatch.setattr(cho_module, "dispatch_packets", checked_dispatch)
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_stable_services] = lambda: services

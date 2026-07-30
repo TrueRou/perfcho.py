@@ -29,6 +29,8 @@ class _S3Client(Protocol):
 
     async def delete_object(self, **kwargs: object) -> object: ...
 
+    def generate_presigned_url(self, operation: str, **kwargs: object) -> str | Awaitable[str]: ...
+
 
 class _S3Session(Protocol):
     def client(self, service_name: str, **kwargs: object) -> AbstractAsyncContextManager[_S3Client]: ...
@@ -62,6 +64,7 @@ class S3ObjectStorage:
         secret_key: str,
         addressing_style: str,
         chunk_size: int,
+        presign_endpoint_url: str | None = None,
         session: _S3Session | None = None,
     ) -> None:
         """Bind bucket configuration without opening network resources."""
@@ -80,6 +83,10 @@ class S3ObjectStorage:
                 retries={"mode": "standard", "max_attempts": 3},
             ),
         }
+        self._presign_client_options = {
+            **self._client_options,
+            "endpoint_url": presign_endpoint_url or endpoint_url,
+        }
 
     @classmethod
     def from_settings(cls, settings: Settings) -> S3ObjectStorage:
@@ -92,6 +99,7 @@ class S3ObjectStorage:
             secret_key=settings.s3_secret_key.get_secret_value(),
             addressing_style=settings.s3_addressing_style,
             chunk_size=settings.object_stream_chunk_size,
+            presign_endpoint_url=settings.s3_presign_endpoint_url,
         )
 
     async def put(
@@ -162,8 +170,29 @@ class S3ObjectStorage:
         except (BotoCoreError, ClientError) as error:
             raise ObjectUnavailable("object storage delete failed") from error
 
-    def _client(self) -> AbstractAsyncContextManager[_S3Client]:
-        return self._session.client("s3", **self._client_options)
+    async def presign_read(self, storage_key: str, *, expires_in_seconds: int) -> str:
+        """Create a short-lived GET URL reachable by an external Calculator."""
+        key = _validate_storage_key(storage_key)
+        if not 1 <= expires_in_seconds <= 7 * 24 * 60 * 60:
+            raise ValueError("presigned URL lifetime is outside the allowed range")
+        try:
+            async with self._client(presign=True) as client:
+                result = client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": self._bucket, "Key": key},
+                    ExpiresIn=expires_in_seconds,
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+                if not isinstance(result, str) or not result:
+                    raise ValueError("object storage returned an invalid presigned URL")
+                return result
+        except (BotoCoreError, ClientError, TypeError, ValueError) as error:
+            raise ObjectUnavailable("object storage URL signing failed") from error
+
+    def _client(self, *, presign: bool = False) -> AbstractAsyncContextManager[_S3Client]:
+        options = self._presign_client_options if presign else self._client_options
+        return self._session.client("s3", **options)
 
 
 def _validate_storage_key(value: str) -> str:

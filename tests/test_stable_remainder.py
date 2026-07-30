@@ -5,7 +5,7 @@ from typing import cast
 
 import pytest
 
-from perfcho.composition import StableServices
+from perfcho.infra.composition import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator
@@ -20,9 +20,7 @@ from perfcho.modules.community import (
 from perfcho.modules.identity import IdentityService, ResolvedStableSession
 from perfcho.modules.multiplayer import CleanupPresence
 from perfcho.modules.realtime import MailboxOverflow, MailboxPacket, PresenceSnapshot, RealtimeSession, SessionFence
-from perfcho.modules.scoring.mods import LEGACY_MOD_BITS
-from perfcho.modules.social import AccountIdentityView, SocialInteractionBlocked, SocialService
-from perfcho.realtime.stable import (
+from perfcho.modules.realtime.stable import (
     ClientPacket,
     ClientStatus,
     Message,
@@ -35,8 +33,10 @@ from perfcho.realtime.stable import (
     user_presence,
     user_stats,
 )
-from perfcho.realtime.stable.countries import stable_country_id
-from perfcho.realtime.stable.dispatcher import StableRuntimeContext, dispatch_packets
+from perfcho.modules.realtime.stable.countries import stable_country_id
+from perfcho.modules.realtime.stable.dispatcher import StableRuntimeContext, dispatch_packets
+from perfcho.modules.scoring.mods import LEGACY_MOD_BITS
+from perfcho.modules.social import AccountIdentityView, SocialInteractionBlocked, SocialService
 
 NOW = datetime(2026, 7, 29, 12, tzinfo=UTC)
 EXPIRY = NOW + timedelta(minutes=5)

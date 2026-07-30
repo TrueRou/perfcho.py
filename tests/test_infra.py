@@ -4,18 +4,21 @@ from unittest.mock import MagicMock
 from urllib.parse import urlparse
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession
+from taskiq import TaskiqEvents
 from taskiq_redis import RedisStreamBroker
 
 from perfcho.infra.db import DbBase
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.models.events import OutboxDelivery
-from perfcho.infra.outbox import write_outbox_event
-from perfcho.infra.settings import settings
-from perfcho.infra.taskiq import broker
-from perfcho.tasks.outbox import dispatch_outbox_delivery
-from perfcho.tasks.performance import calculate_performance
+from perfcho.infra.db.repositories.outbox import append_outbox_event
+from perfcho.infra.settings import Settings, settings
+from perfcho.modules.common.models import PendingEvent
+from perfcho.tasks.outbox_delivery import dispatch_outbox_delivery
+from perfcho.tasks.performance_calculation import calculate_performance
+from perfcho.worker import broker, worker_shutdown, worker_startup
 
 
 def test_redis_state_and_taskiq_use_separate_logical_databases() -> None:
@@ -32,6 +35,21 @@ def test_taskiq_uses_stream_broker_without_result_storage() -> None:
     assert broker.maxlen == settings.taskiq_stream_max_length
     assert dispatch_outbox_delivery.task_name in broker.get_all_tasks()
     assert calculate_performance.task_name in broker.get_all_tasks()
+    assert broker.event_handlers[TaskiqEvents.WORKER_STARTUP] == [worker_startup]
+    assert broker.event_handlers[TaskiqEvents.WORKER_SHUTDOWN] == [worker_shutdown]
+
+
+def test_settings_reject_performance_timing_shorter_than_http_window() -> None:
+    with pytest.raises(ValidationError, match="lease must exceed"):
+        Settings(
+            performance_http_timeout_seconds=60,
+            performance_calculation_lease_seconds=89,
+        )
+    with pytest.raises(ValidationError, match="URL expiry must exceed"):
+        Settings(
+            performance_http_timeout_seconds=60,
+            performance_beatmap_url_expiry_seconds=89,
+        )
 
 
 @pytest.mark.postgres
@@ -68,19 +86,22 @@ async def test_outbox_writer_creates_explicit_consumer_delivery() -> None:
     async def assign_event_id() -> None:
         event = session.add.call_args_list[0].args[0]
         event.id = event_id
+        event.position = 1
 
     session.flush.side_effect = assign_event_id
     available_at = datetime.now(UTC)
-    event = await write_outbox_event(
+    session.scalar.return_value = available_at
+    event = await append_outbox_event(
         session,
-        aggregate_type="test",
-        aggregate_id="1",
-        event_type=event_type,
-        schema_version=1,
-        payload={"value": 1},
-        consumers=(consumer_name,),
-        available_at=available_at,
-        partition_key="test:1",
+        PendingEvent(
+            aggregate_type="test",
+            aggregate_id="1",
+            event_type=event_type,
+            schema_version=1,
+            payload={"value": 1},
+            consumers=(consumer_name,),
+            partition_key="test:1",
+        ),
     )
 
     added = [call.args[0] for call in session.add.call_args_list]
@@ -89,6 +110,8 @@ async def test_outbox_writer_creates_explicit_consumer_delivery() -> None:
     assert added[1].event_id == event_id
     assert added[1].consumer == consumer_name
     assert added[1].partition_key == "test:1"
+    assert added[1].available_at == available_at
+    assert added[1].source_position == 1
     session.execute.assert_awaited_once()
     session.flush.assert_awaited_once()
 
@@ -97,15 +120,15 @@ async def test_outbox_writer_creates_explicit_consumer_delivery() -> None:
 async def test_outbox_writer_rejects_events_without_consumers() -> None:
     session = MagicMock(spec=AsyncSession)
 
-    with pytest.raises(ValueError, match="at least one consumer"):
-        await write_outbox_event(
-            session,
+    with pytest.raises(ValueError, match="non-empty and unique"):
+        PendingEvent(
             aggregate_type="test",
             aggregate_id="1",
             event_type="tests.unrouted-event.v1",
             schema_version=1,
             payload={},
             consumers=(),
+            partition_key="test:1",
         )
 
     session.add.assert_not_called()

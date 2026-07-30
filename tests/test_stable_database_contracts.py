@@ -20,7 +20,8 @@ import perfcho.infra.db.models  # noqa: F401 - register canonical metadata.
 from perfcho.infra.db import DbBase
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.models.events import OutboxDelivery
-from perfcho.infra.outbox import write_outbox_event
+from perfcho.infra.db.repositories.outbox import append_outbox_event
+from perfcho.modules.common.models import PendingEvent
 
 
 def _table(name: str) -> Table:
@@ -194,6 +195,9 @@ def test_replies_multiplayer_events_and_outbox_positions_have_integrity() -> Non
 
     deliveries = _table("events.outbox_deliveries")
     assert not deliveries.c.source_position.nullable
+    assert "status" in deliveries.c
+    assert "available_at" in deliveries.c
+    assert "available_at" not in _table("events.outbox_events").c
     assert _constraint("events.outbox_deliveries", "fk_outbox_deliveries_event_position", ForeignKeyConstraint)
     assert _index("events.outbox_deliveries", "ix_outbox_deliveries_consumer_position")
 
@@ -217,14 +221,17 @@ async def test_outbox_delivery_copies_immutable_source_position(postgres_databas
     session_factory = infra_db.create_session_factory(db_engine)
     try:
         async with session_factory.begin() as session:
-            event = await write_outbox_event(
+            event = await append_outbox_event(
                 session,
-                aggregate_type="test",
-                aggregate_id="stable-contract",
-                event_type="tests.stable-contract.v1",
-                schema_version=1,
-                payload={},
-                consumers=("tests.stable-contract.v1",),
+                PendingEvent(
+                    aggregate_type="test",
+                    aggregate_id="stable-contract",
+                    event_type="tests.stable-contract.v1",
+                    schema_version=1,
+                    payload={},
+                    consumers=("tests.stable-contract.v1",),
+                    partition_key="default",
+                ),
             )
 
         async with session_factory() as session:

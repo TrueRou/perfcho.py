@@ -7,7 +7,7 @@ from math import ceil
 
 from perfcho.modules.authorization.models import EffectiveAuthorization
 from perfcho.modules.common.models import PendingEvent
-from perfcho.modules.common.ports import Clock
+from perfcho.modules.common.ports import Clock, OutboxWriterFactory
 from perfcho.modules.community.errors import (
     AccountSilenced,
     ChannelAccessDenied,
@@ -38,14 +38,13 @@ from perfcho.modules.community.ports import (
     ActiveChannelMembershipQuery,
     ActiveSilencePolicyFactory,
     AuthorizationRepositoryFactory,
-    CommunityOutboxWriterFactory,
     CommunityRepository,
     CommunityRepositoryFactory,
     CommunityUnitOfWork,
 )
 
-_MESSAGE_CONSUMERS = ("community-message.v1",)
-_COMMUNITY_CONSUMERS = ("community-projection.v1",)
+_MESSAGE_CONSUMERS = ("community-message-projector.v1",)
+_COMMUNITY_CONSUMERS = ("community-projector.v1",)
 _DURABLE_MEMBERSHIP_KINDS = frozenset({"private", "group", "team"})
 
 
@@ -58,7 +57,7 @@ class CommunityService:
         repository_factory: CommunityRepositoryFactory,
         authorization_repository_factory: AuthorizationRepositoryFactory,
         silence_policy_factory: ActiveSilencePolicyFactory,
-        outbox_writer_factory: CommunityOutboxWriterFactory,
+        outbox_writer_factory: OutboxWriterFactory,
         clock: Clock,
         active_memberships: ActiveChannelMembershipQuery | None = None,
     ) -> None:

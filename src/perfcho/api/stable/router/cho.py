@@ -7,10 +7,10 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Header, Request, Response
 
-from perfcho.api.stable.client_ip import resolve_client_ip
+from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
+from perfcho.api.stable.canonize.login import StableLoginParseError, parse_stable_login
 from perfcho.api.stable.dependencies import StableServicesDependency
-from perfcho.api.stable.schema import StableLoginParseError, parse_stable_login
-from perfcho.composition import StableServices
+from perfcho.infra.composition import StableServices
 from perfcho.modules.authorization import StablePrivilege
 from perfcho.modules.common import ClientContext, CommandMeta
 from perfcho.modules.identity import InvalidCredentials, InvalidStableSession, StableLogin, StableSessionAlreadyActive
@@ -22,7 +22,7 @@ from perfcho.modules.realtime import (
     RealtimeSessionFenced,
     RealtimeSessionNotFound,
 )
-from perfcho.realtime.stable import (
+from perfcho.modules.realtime.stable import (
     Channel,
     LoginFailureReason,
     Message,
@@ -45,15 +45,15 @@ from perfcho.realtime.stable import (
     user_presence,
     user_stats,
 )
-from perfcho.realtime.stable.countries import stable_country_id
-from perfcho.realtime.stable.dispatcher import (
+from perfcho.modules.realtime.stable.countries import stable_country_id
+from perfcho.modules.realtime.stable.dispatcher import (
     StableRuntimeContext,
     account_stats,
     dispatch_packets,
     realtime_expiry,
 )
 
-router = APIRouter(include_in_schema=False)
+router = APIRouter()
 
 _BINARY_MEDIA_TYPE = "application/octet-stream"
 

@@ -9,8 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.selectable import Exists, Select
 
-from perfcho.infra.db.advisory_lock import acquire_transaction_lock
 from perfcho.infra.db.enums import ChannelKind, SanctionKind
+from perfcho.infra.db.locks import acquire_transaction_lock
 from perfcho.infra.db.models.authz import Permission
 from perfcho.infra.db.models.community import (
     Channel,

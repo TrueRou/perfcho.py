@@ -7,16 +7,14 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.advisory_lock import acquire_transaction_locks, advisory_lock_key
 from perfcho.infra.db.enums import AccountStatus, AccountType, Ruleset
 from perfcho.infra.db.idempotency import CommandReceiptRepository, ReceiptClaim, ReceiptClaimState
+from perfcho.infra.db.locks import acquire_transaction_locks, advisory_lock_key
 from perfcho.infra.db.models.authz import AccountRoleGrant, Role
 from perfcho.infra.db.models.core import Account, AccountEmail, AccountName, UserPreference, UserProfile
 from perfcho.infra.db.models.iam import PasswordCredential
-from perfcho.infra.outbox import write_outbox_event
 from perfcho.modules.account.errors import EmailUnavailable, NameUnavailable
 from perfcho.modules.account.models import RegistrationClaim, RegistrationRecord, RegistrationResult
-from perfcho.modules.common.models import PendingEvent
 
 _RECEIPT_SCOPE = "account.register"
 _NAME_CONSTRAINTS = frozenset({"uq_account_names_current_key"})
@@ -177,28 +175,6 @@ class SqlAlchemyAccountRepository:
                 "status": result.status,
             },
         )
-
-
-class SqlAlchemyOutboxWriter:
-    """Adapt the shared outbox function to a transaction-bound writer port."""
-
-    def __init__(self, session: AsyncSession) -> None:
-        """Bind event writes to the caller-owned session."""
-        self._session = session
-
-    async def append(self, event: PendingEvent) -> uuid.UUID:
-        """Append one event and its deliveries without committing."""
-        persisted = await write_outbox_event(
-            self._session,
-            aggregate_type=event.aggregate_type,
-            aggregate_id=event.aggregate_id,
-            event_type=event.event_type,
-            schema_version=event.schema_version,
-            payload=dict(event.payload),
-            consumers=event.consumers,
-            partition_key=event.partition_key,
-        )
-        return persisted.id
 
 
 def _registration_result_from_receipt(claim: ReceiptClaim) -> RegistrationResult:

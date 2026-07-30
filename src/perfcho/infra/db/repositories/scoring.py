@@ -15,7 +15,6 @@ from sqlalchemy.sql.selectable import Select
 from perfcho.infra.db.enums import (
     AccountStatus,
     AttemptStatus,
-    CalculationKind,
     SanctionKind,
     SessionStatus,
 )
@@ -47,12 +46,8 @@ from perfcho.infra.db.models.multiplayer import (
     TournamentPoolItem,
 )
 from perfcho.infra.db.models.scoring import (
-    CalculationFormula,
-    CalculationFormulaScoreboard,
-    CalculationRelease,
     LeaderboardEntry,
     ModSet,
-    PerformanceCalculationJob,
     PlayAttempt,
     RankingPolicy,
     Replay,
@@ -61,7 +56,6 @@ from perfcho.infra.db.models.scoring import (
     ScoreAttestation,
     Scoreboard,
     ScoreHitStatistic,
-    ScorePerformance,
 )
 from perfcho.modules.common import AccountUnavailable
 from perfcho.modules.scoring.errors import AttemptIdempotencyConflict, MultiplayerContextRejected, ScoreRejected
@@ -88,7 +82,6 @@ from perfcho.modules.scoring.models import (
     ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
-    ScorePerformanceView,
     thaw_json_mapping,
 )
 
@@ -349,54 +342,6 @@ class SqlAlchemyScoringRepository:
             outcome=record.score.outcome,
         )
 
-    async def schedule_performance_calculations(
-        self,
-        *,
-        score_id: int,
-        scoreboard_id: int,
-        ruleset: Ruleset,
-        now: datetime,
-    ) -> tuple[uuid.UUID, ...]:
-        """Create one job for every enabled active formula on this scoreboard."""
-        release_ids = tuple(
-            await self._session.scalars(
-                select(CalculationRelease.id)
-                .join(CalculationFormula, CalculationFormula.id == CalculationRelease.formula_id)
-                .join(
-                    CalculationFormulaScoreboard,
-                    CalculationFormulaScoreboard.formula_id == CalculationFormula.id,
-                )
-                .where(
-                    CalculationFormula.kind == CalculationKind.PERFORMANCE,
-                    CalculationFormulaScoreboard.scoreboard_id == scoreboard_id,
-                    CalculationFormula.enabled.is_(True),
-                    CalculationRelease.ruleset == DbRuleset(ruleset.value),
-                    CalculationRelease.active.is_(True),
-                    CalculationRelease.difficulty_release_id.is_not(None),
-                )
-                .order_by(CalculationFormula.code)
-            )
-        )
-        if release_ids:
-            await self._session.execute(
-                insert(PerformanceCalculationJob)
-                .values(
-                    [
-                        {
-                            "id": uuid.uuid7(),
-                            "score_id": score_id,
-                            "release_id": release_id,
-                            "available_at": now,
-                        }
-                        for release_id in release_ids
-                    ]
-                )
-                .on_conflict_do_nothing(
-                    index_elements=(PerformanceCalculationJob.score_id, PerformanceCalculationJob.release_id)
-                )
-            )
-        return release_ids
-
     async def complete_acceptance(self, idempotency_key: str, result: AcceptedScoreResult) -> None:
         """Attach the exact accepted result to its command receipt."""
         await self._receipts.complete(
@@ -405,44 +350,6 @@ class SqlAlchemyScoringRepository:
             resource_type="score",
             resource_id=str(result.score_id),
             result_snapshot=_result_snapshot(result),
-        )
-
-    async def get_score_performances(self, score_id: int) -> tuple[ScorePerformanceView, ...]:
-        """Return all Formula and immutable release results for one score."""
-        rows = (
-            await self._session.execute(
-                select(
-                    ScorePerformance.score_id,
-                    CalculationFormula.id.label("formula_id"),
-                    CalculationFormula.code.label("formula_code"),
-                    CalculationFormula.name.label("formula_name"),
-                    CalculationFormula.calculator,
-                    CalculationRelease.id.label("release_id"),
-                    CalculationRelease.version.label("release_version"),
-                    CalculationRelease.active.label("release_active"),
-                    ScorePerformance.pp,
-                    ScorePerformance.breakdown,
-                )
-                .join(CalculationRelease, CalculationRelease.id == ScorePerformance.release_id)
-                .join(CalculationFormula, CalculationFormula.id == CalculationRelease.formula_id)
-                .where(ScorePerformance.score_id == score_id)
-                .order_by(CalculationFormula.code, CalculationRelease.created_at.desc())
-            )
-        ).all()
-        return tuple(
-            ScorePerformanceView(
-                score_id=row.score_id,
-                formula_id=row.formula_id,
-                formula_code=row.formula_code,
-                formula_name=row.formula_name,
-                calculator=row.calculator,
-                release_id=row.release_id,
-                release_version=row.release_version,
-                release_active=row.release_active,
-                pp=row.pp,
-                breakdown=row.breakdown,
-            )
-            for row in rows
         )
 
     async def get_replay(self, score_id: int) -> ReplayReference | None:

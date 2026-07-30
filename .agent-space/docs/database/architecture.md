@@ -4,7 +4,7 @@
 
 PostgreSQL 是 Stable 与 Lazer 协议适配器共用的持久事实存储。客户端特有的数据包或 HTTP 数据结构不能泄漏到规范领域模型中。Redis 保存带 TTL 的在线与实时状态，并通过 Redis Stream 承载 Taskiq 消息；Worker 本地内存只能保存单次任务所需数据。
 
-系统只有一个可信中心应用。API、Outbox Relay 和 Taskiq Worker 是同一代码库的进程角色，均直接连接 PostgreSQL 与 Redis，不注册服务节点，也不存在边缘状态导入。
+系统只有一个可信中心应用。API 和 Taskiq Worker 是同一代码库的进程角色，均直接连接 PostgreSQL 与 Redis，不注册业务服务节点，也不存在边缘状态导入。Outbox 与 Calculation Relay 作为 Worker 后台循环运行，不是独立进程。
 
 初始结构包含 12 个 PostgreSQL Schema、129 张表。
 
@@ -88,9 +88,9 @@ PostgreSQL 是 Stable 与 Lazer 协议适配器共用的持久事实存储。客
 
 所有协议请求在中心 API 或实时网关完成认证和规范化，随后直接调用应用服务。所有状态由中心进程产生，不接受外部状态导入。并发控制使用 PostgreSQL 唯一约束、行锁和聚合版本；协议重试幂等键保存在对应领域表中。
 
-业务事务只写 PostgreSQL 事实、Outbox Event 和 Delivery。提交后由独立 Relay 投递 Taskiq；Worker 通过 Delivery 主键和领域约束处理至少一次消息。PostgreSQL 与 Redis 都是中心应用的启动依赖；Relay 在 Redis 恢复后根据未完成 Delivery 继续投递。
+业务事务只写 PostgreSQL 事实、Outbox Event 和 Delivery。提交后由 Worker 内部 Relay 投递 Taskiq；Worker 通过 Delivery 主键和领域约束处理至少一次消息。PostgreSQL 与 Redis 都是中心应用的启动依赖；Redis 恢复后 Relay 根据未完成 Delivery 继续投递。
 
-Calculation Job 同样由 PostgreSQL 持久状态恢复，但与 Outbox Delivery 分表管理，因为外部 Calculator I/O 不能发生在 Outbox Consumer 事务中。Calculator 不连接中心 PostgreSQL/S3，也不领取任务；它只接受带 Release 指纹、Input Digest 和 `.osu` 内容的纯计算请求，中心 Worker 验证响应并拥有最终写权限。
+Calculation Job 同样由 PostgreSQL 持久状态恢复，但与 Outbox Delivery 分表管理，因为外部 Calculator I/O 不能发生在 Outbox Consumer 事务中。Calculator 不连接中心 PostgreSQL/Redis，也不领取任务；它只通过短期签名 URL 直接读取并缓存 S3 Beatmap。中心 Worker 不读取或转发 Beatmap 字节，只负责生成 URL、验证响应并持有最终写权限。
 
 ## Stable 与 Lazer 映射
 

@@ -68,6 +68,15 @@ class OutboxWriter(Protocol):
         ...
 
 
+@runtime_checkable
+class OutboxWriterFactory(Protocol):
+    """Bind an outbox writer to one caller-owned transaction resource."""
+
+    def __call__(self, session: object) -> OutboxWriter:
+        """Return a transaction-bound outbox writer."""
+        ...
+
+
 class ObjectStream(Protocol):
     """Expose one bounded-chunk object body while its provider resource is open."""
 
@@ -101,4 +110,12 @@ class ObjectStorage(Protocol):
 
     async def delete(self, storage_key: str) -> None:
         """Idempotently remove one object."""
+        ...
+
+
+class ObjectUrlProvider(Protocol):
+    """Issue short-lived read URLs for trusted internal consumers."""
+
+    async def presign_read(self, storage_key: str, *, expires_in_seconds: int) -> str:
+        """Return a URL that permits reading one immutable object."""
         ...

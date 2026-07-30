@@ -17,7 +17,7 @@
 | ST-AUTH-001 | Poll 只续 Session，Presence、Preference、Away、频道和 Spectator 在在线约 360 秒后失效 | 已修复 | `infra/redis/scripts.py` 原子 heartbeat；`test_redis_realtime.py` |
 | ST-AUTH-002 | Stable Moderator/Owner 位错误，管理员 Presence 编码溢出并在持久 Session 创建后 500 | 已修复 | `modules/authorization/stable.py` 使用 `1/2/4/8/16`；authorization/composition 测试 |
 | ST-AUTH-003 | 客户端崩溃后旧持久 Session 最多阻塞重登 12 小时 | 已修复 | `AuthSession.last_activity_at`、账户锁、120 秒 stale grace；identity PostgreSQL 测试 |
-| ST-AUTH-004 | 登录身份事务提交后 Bootstrap 失败会留下客户端未获得 Token 的活动 Session | 已修复 | `api/stable/router/bancho.py` 对所有后置步骤执行精确 Token 补偿关闭；Bancho 测试 |
+| ST-AUTH-004 | 登录身份事务提交后 Bootstrap 失败会留下客户端未获得 Token 的活动 Session | 已修复 | `api/stable/router/cho.py` 对所有后置步骤执行精确 Token 补偿关闭；Bancho 测试 |
 | ST-AUTH-005 | 登录只返回本人，不返回其他在线用户 | 已修复 | 登录读取有界 Presence Index，双向发送 Presence/Stats；Bancho Bootstrap 测试 |
 | ST-AUTH-006 | Redis Session 丢失后静默重建不完整状态 | 已修复 | Poll 关闭对应持久 Session 并返回 Restart，要求客户端重新登录；Bancho 测试 |
 | ST-AUTH-007 | Stable 登录后 300-800ms 伪 Logout 会立即关闭会话 | 已修复 | `ResolvedStableSession.opened_at` 和首秒 Logout 抑制；`test_stable_remainder.py` |
@@ -73,11 +73,11 @@
 
 | ID | 原问题与影响 | 状态 | 修复与验证位置 |
 | --- | --- | --- | --- |
-| ST-MP-001 | PostgreSQL 不保证账户只能有一个 active room | 已修复 | 全局 partial unique index、重复数据 repair、IntegrityError 领域映射；PG 并发测试 |
+| ST-MP-001 | PostgreSQL 不保证账户只能有一个 active room | 已修复 | 当前 ORM Schema 定义全局 partial unique index，并将 IntegrityError 映射为领域冲突；PG 并发测试 |
 | ST-MP-002 | PostgreSQL 提交后 Redis 失败被伪装成整个命令失败 | 已修复 | `DurableRoomSnapshot` 与 `DURABLE_RECOVERY` 状态，后续按持久事实恢复 |
 | ST-MP-003 | Redis CAS 只看 state revision，Public ID 复用后旧写可覆盖新房间 | 已修复 | Redis v2 CAS 携带 room/session epoch fence；Redis 测试 |
 | ST-MP-004 | Redis 丢失后正在进行的 Round 恢复成未开始 | 已修复 | Snapshot 恢复 active Round、冻结参与者、Slot/Team/Mods |
-| ST-MP-005 | 同一 Session 可产生多个 active Round | 已修复 | `uq_rounds_session_active`、旧数据 repair、并发错误映射 |
+| ST-MP-005 | 同一 Session 可产生多个 active Round | 已修复 | 当前 ORM Schema 定义 `uq_rounds_session_active`，并映射并发冲突 |
 | ST-MP-006 | Round 中 Settings 更新清除进行中状态 | 已修复 | Canonical Service 在 active Round 拒绝 Settings 变更 |
 | ST-MP-007 | Free Mod 成绩不核对 RoundParticipant 个人冻结 ModSet | 已修复 | Scoring 事务锁定并校验 participant mod set |
 | ST-MP-008 | Attempt 不核对成绩时间、Round/Session 状态 | 已修复 | 校验 started/ended 窗口、active/complete/abort 状态和 2 分钟提交宽限 |
@@ -97,12 +97,12 @@
 
 | ID | 原问题与影响 | 状态 | 修复与验证位置 |
 | --- | --- | --- | --- |
-| ST-SCORE-001 | Ranking ended_at Unix 微秒写入 `NUMERIC(20,5)` 必然溢出 | 已修复 | `NUMERIC(30,5)` 和无浮点 epoch 微秒；Bootstrap schema repair；PG 测试 |
+| ST-SCORE-001 | Ranking ended_at Unix 微秒写入 `NUMERIC(20,5)` 必然溢出 | 已修复 | 当前 ORM Schema 使用 `NUMERIC(30,5)`，Projector 使用无浮点 epoch 微秒；PG 测试 |
 | ST-SCORE-002 | Online Checksum 只保存不重算，伪造成绩可成为权威事实 | 已修复 | 按 bancho.py 公式重算并 `compare_digest`；Score submission 测试 |
 | ST-SCORE-003 | `bmk`、`sbk`、`c1` 和 Build Marker 仅保存不验证 | 已修复 | 谱面 Hash、格式、双设备分量和 Build Marker 子校验；Attestation 仍正确保持 pending |
 | ST-SCORE-004 | Multipart 无 Content-Length 时先无界 spool，再检查 Replay | 已修复 | 在 MultiPartParser 前流式累计总字节；Chunked 同样受限 |
 | ST-SCORE-005 | Replay 可为空/损坏却标记 ready | 已修复 | 最大值、24 字节最小结构和有界读取；完整 Replay 语义分析仍属设计边界 |
-| ST-SCORE-006 | Replay SHA/storage key 全局唯一导致相同内容的第二个 Score 500 | 已修复 | 多个 Score manifest 可引用同一内容寻址对象；旧约束 repair 删除 |
+| ST-SCORE-006 | Replay SHA/storage key 全局唯一导致相同内容的第二个 Score 500 | 已修复 | 当前 ORM Schema 允许多个 Score manifest 引用同一内容寻址对象 |
 | ST-SCORE-007 | Score request digest 漏掉 `x/ft/st/bmk/sbk/c1` | 已修复 | 长度前缀覆盖全部事实字段和 Replay digest |
 | ST-SCORE-008 | `st/ft` 可触发 timedelta Overflow，多类预期错误泄漏 JSON 500 | 已修复 | 数值/时间窗口限制和完整 Stable 文本错误映射 |
 | ST-SCORE-009 | 命中数、Combo、普通 FC 与谱面对象边界不足 | 已修复 | Ruleset 对象数、最大 Combo、Pass/Fail 和时间一致性校验 |
@@ -110,7 +110,7 @@
 | ST-SCORE-011 | RX/AP 暂无 PP 时静默改用 Total Score 排名 | 已修复 | PP Policy 缺结果标记 `performance_pending`，不伪造排名 |
 | ST-SCORE-012 | Stable Loved/Qualified 排行策略不明确 | 已修复 | Vanilla 明确允许 Ranked/Approved/Qualified/Loved；RX/AP 仅 Ranked/Approved |
 | ST-SCORE-013 | Exact Mods 对同 legacy bitmask 的多个 Lazer ModSet 随机选一条 | 已修复 | 合并全部相同 `legacy_bits` 的 Canonical ModSet，再按账户选最佳 |
-| ST-SCORE-014 | Stable Rating 错误绑定 Beatmapset | 已修复 | 绑定 logical Beatmap；旧 Revision vote 迁移、去重并重建约束 |
+| ST-SCORE-014 | Stable Rating 错误绑定 Beatmapset | 已修复 | 当前 ORM Schema 与 Service 直接绑定 logical Beatmap |
 | ST-SCORE-015 | Beatmap Info 固定全 `N`，Web Friends 缺系统账户 1 | 已修复 | 查询真实 Vanilla Grade projection；Friend List 固定含系统账户并去重 |
 | ST-SCORE-016 | 默认 `.osz` 上游要求官方登录，Direct 下载失败 | 已修复 | 遗留官方默认值转换到可公开下载端点，自定义上游仍可配置 |
 | ST-SCORE-017 | Web 认证对离线账户执行高成本 KDF，且不绑定 realtime epoch | 已修复 | 先查活动 Session candidate、dummy verification、Redis epoch 校验 |
@@ -130,26 +130,22 @@
 | ST-BOUND-007 | Web KDF 仍需要入口层请求速率限制 | 代码已消除离线账户直接 KDF 与账户枚举；生产反向代理仍必须限制认证请求速率 |
 | ST-BOUND-008 | `.osz` 尚未本地缓存 | 当前使用可配置公开上游重定向 |
 
-## 7. 数据库升级要求
+## 7. 数据库结构生命周期
 
-`bootstrap_database()` 现在会在同一 advisory lock 下幂等执行以下 repair：
+当前服务尚未部署，不维护旧开发 Schema 的向前兼容，也不在应用 Bootstrap 中执行 `ALTER`、数据回填、去重或约束替换。
 
-- 回填并约束 `iam.auth_sessions.last_activity_at`。
-- 回填 `multiplayer.session_presences.connection_session_id`。
-- 关闭历史重复 active presence，再创建账户级 partial unique index。
-- 将历史重复 active Round 标记 aborted，再创建 Session 级 partial unique index。
-- 放宽未知谱面 Round 的 source 约束。
-- 扩展 Ranking Numeric 精度、删除 Replay 错误唯一约束并迁移 Stable Rating。
-
-部署现有数据库前应备份并在维护窗口运行 Bootstrap；`create_all()` 本身不会修改旧表。
+- `DbBase.metadata` 是当前数据库结构的唯一实现基线。
+- `bootstrap_database()` 只在 advisory lock 下幂等写入运行所需的目录和系统种子，不修改 Schema。
+- ORM Schema 发生变化后，开发与测试数据库直接删除并按当前 Metadata 重建。
+- 在服务首次正式部署并产生持久事实后，再引入显式、可审计的迁移机制；不能把迁移逻辑重新塞回启动 Bootstrap。
 
 ## 8. 验证记录
 
 - 单元与无外部依赖测试覆盖 Stable Login/Poll、Codec、Dispatcher、Web、Scoring、Spectator 和 Multiplayer。
-- PostgreSQL focused 测试覆盖 Session 并发、Ranking、Round、Attempt 和 Schema repair。
+- PostgreSQL focused 测试覆盖当前 Metadata、Session 并发、Ranking、Round 和 Attempt。
 - Redis focused 测试覆盖 Session Fence、Mailbox、Presence、Spectator 与 Multiplayer CAS。
-- 无外部服务完整测试：`260 passed, 15 skipped`。
-- 启用本地真实 PostgreSQL 与 Redis 的完整测试：`275 passed`。
+- 无外部服务完整测试：`259 passed, 15 skipped`。
+- 启用本地真实 PostgreSQL 与 Redis 的完整测试：`274 passed`。
 - 完整验证命令：`uv run ruff format .`、`uv run ruff check --fix .`、`uv run pytest`、`python -m compileall src tests`、`git diff --check`。
 
 本文件是问题历史，不因修复完成而删除条目。若问题复发，应保留原 ID 并追加回归时间、原因与新测试。

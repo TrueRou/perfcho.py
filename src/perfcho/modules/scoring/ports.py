@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Protocol
 
-from perfcho.modules.common.ports import OutboxWriter, UnitOfWork
+from perfcho.modules.common.ports import UnitOfWork
 from perfcho.modules.scoring.models import (
     AcceptanceClaim,
     AcceptedScoreResult,
@@ -18,9 +18,6 @@ from perfcho.modules.scoring.models import (
     ModSetInfo,
     MultiplayerSubmissionContext,
     NormalizedModSet,
-    PerformanceCalculationInput,
-    PerformanceCompletion,
-    PerformanceResult,
     PlayAttemptRecord,
     PlayAttemptSubmission,
     ReplayReference,
@@ -28,7 +25,6 @@ from perfcho.modules.scoring.models import (
     ScoreAcceptanceRecord,
     ScoreboardInfo,
     ScoreboardVariant,
-    ScorePerformanceView,
 )
 
 
@@ -75,23 +71,8 @@ class ScoringRepository(Protocol):
         """Insert score, hits, replay, and attestation facts."""
         ...
 
-    async def schedule_performance_calculations(
-        self,
-        *,
-        score_id: int,
-        scoreboard_id: int,
-        ruleset: Ruleset,
-        now: datetime,
-    ) -> tuple[uuid.UUID, ...]:
-        """Create one durable job for every enabled active formula release."""
-        ...
-
     async def complete_acceptance(self, idempotency_key: str, result: AcceptedScoreResult) -> None:
         """Attach the non-secret accepted result to its command receipt."""
-        ...
-
-    async def get_score_performances(self, score_id: int) -> tuple[ScorePerformanceView, ...]:
-        """Return every persisted Formula release result for one score."""
         ...
 
     async def get_replay(self, score_id: int) -> ReplayReference | None:
@@ -179,54 +160,6 @@ class MultiplayerSubmissionValidator(Protocol):
         ...
 
 
-class PerformanceCalculator(Protocol):
-    """Calculate difficulty and PP through a versioned external engine."""
-
-    async def calculate(self, calculation: PerformanceCalculationInput, beatmap_content: bytes) -> PerformanceResult:
-        """Return deterministic output for one immutable calculation input."""
-        ...
-
-
-class PerformanceCalculationRepository(Protocol):
-    """Coordinate short transaction phases around external calculation I/O."""
-
-    async def start(
-        self,
-        job_id: uuid.UUID,
-        lease_token: uuid.UUID,
-        *,
-        now: datetime,
-    ) -> PerformanceCalculationInput | None:
-        """Fence and materialize one leased immutable calculation input."""
-        ...
-
-    async def complete(
-        self,
-        calculation: PerformanceCalculationInput,
-        lease_token: uuid.UUID,
-        result: PerformanceResult,
-        *,
-        output_digest: bytes,
-        now: datetime,
-    ) -> PerformanceCompletion | None:
-        """Persist one idempotent result if the caller still owns the lease."""
-        ...
-
-    async def fail(
-        self,
-        job_id: uuid.UUID,
-        lease_token: uuid.UUID,
-        *,
-        error: str,
-        retry_at: datetime,
-        dead: bool,
-        consume_attempt: bool,
-        now: datetime,
-    ) -> None:
-        """Release or dead-letter a failed fenced job."""
-        ...
-
-
 class AnticheatAnalyzer(Protocol):
     """Reserve the future asynchronous anti-cheat boundary without an implementation."""
 
@@ -240,14 +173,6 @@ class ScoringRepositoryFactory(Protocol):
 
     def __call__(self, session: object) -> ScoringRepository:
         """Return a transaction-bound repository."""
-        ...
-
-
-class PerformanceCalculationRepositoryFactory(Protocol):
-    """Bind calculation persistence to one caller-owned transaction."""
-
-    def __call__(self, session: object) -> PerformanceCalculationRepository:
-        """Return a transaction-bound calculation repository."""
         ...
 
 
@@ -267,9 +192,23 @@ class MultiplayerSubmissionValidatorFactory(Protocol):
         ...
 
 
-class ScoringOutboxWriterFactory(Protocol):
-    """Bind an outbox writer to the scoring transaction."""
+class ScoreAcceptedTaskScheduler(Protocol):
+    """Schedule durable follow-up work inside the score transaction."""
 
-    def __call__(self, session: object) -> OutboxWriter:
-        """Return a transaction-bound outbox writer."""
+    async def schedule(
+        self,
+        *,
+        score_id: int,
+        scoreboard: ScoreboardInfo,
+        now: datetime,
+    ) -> None:
+        """Schedule all required asynchronous work for an accepted score."""
+        ...
+
+
+class ScoreAcceptedTaskSchedulerFactory(Protocol):
+    """Bind accepted-score scheduling to one caller-owned transaction."""
+
+    def __call__(self, session: object) -> ScoreAcceptedTaskScheduler:
+        """Return a transaction-bound follow-up scheduler."""
         ...

@@ -420,8 +420,18 @@ class PerformanceCalculationJob(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
             "(lease_owner IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)",
             name="running_lease_required",
         ),
-        CheckConstraint("status != 'succeeded' OR completed_at IS NOT NULL", name="succeeded_completion_required"),
+        CheckConstraint(
+            "status = 'running' OR (lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL)",
+            name="nonrunning_lease_forbidden",
+        ),
+        CheckConstraint(
+            "status != 'succeeded' OR (completed_at IS NOT NULL AND output_digest IS NOT NULL)",
+            name="succeeded_completion_required",
+        ),
+        CheckConstraint("status = 'succeeded' OR completed_at IS NULL", name="non_succeeded_completion_forbidden"),
         CheckConstraint("status != 'dead' OR dead_lettered_at IS NOT NULL", name="dead_letter_required"),
+        CheckConstraint("status = 'dead' OR dead_lettered_at IS NULL", name="non_dead_letter_forbidden"),
+        CheckConstraint("status != 'pending' OR attempt_started_at IS NULL", name="pending_attempt_forbidden"),
         UniqueConstraint("score_id", "release_id"),
         Index(
             "ix_performance_calculation_jobs_due",
@@ -447,6 +457,7 @@ class PerformanceCalculationJob(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     )
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")

@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.api.stable import router
 from perfcho.api.stable.dependencies import get_stable_services
-from perfcho.composition import StableServices
+from perfcho.infra.composition import StableServices
 from perfcho.infra.db.models.scoring import RankingPolicy, Score
 from perfcho.infra.db.projectors.ranking import _metric_value, _tie_break_value
 from perfcho.infra.settings import Settings

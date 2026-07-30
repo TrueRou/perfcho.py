@@ -122,6 +122,8 @@ Lazer Attempt Token 只应返回给对应账户，数据库只保存 Digest。St
 
 ## 3. PP、Difficulty 与 Ranking
 
+已实现方法论、当前 HTTP Wire Contract 和外部 Calculator 验收要求见 [Multi-PP Formula 与外部 Calculator 对接规范](performance-calculation.md)。本节只跟踪尚未交付的发布和运维能力。
+
 ### 3.1 当前阻塞
 
 `rosu-pp-py==4.0.2` 在当前 Python 3.14t 平台没有 Wheel，源码构建连续超时。中心应用已经不依赖 Python 绑定，支持按 Formula 调用独立 C#/Rust HTTP Calculator；当前阻塞改为发布真实 Calculator 制品、登记不可变 Formula/Release 并完成跨引擎金样本验证。
@@ -159,7 +161,7 @@ Rebuild 必须写入新 Projection Generation，完成后原子切换，不能�
 - 增加按 Beatmapset 分区的幂等 Key，避免并发同步同一 Set。
 - OAuth Token 在 Source 内缓存到过期前安全窗口，不写数据库明文。
 - 周期同步只负责发现待同步集合；每个 Set 使用独立任务和短数据库事务。
-- 实现 `content-projection.v1` 后再让生产任务持续产生该 Delivery。
+- 为已实现的 `content-projector.v1` 增加生产 Content Sync 入口。
 
 ### 4.2 对账与 GC
 

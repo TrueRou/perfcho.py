@@ -17,19 +17,20 @@ from perfcho.infra.db.projectors.common import (
     require_accounts,
     require_event_context,
 )
-from perfcho.infra.outbox import register_consumer
 
-_SOCIAL_CONSUMER = "social-projection.v1"
-_ACHIEVEMENT_CONSUMER = "achievement-projection.v1"
-_SOCIAL_EVENT_TYPES = (
-    "social.account-followed.v1",
-    "social.account-unfollowed.v1",
-    "social.account-blocked.v1",
-    "social.account-unblocked.v1",
+SOCIAL_CONSUMER_NAME = "social-projector.v1"
+ACHIEVEMENT_CONSUMER_NAME = "achievement-projector.v1"
+SOCIAL_EVENT_TYPES = frozenset(
+    {
+        "social.account-followed.v1",
+        "social.account-unfollowed.v1",
+        "social.account-blocked.v1",
+        "social.account-unblocked.v1",
+    }
 )
+ACHIEVEMENT_EVENT_TYPES = frozenset({"social.achievement-unlocked.v1"})
 
 
-@register_consumer(_SOCIAL_CONSUMER, _SOCIAL_EVENT_TYPES)
 async def project_social_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project one account-pair relationship change into private activity."""
     actor_account_id = payload_integer(event.payload, "actor_account_id")
@@ -68,10 +69,9 @@ async def project_social_event(session: AsyncSession, event: OutboxEvent, partit
         occurred_at=occurred_at,
         snapshot=snapshot,
     )
-    await advance_checkpoint(session, event, projector=_SOCIAL_CONSUMER, partition_key=partition_key)
+    await advance_checkpoint(session, event, projector=SOCIAL_CONSUMER_NAME, partition_key=partition_key)
 
 
-@register_consumer(_ACHIEVEMENT_CONSUMER, ("social.achievement-unlocked.v1",))
 async def project_achievement_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project an achievement unlock into activity and a durable notification."""
     account_id = payload_integer(event.payload, "account_id")
@@ -123,4 +123,4 @@ async def project_achievement_event(session: AsyncSession, event: OutboxEvent, p
         payload=snapshot,
         recipient_account_ids=(account_id,),
     )
-    await advance_checkpoint(session, event, projector=_ACHIEVEMENT_CONSUMER, partition_key=partition_key)
+    await advance_checkpoint(session, event, projector=ACHIEVEMENT_CONSUMER_NAME, partition_key=partition_key)

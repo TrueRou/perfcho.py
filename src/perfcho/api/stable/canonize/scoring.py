@@ -6,12 +6,17 @@ import binascii
 import hashlib
 import hmac
 import re
+import struct
 from base64 import b64decode
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from fastapi import Request
 from py3rijndael import Pkcs7Padding, RijndaelCbc
+from starlette.datastructures import FormData, UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from perfcho.modules.scoring import (
     CanonicalMod,
@@ -34,6 +39,27 @@ _RULESET_IDS = {ruleset: identifier for identifier, ruleset in _RULESETS.items()
 _MAX_ELAPSED_MS = 7 * 24 * 60 * 60 * 1000
 _MAX_INT32 = 2_147_483_647
 _MAX_INT64 = 9_223_372_036_854_775_807
+_MIN_REPLAY_BYTES = 24
+_MAX_SUBMISSION_AGE = timedelta(days=30)
+_MAX_CLOCK_SKEW = timedelta(minutes=5)
+
+
+@dataclass(frozen=True, slots=True)
+class StableScoreSubmissionForm:
+    """Carry validated Stable multipart fields and the uploaded replay."""
+
+    encrypted_score: str
+    replay: UploadFile
+    exited: bool
+    fail_time_ms: int
+    score_time_ms: int
+    password_token: str
+    osu_version: str
+    encrypted_client_hash: str
+    iv: str
+    updated_beatmap_hash: str
+    storyboard_hash: str | None
+    unique_ids: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +76,112 @@ class ParsedStableScore:
     attestation: ScoreAttestation
     client_hash: str
     legacy_mod_bits: int
+
+
+async def parse_stable_submission_form(request: Request, maximum: int) -> StableScoreSubmissionForm:
+    """Parse one bounded Stable multipart score submission."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None and (
+        not content_length.isascii() or not content_length.isdigit() or int(content_length) > maximum
+    ):
+        raise MultiPartException("Stable score submission is too large")
+    if request.headers.get("content-type", "").partition(";")[0].strip().casefold() != "multipart/form-data":
+        raise MultiPartException("Stable score submission must be multipart")
+    parser = MultiPartParser(
+        request.headers,
+        _limited_multipart_stream(request, maximum),
+        max_files=2,
+        max_fields=32,
+        max_part_size=maximum,
+    )
+    form = await parser.parse()
+    return _parse_submission_form(form)
+
+
+async def read_stable_replay(upload: UploadFile, maximum: int) -> bytes:
+    """Read one bounded replay with the minimum Stable replay structure."""
+    content = await upload.read(maximum + 1)
+    if len(content) > maximum:
+        raise ValueError("Stable replay exceeds the configured limit")
+    if len(content) < _MIN_REPLAY_BYTES:
+        raise ValueError("Stable replay does not contain its minimum structure")
+    return content
+
+
+def validate_stable_submission_evidence(
+    form: StableScoreSubmissionForm,
+    parsed: ParsedStableScore,
+) -> None:
+    """Validate Stable multipart evidence that is not inside the encrypted score."""
+    updated_beatmap_hash = _md5_bytes(form.updated_beatmap_hash, "bmk")
+    if not hmac.compare_digest(updated_beatmap_hash, parsed.beatmap_md5):
+        raise ValueError("Stable updated beatmap hash does not match the score")
+    if form.storyboard_hash is not None:
+        _md5_bytes(form.storyboard_hash, "sbk")
+    identifiers = form.unique_ids.split("|")
+    if len(identifiers) != 2 or any(
+        not value or len(value) > 1024 or not all(character.isprintable() for character in value)
+        for value in identifiers
+    ):
+        raise ValueError("Stable unique client identifiers are invalid")
+
+
+def validate_stable_submission_time(parsed: ParsedStableScore, received_at: datetime) -> None:
+    """Reject Stable timestamps outside the adapter's accepted transport window."""
+    if not received_at - _MAX_SUBMISSION_AGE <= parsed.attempt.ended_at <= received_at + _MAX_CLOCK_SKEW:
+        raise ValueError("Stable score timestamp is outside the accepted submission window")
+
+
+def stable_submission_digest(form: StableScoreSubmissionForm, replay_digest: bytes) -> bytes:
+    """Hash all Stable score submission facts with unambiguous field framing."""
+    fields = (
+        ("score", form.encrypted_score.encode()),
+        ("replay_sha256", replay_digest),
+        ("x", str(int(form.exited)).encode()),
+        ("ft", str(form.fail_time_ms).encode()),
+        ("st", str(form.score_time_ms).encode()),
+        ("pass", form.password_token.encode()),
+        ("osuver", form.osu_version.encode()),
+        ("s", form.encrypted_client_hash.encode()),
+        ("iv", form.iv.encode()),
+        ("bmk", form.updated_beatmap_hash.encode()),
+        ("sbk", (form.storyboard_hash or "").encode()),
+        ("c1", form.unique_ids.encode()),
+    )
+    digest = hashlib.sha256()
+    for name, value in fields:
+        encoded_name = name.encode()
+        digest.update(struct.pack(">H", len(encoded_name)))
+        digest.update(encoded_name)
+        digest.update(struct.pack(">Q", len(value)))
+        digest.update(value)
+    return digest.digest()
+
+
+def normalize_stable_attestation(
+    form: StableScoreSubmissionForm,
+    parsed: ParsedStableScore,
+) -> ScoreAttestation:
+    """Add verified multipart evidence to the canonical Stable attestation."""
+    online_checksum = parsed.score.online_checksum
+    if online_checksum is None:
+        raise ValueError("Stable online checksum is missing")
+    return replace(
+        parsed.attestation,
+        checksum=online_checksum,
+        client_integrity_digest=hashlib.sha256(parsed.client_hash.encode()).digest(),
+        evidence={
+            **dict(parsed.attestation.evidence),
+            "online_checksum": "verified",
+            "updated_beatmap_hash": "verified",
+            "storyboard_hash": "format_valid_authoritative_match_pending"
+            if form.storyboard_hash is not None
+            else "not_supplied",
+            "client_hash": "format_valid_authoritative_session_match_pending",
+            "unique_ids": "format_valid_authoritative_session_match_pending",
+            "unique_ids_digest": hashlib.sha256(form.unique_ids.encode()).hexdigest(),
+        },
+    )
 
 
 def decrypt_stable_score(
@@ -210,6 +342,84 @@ def verify_stable_online_checksum(
     )
     if not hmac.compare_digest(supplied, expected):
         raise ValueError("Stable online checksum does not match the submitted score")
+
+
+async def _limited_multipart_stream(request: Request, maximum: int) -> AsyncGenerator[bytes]:
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > maximum:
+            raise MultiPartException("Stable score submission is too large")
+        yield chunk
+
+
+def _parse_submission_form(form: FormData) -> StableScoreSubmissionForm:
+    score_parts = form.getlist("score")
+    encrypted_score = next((part for part in score_parts if isinstance(part, str)), None)
+    replay = next((part for part in score_parts if isinstance(part, UploadFile)), None)
+    if encrypted_score is None or replay is None or len(score_parts) != 2:
+        raise ValueError("Stable score multipart fields are invalid")
+    return StableScoreSubmissionForm(
+        encrypted_score=encrypted_score,
+        replay=replay,
+        exited=_form_boolean(form, "x"),
+        fail_time_ms=_form_integer(form, "ft", maximum=_MAX_ELAPSED_MS),
+        score_time_ms=_form_integer(form, "st", maximum=_MAX_ELAPSED_MS),
+        password_token=_form_text(form, "pass", maximum=32),
+        osu_version=_form_text(form, "osuver", maximum=16),
+        encrypted_client_hash=_form_text(form, "s", maximum=16_384),
+        iv=_form_text(form, "iv", maximum=1024),
+        updated_beatmap_hash=_form_text(form, "bmk", maximum=128),
+        storyboard_hash=_optional_form_text(form, "sbk", maximum=128),
+        unique_ids=_form_text(form, "c1", maximum=2048),
+    )
+
+
+def _form_text(form: FormData, key: str, *, maximum: int) -> str:
+    value = form.get(key)
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise ValueError(f"Stable score field {key} is invalid")
+    return value
+
+
+def _optional_form_text(form: FormData, key: str, *, maximum: int) -> str | None:
+    value = form.get(key)
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or len(value) > maximum:
+        raise ValueError(f"Stable score field {key} is invalid")
+    return value
+
+
+def _form_integer(form: FormData, key: str, *, maximum: int) -> int:
+    value = _form_text(form, key, maximum=20)
+    if not value.isascii() or not value.isdigit():
+        raise ValueError(f"Stable score field {key} is invalid")
+    result = int(value)
+    if result > maximum:
+        raise ValueError(f"Stable score field {key} is outside its supported range")
+    return result
+
+
+def _form_boolean(form: FormData, key: str) -> bool:
+    value = _form_text(form, key, maximum=5)
+    if value in {"1", "True"}:
+        return True
+    if value in {"0", "False"}:
+        return False
+    raise ValueError(f"Stable score field {key} is invalid")
+
+
+def _md5_bytes(value: str, field_name: str) -> bytes:
+    if len(value) != 32:
+        raise ValueError(f"Stable score field {field_name} is not an MD5")
+    try:
+        digest = bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(f"Stable score field {field_name} is not an MD5") from error
+    if len(digest) != 16:
+        raise ValueError(f"Stable score field {field_name} is not an MD5")
+    return digest
 
 
 def _integer(value: str, *, maximum: int = _MAX_INT64) -> int:

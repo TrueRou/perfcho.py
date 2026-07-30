@@ -31,18 +31,16 @@ dependencies, starts and waits for PostgreSQL, Redis, and MinIO, initializes the
 these roles in parallel:
 
 - API
-- Outbox Relay
-- Taskiq Worker
+- Taskiq Worker, including the durable Outbox and Performance relay loop
 
-Stopping one debug session stops all three application roles. PostgreSQL, Redis, and MinIO remain running so that
+Stopping one debug session stops both application roles. PostgreSQL, Redis, and MinIO remain running so that
 subsequent debug sessions start quickly; stop them explicitly with `docker compose down` when they are no longer needed.
 
 Run the process roles separately:
 
 ```bash
 uv run uvicorn perfcho.main:asgi_app --host 127.0.0.1 --port 8000
-uv run taskiq worker perfcho.infra.taskiq:broker perfcho.tasks.outbox perfcho.tasks.performance --ack-type when_executed
-uv run python -m perfcho.infra.outbox
+uv run taskiq worker perfcho.worker:broker --ack-type when_executed
 ```
 
 ## Production Compose
@@ -57,7 +55,8 @@ docker compose --env-file .env.production -f compose.prod.yaml up -d --build
 docker compose --env-file .env.production -f compose.prod.yaml ps
 ```
 
-The production topology runs PostgreSQL, authenticated Redis, API, Outbox Relay, and Taskiq Worker. Each application role
+The production topology runs PostgreSQL, authenticated Redis, API, and Taskiq Worker. The Worker also relays durable
+Outbox and Performance jobs before consuming them. Each application role
 ensures missing schemas and tables exist at startup; a PostgreSQL advisory lock serializes concurrent initialization.
 S3-compatible object storage remains an external production dependency. Only the API is published, on `127.0.0.1:8000`
 by default, for a same-host reverse proxy to terminate TLS. PostgreSQL and Redis use named volumes and are not published
@@ -92,9 +91,14 @@ src/perfcho/infra/db/
   mixins.py               ID and timestamp policies
   models/                 Domain-separated models with English purpose docstrings
   projectors/             Idempotent outbox consumers and projection checkpoints
-src/perfcho/infra/outbox.py  PostgreSQL delivery ledger and Taskiq relay
-src/perfcho/infra/taskiq.py  Redis Stream broker and worker lifecycle
-src/perfcho/tasks/outbox.py  Taskiq dispatch task and explicit consumer registration
+src/perfcho/modules/performance/   Performance models, ports, and application services
+src/perfcho/infra/db/repositories/performance/  Performance scheduling, job, and query adapters
+src/perfcho/infra/db/relays/       Outbox Delivery and Performance Job state machines
+src/perfcho/infra/db/projectors/catalog.py      Explicit outbox consumer catalog
+src/perfcho/infra/upstream/performance_calculator.py  External Calculator HTTP client
+src/perfcho/infra/taskiq.py        Redis Stream broker transport
+src/perfcho/tasks/                 Thin Taskiq task adapters
+src/perfcho/worker.py              Worker composition root and process lifecycle
 .agent-space/docs/        Chinese architecture, operations, and business contracts
 tests/                    Infrastructure and domain contract tests
 ```

@@ -15,13 +15,11 @@ from perfcho.infra.db.projectors.common import (
     require_accounts,
     require_event_context,
 )
-from perfcho.infra.outbox import register_consumer
 
-_CONSUMER = "identity-projection.v1"
-_EVENT_TYPES = ("identity.session-opened.v1", "identity.session-closed.v1")
+CONSUMER_NAME = "identity-projector.v1"
+EVENT_TYPES = frozenset({"identity.session-opened.v1", "identity.session-closed.v1"})
 
 
-@register_consumer(_CONSUMER, _EVENT_TYPES)
 async def project_identity_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project one opened or closed authentication session without changing Presence."""
     account_id = payload_integer(event.payload, "account_id")
@@ -63,4 +61,4 @@ async def project_identity_event(session: AsyncSession, event: OutboxEvent, part
         occurred_at=occurred_at,
         snapshot=snapshot,
     )
-    await advance_checkpoint(session, event, projector=_CONSUMER, partition_key=partition_key)
+    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)

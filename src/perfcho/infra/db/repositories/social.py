@@ -11,8 +11,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from perfcho.infra.db.advisory_lock import acquire_transaction_lock
 from perfcho.infra.db.enums import AccountStatus
+from perfcho.infra.db.locks import acquire_transaction_lock
 from perfcho.infra.db.models.core import Account, AccountName
 from perfcho.infra.db.models.social import (
     AchievementDefinition,

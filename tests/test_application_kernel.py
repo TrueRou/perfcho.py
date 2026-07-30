@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import LargeBinary, Table
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.advisory_lock import acquire_transaction_locks, advisory_lock_key
+from perfcho.infra.db.locks import acquire_transaction_locks, advisory_lock_key
 from perfcho.infra.db.models.system import CommandReceipt
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWork
 from perfcho.modules.common import Actor, ClientContext, CommandMeta, PendingEvent

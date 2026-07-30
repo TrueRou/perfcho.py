@@ -1,6 +1,6 @@
 import hashlib
 import uuid
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import cast
@@ -18,7 +18,8 @@ from perfcho.infra.db.models.core import Account, AccountEmail, AccountName, Use
 from perfcho.infra.db.models.events import OutboxEvent
 from perfcho.infra.db.models.iam import PasswordCredential
 from perfcho.infra.db.models.system import CommandReceipt
-from perfcho.infra.db.repositories.account import SqlAlchemyAccountRepository, SqlAlchemyOutboxWriter
+from perfcho.infra.db.repositories.account import SqlAlchemyAccountRepository
+from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
 from perfcho.infra.security.password import Argon2Policy, PasswordHash, PasswordPepper
 from perfcho.modules.account import (
@@ -367,15 +368,17 @@ async def test_registration_is_atomic_replayable_and_grants_only_user_role(postg
     db_engine = await infra_db.create_engine()
     session_factory = infra_db.create_session_factory(db_engine)
     try:
+        instant = datetime.now(UTC)
         service = AccountService(
             uow_factory=SqlAlchemyUnitOfWorkFactory(session_factory),
             repository_factory=lambda session: SqlAlchemyAccountRepository(cast(AsyncSession, session)),
             outbox_writer_factory=lambda session: SqlAlchemyOutboxWriter(cast(AsyncSession, session)),
             password_pepper=PasswordPepper(1, b"integration-test-pepper"),
             argon2_policy=Argon2Policy(1, 8, 1),
-            clock=FixedClock(datetime(2026, 7, 28, 12, 30, tzinfo=UTC)),
+            clock=FixedClock(instant),
         )
-        command = _command()
+        base_command = _command()
+        command = replace(base_command, meta=replace(base_command.meta, received_at=instant))
 
         result = await service.register(command)
         assert await service.register(command) == result

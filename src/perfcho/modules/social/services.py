@@ -5,7 +5,7 @@ from collections.abc import Callable, Mapping
 
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.normalization import normalize_stable_name
-from perfcho.modules.common.ports import Clock
+from perfcho.modules.common.ports import Clock, OutboxWriterFactory
 from perfcho.modules.social.errors import (
     AchievementNotFound,
     SocialAccountNotFound,
@@ -23,14 +23,13 @@ from perfcho.modules.social.models import (
     PairRelationship,
 )
 from perfcho.modules.social.ports import (
-    SocialOutboxWriterFactory,
     SocialRepository,
     SocialRepositoryFactory,
     SocialUnitOfWork,
 )
 
-_SOCIAL_CONSUMERS = ("social-projection.v1",)
-_ACHIEVEMENT_CONSUMERS = ("achievement-projection.v1",)
+_SOCIAL_CONSUMERS = ("social-projector.v1",)
+_ACHIEVEMENT_CONSUMERS = ("achievement-projector.v1",)
 
 
 class SocialService:
@@ -40,7 +39,7 @@ class SocialService:
         self,
         uow_factory: Callable[[], SocialUnitOfWork],
         repository_factory: SocialRepositoryFactory,
-        outbox_writer_factory: SocialOutboxWriterFactory,
+        outbox_writer_factory: OutboxWriterFactory,
         clock: Clock,
     ) -> None:
         """Bind transaction, persistence, event, and time dependencies."""

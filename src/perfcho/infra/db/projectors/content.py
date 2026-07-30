@@ -17,12 +17,11 @@ from perfcho.infra.db.projectors.common import (
     project_notification,
     require_event_context,
 )
-from perfcho.infra.outbox import register_consumer
 
-_CONSUMER = "content-projection.v1"
+CONSUMER_NAME = "content-projector.v1"
+EVENT_TYPES = frozenset({"content.beatmapset-synchronized.v1"})
 
 
-@register_consumer(_CONSUMER, ("content.beatmapset-synchronized.v1",))
 async def project_content_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project the latest beatmapset synchronization and notify a linked creator."""
     beatmapset_id = payload_integer(event.payload, "beatmapset_id")
@@ -96,4 +95,4 @@ async def project_content_event(session: AsyncSession, event: OutboxEvent, parti
             payload=snapshot,
             recipient_account_ids=(beatmapset.creator_account_id,),
         )
-    await advance_checkpoint(session, event, projector=_CONSUMER, partition_key=partition_key)
+    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)

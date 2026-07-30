@@ -6,7 +6,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from perfcho.composition import StableServices
+from perfcho.infra.composition import StableServices
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
 from perfcho.modules.common.errors import ApplicationError
 from perfcho.modules.community import (
@@ -33,10 +33,7 @@ from perfcho.modules.realtime import (
     SpectatorHostOffline,
     SpectatorRelation,
 )
-from perfcho.modules.scoring import Ruleset
-from perfcho.modules.scoring.mods import LEGACY_MOD_BITS, parse_legacy_mods
-from perfcho.modules.social import SocialAccountNotFound, SocialInteractionBlocked, SocialRelationRejected
-from perfcho.realtime.stable.builders import (
+from perfcho.modules.realtime.stable.builders import (
     channel_info,
     channel_join,
     channel_kick,
@@ -59,8 +56,8 @@ from perfcho.realtime.stable.builders import (
     user_presence,
     user_stats,
 )
-from perfcho.realtime.stable.codec import Packet, PacketReader, build_packet
-from perfcho.realtime.stable.models import (
+from perfcho.modules.realtime.stable.codec import Packet, PacketReader, build_packet
+from perfcho.modules.realtime.stable.models import (
     Channel,
     ClientPacket,
     ClientStatus,
@@ -69,13 +66,16 @@ from perfcho.realtime.stable.models import (
     UserPresence,
     UserStats,
 )
-from perfcho.realtime.stable.multiplayer import (
+from perfcho.modules.realtime.stable.multiplayer import (
     MULTIPLAYER_PACKETS,
     _broadcast_lobby,
     _broadcast_state,
     _enqueue,
     dispatch_multiplayer_packet,
 )
+from perfcho.modules.scoring import Ruleset
+from perfcho.modules.scoring.mods import LEGACY_MOD_BITS, parse_legacy_mods
+from perfcho.modules.social import SocialAccountNotFound, SocialInteractionBlocked, SocialRelationRejected
 
 _MESSAGE_ID_WINDOW_SECONDS = 5
 
