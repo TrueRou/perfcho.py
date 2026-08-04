@@ -48,7 +48,7 @@ docker compose --env-file .env.production up -d --build
 docker compose --env-file .env.production ps
 ```
 
-部署拓扑等待 PostgreSQL/Redis/MinIO 健康，并由 MinIO 初始化容器创建 bucket 后启动 API/Taskiq。最先获得数据库初始化锁的角色通过 SQLAlchemy 创建缺失的 Schema 和表。两个应用角色复用同一 Python 3.14t 镜像并独立监管；API 提供 HTTP 健康检查，Taskiq 由主进程退出状态触发重启，并结合最老 Delivery 延迟、Dead Letter 和 Redis Pending Entry 监控判断业务健康。
+部署拓扑等待 PostgreSQL/Redis/MinIO 健康，并由 MinIO 初始化容器创建 bucket 后启动 API/Taskiq。最先获得数据库初始化锁的角色通过 SQLAlchemy 创建缺失的 Schema 和表。两个应用角色复用同一标准 Python 3.14 镜像并独立监管；API 提供 HTTP 健康检查，Taskiq 由主进程退出状态触发重启，并结合最老 Delivery 延迟、Dead Letter 和 Redis Pending Entry 监控判断业务健康。
 
 依赖只发布到宿主机回环地址。MinIO 的 `perfcho-minio` volume 必须与 PostgreSQL Manifest 的事务点一致备份。API 默认只发布到 `127.0.0.1:10727`，由同机反向代理终止 TLS；必须显式修改 `APP_BIND_ADDRESS` 才能监听其他地址。`perfcho-postgres`、`perfcho-redis` 和 `perfcho-minio` 是持久卷，执行 `down` 时禁止附带 `--volumes`，除非已确认永久删除数据。
 

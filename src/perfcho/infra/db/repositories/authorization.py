@@ -6,6 +6,7 @@ from datetime import datetime
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from perfcho.infra.db.base import DbSessionFactory
 from perfcho.infra.db.enums import GrantEffect
 from perfcho.infra.db.models.authz import (
     AccountEntitlementGrant,
@@ -295,3 +296,16 @@ class SqlAlchemyAuthorizationRepository:
         if catalog_id is None:
             raise ResourceNotFound("authorization catalog entry does not exist")
         return catalog_id
+
+
+class SqlAlchemyAuthorizationQueryRepository:
+    """Open a short read session for each process-owned authorization query."""
+
+    def __init__(self, session_factory: DbSessionFactory) -> None:
+        """Store the process-owned session factory without sharing sessions."""
+        self._session_factory = session_factory
+
+    async def get_effective(self, account_id: int, *, at: datetime) -> EffectiveAuthorization:
+        """Resolve effective grants in an isolated read-only application operation."""
+        async with self._session_factory() as session:
+            return await SqlAlchemyAuthorizationRepository(session).get_effective(account_id, at=at)

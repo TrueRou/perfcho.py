@@ -28,31 +28,31 @@ async def test_stable_composition_wires_independent_security_keys() -> None:
     session_factory = async_sessionmaker(expire_on_commit=False)
     redis = Redis()
     try:
-        async with compose_stable_services(session_factory, redis, config=config) as services:
-            assert services.account is not None
-            assert services.bot is not None
-            assert services.bot.bot_name == "BanchoBot"
-            assert {command.name for command in services.bot.registry.get_commands()} == {
-                "roll",
-                "server",
-                "reconnect",
-                "quit",
-                "help",
-            }
-            assert {group.name for group in services.bot.registry.get_groups()} == {"mp", "pool", "clan"}
-            assert services.identity._token_hmac_key == token_key.encode()
-            assert services.identity._stable_session_stale_grace == timedelta(seconds=180)
-            assert services.multiplayer is not None
-            assert services.multiplayer._password_key == match_password_key.encode()
-            assert services.multiplayer._admission_key == admission_key.encode()
-            assert services.identity._token_hmac_key != services.multiplayer._password_key
-            assert services.identity._token_hmac_key != services.multiplayer._admission_key
-            assert services.multiplayer._password_key != services.multiplayer._admission_key
-            assert services.community is not None
-            assert services.community._active_memberships is services.realtime
-            assert isinstance(services.realtime, RedisRealtimeRepository)
-            assert services.realtime._max_channels_per_session == 17
-            assert services.realtime._max_spectators_per_host == 23
+        services = compose_stable_services(session_factory, redis, config=config)
+        assert services.account is not None
+        assert services.bot is not None
+        assert services.bot.bot_name == "BanchoBot"
+        assert {command.name for command in services.bot.registry.get_commands()} == {
+            "roll",
+            "server",
+            "reconnect",
+            "quit",
+            "help",
+        }
+        assert {group.name for group in services.bot.registry.get_groups()} == {"mp", "pool", "clan"}
+        assert services.identity._token_hmac_key == token_key.encode()
+        assert services.identity._stable_session_stale_grace == timedelta(seconds=180)
+        assert services.multiplayer is not None
+        assert services.multiplayer._password_key == match_password_key.encode()
+        assert services.multiplayer._admission_key == admission_key.encode()
+        assert services.identity._token_hmac_key != services.multiplayer._password_key
+        assert services.identity._token_hmac_key != services.multiplayer._admission_key
+        assert services.multiplayer._password_key != services.multiplayer._admission_key
+        assert services.community is not None
+        assert services.community._active_memberships is services.realtime
+        assert isinstance(services.realtime, RedisRealtimeRepository)
+        assert services.realtime._max_channels_per_session == 17
+        assert services.realtime._max_spectators_per_host == 23
     finally:
         await redis.aclose()
 

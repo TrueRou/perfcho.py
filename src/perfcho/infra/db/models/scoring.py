@@ -656,6 +656,7 @@ class UserRankedStat(TimestampMixin, DbBase):
         CheckConstraint("ranked_score >= 0 AND performance >= 0", name="nonnegative_values"),
         CheckConstraint("accuracy BETWEEN 0 AND 1", name="accuracy_range"),
         Index("ix_user_ranked_stats_rank", "policy_id", "performance", "account_id"),
+        Index("ix_user_ranked_stats_ranked_score", "policy_id", "ranked_score", "account_id"),
         {"schema": "scoring"},
     )
 

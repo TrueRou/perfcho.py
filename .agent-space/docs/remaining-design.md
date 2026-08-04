@@ -126,7 +126,7 @@ Lazer Attempt Token 只应返回给对应账户，数据库只保存 Digest。St
 
 ### 3.1 当前阻塞
 
-`rosu-pp-py==4.0.2` 在当前 Python 3.14t 平台没有 Wheel，源码构建连续超时。中心应用已经不依赖 Python 绑定，支持按 Formula 调用独立 C#/Rust HTTP Calculator；当前阻塞改为发布真实 Calculator 制品、登记不可变 Formula/Release 并完成跨引擎金样本验证。
+中心应用不内嵌 Python PP 引擎，支持按 Formula 调用独立 C#/Rust HTTP Calculator；当前阻塞是发布真实 Calculator 制品、登记不可变 Formula/Release 并完成跨引擎金样本验证。
 
 ### 3.2 已实现基础
 

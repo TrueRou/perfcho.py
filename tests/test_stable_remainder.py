@@ -176,7 +176,14 @@ class FakeCommunity:
         }
         return self.channel
 
-    async def get_channel_member_count(self, account_id: int, channel_id: int) -> int:
+    async def get_channel_member_count(
+        self,
+        account_id: int,
+        channel_id: int,
+        *,
+        already_authorized: bool = False,
+    ) -> int:
+        del already_authorized
         assert account_id == 10 and channel_id == self.channel.channel_id
         return self.member_count
 

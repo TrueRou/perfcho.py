@@ -16,6 +16,7 @@ from perfcho.infra import logging
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.base import DbSessionFactory
 from perfcho.infra.glue.content import ContentRuntime, create_content_runtime
+from perfcho.infra.glue.stable import StableServices, compose_stable_services
 from perfcho.infra.redis import engine as infra_redis
 
 
@@ -26,6 +27,7 @@ class AppState(TypedDict):
     redis_engine: Redis
     db_session_factory: DbSessionFactory
     content_runtime: ContentRuntime
+    stable_services: StableServices
 
 
 @asynccontextmanager
@@ -43,6 +45,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
         redis_engine = await infra_redis.create_redis()
         session_factory = infra_db.create_session_factory(db_engine)
         content_runtime = create_content_runtime(session_factory)
+        stable_services = compose_stable_services(
+            session_factory,
+            redis_engine,
+            content_runtime=content_runtime,
+        )
         logging.log_event("INFO", "runtime.api.ready", duration_ms=logging.duration_ms(started_ns))
         ready = True
         yield {
@@ -50,6 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
             "redis_engine": redis_engine,
             "db_session_factory": session_factory,
             "content_runtime": content_runtime,
+            "stable_services": stable_services,
         }
     except Exception as error:
         logging.log_event(

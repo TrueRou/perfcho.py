@@ -163,9 +163,15 @@ class FakeIdentityRepository:
         self.calls.append("resolve")
         return self.resolved
 
-    async def touch_stable_session(self, token_digest: bytes, *, at: datetime) -> ResolvedStableSession | None:
+    async def touch_stable_session(
+        self,
+        token_digest: bytes,
+        *,
+        at: datetime,
+        minimum_interval: timedelta,
+    ) -> tuple[ResolvedStableSession, bool] | None:
         self.calls.append("touch")
-        return replace(self.resolved, last_activity_at=at) if self.resolved is not None else None
+        return (replace(self.resolved, last_activity_at=at), True) if self.resolved is not None else None
 
     async def get_stable_session_account_id(self, session_id: uuid.UUID) -> int | None:
         self.calls.append("session-account")
@@ -193,6 +199,20 @@ class FakeOutboxWriter:
         self.calls.append(f"event:{event.event_type}")
         self.events.append(event)
         return uuid.uuid7()
+
+
+class FakeWebVerificationCache:
+    def __init__(self, *, matched: bool) -> None:
+        self.matched = matched
+        self.matches_calls: list[dict[str, object]] = []
+        self.store_calls: list[dict[str, object]] = []
+
+    async def matches(self, **kwargs: object) -> bool:
+        self.matches_calls.append(dict(kwargs))
+        return self.matched
+
+    async def store(self, **kwargs: object) -> None:
+        self.store_calls.append(dict(kwargs))
 
 
 def _snapshot(
@@ -244,6 +264,7 @@ def _service(
     repository: FakeIdentityRepository,
     outbox: FakeOutboxWriter,
     calls: list[str],
+    cache: FakeWebVerificationCache | None = None,
 ) -> tuple[IdentityService, list[FakeUnitOfWork]]:
     units: list[FakeUnitOfWork] = []
 
@@ -263,6 +284,7 @@ def _service(
             clock=FixedClock(),
             id_generator=SequenceIds(),
             stable_session_stale_grace=timedelta(minutes=2),
+            stable_web_verification_cache=cache,
             token_factory=lambda: "raw-stable-token-secret",
         ),
         units,
@@ -660,6 +682,35 @@ async def test_web_verification_checks_session_before_password_and_rechecks_afte
 
 
 @pytest.mark.asyncio
+async def test_web_verification_cache_hit_skips_password_kdf_and_credential_recheck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    snapshot = _snapshot()
+    session = OpenStableSession(
+        uuid.uuid7(),
+        INSTANT - timedelta(minutes=5),
+        INSTANT - timedelta(seconds=5),
+        INSTANT + timedelta(hours=1),
+    )
+    repository = FakeIdentityRepository(calls, snapshot)
+    repository.web_candidate = (snapshot, session)
+    cache = FakeWebVerificationCache(matched=True)
+    service, _ = _service(repository, FakeOutboxWriter(calls), calls, cache)
+    monkeypatch.setattr(
+        "perfcho.modules.identity.services.verify_password",
+        lambda *args, **kwargs: pytest.fail("a valid cached proof must skip Argon2"),
+    )
+
+    principal = await service.verify_stable_web("Alice", "a" * 32)
+
+    assert principal.session_id == session.session_id
+    assert len(cache.matches_calls) == 1
+    assert cache.store_calls == []
+    assert "recheck:42" not in calls
+
+
+@pytest.mark.asyncio
 async def test_web_verification_uses_dummy_kdf_without_an_online_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -789,17 +840,57 @@ async def test_sqlalchemy_repository_touches_session_monotonically_under_row_loc
     session.execute = AsyncMock(side_effect=(query_result, MagicMock()))
     repository = SqlAlchemyIdentityRepository(session)
 
-    resolved = await repository.touch_stable_session(hashlib.sha256(b"token").digest(), at=INSTANT)
+    resolved = await repository.touch_stable_session(
+        hashlib.sha256(b"token").digest(),
+        at=INSTANT,
+        minimum_interval=timedelta(seconds=5),
+    )
 
     assert resolved is not None
-    assert resolved.opened_at == row.opened_at
-    assert resolved.last_activity_at == INSTANT
+    touched, persisted = resolved
+    assert touched.opened_at == row.opened_at
+    assert touched.last_activity_at == INSTANT
+    assert persisted
     lock_statement = session.execute.await_args_list[0].args[0]
     lock_sql = str(lock_statement.compile(dialect=postgresql.dialect()))
-    assert "FOR UPDATE OF auth_sessions" in lock_sql
+    assert "FOR UPDATE OF auth_sessions" not in lock_sql
     update_statement = session.execute.await_args_list[1].args[0]
     assert INSTANT in update_statement.compile().params.values()
     session.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sqlalchemy_repository_skips_heartbeat_write_before_interval() -> None:
+    row = SimpleNamespace(
+        account_id=42,
+        current_name="Alice",
+        auth_version=1,
+        country_code=None,
+        session_id=uuid.uuid7(),
+        device_id=uuid.uuid7(),
+        client_version="b20260729",
+        client_variant="cuttingedge",
+        opened_at=INSTANT - timedelta(minutes=5),
+        last_activity_at=INSTANT - timedelta(seconds=5),
+        expires_at=INSTANT + timedelta(hours=1),
+    )
+    query_result = MagicMock()
+    query_result.one_or_none.return_value = row
+    session = MagicMock(spec=AsyncSession)
+    session.execute = AsyncMock(return_value=query_result)
+    repository = SqlAlchemyIdentityRepository(session)
+
+    result = await repository.touch_stable_session(
+        hashlib.sha256(b"token").digest(),
+        at=INSTANT,
+        minimum_interval=timedelta(seconds=30),
+    )
+
+    assert result is not None
+    resolved, persisted = result
+    assert resolved.last_activity_at == row.last_activity_at
+    assert not persisted
+    session.execute.assert_awaited_once()
 
 
 @pytest.mark.asyncio

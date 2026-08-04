@@ -164,6 +164,7 @@ class SqlAlchemyPerformanceJobRepository:
         calculation = PerformanceCalculationInput(
             job_id=job.id,
             score_id=score.id,
+            account_id=score.account_id,
             attempt_count=job.attempt_count,
             formula_id=row.formula_id,
             formula_code=row.formula_code,
@@ -320,6 +321,7 @@ class SqlAlchemyPerformanceJobRepository:
         job.last_error = None
         return PerformanceCompletion(
             score_id=calculation.score_id,
+            account_id=calculation.account_id,
             scoreboard_id=calculation.scoreboard.scoreboard_id,
             formula_id=calculation.formula_id,
             formula_code=calculation.formula_code,

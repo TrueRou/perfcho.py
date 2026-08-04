@@ -42,6 +42,7 @@ from perfcho.modules.identity.ports import (
     IdentityRepository,
     IdentityRepositoryFactory,
     IdentityUnitOfWork,
+    StableWebVerificationCache,
 )
 
 _IDENTITY_CONSUMERS = ("identity-projector.v1",)
@@ -65,6 +66,8 @@ class IdentityService:
         id_generator: IdGenerator,
         *,
         stable_session_stale_grace: timedelta,
+        stable_session_touch_interval: timedelta = timedelta(seconds=30),
+        stable_web_verification_cache: StableWebVerificationCache | None = None,
         token_factory: Callable[[], str] = generate_urlsafe_token,
     ) -> None:
         """Bind explicit transaction, security, event, time, and ID dependencies."""
@@ -72,6 +75,8 @@ class IdentityService:
             raise ValueError("identity HMAC keys must not be empty")
         if stable_session_stale_grace <= timedelta(0):
             raise ValueError("Stable session stale grace must be positive")
+        if not timedelta(0) < stable_session_touch_interval < stable_session_stale_grace:
+            raise ValueError("Stable session touch interval must be positive and shorter than stale grace")
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
         self._outbox_writer_factory = outbox_writer_factory
@@ -82,6 +87,8 @@ class IdentityService:
         self._clock = clock
         self._id_generator = id_generator
         self._stable_session_stale_grace = stable_session_stale_grace
+        self._stable_session_touch_interval = stable_session_touch_interval
+        self._stable_web_verification_cache = stable_web_verification_cache
         self._token_factory = token_factory
 
     async def login_stable(self, command: StableLogin) -> StableSessionResult:
@@ -311,10 +318,16 @@ class IdentityService:
         token_digest = digest_opaque_token(raw_token, key=self._token_hmac_key)
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
-            resolved = await repository.touch_stable_session(token_digest, at=self._clock.now())
-            if resolved is None:
+            touch = await repository.touch_stable_session(
+                token_digest,
+                at=self._clock.now(),
+                minimum_interval=self._stable_session_touch_interval,
+            )
+            if touch is None:
                 raise InvalidStableSession("invalid Stable session")
-            await uow.commit()
+            resolved, persisted = touch
+            if persisted:
+                await uow.commit()
         return resolved
 
     async def verify_stable_web(self, identifier: str, password_token: str) -> StableWebPrincipal:
@@ -354,6 +367,33 @@ class IdentityService:
             )
             raise InvalidCredentials("invalid credentials")
 
+        password_proof = _stable_web_password_proof(snapshot.account_id, password_token, key=self._device_hmac_key)
+        credential_fingerprint = _credential_fingerprint(snapshot, key=self._device_hmac_key)
+        cache = self._stable_web_verification_cache
+        if cache is not None:
+            try:
+                if await cache.matches(
+                    account_id=snapshot.account_id,
+                    session_id=observed_session.session_id,
+                    password_proof=password_proof,
+                    credential_fingerprint=credential_fingerprint,
+                ):
+                    return StableWebPrincipal(
+                        snapshot.account_id,
+                        snapshot.current_name,
+                        observed_session.session_id,
+                        observed_session.expires_at,
+                    )
+            except Exception as error:
+                log_event(
+                    "WARNING",
+                    "identity.stable_web_verification_cache.failed",
+                    exception=error,
+                    operation="read",
+                    account_id=snapshot.account_id,
+                    error_type=type(error).__name__,
+                )
+
         verification = await asyncio.to_thread(
             _verify_credential,
             password_token,
@@ -381,6 +421,23 @@ class IdentityService:
         ):
             raise InvalidCredentials("invalid credentials")
         assert current is not None
+        if cache is not None:
+            try:
+                await cache.store(
+                    account_id=snapshot.account_id,
+                    session_id=session.session_id,
+                    password_proof=password_proof,
+                    credential_fingerprint=_credential_fingerprint(current, key=self._device_hmac_key),
+                )
+            except Exception as error:
+                log_event(
+                    "WARNING",
+                    "identity.stable_web_verification_cache.failed",
+                    exception=error,
+                    operation="write",
+                    account_id=snapshot.account_id,
+                    error_type=type(error).__name__,
+                )
         return StableWebPrincipal(snapshot.account_id, current.current_name, session.session_id, session.expires_at)
 
     async def close_stable_session(self, raw_token: str, *, reason: str = "client_closed") -> None:
@@ -489,6 +546,25 @@ def _identifier_hmac(normalized: tuple[str, str] | None, raw_identifier: str, *,
     else:
         canonical = f"{normalized[0]}:{normalized[1]}"
     return hmac_sha256_digest(canonical, key=key)
+
+
+def _stable_web_password_proof(account_id: int, password_token: str, *, key: bytes) -> bytes:
+    return hmac_sha256_digest(f"stable-web:{account_id}:{password_token}", key=key)
+
+
+def _credential_fingerprint(snapshot: CredentialSnapshot, *, key: bytes) -> bytes:
+    material = "\0".join(
+        (
+            str(snapshot.account_id),
+            str(snapshot.auth_version),
+            snapshot.password_verifier,
+            snapshot.algorithm,
+            str(snapshot.pepper_version),
+            snapshot.password_changed_at.isoformat(),
+            str(int(snapshot.must_change)),
+        )
+    )
+    return hmac_sha256_digest(material, key=key)
 
 
 def _digest_device_components(

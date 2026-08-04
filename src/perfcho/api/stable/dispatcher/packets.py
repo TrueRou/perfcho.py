@@ -1,7 +1,9 @@
 """Dispatch core Stable packets over canonical identity and realtime services."""
 
+import asyncio
 import hashlib
 import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta
 from time import monotonic_ns
 
@@ -429,23 +431,35 @@ async def broadcast_presence_update(payload: bytes, account_id: int, services: S
     followers = (
         await services.social.list_follower_account_ids(account_id) if services.social is not None else frozenset()
     )
-    failure_count = 0
-    representative_error: BaseException | None = None
-    for snapshot in snapshots:
+
+    async def enqueue_snapshot(snapshot: PresenceSnapshot) -> BaseException | None:
         if snapshot.account_id == account_id:
-            continue
+            return None
         update_filter = await services.realtime.get_presence_filter(snapshot.account_id)
-        if update_filter == 1 or update_filter == 2 and snapshot.account_id in followers:
-            try:
-                await services.realtime.enqueue_mailbox(
-                    snapshot.account_id,
-                    payload,
-                    recipient_fence=snapshot.fence,
-                    expires_at=snapshot.expires_at,
-                )
-            except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
-                failure_count += 1
-                representative_error = representative_error or error
+        if update_filter != 1 and not (update_filter == 2 and snapshot.account_id in followers):
+            return None
+        try:
+            await services.realtime.enqueue_mailbox(
+                snapshot.account_id,
+                payload,
+                recipient_fence=snapshot.fence,
+                expires_at=snapshot.expires_at,
+            )
+        except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+            return error
+        return None
+
+    errors = tuple(
+        error
+        for error in await _bounded_gather(
+            snapshots,
+            enqueue_snapshot,
+            limit=services.settings.stable_presence_fanout_concurrency,
+        )
+        if error is not None
+    )
+    failure_count = len(errors)
+    representative_error = errors[0] if errors else None
     if representative_error is not None and rate_limit("stable-presence-broadcast-failed", interval_seconds=5):
         log_event(
             "WARNING",
@@ -470,6 +484,21 @@ def _extend_response(output: bytearray, payload: bytes, maximum: int) -> bool:
             return False
         output.extend(wire)
     return True
+
+
+async def _bounded_gather[T, R](
+    values: Sequence[T],
+    operation: Callable[[T], Awaitable[R]],
+    *,
+    limit: int,
+) -> tuple[R, ...]:
+    semaphore = asyncio.Semaphore(limit)
+
+    async def run(value: T) -> R:
+        async with semaphore:
+            return await operation(value)
+
+    return tuple(await asyncio.gather(*(run(value) for value in values)))
 
 
 async def _store_presence(

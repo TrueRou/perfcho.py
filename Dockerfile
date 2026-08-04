@@ -9,13 +9,13 @@ ENV PATH="/app/.venv/bin:$PATH" \
     UV_LINK_MODE=copy \
     UV_NO_CACHE=1 \
     UV_NO_DEV=1 \
-    UV_PYTHON=3.14t \
+    UV_PYTHON=3.14+gil \
     UV_PYTHON_INSTALL_DIR=/opt/uv/python
 
 WORKDIR /app
 
 COPY .python-version pyproject.toml uv.lock README.md ./
-RUN uv python install 3.14t && \
+RUN uv python install 3.14+gil && \
     uv sync --locked --no-install-project
 
 COPY src ./src

@@ -115,6 +115,7 @@ class PerformanceCalculationService:
                             schema_version=1,
                             payload={
                                 "score_id": completion.score_id,
+                                "account_id": completion.account_id,
                                 "scoreboard_id": completion.scoreboard_id,
                                 "formula_id": str(completion.formula_id),
                                 "formula_code": completion.formula_code,
@@ -123,7 +124,7 @@ class PerformanceCalculationService:
                                 "output_digest": completion.output_digest.hex(),
                             },
                             consumers=(_RANKING_CONSUMER,),
-                            partition_key=f"scoreboard:{completion.scoreboard_id}",
+                            partition_key=f"account:{completion.account_id}:scoreboard:{completion.scoreboard_id}",
                         )
                     )
                 await uow.commit()

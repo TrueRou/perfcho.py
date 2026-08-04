@@ -1,6 +1,7 @@
 """Persist broker relay leases for durable Performance calculation jobs."""
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from time import monotonic_ns
@@ -108,59 +109,68 @@ class SqlAlchemyPerformanceJobRelayStore:
             )
         return tuple(references)
 
-    async def mark_enqueued(
+    async def record_enqueue_outcomes(
         self,
-        reference: PerformanceJobReference,
+        outcomes: Sequence[tuple[PerformanceJobReference, str | Exception]],
         owner: str,
-        broker_task_id: str,
     ) -> None:
-        """Record Taskiq transport identity under a live relay lease."""
+        """Persist all Taskiq enqueue outcomes in one fenced transaction."""
+        if not outcomes:
+            return
         async with self._session_factory.begin() as session:
-            job = await _locked_job(session, reference.job_id)
             now = await _database_now(session)
-            if not _owns_live_lease(job, reference, owner, now):
-                return
-            assert job is not None
-            job.enqueued_at = now
-            job.broker_task_id = broker_task_id
-            job.last_error = None
+            jobs = {
+                job.id: job
+                for job in await session.scalars(
+                    select(PerformanceCalculationJob)
+                    .where(PerformanceCalculationJob.id.in_(reference.job_id for reference, _ in outcomes))
+                    .with_for_update()
+                )
+            }
+            for reference, outcome in outcomes:
+                job = jobs.get(reference.job_id)
+                if not _owns_live_lease(job, reference, owner, now):
+                    continue
+                assert job is not None
+                if isinstance(outcome, Exception):
+                    job.status = CalculationJobStatus.PENDING
+                    job.available_at = now + _retry_delay(job.enqueue_count, self._max_retry_seconds)
+                    job.enqueued_at = None
+                    job.broker_task_id = None
+                    job.attempt_started_at = None
+                    job.last_error = _error_message(outcome)
+                    _clear_job_lease(job)
+                else:
+                    job.enqueued_at = now
+                    job.broker_task_id = outcome
+                    job.last_error = None
 
-    async def mark_enqueue_failed(
-        self,
-        reference: PerformanceJobReference,
-        owner: str,
-        error: Exception,
-    ) -> None:
-        """Release a failed enqueue without consuming a calculation attempt."""
+    async def release(self, references: Sequence[PerformanceJobReference], owner: str) -> None:
+        """Release unattempted claims in one graceful-cancellation transaction."""
+        if not references:
+            return
         async with self._session_factory.begin() as session:
-            job = await _locked_job(session, reference.job_id)
-            now = await _database_now(session)
-            if not _owns_live_lease(job, reference, owner, now):
-                return
-            assert job is not None
-            job.status = CalculationJobStatus.PENDING
-            job.available_at = now + _retry_delay(job.enqueue_count, self._max_retry_seconds)
-            job.enqueued_at = None
-            job.broker_task_id = None
-            job.attempt_started_at = None
-            job.last_error = _error_message(error)
-            _clear_job_lease(job)
-
-    async def release(self, reference: PerformanceJobReference, owner: str) -> None:
-        """Release one unattempted claim during graceful relay cancellation."""
-        async with self._session_factory.begin() as session:
-            job = await _locked_job(session, reference.job_id)
-            if (
-                job is None
-                or job.status is not CalculationJobStatus.RUNNING
-                or job.lease_owner != owner
-                or job.lease_token != reference.lease_token
-                or job.enqueued_at is not None
-                or job.attempt_started_at is not None
-            ):
-                return
-            job.status = CalculationJobStatus.PENDING
-            _clear_job_lease(job)
+            jobs = {
+                job.id: job
+                for job in await session.scalars(
+                    select(PerformanceCalculationJob)
+                    .where(PerformanceCalculationJob.id.in_(reference.job_id for reference in references))
+                    .with_for_update()
+                )
+            }
+            for reference in references:
+                job = jobs.get(reference.job_id)
+                if (
+                    job is None
+                    or job.status is not CalculationJobStatus.RUNNING
+                    or job.lease_owner != owner
+                    or job.lease_token != reference.lease_token
+                    or job.enqueued_at is not None
+                    or job.attempt_started_at is not None
+                ):
+                    continue
+                job.status = CalculationJobStatus.PENDING
+                _clear_job_lease(job)
 
 
 async def _database_now(session: AsyncSession) -> datetime:
@@ -168,10 +178,6 @@ async def _database_now(session: AsyncSession) -> datetime:
     if now is None:
         raise RuntimeError("PostgreSQL did not return a relay timestamp")
     return now
-
-
-async def _locked_job(session: AsyncSession, job_id: uuid.UUID) -> PerformanceCalculationJob | None:
-    return await session.get(PerformanceCalculationJob, job_id, with_for_update=True)
 
 
 def _owns_live_lease(

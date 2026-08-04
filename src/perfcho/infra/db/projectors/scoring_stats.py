@@ -42,13 +42,14 @@ async def project_scoring_stats(session: AsyncSession, event: OutboxEvent, parti
 
 async def _project_score(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     score_id = payload_integer(event.payload, "score_id")
+    account_id = payload_integer(event.payload, "account_id")
     scoreboard_id = payload_integer(event.payload, "scoreboard_id")
     require_event_context(
         event,
         partition_key,
         aggregate_type="score",
         aggregate_id=str(score_id),
-        expected_partition_key=f"scoreboard:{scoreboard_id}",
+        expected_partition_key=f"account:{account_id}:scoreboard:{scoreboard_id}",
     )
     row = (
         await session.execute(
@@ -62,6 +63,8 @@ async def _project_score(session: AsyncSession, event: OutboxEvent, partition_ke
     score, progress = row
     if score.scoreboard_id != scoreboard_id:
         raise RuntimeError("score statistics event scoreboard does not match the authoritative score")
+    if score.account_id != account_id:
+        raise RuntimeError("score statistics event account does not match the authoritative score")
     total_hits = int(
         await session.scalar(
             select(func.coalesce(func.sum(ScoreHitStatistic.actual), 0)).where(ScoreHitStatistic.score_id == score.id)
@@ -180,7 +183,7 @@ async def _project_replay_view(session: AsyncSession, event: OutboxEvent, partit
         partition_key,
         aggregate_type="score",
         aggregate_id=str(score_id),
-        expected_partition_key=f"scoreboard:{scoreboard_id}",
+        expected_partition_key=f"account:{account_id}:scoreboard:{scoreboard_id}",
     )
     dimensions = (
         await session.execute(select(Score.account_id, Score.scoreboard_id).where(Score.id == score_id))

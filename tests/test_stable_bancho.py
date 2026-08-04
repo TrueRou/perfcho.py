@@ -303,7 +303,14 @@ class FakeCommunity:
         assert account_id == 3
         return self.silence_seconds
 
-    async def get_channel_member_count(self, account_id: int, channel_id: int) -> int:
+    async def get_channel_member_count(
+        self,
+        account_id: int,
+        channel_id: int,
+        *,
+        already_authorized: bool = False,
+    ) -> int:
+        del already_authorized
         assert account_id == 3 and self.realtime is not None
         return len(await self.realtime.list_channel_members(channel_id)) + 3
 
@@ -673,7 +680,7 @@ async def test_poll_with_lost_redis_epoch_closes_durable_session_and_restarts(
     assert list(PacketReader(response.content, packet_enum=ServerPacket))[-1].packet_type is ServerPacket.RESTART
     assert identity.close_calls == [("stable-token-value", "realtime_state_lost")]
     assert realtime.open_calls == 0
-    assert identity.touch_calls == 0
+    assert identity.touch_calls == 1
     session_lost = next(fields for event, fields in events if event == "stable.poll.session_lost")
     assert session_lost["error_code"] == "realtime_session_not_found"
     assert session_lost["error_type"] == "RealtimeSessionNotFound"

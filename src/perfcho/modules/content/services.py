@@ -26,6 +26,7 @@ from perfcho.modules.content.models import (
     RatingSummary,
     SyncedBeatmapFile,
     UpstreamBeatmapsetSnapshot,
+    UpstreamBeatmapSnapshot,
 )
 from perfcho.modules.content.ports import (
     ContentRepositoryFactory,
@@ -217,8 +218,11 @@ class ContentSyncService:
         object_storage: ObjectStorage,
         clock: Clock,
         id_generator: IdGenerator,
+        *,
+        max_concurrency: int = 8,
     ) -> None:
         """Bind upstream, storage, transaction, event, time, and ID dependencies."""
+        _positive("max_concurrency", max_concurrency)
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
         self._outbox_writer_factory = outbox_writer_factory
@@ -226,6 +230,7 @@ class ContentSyncService:
         self._object_storage = object_storage
         self._clock = clock
         self._id_generator = id_generator
+        self._io_semaphore = asyncio.Semaphore(max_concurrency)
         self._inflight_lock = asyncio.Lock()
         self._inflight: dict[int, asyncio.Task[ContentSyncResult]] = {}
         self._closing = False
@@ -339,23 +344,11 @@ class ContentSyncService:
         if snapshot.external_beatmapset_id != external_beatmapset_id:
             raise ContentInputRejected("upstream beatmapset identity does not match the request")
 
-        files: list[SyncedBeatmapFile] = []
-        for beatmap in snapshot.beatmaps:
-            content = await self._upstream.fetch_beatmap_file(beatmap.external_beatmap_id)
-            if hashlib.md5(content, usedforsecurity=False).digest() != beatmap.md5:
-                raise UpstreamContentUnavailable("upstream beatmap file does not match its MD5 metadata")
-            sha256 = hashlib.sha256(content).digest()
-            storage_key = (
-                f"beatmaps/{snapshot.source_code}/{snapshot.external_beatmapset_id}/"
-                f"{beatmap.external_beatmap_id}/{sha256.hex()}.osu"
-            )
-            stored = await self._object_storage.put(
-                storage_key,
-                content,
-                media_type="application/x-osu-beatmap",
-                expected_sha256=sha256,
-            )
-            files.append(SyncedBeatmapFile(beatmap, self._id_generator.new(), stored))
+        async def synchronize_file(beatmap: UpstreamBeatmapSnapshot) -> SyncedBeatmapFile:
+            async with self._io_semaphore:
+                return await self._fetch_and_store_file(snapshot, beatmap)
+
+        files = await asyncio.gather(*(synchronize_file(beatmap) for beatmap in snapshot.beatmaps))
 
         now = self._clock.now()
         next_check_at = _next_check_at(snapshot, now)
@@ -407,6 +400,31 @@ class ContentSyncService:
             )
             return result
 
+    async def _fetch_and_store_file(
+        self,
+        snapshot: UpstreamBeatmapsetSnapshot,
+        beatmap: UpstreamBeatmapSnapshot,
+    ) -> SyncedBeatmapFile:
+        """Fetch, verify, and store one beatmap while holding a bounded I/O slot."""
+        content = await self._upstream.fetch_beatmap_file(beatmap.external_beatmap_id)
+        if len(content) >= 256 * 1024:
+            md5, sha256 = await asyncio.to_thread(_content_digests, content)
+        else:
+            md5, sha256 = _content_digests(content)
+        if md5 != beatmap.md5:
+            raise UpstreamContentUnavailable("upstream beatmap file does not match its MD5 metadata")
+        storage_key = (
+            f"beatmaps/{snapshot.source_code}/{snapshot.external_beatmapset_id}/"
+            f"{beatmap.external_beatmap_id}/{sha256.hex()}.osu"
+        )
+        stored = await self._object_storage.put(
+            storage_key,
+            content,
+            media_type="application/x-osu-beatmap",
+            expected_sha256=sha256,
+        )
+        return SyncedBeatmapFile(beatmap, self._id_generator.new(), stored)
+
     async def _synchronize_once(self, external_beatmapset_id: int) -> ContentSyncResult:
         async with self._inflight_lock:
             if self._closing:
@@ -440,6 +458,10 @@ class ContentSyncService:
                 external_beatmapset_id,
                 external=True,
             )
+
+
+def _content_digests(content: bytes) -> tuple[bytes, bytes]:
+    return hashlib.md5(content, usedforsecurity=False).digest(), hashlib.sha256(content).digest()
 
 
 def _md5_bytes(value: str | bytes) -> bytes:

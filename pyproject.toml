@@ -1,7 +1,7 @@
 [project]
 name = "perfcho"
 version = "0.1.0"
-description = "Our attempt to build high-performance osu! server implementation in modern python>=3.14t"
+description = "Our attempt to build a high-performance osu! server implementation in modern Python 3.14"
 requires-python = ">=3.14,<3.15"
 authors = [
     {name = "TuRou", email = "truerou@outlook.com"}

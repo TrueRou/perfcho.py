@@ -1,7 +1,9 @@
 """Adapt Stable login and binary HTTP polling to shared application services."""
 
+import asyncio
 import hashlib
 import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from time import monotonic_ns
 
@@ -15,6 +17,7 @@ from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.logging import duration_ms, log_event, rate_limit, sampled
 from perfcho.modules.authorization import StablePrivilege
 from perfcho.modules.common import ClientContext, CommandMeta
+from perfcho.modules.community import StableChannel
 from perfcho.modules.identity import InvalidCredentials, InvalidStableSession, StableLogin, StableSessionAlreadyActive
 from perfcho.modules.realtime import (
     MailboxOverflow,
@@ -50,6 +53,7 @@ from perfcho.modules.realtime.stable import (
     user_stats,
 )
 from perfcho.modules.realtime.stable.countries import stable_country_id
+from perfcho.modules.social import FollowView
 
 router = APIRouter()
 
@@ -186,27 +190,23 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         if len(online_presences) >= services.settings.stable_presence_batch_size:
             raise PresenceCapacityReached
 
-        stable_privileges = await services.authorization.get_stable_privileges(result.account_id)
-        if services.community is not None:
-            await services.community.set_private_message_policy(
-                result.account_id,
-                "friends" if parsed.private_messages_from_friends_only else "all",
-            )
-        channels = (
-            await services.community.list_public_channels(result.account_id) if services.community is not None else ()
+        stable_privileges, social_friends = await asyncio.gather(
+            services.authorization.get_stable_privileges(result.account_id),
+            services.social.list_friends(result.account_id) if services.social is not None else _empty_friends(),
         )
-        social_friends = await services.social.list_friends(result.account_id) if services.social is not None else ()
         friend_ids = tuple(dict.fromkeys((1, *(friend.account_id for friend in social_friends))))
-        offline_messages = (
-            await services.community.list_unread_offline_direct_messages(result.account_id)
-            if services.community is not None
-            else ()
-        )
-        silence_seconds = (
-            await services.community.get_global_silence_remaining_seconds(result.account_id)
-            if services.community is not None
-            else 0
-        )
+        if services.community is not None:
+            channels, offline_messages, silence_seconds, _ = await asyncio.gather(
+                services.community.list_public_channels(result.account_id),
+                services.community.list_unread_offline_direct_messages(result.account_id),
+                services.community.get_global_silence_remaining_seconds(result.account_id),
+                services.community.set_private_message_policy(
+                    result.account_id,
+                    "friends" if parsed.private_messages_from_friends_only else "all",
+                ),
+            )
+        else:
+            channels, offline_messages, silence_seconds = (), (), 0
         online_expiry = min(
             result.expires_at,
             now + timedelta(seconds=services.settings.redis_session_ttl_seconds),
@@ -218,21 +218,31 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             durable_expires_at=result.expires_at,
         )
 
-        channel_packets: list[bytes] = []
-        if services.community is not None:
-            for channel in channels:
-                if not channel.auto_join or channel.name == "#lobby":
-                    continue
+        channel_packets: tuple[bytes, ...] = ()
+        community = services.community
+        if community is not None:
+            auto_join_channels = tuple(
+                channel for channel in channels if channel.auto_join and channel.name != "#lobby"
+            )
+
+            async def initialize_channel(channel: StableChannel) -> bytes:
                 await services.realtime.join_channel(
                     channel.channel_id,
                     session_id=result.session_id,
                     expected_revision=realtime.revision,
                 )
-                member_count = await services.community.get_channel_member_count(
+                member_count = await community.get_channel_member_count(
                     result.account_id,
                     channel.channel_id,
+                    already_authorized=True,
                 )
-                channel_packets.append(channel_info(Channel(channel.name, channel.topic, member_count)))
+                return channel_info(Channel(channel.name, channel.topic, member_count))
+
+            channel_packets = await _bounded_gather(
+                auto_join_channels,
+                initialize_channel,
+                limit=services.settings.stable_presence_fanout_concurrency,
+            )
 
         presence = UserPresence(
             user_id=result.account_id,
@@ -268,9 +278,8 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             )
             if snapshot.account_id != result.account_id
         )
-        presence_broadcast_failure_count = 0
-        presence_broadcast_error: BaseException | None = None
-        for snapshot in online_presences:
+
+        async def enqueue_presence(snapshot: PresenceSnapshot) -> BaseException | None:
             try:
                 await services.realtime.enqueue_mailbox(
                     snapshot.account_id,
@@ -279,8 +288,20 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
                     expires_at=snapshot.expires_at,
                 )
             except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
-                presence_broadcast_failure_count += 1
-                presence_broadcast_error = presence_broadcast_error or error
+                return error
+            return None
+
+        broadcast_errors = tuple(
+            error
+            for error in await _bounded_gather(
+                online_presences,
+                enqueue_presence,
+                limit=services.settings.stable_presence_fanout_concurrency,
+            )
+            if error is not None
+        )
+        presence_broadcast_failure_count = len(broadcast_errors)
+        presence_broadcast_error = broadcast_errors[0] if broadcast_errors else None
 
         online_packets = tuple(_presence_projection(snapshot) for snapshot in online_presences)
         offline_packets = tuple(
@@ -358,14 +379,15 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
 
 async def _poll(request: Request, body: bytes, raw_token: str, services: StableServices) -> Response:
     started_ns = monotonic_ns()
+    now = services.clock.now()
     try:
-        identity = await services.identity.resolve_stable_session(raw_token)
+        identity = await services.identity.touch_stable_session(raw_token)
     except InvalidStableSession as error:
-        _log_invalid_poll_session("resolve_identity", error)
+        _log_invalid_poll_session("touch_identity", error)
         return _binary_response(notification("Session expired. Please reconnect.") + restart(0))
 
     try:
-        realtime = await services.realtime.resolve_session(identity.session_id, at=services.clock.now())
+        realtime = await services.realtime.resolve_session(identity.session_id, at=now)
     except (RealtimeSessionNotFound, RealtimeSessionFenced) as error:
         return await _realtime_lost(
             raw_token,
@@ -382,11 +404,6 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
             stage="account_fence",
         )
 
-    try:
-        identity = await services.identity.touch_stable_session(raw_token)
-    except InvalidStableSession as error:
-        _log_invalid_poll_session("touch_identity", error)
-        return _binary_response(notification("Session expired. Please reconnect.") + restart(0))
     if identity.session_id != realtime.session_id or identity.account_id != realtime.account_id:
         return await _realtime_lost(
             raw_token,
@@ -412,7 +429,7 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
         )
 
     try:
-        stored_presence = await services.realtime.get_presence(identity.account_id, at=services.clock.now())
+        stored_presence = await services.realtime.get_presence(identity.account_id, at=now)
         presence, stats = _presence_and_stats(
             identity.account_id,
             identity.current_name,
@@ -447,7 +464,7 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
             recipient_fence=realtime.fence,
             lease_id=lease_id,
             limit=services.settings.stable_mailbox_batch_size,
-            expires_at=services.clock.now() + timedelta(seconds=services.settings.stable_mailbox_lease_seconds),
+            expires_at=now + timedelta(seconds=services.settings.stable_mailbox_lease_seconds),
         )
     except PollLeaseConflict as error:
         if rate_limit("stable.poll.mailbox_lease_conflict", interval_seconds=5.0):
@@ -593,6 +610,25 @@ async def _read_limited_body(request: Request, maximum: int) -> bytes:
 
 def _empty_stats(account_id: int) -> UserStats:
     return UserStats(account_id, 0, "", "", 0, 0, 0, 0, 0.0, 0, 0, 0, 0)
+
+
+async def _empty_friends() -> tuple[FollowView, ...]:
+    return ()
+
+
+async def _bounded_gather[T, R](
+    values: Sequence[T],
+    operation: Callable[[T], Awaitable[R]],
+    *,
+    limit: int,
+) -> tuple[R, ...]:
+    semaphore = asyncio.Semaphore(limit)
+
+    async def run(value: T) -> R:
+        async with semaphore:
+            return await operation(value)
+
+    return tuple(await asyncio.gather(*(run(value) for value in values)))
 
 
 def _presence_and_stats(

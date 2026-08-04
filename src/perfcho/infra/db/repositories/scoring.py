@@ -559,59 +559,64 @@ class SqlAlchemyScoringRepository:
         variant: ScoreboardVariant,
     ) -> AccountStatsView:
         """Compose factual play totals with default-policy ranked statistics."""
-        scoreboard_id = await self._session.scalar(
-            select(Scoreboard.id).where(
-                Scoreboard.ruleset == DbRuleset(ruleset.value),
-                Scoreboard.variant == DbScoreboardVariant(variant.value),
-                Scoreboard.active.is_(True),
-            )
-        )
-        if scoreboard_id is None:
-            return AccountStatsView(0, Decimal(0), 0, 0, 0)
-        play_stat = await self._session.get(
-            UserPlayStat,
-            {"account_id": account_id, "scoreboard_id": scoreboard_id},
-        )
-        policy_row = (
+        row = (
             await self._session.execute(
-                select(RankingPolicy.id, RankingPolicy.metric).where(
-                    RankingPolicy.scoreboard_id == scoreboard_id,
-                    RankingPolicy.active.is_(True),
-                    RankingPolicy.is_default.is_(True),
+                select(
+                    Scoreboard.id.label("scoreboard_id"),
+                    RankingPolicy.id.label("policy_id"),
+                    RankingPolicy.metric,
+                    UserPlayStat.play_count,
+                    UserPlayStat.total_score,
+                    UserRankedStat.ranked_score,
+                    UserRankedStat.accuracy,
+                    UserRankedStat.performance,
                 )
+                .select_from(Scoreboard)
+                .outerjoin(
+                    UserPlayStat,
+                    (UserPlayStat.scoreboard_id == Scoreboard.id) & (UserPlayStat.account_id == account_id),
+                )
+                .outerjoin(
+                    RankingPolicy,
+                    (RankingPolicy.scoreboard_id == Scoreboard.id)
+                    & RankingPolicy.active.is_(True)
+                    & RankingPolicy.is_default.is_(True),
+                )
+                .outerjoin(
+                    UserRankedStat,
+                    (UserRankedStat.policy_id == RankingPolicy.id) & (UserRankedStat.account_id == account_id),
+                )
+                .where(
+                    Scoreboard.ruleset == DbRuleset(ruleset.value),
+                    Scoreboard.variant == DbScoreboardVariant(variant.value),
+                    Scoreboard.active.is_(True),
+                )
+                .limit(1)
             )
         ).one_or_none()
-        ranked_stat = None
+        if row is None:
+            return AccountStatsView(0, Decimal(0), 0, 0, 0)
         global_rank = 0
-        if policy_row is not None:
-            policy_id, policy_metric = policy_row
-            ranked_stat = await self._session.get(
-                UserRankedStat,
-                {"account_id": account_id, "policy_id": policy_id},
-            )
-            if ranked_stat is not None:
-                rank_column = UserRankedStat.performance if policy_metric == "pp" else UserRankedStat.ranked_score
-                rank_value = ranked_stat.performance if policy_metric == "pp" else Decimal(ranked_stat.ranked_score)
-                higher = (
-                    await self._session.scalar(
-                        select(func.count())
-                        .select_from(UserRankedStat)
-                        .where(
-                            UserRankedStat.policy_id == policy_id,
-                            rank_column > rank_value,
-                        )
+        if row.policy_id is not None and row.ranked_score is not None:
+            rank_column = UserRankedStat.performance if row.metric == "pp" else UserRankedStat.ranked_score
+            rank_value = row.performance if row.metric == "pp" else row.ranked_score
+            if rank_value > 0:
+                higher = await self._session.scalar(
+                    select(func.count())
+                    .select_from(UserRankedStat)
+                    .where(
+                        UserRankedStat.policy_id == row.policy_id,
+                        rank_column > rank_value,
                     )
-                    if rank_value > 0
-                    else 0
                 )
                 global_rank = int(higher or 0) + 1
         return AccountStatsView(
-            ranked_score=ranked_stat.ranked_score if ranked_stat is not None else 0,
-            accuracy=ranked_stat.accuracy if ranked_stat is not None else Decimal(0),
-            play_count=play_stat.play_count if play_stat is not None else 0,
-            total_score=play_stat.total_score if play_stat is not None else 0,
+            ranked_score=row.ranked_score or 0,
+            accuracy=row.accuracy or Decimal(0),
+            play_count=row.play_count or 0,
+            total_score=row.total_score or 0,
             global_rank=global_rank,
-            performance=int(ranked_stat.performance) if ranked_stat is not None else 0,
+            performance=int(row.performance) if row.performance is not None else 0,
         )
 
     async def get_beatmap_grades(

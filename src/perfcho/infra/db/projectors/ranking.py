@@ -31,13 +31,14 @@ EVENT_TYPES = frozenset({"score.accepted.v1", "score.performance-calculated.v1"}
 async def project_accepted_score(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project one accepted score under the active versioned ranking policy."""
     score_id = payload_integer(event.payload, "score_id")
+    account_id = payload_integer(event.payload, "account_id")
     scoreboard_id = payload_integer(event.payload, "scoreboard_id")
     require_event_context(
         event,
         partition_key,
         aggregate_type="score",
         aggregate_id=str(score_id),
-        expected_partition_key=f"scoreboard:{scoreboard_id}",
+        expected_partition_key=f"account:{account_id}:scoreboard:{scoreboard_id}",
     )
     row = (
         await session.execute(
@@ -53,6 +54,8 @@ async def project_accepted_score(session: AsyncSession, event: OutboxEvent, part
     score, beatmap_status, country_code, canonical_mods = row
     if score.scoreboard_id != scoreboard_id:
         raise RuntimeError("score event scoreboard does not match the authoritative score")
+    if score.account_id != account_id:
+        raise RuntimeError("score event account does not match the authoritative score")
     policy_rows = list(
         (
             await session.execute(
@@ -71,7 +74,7 @@ async def project_accepted_score(session: AsyncSession, event: OutboxEvent, part
     if len(mod_acronyms) != len(canonical_mods):
         raise RuntimeError("score mod set contains invalid canonical entries")
     for policy, mod_rules in policy_rows:
-        await _project_policy(
+        overall_changed = await _project_policy(
             session,
             score,
             beatmap_status.value,
@@ -80,7 +83,8 @@ async def project_accepted_score(session: AsyncSession, event: OutboxEvent, part
             mod_acronyms,
             mod_rules,
         )
-        await _project_user_ranked_stat(session, score.account_id, policy, event.id)
+        if overall_changed:
+            await _project_user_ranked_stat(session, score.account_id, policy, event.id)
     await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
 
 
@@ -152,7 +156,7 @@ async def _project_policy(
     policy: RankingPolicy,
     mod_acronyms: set[str],
     mod_rules: dict[str, object],
-) -> None:
+) -> bool:
     """Project one score under one explicit policy and Formula release."""
     configured_statuses = policy.configuration.get("eligible_beatmap_statuses", [])
     eligible_statuses = (
@@ -190,10 +194,10 @@ async def _project_policy(
         )
     )
     if not eligible or metric_value is None:
-        return
+        return False
 
     tie_break_value = _tie_break_value(score, policy.tie_breaker)
-    await _upsert_entry(
+    overall_changed = await _upsert_entry(
         session,
         policy_id=policy.id,
         beatmap_id=score.beatmap_id,
@@ -217,6 +221,7 @@ async def _project_policy(
         metric_value=metric_value,
         tie_break_value=tie_break_value,
     )
+    return overall_changed
 
 
 def _mods_are_eligible(acronyms: set[str], rules: dict[str, object]) -> bool:
@@ -279,7 +284,7 @@ async def _upsert_entry(
     filter_mod_set_id: int | None,
     metric_value: Decimal,
     tie_break_value: Decimal,
-) -> None:
+) -> bool:
     statement = insert(LeaderboardEntry).values(
         policy_id=policy_id,
         beatmap_id=beatmap_id,
@@ -292,7 +297,7 @@ async def _upsert_entry(
         tie_break_value=tie_break_value,
     )
     excluded = statement.excluded
-    await session.execute(
+    entry_id = await session.scalar(
         statement.on_conflict_do_update(
             index_elements=(
                 LeaderboardEntry.policy_id,
@@ -319,5 +324,6 @@ async def _upsert_entry(
                     & (excluded.score_id < LeaderboardEntry.score_id)
                 )
             ),
-        )
+        ).returning(LeaderboardEntry.id)
     )
+    return entry_id is not None

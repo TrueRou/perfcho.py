@@ -152,6 +152,8 @@ async def _append_round_completed(
 
 
 async def _append_score_accepted(session: AsyncSession, score_id: int, scoreboard_id: int) -> uuid.UUID:
+    account_id = await session.scalar(select(Score.account_id).where(Score.id == score_id))
+    assert account_id is not None
     event = await append_outbox_event(
         session,
         PendingEvent(
@@ -159,9 +161,9 @@ async def _append_score_accepted(session: AsyncSession, score_id: int, scoreboar
             aggregate_id=str(score_id),
             event_type="score.accepted.v1",
             schema_version=1,
-            payload={"score_id": score_id, "scoreboard_id": scoreboard_id},
+            payload={"score_id": score_id, "account_id": account_id, "scoreboard_id": scoreboard_id},
             consumers=(CONSUMER_NAME,),
-            partition_key=f"scoreboard:{scoreboard_id}",
+            partition_key=f"account:{account_id}:scoreboard:{scoreboard_id}",
         ),
     )
     return event.id
@@ -557,11 +559,12 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
         async with session_factory.begin() as session:
             score_event = await session.get(OutboxEvent, score_event_id)
             assert score_event is not None
-            await project_multiplayer_results(session, score_event, f"scoreboard:{scoreboard_id}")
+            score_partition = f"account:1:scoreboard:{scoreboard_id}"
+            await project_multiplayer_results(session, score_event, score_partition)
             late_result = await session.scalar(select(RoundResult).where(RoundResult.round_id == second_round_id))
             assert late_result is not None
             digest = late_result.result_digest
-            await project_multiplayer_results(session, score_event, f"scoreboard:{scoreboard_id}")
+            await project_multiplayer_results(session, score_event, score_partition)
             assert late_result.result_digest == digest
 
         async with session_factory.begin() as session:
@@ -612,7 +615,7 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
             )
             checkpoint = await session.get(
                 ProjectionCheckpoint,
-                {"projector": CONSUMER_NAME, "partition_key": f"scoreboard:{scoreboard_id}"},
+                {"projector": CONSUMER_NAME, "partition_key": f"account:1:scoreboard:{scoreboard_id}"},
             )
             assert standing is not None and standing.points == Decimal("2.0000")
             assert playlist_summary is not None

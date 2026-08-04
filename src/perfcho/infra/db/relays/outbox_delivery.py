@@ -1,14 +1,14 @@
 """Persist and execute ordered outbox delivery leases."""
 
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from time import monotonic_ns
 from typing import Literal, TypedDict
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -137,60 +137,77 @@ class SqlAlchemyOutboxDeliveryRelayStore:
             )
         return tuple(references)
 
-    async def mark_enqueued(
+    async def record_enqueue_outcomes(
         self,
-        reference: OutboxDeliveryReference,
+        outcomes: Sequence[tuple[OutboxDeliveryReference, str | Exception]],
         owner: str,
-        broker_task_id: str,
     ) -> None:
-        """Record a broker task identifier while the relay owns a live lease."""
+        """Persist all broker enqueue outcomes in one fenced transaction."""
+        if not outcomes:
+            return
         async with self._session_factory.begin() as session:
-            delivery = await _locked_delivery(session, reference)
             now = await _database_now(session)
-            if not _owns_live_lease(delivery, reference, owner, now):
-                return
-            assert delivery is not None
-            delivery.enqueued_at = now
-            delivery.broker_task_id = broker_task_id
-            delivery.last_error = None
+            deliveries = {
+                (delivery.event_id, delivery.consumer): delivery
+                for delivery in await session.scalars(
+                    select(OutboxDelivery)
+                    .where(
+                        tuple_(OutboxDelivery.event_id, OutboxDelivery.consumer).in_(
+                            (reference.event_id, reference.consumer) for reference, _ in outcomes
+                        )
+                    )
+                    .with_for_update()
+                )
+            }
+            for reference, outcome in outcomes:
+                delivery = deliveries.get((reference.event_id, reference.consumer))
+                if not _owns_live_lease(delivery, reference, owner, now):
+                    continue
+                assert delivery is not None
+                if isinstance(outcome, Exception):
+                    delivery.status = OutboxDeliveryStatus.PENDING
+                    delivery.available_at = now + _retry_delay(
+                        delivery.enqueue_count,
+                        self._max_retry_seconds,
+                    )
+                    _clear_delivery_lease(delivery)
+                    delivery.enqueued_at = None
+                    delivery.broker_task_id = None
+                    delivery.last_error = _error_message(outcome)
+                else:
+                    delivery.enqueued_at = now
+                    delivery.broker_task_id = outcome
+                    delivery.last_error = None
 
-    async def mark_enqueue_failed(
-        self,
-        reference: OutboxDeliveryReference,
-        owner: str,
-        error: Exception,
-    ) -> None:
-        """Release a failed enqueue lease without consuming a business attempt."""
+    async def release(self, references: Sequence[OutboxDeliveryReference], owner: str) -> None:
+        """Release unattempted claims in one graceful-cancellation transaction."""
+        if not references:
+            return
         async with self._session_factory.begin() as session:
-            delivery = await _locked_delivery(session, reference)
-            now = await _database_now(session)
-            if not _owns_live_lease(delivery, reference, owner, now):
-                return
-            assert delivery is not None
-            delivery.status = OutboxDeliveryStatus.PENDING
-            delivery.available_at = now + _retry_delay(
-                delivery.enqueue_count,
-                self._max_retry_seconds,
-            )
-            _clear_delivery_lease(delivery)
-            delivery.enqueued_at = None
-            delivery.broker_task_id = None
-            delivery.last_error = _error_message(error)
-
-    async def release(self, reference: OutboxDeliveryReference, owner: str) -> None:
-        """Release one unattempted claim during graceful relay cancellation."""
-        async with self._session_factory.begin() as session:
-            delivery = await _locked_delivery(session, reference)
-            if (
-                delivery is None
-                or delivery.status is not OutboxDeliveryStatus.RUNNING
-                or delivery.lease_owner != owner
-                or delivery.delivery_token != reference.delivery_token
-                or delivery.enqueued_at is not None
-            ):
-                return
-            delivery.status = OutboxDeliveryStatus.PENDING
-            _clear_delivery_lease(delivery)
+            deliveries = {
+                (delivery.event_id, delivery.consumer): delivery
+                for delivery in await session.scalars(
+                    select(OutboxDelivery)
+                    .where(
+                        tuple_(OutboxDelivery.event_id, OutboxDelivery.consumer).in_(
+                            (reference.event_id, reference.consumer) for reference in references
+                        )
+                    )
+                    .with_for_update()
+                )
+            }
+            for reference in references:
+                delivery = deliveries.get((reference.event_id, reference.consumer))
+                if (
+                    delivery is None
+                    or delivery.status is not OutboxDeliveryStatus.RUNNING
+                    or delivery.lease_owner != owner
+                    or delivery.delivery_token != reference.delivery_token
+                    or delivery.enqueued_at is not None
+                ):
+                    continue
+                delivery.status = OutboxDeliveryStatus.PENDING
+                _clear_delivery_lease(delivery)
 
     async def unknown_consumers(self, known_consumers: Collection[str]) -> frozenset[str]:
         """Return unfinished delivery consumers absent from the worker catalog."""
@@ -230,6 +247,7 @@ class OutboxDeliveryProcessor:
         outcome: Literal["stale", "succeeded"] = "stale"
         attempt_count: int | None = None
         event_fields: _OutboxEventLogFields = {}
+        event: OutboxEvent | None = None
         try:
             async with self._session_factory.begin() as session:
                 delivery = await _locked_delivery(session, reference)
@@ -270,6 +288,7 @@ class OutboxDeliveryProcessor:
                 raise
             _mark_outbox_failure_handled(error)
             failure_outcome, failure_attempt_count = failure
+            failure_fields = _outbox_event_fields(event, include_payload=True) if event is not None else event_fields
             log_event(
                 "ERROR" if failure_outcome == "dead" else "WARNING",
                 f"outbox.delivery.{failure_outcome}",
@@ -279,7 +298,7 @@ class OutboxDeliveryProcessor:
                 attempt_count=failure_attempt_count,
                 error_type=type(error).__name__,
                 duration_ms=duration_ms(started_ns),
-                **event_fields,
+                **failure_fields,
             )
             raise
         if outcome == "succeeded":
@@ -394,14 +413,20 @@ def _error_message(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"[:4000]
 
 
-def _outbox_event_fields(event: OutboxEvent) -> _OutboxEventLogFields:
-    """Return event identity and its complete payload for delivery diagnostics."""
-    return {
+def _outbox_event_fields(
+    event: OutboxEvent,
+    *,
+    include_payload: bool = False,
+) -> _OutboxEventLogFields:
+    """Return event identity, adding the complete payload only for failure diagnostics."""
+    fields: _OutboxEventLogFields = {
         "event_type": event.event_type,
         "aggregate_type": event.aggregate_type,
         "aggregate_id": event.aggregate_id,
         "schema_version": event.schema_version,
         "source_position": event.position,
         "payload_fields": tuple(sorted(event.payload)),
-        "outbox_payload": event.payload,
     }
+    if include_payload:
+        fields["outbox_payload"] = event.payload
+    return fields

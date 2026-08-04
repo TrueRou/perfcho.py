@@ -1,7 +1,7 @@
 """Define transaction-bound ports consumed by Stable identity operations."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol
 
 from perfcho.modules.common.ports import UnitOfWork
@@ -113,8 +113,14 @@ class IdentityRepository(Protocol):
         """Resolve a digest only when token, session, account, and name are active."""
         ...
 
-    async def touch_stable_session(self, token_digest: bytes, *, at: datetime) -> ResolvedStableSession | None:
-        """Resolve and monotonically advance one active Stable session under a row lock."""
+    async def touch_stable_session(
+        self,
+        token_digest: bytes,
+        *,
+        at: datetime,
+        minimum_interval: timedelta,
+    ) -> tuple[ResolvedStableSession, bool] | None:
+        """Resolve a Stable session and report whether its durable heartbeat advanced."""
         ...
 
     async def get_stable_session_account_id(self, session_id: uuid.UUID) -> int | None:
@@ -138,4 +144,30 @@ class IdentityRepositoryFactory(Protocol):
 
     def __call__(self, session: object) -> IdentityRepository:
         """Return a repository that never owns the transaction."""
+        ...
+
+
+class StableWebVerificationCache(Protocol):
+    """Cache only a bounded proof of a previously verified Stable Web credential."""
+
+    async def matches(
+        self,
+        *,
+        account_id: int,
+        session_id: uuid.UUID,
+        password_proof: bytes,
+        credential_fingerprint: bytes,
+    ) -> bool:
+        """Return whether the current session and credential exactly match the cached proof."""
+        ...
+
+    async def store(
+        self,
+        *,
+        account_id: int,
+        session_id: uuid.UUID,
+        password_proof: bytes,
+        credential_fingerprint: bytes,
+    ) -> None:
+        """Store one short-lived HMAC-only verification proof."""
         ...

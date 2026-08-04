@@ -443,23 +443,30 @@ class CommunityService:
         remaining = _remaining_seconds(silence.ends_at, now)
         return 2**31 - 1 if remaining is None else min(remaining, 2**31 - 1)
 
-    async def get_channel_member_count(self, account_id: int, channel_id: int) -> int:
+    async def get_channel_member_count(
+        self,
+        account_id: int,
+        channel_id: int,
+        *,
+        already_authorized: bool = False,
+    ) -> int:
         """Return authoritative active membership size for channel join/part updates."""
         _validate_account_id(account_id)
         _validate_account_id(channel_id)
         active_memberships = self._require_active_memberships()
         now = self._clock.now()
-        async with self._uow_factory() as uow:
-            repository = self._repository_factory(uow.session)
-            channel = await repository.get_channel(channel_id, account_id)
-            if channel is None or channel.archived:
-                raise ChannelNotFound("channel does not exist")
-            authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                account_id,
-                at=now,
-            )
-            if not _evaluate_permissions(channel, account_id, authorization).can_read:
-                raise ChannelAccessDenied("channel is not readable")
+        if not already_authorized:
+            async with self._uow_factory() as uow:
+                repository = self._repository_factory(uow.session)
+                channel = await repository.get_channel(channel_id, account_id)
+                if channel is None or channel.archived:
+                    raise ChannelNotFound("channel does not exist")
+                authorization = await self._authorization_repository_factory(uow.session).get_effective(
+                    account_id,
+                    at=now,
+                )
+                if not _evaluate_permissions(channel, account_id, authorization).can_read:
+                    raise ChannelAccessDenied("channel is not readable")
         count = await active_memberships.count_active_members(channel_id, at=now)
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise RuntimeError("active channel membership query returned an invalid count")

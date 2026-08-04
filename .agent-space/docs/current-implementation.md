@@ -214,7 +214,7 @@ Session 登录 deadline 由 Redis Lua 在 Redis `TIME` 基准下限制为配置�
 
 当前共享工作树完整验证：
 
-- 无外部服务环境：`430 passed, 23 skipped, 11 xfailed`
+- 无外部服务环境：`433 passed, 23 skipped, 11 xfailed`
 - 启用本地真实 PostgreSQL 与 Redis：`288 passed`
 - Consumer 与生产者定向测试：`33 passed, 3 skipped`
 - Consumer 真实 PostgreSQL 全链路：`2 passed`
@@ -227,15 +227,16 @@ Session 登录 deadline 由 Redis Lua 在 Redis `TIME` 基准下限制为配置�
 
 ## 9. 当前已知限制
 
-- 运行日志已统一为生产 JSON/开发文本事件格式；未预期失败事件通过 Loguru 输出原始异常消息和完整 traceback（不输出局部变量），预期 Stable 会话重连事件只保留错误类型与错误码，Taskiq Worker 执行日志不输出 task id 并带具体 relay task name，Outbox Delivery 日志带事件类型和完整 payload，API 请求、Worker Relay、Outbox、Performance、Stable 和迁移阶段均有生命周期事件，热路径使用采样和限频。
+- 运行日志已统一为生产 JSON/开发文本事件格式；未预期失败事件通过 Loguru 输出原始异常消息和完整 traceback（不输出局部变量），预期 Stable 会话重连事件只保留错误类型与错误码，Taskiq Worker 执行日志不输出 task id 并带具体 relay task name；Outbox Delivery 成功日志只记录事件摘要，重试和 Dead Letter 才记录完整 payload。API 请求、Worker Relay、Outbox、Performance、Stable 和迁移阶段均有生命周期事件，热路径使用采样和限频。
 
 - Multiplayer 已完成 Stable 创建、加入、准备、开始、房内 `#multiplayer` 消息、帧扇出和完成；虚拟房间消息按当前权威 RoomState 临时投递，不查询同名普通公开频道。未知或未同步谱面可联机但不会创建排名 Attempt。当前使用 Event Command ID 和自然幂等，尚未实现面向未来 Lazer 写命令的可重放 Command Receipt。
 - Multiplayer 完成事件与多人 Score Accepted 事件会幂等重建结果；Round 完成后宽限期内迟到的已验证成绩可修正 Result/Standing/Summary。Abort 不生成 Round Result。
 - Authorization/Moderation 管理命令和 Audit 已实现并有独立组合根，但没有对外管理 API；在认证、授权和错误映射完成前不能视为生产可调用入口。
 - `ContentSyncService` 已有 Stable 排行榜按需补全与响应后到期刷新，但仍没有主动 Scheduler、Worker 或管理命令入口。
+- 在线性能路径已完成首轮收敛：Stable 服务/Bot 在 API lifespan 组合一次；Poll 合并身份解析并按间隔持久化 touch，Stable Web 使用数据库事实校验后的短期 HMAC 验证缓存，Presence 列表消除 Redis N+1，登录与 Presence 扇出使用有界并发；Relay 有界并发入队并按批次事务写回 enqueue outcome；成绩统计主投影合并查询并补齐 Ranked Score 排名索引，Ranking 只在 Overall 最佳成绩变化后重算，Multiplayer 汇总使用批量 Upsert；Content Sync 外部文件 I/O 使用有界并发。
 - Activity、Notification、Beatmapset Sync 和 Channel Read 投影已由 Outbox Consumer 生成，但尚无 Lazer Query API、分页读取服务或全量 Rebuild。
 - `NotificationDispatch` 当前只生成邮件/Push 待投递意图，尚无外部 Provider Sender；Stable Redis Mailbox 继续由同步适配器负责。
-- `rosu-pp-py` 4.0.2 在 Python 3.14t 环境无可用 Wheel，源码构建持续超时；当前不能输出真实 PP。
+- 中心应用不内嵌 Python PP 引擎；发布并配置外部 C#/Rust Calculator 制品前，当前不能输出真实 PP。
 - Lazer OAuth/API 适配器尚未实现，当前生产组合根仍以 Stable 请求为主。
 - User Stats 已由规范拆分投影覆盖 Play Count、Total Score、Accuracy、Ranked Score、默认 PP、Grade Count 和失败进度；Worker 每日生成 Global/Country `RankSnapshot`，仍缺少全量重建和统计对账工具。
 - 没有完整的 Ranking Rebuild、Eligibility 反转、统计对账和 Dead Letter 运维工具。

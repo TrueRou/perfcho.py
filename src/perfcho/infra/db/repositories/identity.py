@@ -1,7 +1,7 @@
 """Persist the Stable identity lifecycle in caller-owned transactions."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol, cast
 
 from sqlalchemy import Select, func, select, update
@@ -378,25 +378,36 @@ class SqlAlchemyIdentityRepository:
         row = (await self._session.execute(_active_stable_session_statement(token_digest, at=at))).one_or_none()
         return _resolved_stable_session(row)
 
-    async def touch_stable_session(self, token_digest: bytes, *, at: datetime) -> ResolvedStableSession | None:
-        """Resolve and monotonically touch an active Stable session while locking its row."""
-        statement = _active_stable_session_statement(token_digest, at=at).with_for_update(of=AuthSession)
+    async def touch_stable_session(
+        self,
+        token_digest: bytes,
+        *,
+        at: datetime,
+        minimum_interval: timedelta,
+    ) -> tuple[ResolvedStableSession, bool] | None:
+        """Resolve an active session and persist its heartbeat only when the interval elapsed."""
+        if minimum_interval <= timedelta(0):
+            raise ValueError("minimum_interval must be positive")
+        statement = _active_stable_session_statement(token_digest, at=at)
         row = (await self._session.execute(statement)).one_or_none()
         if row is None:
             return None
 
-        last_activity_at = max(row.last_activity_at, at)
-        if last_activity_at != row.last_activity_at:
-            await self._session.execute(
-                update(AuthSession)
-                .where(
-                    AuthSession.id == row.session_id,
-                    AuthSession.closed_at.is_(None),
-                    AuthSession.revoked_at.is_(None),
-                )
-                .values(last_activity_at=last_activity_at)
+        if at - row.last_activity_at < minimum_interval:
+            resolved = _resolved_stable_session(row)
+            return (resolved, False) if resolved is not None else None
+        await self._session.execute(
+            update(AuthSession)
+            .where(
+                AuthSession.id == row.session_id,
+                AuthSession.closed_at.is_(None),
+                AuthSession.revoked_at.is_(None),
+                AuthSession.last_activity_at < at,
             )
-        return _resolved_stable_session(row, last_activity_at=last_activity_at)
+            .values(last_activity_at=func.greatest(AuthSession.last_activity_at, at))
+        )
+        resolved = _resolved_stable_session(row, last_activity_at=at)
+        return (resolved, True) if resolved is not None else None
 
     async def get_stable_session_account_id(self, session_id: uuid.UUID) -> int | None:
         """Return the owning account ID for a normal Stable session."""

@@ -115,7 +115,7 @@ perfcho Worker 始终不读取或转发 Beatmap 字节。Revision 必须已经�
 }
 ```
 
-`ranking-projector.v1` 同时消费 `score.accepted.v1` 和 `score.performance-calculated.v1`，并投影该 Scoreboard 的全部活动 Ranking Policy。PP Policy 只读取自身 `calculation_release_id` 对应的结果；缺失时记为 `performance_pending`，不能回退到其他 Formula。Stable 查询只读取 `is_default = true` 的 Policy。
+`ranking-projector.v1` 同时消费 `score.accepted.v1` 和 `score.performance-calculated.v1`，并投影该 Scoreboard 的全部活动 Ranking Policy。成绩 Delivery 按账户与 Scoreboard 分区，保留同一账户的顺序并允许不同账户并行。PP Policy 只读取自身 `calculation_release_id` 对应的结果；缺失时记为 `performance_pending`，不能回退到其他 Formula。Stable 查询只读取 `is_default = true` 的 Policy。
 
 ### 3.5 多 PP 查询语义
 

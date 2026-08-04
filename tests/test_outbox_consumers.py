@@ -140,7 +140,11 @@ def test_outbox_event_log_fields_include_complete_payload() -> None:
 
     assert fields.get("event_type") == TEST_EVENT_TYPE
     assert fields.get("payload_fields") == ("detail", "nested")
-    assert fields.get("outbox_payload") == {"detail": "outbox body", "nested": {"value": 1}}
+    assert fields.get("outbox_payload") is None
+    assert _outbox_event_fields(event, include_payload=True).get("outbox_payload") == {
+        "detail": "outbox body",
+        "nested": {"value": 1},
+    }
 
 
 @pytest.mark.postgres
@@ -277,7 +281,10 @@ async def test_outbox_stale_token_and_enqueue_failure_do_not_consume_attempt(
         assert stale_event["extra"]["payload_fields"] == ("detail",)
         assert stale_event["extra"]["outbox_payload"] == {"detail": "outbox body"}
         assert {"partition_key", "delivery_token", "lease_owner", "error"}.isdisjoint(stale_event["extra"])
-        await store.mark_enqueue_failed(reference, "tests:enqueue-owner", RuntimeError("Redis unavailable"))
+        await store.record_enqueue_outcomes(
+            [(reference, RuntimeError("Redis unavailable"))],
+            "tests:enqueue-owner",
+        )
 
         async with session_factory() as session:
             delivery = await session.get(

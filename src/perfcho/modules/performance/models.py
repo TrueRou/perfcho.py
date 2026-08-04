@@ -19,6 +19,7 @@ class PerformanceCalculationInput:
 
     job_id: uuid.UUID
     score_id: int
+    account_id: int
     attempt_count: int
     formula_id: uuid.UUID
     formula_code: str
@@ -149,6 +150,7 @@ class PerformanceCompletion:
     """Return persisted formula identities needed to publish completion."""
 
     score_id: int
+    account_id: int
     scoreboard_id: int
     formula_id: uuid.UUID
     formula_code: str

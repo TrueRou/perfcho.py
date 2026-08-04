@@ -1,21 +1,15 @@
-"""Resolve process-owned resources into Stable application services."""
+"""Resolve process-owned Stable application services."""
 
-from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import Depends, Request
 
-from perfcho.infra.glue.stable import StableServices, compose_stable_services
+from perfcho.infra.glue.stable import StableServices
 
 
-async def get_stable_services(request: Request) -> AsyncIterator[StableServices]:
-    """Compose request-scoped Stable services from lifespan state."""
-    async with compose_stable_services(
-        request.state.db_session_factory,
-        request.state.redis_engine,
-        content_runtime=request.state.content_runtime,
-    ) as services:
-        yield services
+async def get_stable_services(request: Request) -> StableServices:
+    """Return the process-owned Stable composition from lifespan state."""
+    return request.state.stable_services
 
 
 StableServicesDependency = Annotated[StableServices, Depends(get_stable_services)]

@@ -345,6 +345,7 @@ def _calculation() -> PerformanceCalculationInput:
     return PerformanceCalculationInput(
         job_id=uuid.uuid7(),
         score_id=1,
+        account_id=42,
         attempt_count=1,
         formula_id=uuid.uuid7(),
         formula_code="official",
@@ -426,6 +427,7 @@ class _FakeCalculationRepository:
         self.calls.append("complete")
         return PerformanceCompletion(
             calculation.score_id,
+            calculation.account_id,
             calculation.scoreboard.scoreboard_id,
             calculation.formula_id,
             calculation.formula_code,

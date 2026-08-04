@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Sequence
 from typing import Any, cast
 
 import pytest
@@ -18,14 +19,19 @@ class FakeRelayStore:
         del owner
         return self.references
 
-    async def mark_enqueued(self, reference: int, owner: str, broker_task_id: str) -> None:
-        self.enqueued.append((reference, owner, broker_task_id))
+    async def record_enqueue_outcomes(
+        self,
+        outcomes: Sequence[tuple[int, str | Exception]],
+        owner: str,
+    ) -> None:
+        for reference, outcome in outcomes:
+            if isinstance(outcome, Exception):
+                self.failed.append((reference, owner, outcome))
+            else:
+                self.enqueued.append((reference, owner, outcome))
 
-    async def mark_enqueue_failed(self, reference: int, owner: str, error: Exception) -> None:
-        self.failed.append((reference, owner, error))
-
-    async def release(self, reference: int, owner: str) -> None:
-        self.released.append((reference, owner))
+    async def release(self, references: Sequence[int], owner: str) -> None:
+        self.released.extend((reference, owner) for reference in references)
 
 
 @pytest.mark.asyncio
@@ -53,6 +59,26 @@ async def test_relay_records_each_enqueue_outcome_and_continues_batch() -> None:
     assert enqueue_failure["level"].name == "WARNING"
     assert enqueue_failure["extra"]["error_type"] == "RuntimeError"
     assert enqueue_failure["exception"].value.args == ("broker unavailable",)
+
+
+@pytest.mark.asyncio
+async def test_relay_bounds_concurrent_broker_enqueues() -> None:
+    store = FakeRelayStore((1, 2, 3, 4, 5))
+    active = 0
+    maximum_active = 0
+
+    async def enqueue(reference: int) -> str:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return f"task-{reference}"
+
+    result = await _relay_once(store, "tests:owner", enqueue, enqueue_concurrency=2)
+
+    assert (result.claimed, result.enqueued, result.enqueue_failed) == (5, 5, 0)
+    assert maximum_active == 2
 
 
 @pytest.mark.asyncio

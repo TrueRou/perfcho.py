@@ -2,7 +2,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from redis.asyncio import Redis
@@ -205,6 +205,47 @@ async def test_presence_claim_passes_capacity_to_atomic_script_and_maps_overflow
     call = set_presence.await_args
     assert call is not None
     assert call.kwargs["args"][-1] == 17
+
+
+@pytest.mark.asyncio
+async def test_list_presences_decodes_pipeline_values_without_per_account_reads(
+    repository_double: RepositoryDouble,
+) -> None:
+    first_session = uuid.uuid7()
+    second_session = uuid.uuid7()
+    index_pipeline = MagicMock()
+    index_pipeline.__aenter__.return_value = index_pipeline
+    index_pipeline.execute = AsyncMock(return_value=[0, [b"42", b"43"]])
+    hash_pipeline = MagicMock()
+    hash_pipeline.__aenter__.return_value = hash_pipeline
+    hash_pipeline.execute = AsyncMock(
+        return_value=[
+            {
+                b"account_id": b"42",
+                b"revision": b"2",
+                b"expires_at": str(datetime_to_milliseconds(PRESENCE_EXPIRY)).encode(),
+                b"session_id": str(first_session).encode(),
+                b"payload": b"first",
+            },
+            {
+                b"account_id": b"43",
+                b"revision": b"3",
+                b"expires_at": str(datetime_to_milliseconds(PRESENCE_EXPIRY)).encode(),
+                b"session_id": str(second_session).encode(),
+                b"payload": b"second",
+            },
+        ]
+    )
+    repository_double.redis.pipeline.side_effect = [index_pipeline, hash_pipeline]
+
+    snapshots = await repository_double.repository.list_presences(at=NOW, limit=10)
+
+    assert snapshots == (
+        PresenceSnapshot(42, 2, b"first", PRESENCE_EXPIRY, first_session),
+        PresenceSnapshot(43, 3, b"second", PRESENCE_EXPIRY, second_session),
+    )
+    repository_double.redis.hgetall.assert_not_awaited()
+    assert repository_double.redis.pipeline.call_count == 2
 
 
 @pytest.mark.asyncio

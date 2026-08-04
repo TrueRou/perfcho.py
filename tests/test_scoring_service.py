@@ -597,12 +597,11 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
         )
         performance_claims = await performance_relay.claim("tests:performance-owner")
         assert len(performance_claims) == 2
-        await performance_relay.mark_enqueue_failed(
-            performance_claims[0],
+        await performance_relay.record_enqueue_outcomes(
+            [(performance_claims[0], RuntimeError("Redis unavailable"))],
             "tests:performance-owner",
-            RuntimeError("Redis unavailable"),
         )
-        await performance_relay.release(performance_claims[1], "tests:performance-owner")
+        await performance_relay.release((performance_claims[1],), "tests:performance-owner")
 
         async with session_factory.begin() as session:
             assert (

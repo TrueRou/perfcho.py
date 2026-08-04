@@ -46,11 +46,13 @@ class _RelayStore[Reference](Protocol):
 
     async def claim(self, owner: str) -> Sequence[Reference]: ...
 
-    async def mark_enqueued(self, reference: Reference, owner: str, broker_task_id: str) -> None: ...
+    async def record_enqueue_outcomes(
+        self,
+        outcomes: Sequence[tuple[Reference, str | Exception]],
+        owner: str,
+    ) -> None: ...
 
-    async def mark_enqueue_failed(self, reference: Reference, owner: str, error: Exception) -> None: ...
-
-    async def release(self, reference: Reference, owner: str) -> None: ...
+    async def release(self, references: Sequence[Reference], owner: str) -> None: ...
 
 
 type _Enqueue[Reference] = Callable[[Reference], Awaitable[str]]
@@ -144,6 +146,7 @@ async def worker_startup(state: TaskiqState) -> None:
                 owner,
                 _enqueue_outbox,
                 poll_interval=settings.durable_relay_poll_interval_seconds,
+                enqueue_concurrency=settings.durable_relay_enqueue_concurrency,
             ),
             name="perfcho-outbox-relay",
         )
@@ -155,6 +158,7 @@ async def worker_startup(state: TaskiqState) -> None:
                 owner,
                 _enqueue_performance,
                 poll_interval=settings.durable_relay_poll_interval_seconds,
+                enqueue_concurrency=settings.durable_relay_enqueue_concurrency,
             ),
             name="perfcho-performance-relay",
         )
@@ -267,42 +271,93 @@ async def _relay_once[Reference](
     enqueue: _Enqueue[Reference],
     *,
     relay: str = "unknown",
+    enqueue_concurrency: int = 1,
 ) -> _RelayBatchResult:
     """Claim and publish one batch while preserving uncertain enqueue leases."""
+    if enqueue_concurrency < 1:
+        raise ValueError("enqueue_concurrency must be positive")
     references = tuple(await store.claim(owner))
     enqueued = 0
     enqueue_failed = 0
-    for index, reference in enumerate(references):
+    outcomes: list[tuple[Reference, str | Exception]] = []
+
+    async def enqueue_one(reference: Reference) -> str | Exception:
         try:
-            broker_task_id = await enqueue(reference)
+            return await enqueue(reference)
         except asyncio.CancelledError:
-            for unattempted in references[index + 1 :]:
-                try:
-                    await store.release(unattempted, owner)
-                except Exception as error:
-                    logging.log_event(
-                        "ERROR",
-                        "runtime.worker.relay.release_failed",
-                        exception=error,
-                        relay=relay,
-                        error_type=type(error).__name__,
-                        **_reference_fields(unattempted),
-                    )
             raise
         except Exception as error:
-            await store.mark_enqueue_failed(reference, owner, error)
-            enqueue_failed += 1
-            logging.log_event(
-                "WARNING",
-                "runtime.worker.relay.enqueue_failed",
-                exception=error,
-                relay=relay,
-                error_type=type(error).__name__,
-                **_reference_fields(reference),
-            )
-        else:
-            await store.mark_enqueued(reference, owner, broker_task_id)
-            enqueued += 1
+            return error
+
+    async def preserve_cancelled_tail(unattempted: Sequence[Reference]) -> None:
+        if outcomes:
+            try:
+                await store.record_enqueue_outcomes(outcomes, owner)
+            except Exception as error:
+                logging.log_event(
+                    "ERROR",
+                    "runtime.worker.relay.outcome_persist_failed",
+                    exception=error,
+                    relay=relay,
+                    error_type=type(error).__name__,
+                )
+        if unattempted:
+            try:
+                await store.release(unattempted, owner)
+            except Exception as error:
+                logging.log_event(
+                    "ERROR",
+                    "runtime.worker.relay.release_failed",
+                    exception=error,
+                    relay=relay,
+                    error_type=type(error).__name__,
+                    release_count=len(unattempted),
+                )
+
+    for offset in range(0, len(references), enqueue_concurrency):
+        chunk = references[offset : offset + enqueue_concurrency]
+        tasks = tuple(asyncio.create_task(enqueue_one(reference)) for reference in chunk)
+        try:
+            chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            settled = await asyncio.gather(*tasks, return_exceptions=True)
+            for reference, outcome in zip(chunk, settled, strict=True):
+                if isinstance(outcome, asyncio.CancelledError):
+                    continue
+                if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+                    continue
+                outcomes.append((reference, cast(str | Exception, outcome)))
+            unattempted = references[offset + len(chunk) :]
+            await preserve_cancelled_tail(unattempted)
+            raise
+        cancelled = False
+        for reference, outcome in zip(chunk, chunk_results, strict=True):
+            if isinstance(outcome, asyncio.CancelledError):
+                cancelled = True
+                continue
+            if isinstance(outcome, Exception):
+                outcomes.append((reference, outcome))
+                enqueue_failed += 1
+                logging.log_event(
+                    "WARNING",
+                    "runtime.worker.relay.enqueue_failed",
+                    exception=outcome,
+                    relay=relay,
+                    error_type=type(outcome).__name__,
+                    **_reference_fields(reference),
+                )
+            elif isinstance(outcome, BaseException):
+                raise outcome
+            else:
+                outcomes.append((reference, outcome))
+                enqueued += 1
+        if cancelled:
+            await preserve_cancelled_tail(references[offset + len(chunk) :])
+            raise asyncio.CancelledError
+    if outcomes:
+        await store.record_enqueue_outcomes(outcomes, owner)
     return _RelayBatchResult(len(references), enqueued, enqueue_failed)
 
 
@@ -313,6 +368,7 @@ async def _run_relay_loop[Reference](
     enqueue: _Enqueue[Reference],
     *,
     poll_interval: float,
+    enqueue_concurrency: int = 1,
 ) -> None:
     """Run one independently supervised work-family relay."""
     if poll_interval <= 0:
@@ -323,7 +379,13 @@ async def _run_relay_loop[Reference](
         while True:
             iteration_started_ns = monotonic_ns()
             try:
-                result = await _relay_once(store, owner, enqueue, relay=name)
+                result = await _relay_once(
+                    store,
+                    owner,
+                    enqueue,
+                    relay=name,
+                    enqueue_concurrency=enqueue_concurrency,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as error:

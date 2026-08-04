@@ -357,6 +357,16 @@ class RedisRealtimeRepository(RealtimeRepository):
         """Read a live presence projection with its owning session fence."""
         _positive_integer("account_id", account_id)
         values = await self._redis.hgetall(self._keys.presence(account_id))
+        return self._decode_presence(account_id, values, at=at)
+
+    @staticmethod
+    def _decode_presence(
+        account_id: int,
+        values: Mapping[bytes | str, bytes | str],
+        *,
+        at: datetime,
+    ) -> PresenceSnapshot | None:
+        """Decode one already-fetched presence hash without another Redis read."""
         if not values:
             return None
         try:
@@ -391,13 +401,17 @@ class RedisRealtimeRepository(RealtimeRepository):
                 pipeline.hgetall(self._keys.presence(account_id))
             values = await pipeline.execute()
         snapshots: list[PresenceSnapshot] = []
+        stale_accounts: list[int] = []
         for account_id, presence in zip(account_ids, values, strict=True):
-            if not presence:
-                await self._redis.zrem(self._keys.presence_index, account_id)
-                continue
-            snapshot = await self.get_presence(account_id, at=at)
+            snapshot = self._decode_presence(account_id, presence, at=at)
             if snapshot is not None:
                 snapshots.append(snapshot)
+            else:
+                stale_accounts.append(account_id)
+        if stale_accounts:
+            async with self._redis.pipeline(transaction=False) as pipeline:
+                pipeline.zrem(self._keys.presence_index, *stale_accounts)
+                await pipeline.execute()
         return tuple(snapshots)
 
     async def clear_presence(self, account_id: int, *, expected_fence: SessionFence) -> bool:

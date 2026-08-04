@@ -254,7 +254,7 @@ class ScoringService:
                         "request_id": str(command.meta.request_id),
                     },
                     consumers=consumers,
-                    partition_key=f"scoreboard:{scoreboard.scoreboard_id}",
+                    partition_key=f"account:{account_context.account_id}:scoreboard:{scoreboard.scoreboard_id}",
                 )
             )
             await repository.complete_acceptance(command.meta.idempotency_key, result)
@@ -338,7 +338,7 @@ class ReplayService:
                             "request_id": str(request_id),
                         },
                         consumers=(_STATS_CONSUMER,),
-                        partition_key=f"scoreboard:{replay.scoreboard_id}",
+                        partition_key=f"account:{replay.owner_account_id}:scoreboard:{replay.scoreboard_id}",
                     )
                 )
             await uow.commit()

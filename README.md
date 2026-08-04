@@ -7,7 +7,7 @@ outbox runtime. Stable/Lazer protocol services will be implemented against this 
 
 ## Requirements
 
-- Python 3.14t
+- Python 3.14
 - uv
 - Docker Compose V2
 - PostgreSQL 17, Redis 8, and S3-compatible object storage, normally started through Docker Compose

@@ -59,5 +59,6 @@ def create_content_runtime(
             object_storage,
             application_clock,
             application_ids,
+            max_concurrency=config.content_sync_max_concurrency,
         ),
     )

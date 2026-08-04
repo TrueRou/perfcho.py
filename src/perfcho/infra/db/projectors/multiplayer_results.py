@@ -5,11 +5,12 @@ import json
 import uuid
 from collections import defaultdict
 from decimal import Decimal
-from typing import Protocol
+from typing import NotRequired, Protocol, TypedDict
 
 from sqlalchemy import and_, delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
 
 from perfcho.infra.db.models.events import OutboxEvent, ProjectionCheckpoint
 from perfcho.infra.db.models.multiplayer import (
@@ -40,9 +41,27 @@ _TEAM_MODES = frozenset({"team_vs", "tag_team_vs"})
 class _MetricRow(Protocol):
     """Expose score columns used by deterministic result calculations."""
 
+    account_id: int
+    team_number: int
+    score_id: int
+    status: str
+    scoring_mode: str
     total_score: int
     accuracy: Decimal
     max_combo: int
+
+
+class _RoundResultValue(TypedDict):
+    """Describe one row in a bulk RoundResult upsert."""
+
+    round_id: uuid.UUID
+    account_id: int | None
+    team_number: int | None
+    score_id: int | None
+    rank: int
+    metric_value: Decimal
+    points: Decimal
+    result_digest: NotRequired[bytes]
 
 
 async def project_multiplayer_results(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
@@ -63,22 +82,23 @@ async def project_multiplayer_results(session: AsyncSession, event: OutboxEvent,
         )
     elif event.event_type == "score.accepted.v1":
         score_id = payload_integer(event.payload, "score_id")
+        account_id = payload_integer(event.payload, "account_id")
         scoreboard_id = payload_integer(event.payload, "scoreboard_id")
         require_event_context(
             event,
             partition_key,
             aggregate_type="score",
             aggregate_id=str(score_id),
-            expected_partition_key=f"scoreboard:{scoreboard_id}",
+            expected_partition_key=f"account:{account_id}:scoreboard:{scoreboard_id}",
         )
         dimensions = (
             await session.execute(
-                select(Score.scoreboard_id, MultiplayerAttempt.round_id)
+                select(Score.account_id, Score.scoreboard_id, MultiplayerAttempt.round_id)
                 .outerjoin(MultiplayerAttempt, MultiplayerAttempt.score_id == Score.id)
                 .where(Score.id == score_id)
             )
         ).one_or_none()
-        if dimensions is None or dimensions.scoreboard_id != scoreboard_id:
+        if dimensions is None or dimensions.scoreboard_id != scoreboard_id or dimensions.account_id != account_id:
             raise RuntimeError("accepted score event does not match the authoritative score")
         round_id = dimensions.round_id
     else:
@@ -155,70 +175,73 @@ async def _replace_round_results(
             key=lambda item: (-item[1], item[0]),
         )
         await session.execute(delete(RoundResult).where(RoundResult.round_id == round_row.id))
-        for index, (team, metric) in enumerate(ranked, start=1):
-            points = Decimal(len(ranked) - index + 1)
-            await _upsert_round_result(
-                session,
-                round_id=round_row.id,
-                account_id=None,
-                team_number=team,
-                score_id=None,
-                rank=index,
-                metric=metric,
-                points=points,
-            )
+        await _upsert_round_results(
+            session,
+            [
+                {
+                    "round_id": round_row.id,
+                    "account_id": None,
+                    "team_number": team,
+                    "score_id": None,
+                    "rank": index,
+                    "metric_value": metric,
+                    "points": Decimal(len(ranked) - index + 1),
+                }
+                for index, (team, metric) in enumerate(ranked, start=1)
+            ],
+            subject=RoundResult.team_number,
+        )
         return
 
     ranked = sorted(scored, key=lambda row: (-_score_metric(row, scoring_mode), row.account_id))
     await session.execute(delete(RoundResult).where(RoundResult.round_id == round_row.id))
-    for index, row in enumerate(ranked, start=1):
-        metric = _score_metric(row, scoring_mode)
-        points = Decimal(len(ranked) - index + 1)
-        await _upsert_round_result(
-            session,
-            round_id=round_row.id,
-            account_id=row.account_id,
-            team_number=None,
-            score_id=row.score_id,
-            rank=index,
-            metric=metric,
-            points=points,
-        )
-
-
-async def _upsert_round_result(
-    session: AsyncSession,
-    *,
-    round_id: uuid.UUID,
-    account_id: int | None,
-    team_number: int | None,
-    score_id: int | None,
-    rank: int,
-    metric: Decimal,
-    points: Decimal,
-) -> None:
-    digest = _result_digest(round_id, account_id, team_number, score_id, rank, metric, points)
-    statement = insert(RoundResult).values(
-        round_id=round_id,
-        account_id=account_id,
-        team_number=team_number,
-        score_id=score_id,
-        rank=rank,
-        metric_value=metric,
-        points=points,
-        result_digest=digest,
+    await _upsert_round_results(
+        session,
+        [
+            {
+                "round_id": round_row.id,
+                "account_id": row.account_id,
+                "team_number": None,
+                "score_id": row.score_id,
+                "rank": index,
+                "metric_value": _score_metric(row, scoring_mode),
+                "points": Decimal(len(ranked) - index + 1),
+            }
+            for index, row in enumerate(ranked, start=1)
+        ],
+        subject=RoundResult.account_id,
     )
-    subject = RoundResult.account_id if account_id is not None else RoundResult.team_number
+
+
+async def _upsert_round_results(
+    session: AsyncSession,
+    values: list[_RoundResultValue],
+    *,
+    subject: InstrumentedAttribute,
+) -> None:
+    if not values:
+        return
+    for value in values:
+        value["result_digest"] = _result_digest(
+            value["round_id"],
+            value["account_id"],
+            value["team_number"],
+            value["score_id"],
+            value["rank"],
+            value["metric_value"],
+            value["points"],
+        )
+    statement = insert(RoundResult).values(values)
     await session.execute(
         statement.on_conflict_do_update(
             index_elements=(RoundResult.round_id, subject),
             index_where=subject.is_not(None),
             set_={
-                "score_id": score_id,
-                "rank": rank,
-                "metric_value": metric,
-                "points": points,
-                "result_digest": digest,
+                "score_id": statement.excluded.score_id,
+                "rank": statement.excluded.rank,
+                "metric_value": statement.excluded.metric_value,
+                "points": statement.excluded.points,
+                "result_digest": statement.excluded.result_digest,
             },
         )
     )
@@ -265,14 +288,18 @@ async def _rebuild_session_standings(
             (SessionStanding.subject_type != subject_type) | SessionStanding.subject_key.not_in(keys),
         )
     )
-    for key in sorted(keys, key=int):
-        statement = insert(SessionStanding).values(
-            session_id=multiplayer_session.id,
-            subject_type=subject_type,
-            subject_key=key,
-            points=points[key],
-            version=multiplayer_session.version,
-        )
+    values = [
+        {
+            "session_id": multiplayer_session.id,
+            "subject_type": subject_type,
+            "subject_key": key,
+            "points": points[key],
+            "version": multiplayer_session.version,
+        }
+        for key in sorted(keys, key=int)
+    ]
+    if values:
+        statement = insert(SessionStanding).values(values)
         await session.execute(
             statement.on_conflict_do_update(
                 index_elements=(
@@ -280,7 +307,7 @@ async def _rebuild_session_standings(
                     SessionStanding.subject_type,
                     SessionStanding.subject_key,
                 ),
-                set_={"points": points[key], "version": multiplayer_session.version},
+                set_={"points": statement.excluded.points, "version": statement.excluded.version},
             )
         )
 
@@ -309,25 +336,30 @@ async def _rebuild_playlist_summaries(session: AsyncSession, playlist_revision_i
     by_account: dict[int, list[_MetricRow]] = defaultdict(list)
     for row in rows:
         by_account[row.account_id].append(row)
+    values: list[dict[str, object]] = []
     for account_id, attempts in by_account.items():
         completed = [row for row in attempts if row.status == "completed" and row.score_id is not None]
         best = max(completed, key=lambda row: (_score_metric(row, row.scoring_mode), -row.score_id), default=None)
-        statement = insert(PlaylistItemUserSummary).values(
-            playlist_item_id=item_id,
-            account_id=account_id,
-            attempt_count=len(attempts),
-            completion_count=len(completed),
-            best_score_id=best.score_id if best is not None else None,
-            best_metric_value=_score_metric(best, best.scoring_mode) if best is not None else None,
+        values.append(
+            {
+                "playlist_item_id": item_id,
+                "account_id": account_id,
+                "attempt_count": len(attempts),
+                "completion_count": len(completed),
+                "best_score_id": best.score_id if best is not None else None,
+                "best_metric_value": _score_metric(best, best.scoring_mode) if best is not None else None,
+            }
         )
+    if values:
+        statement = insert(PlaylistItemUserSummary).values(values)
         await session.execute(
             statement.on_conflict_do_update(
                 index_elements=(PlaylistItemUserSummary.playlist_item_id, PlaylistItemUserSummary.account_id),
                 set_={
-                    "attempt_count": len(attempts),
-                    "completion_count": len(completed),
-                    "best_score_id": best.score_id if best is not None else None,
-                    "best_metric_value": _score_metric(best, best.scoring_mode) if best is not None else None,
+                    "attempt_count": statement.excluded.attempt_count,
+                    "completion_count": statement.excluded.completion_count,
+                    "best_score_id": statement.excluded.best_score_id,
+                    "best_metric_value": statement.excluded.best_metric_value,
                 },
             )
         )
@@ -352,30 +384,35 @@ async def _rebuild_room_summaries(session: AsyncSession, room_id: uuid.UUID) -> 
     by_account: dict[int, list[_MetricRow]] = defaultdict(list)
     for row in rows:
         by_account[row.account_id].append(row)
+    values: list[dict[str, object]] = []
     for account_id, attempts in by_account.items():
         completed = [row for row in attempts if row.status == "completed" and row.score_id is not None]
         total_score = sum((row.total_score for row in completed), start=0)
         average_accuracy = (
             sum((row.accuracy for row in completed), start=Decimal(0)) / len(completed) if completed else Decimal(0)
         )
-        statement = insert(RoomUserSummary).values(
-            room_id=room_id,
-            account_id=account_id,
-            attempt_count=len(attempts),
-            completion_count=len(completed),
-            total_score=total_score,
-            total_performance=Decimal(0),
-            average_accuracy=average_accuracy,
+        values.append(
+            {
+                "room_id": room_id,
+                "account_id": account_id,
+                "attempt_count": len(attempts),
+                "completion_count": len(completed),
+                "total_score": total_score,
+                "total_performance": Decimal(0),
+                "average_accuracy": average_accuracy,
+            }
         )
+    if values:
+        statement = insert(RoomUserSummary).values(values)
         await session.execute(
             statement.on_conflict_do_update(
                 index_elements=(RoomUserSummary.room_id, RoomUserSummary.account_id),
                 set_={
-                    "attempt_count": len(attempts),
-                    "completion_count": len(completed),
-                    "total_score": total_score,
-                    "total_performance": Decimal(0),
-                    "average_accuracy": average_accuracy,
+                    "attempt_count": statement.excluded.attempt_count,
+                    "completion_count": statement.excluded.completion_count,
+                    "total_score": statement.excluded.total_score,
+                    "total_performance": statement.excluded.total_performance,
+                    "average_accuracy": statement.excluded.average_accuracy,
                 },
             )
         )

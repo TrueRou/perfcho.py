@@ -1,7 +1,5 @@
 """Compose application services from process-owned infrastructure."""
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import cast
@@ -11,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.base import DbSessionFactory
 from perfcho.infra.db.repositories.account import SqlAlchemyAccountRepository
+from perfcho.infra.db.repositories.authorization import SqlAlchemyAuthorizationQueryRepository
 from perfcho.infra.db.repositories.community import (
     SqlAlchemyActiveSilencePolicy,
     SqlAlchemyCommunityRepository,
@@ -37,6 +36,7 @@ from perfcho.infra.glue.common import (
     outbox_writer,
 )
 from perfcho.infra.glue.content import ContentRuntime
+from perfcho.infra.redis.identity import RedisStableWebVerificationCache
 from perfcho.infra.redis.multiplayer import RedisMultiplayerStateRepository
 from perfcho.infra.redis.realtime import RedisRealtimeRepository
 from perfcho.infra.security.password import Argon2Policy, PasswordPepper
@@ -188,8 +188,7 @@ class StableServices:
     bot: BotCommandService | None = None
 
 
-@asynccontextmanager
-async def compose_stable_services(
+def compose_stable_services(
     session_factory: DbSessionFactory,
     redis: Redis,
     *,
@@ -197,8 +196,8 @@ async def compose_stable_services(
     clock: Clock | None = None,
     id_generator: IdGenerator | None = None,
     content_runtime: ContentRuntime | None = None,
-) -> AsyncIterator[StableServices]:
-    """Build Stable-facing services while owning one authorization read session."""
+) -> StableServices:
+    """Build process-owned Stable-facing services without sharing transaction resources."""
     application_clock = clock or SystemClock()
     application_ids = id_generator or Uuid7Generator()
     identity = IdentityService(
@@ -219,6 +218,12 @@ async def compose_stable_services(
         application_clock,
         application_ids,
         stable_session_stale_grace=timedelta(seconds=config.stable_session_stale_grace_seconds),
+        stable_session_touch_interval=timedelta(seconds=config.stable_session_touch_interval_seconds),
+        stable_web_verification_cache=RedisStableWebVerificationCache(
+            redis,
+            prefix=config.redis_state_prefix,
+            ttl_seconds=config.stable_web_auth_cache_ttl_seconds,
+        ),
     )
     realtime = RedisRealtimeRepository(
         redis,
@@ -291,32 +296,31 @@ async def compose_stable_services(
 
     bot = _bot_service(config, multiplayer=multiplayer, social=social, content_query=content_query)
 
-    async with session_factory() as session:
-        authorization = AuthorizationQueryService(
-            authorization_repository(session),
-            application_clock,
-        )
-        yield StableServices(
-            identity=identity,
-            authorization=authorization,
-            realtime=realtime,
-            clock=application_clock,
-            id_generator=application_ids,
-            settings=config,
-            content_query=content_query,
-            content=content,
-            content_sync=content_runtime.sync if content_runtime is not None else None,
-            social=social,
-            community=community,
-            object_storage=(
-                content_runtime.object_storage if content_runtime is not None else S3ObjectStorage.from_settings(config)
-            ),
-            scoring=scoring,
-            performance_query=PerformanceQueryService(uow_factory, _performance_query_repository),
-            replay_query=ReplayQueryService(uow_factory, _scoring_repository),
-            replay=ReplayService(uow_factory, _scoring_repository, outbox_writer),
-            ranking_query=RankingQueryService(uow_factory, _scoring_repository),
-            multiplayer=multiplayer,
-            account=account,
-            bot=bot,
-        )
+    authorization = AuthorizationQueryService(
+        SqlAlchemyAuthorizationQueryRepository(session_factory),
+        application_clock,
+    )
+    return StableServices(
+        identity=identity,
+        authorization=authorization,
+        realtime=realtime,
+        clock=application_clock,
+        id_generator=application_ids,
+        settings=config,
+        content_query=content_query,
+        content=content,
+        content_sync=content_runtime.sync if content_runtime is not None else None,
+        social=social,
+        community=community,
+        object_storage=(
+            content_runtime.object_storage if content_runtime is not None else S3ObjectStorage.from_settings(config)
+        ),
+        scoring=scoring,
+        performance_query=PerformanceQueryService(uow_factory, _performance_query_repository),
+        replay_query=ReplayQueryService(uow_factory, _scoring_repository),
+        replay=ReplayService(uow_factory, _scoring_repository, outbox_writer),
+        ranking_query=RankingQueryService(uow_factory, _scoring_repository),
+        multiplayer=multiplayer,
+        account=account,
+        bot=bot,
+    )

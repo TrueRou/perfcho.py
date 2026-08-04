@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     stable_max_response_bytes: int = Field(default=1024 * 1024, ge=7, le=16 * 1024 * 1024)
     stable_session_lifetime_seconds: int = Field(default=12 * 60 * 60, ge=60)
     stable_session_stale_grace_seconds: int = Field(default=120, ge=30, le=30 * 60)
+    stable_session_touch_interval_seconds: int = Field(default=30, ge=1, le=5 * 60)
+    stable_web_auth_cache_ttl_seconds: int = Field(default=60, ge=1, le=300)
+    stable_presence_fanout_concurrency: int = Field(default=32, ge=1, le=256)
     stable_mailbox_batch_size: int = Field(default=256, ge=1, le=4096)
     stable_mailbox_lease_seconds: int = Field(default=10, ge=1, le=60)
     stable_welcome_notification: str = Field(default="Welcome to perfcho.py.", max_length=1024)
@@ -109,6 +112,7 @@ class Settings(BaseSettings):
     osu_api_client_secret: SecretStr = Field(default=SecretStr(""))
     upstream_beatmap_file_base_url: str = Field(default="https://osu.ppy.sh/osu", min_length=1, max_length=512)
     upstream_beatmap_file_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    content_sync_max_concurrency: int = Field(default=8, ge=1, le=64)
 
     taskiq_broker_url: str = Field(default="redis://127.0.0.1:56379/1")
     taskiq_queue_name: str = Field(default="perfcho:tasks")
@@ -116,6 +120,7 @@ class Settings(BaseSettings):
     taskiq_stream_max_length: int = Field(default=100_000, ge=1000)
 
     durable_relay_poll_interval_seconds: float = Field(default=1.0, gt=0)
+    durable_relay_enqueue_concurrency: int = Field(default=16, ge=1, le=256)
     outbox_delivery_batch_size: int = Field(default=100, ge=1, le=1000)
     outbox_delivery_lease_seconds: int = Field(default=300, ge=30)
     outbox_delivery_max_attempts: int = Field(default=10, ge=1)
@@ -147,6 +152,8 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_performance_timing(self) -> Self:
         """Keep execution leases and signed URLs beyond the HTTP timeout window."""
+        if self.stable_session_touch_interval_seconds >= self.stable_session_stale_grace_seconds:
+            raise ValueError("Stable session touch interval must be shorter than stale grace")
         minimum_window = ceil(self.performance_http_timeout_seconds) + 30
         if self.performance_calculation_lease_seconds < minimum_window:
             raise ValueError("performance calculation lease must exceed the HTTP timeout by at least 30 seconds")
