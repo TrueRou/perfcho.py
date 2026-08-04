@@ -9,7 +9,7 @@ from decimal import Decimal
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.orm import aliased
 from sqlalchemy.sql.selectable import Select
 
 from perfcho.infra.db.enums import (
@@ -59,6 +59,7 @@ from perfcho.infra.db.models.scoring import (
     UserPlayStat,
     UserRankedStat,
 )
+from perfcho.infra.db.models.social import Follow
 from perfcho.modules.common import AccountUnavailable
 from perfcho.modules.scoring.errors import AttemptIdempotencyConflict, MultiplayerContextRejected, ScoreRejected
 from perfcho.modules.scoring.models import (
@@ -416,137 +417,126 @@ class SqlAlchemyScoringRepository:
         leaderboard_type: int,
         legacy_mod_bits: int,
         requester_account_id: int,
-        friend_account_ids: tuple[int, ...],
         limit: int,
     ) -> LeaderboardPage:
         """Read one Stable page from active ranking-policy projections."""
-        scoreboard_id = await self._session.scalar(
-            select(Scoreboard.id).where(
-                Scoreboard.ruleset == DbRuleset(ruleset.value),
-                Scoreboard.variant == DbScoreboardVariant(variant.value),
-                Scoreboard.active.is_(True),
-            )
-        )
-        if scoreboard_id is None:
-            return LeaderboardPage((), None)
-        policy_id = await self._session.scalar(
-            select(RankingPolicy.id).where(
-                RankingPolicy.scoreboard_id == scoreboard_id,
-                RankingPolicy.active.is_(True),
-                RankingPolicy.is_default.is_(True),
-            )
-        )
-        if policy_id is None:
-            return LeaderboardPage((), None)
-
-        scope = "exact_mods" if leaderboard_type == 2 else "overall"
-        filter_mod_set_id = None
-        if scope == "exact_mods":
-            filter_mod_set_ids = tuple(
-                await self._session.scalars(
-                    select(ModSet.id).where(
-                        ModSet.scoreboard_id == scoreboard_id,
-                        ModSet.legacy_bits == legacy_mod_bits,
-                    )
-                )
-            )
-            if not filter_mod_set_ids:
-                return LeaderboardPage((), None)
-            candidate_order = (
-                LeaderboardEntry.metric_value.desc(),
-                LeaderboardEntry.tie_break_value.desc(),
-                LeaderboardEntry.score_id.asc(),
-            )
-            candidates = (
-                select(
-                    LeaderboardEntry.id.label("entry_id"),
-                    func.row_number()
-                    .over(partition_by=LeaderboardEntry.account_id, order_by=candidate_order)
-                    .label("account_position"),
-                )
-                .where(
-                    LeaderboardEntry.policy_id == policy_id,
-                    LeaderboardEntry.beatmap_id == beatmap_id,
-                    LeaderboardEntry.scope == scope,
-                    LeaderboardEntry.filter_mod_set_id.in_(filter_mod_set_ids),
-                )
-                .subquery()
-            )
-            selected_entries = select(candidates.c.entry_id).where(candidates.c.account_position == 1)
-            filters: list[ColumnElement[bool]] = [LeaderboardEntry.id.in_(selected_entries)]
-        else:
-            filters = [
-                LeaderboardEntry.policy_id == policy_id,
-                LeaderboardEntry.beatmap_id == beatmap_id,
-                LeaderboardEntry.scope == scope,
-                LeaderboardEntry.filter_mod_set_id == filter_mod_set_id,
-            ]
-        if leaderboard_type == 3:
-            visible_accounts = tuple(dict.fromkeys((*friend_account_ids, requester_account_id)))
-            filters.append(LeaderboardEntry.account_id.in_(visible_accounts))
-        elif leaderboard_type == 4:
-            country_code = await self._session.scalar(
-                select(Account.country_code).where(Account.id == requester_account_id)
-            )
-            if country_code is None:
-                return LeaderboardPage((), None)
-            filters.append(LeaderboardEntry.country_code == country_code)
-
         order = (
             LeaderboardEntry.metric_value.desc(),
             LeaderboardEntry.tie_break_value.desc(),
             LeaderboardEntry.score_id.asc(),
         )
+        scope = "exact_mods" if leaderboard_type == 2 else "overall"
+        candidate_statement = (
+            select(
+                LeaderboardEntry.id.label("entry_id"),
+                LeaderboardEntry.account_id,
+                LeaderboardEntry.metric_value,
+                LeaderboardEntry.tie_break_value,
+                LeaderboardEntry.score_id,
+            )
+            .join(RankingPolicy, RankingPolicy.id == LeaderboardEntry.policy_id)
+            .join(Scoreboard, Scoreboard.id == RankingPolicy.scoreboard_id)
+            .where(
+                Scoreboard.ruleset == DbRuleset(ruleset.value),
+                Scoreboard.variant == DbScoreboardVariant(variant.value),
+                Scoreboard.active.is_(True),
+                RankingPolicy.active.is_(True),
+                RankingPolicy.is_default.is_(True),
+                LeaderboardEntry.beatmap_id == beatmap_id,
+                LeaderboardEntry.scope == scope,
+            )
+        )
+        if scope == "exact_mods":
+            filter_mod_set = aliased(ModSet)
+            candidate_statement = candidate_statement.join(
+                filter_mod_set,
+                (filter_mod_set.id == LeaderboardEntry.filter_mod_set_id)
+                & (filter_mod_set.scoreboard_id == RankingPolicy.scoreboard_id),
+            ).where(filter_mod_set.legacy_bits == legacy_mod_bits)
+        else:
+            candidate_statement = candidate_statement.where(LeaderboardEntry.filter_mod_set_id.is_(None))
+        if leaderboard_type == 3:
+            follows_requester = (
+                select(Follow.actor_account_id)
+                .where(
+                    Follow.actor_account_id == requester_account_id,
+                    Follow.target_account_id == LeaderboardEntry.account_id,
+                )
+                .exists()
+            )
+            candidate_statement = candidate_statement.where(
+                or_(LeaderboardEntry.account_id == requester_account_id, follows_requester)
+            )
+        elif leaderboard_type == 4:
+            requester_country = select(Account.country_code).where(Account.id == requester_account_id).scalar_subquery()
+            candidate_statement = candidate_statement.where(LeaderboardEntry.country_code == requester_country)
+
+        if scope == "exact_mods":
+            mod_candidates = candidate_statement.add_columns(
+                func.row_number()
+                .over(
+                    partition_by=LeaderboardEntry.account_id,
+                    order_by=order,
+                )
+                .label("account_position")
+            ).cte("stable_mod_leaderboard_candidates")
+            candidates = (
+                select(
+                    mod_candidates.c.entry_id,
+                    mod_candidates.c.account_id,
+                    mod_candidates.c.metric_value,
+                    mod_candidates.c.tie_break_value,
+                    mod_candidates.c.score_id,
+                )
+                .where(mod_candidates.c.account_position == 1)
+                .cte("stable_leaderboard_candidates")
+            )
+        else:
+            candidates = candidate_statement.cte("stable_leaderboard_candidates")
+        ranked_entries = select(
+            candidates.c.entry_id,
+            candidates.c.account_id,
+            func.row_number()
+            .over(
+                order_by=(
+                    candidates.c.metric_value.desc(),
+                    candidates.c.tie_break_value.desc(),
+                    candidates.c.score_id.asc(),
+                )
+            )
+            .label("rank"),
+        ).cte("stable_ranked_leaderboard_entries")
         rows = (
-            await self._session.execute(_leaderboard_row_statement().where(*filters).order_by(*order).limit(limit))
-        ).all()
-        personal_row = (
             await self._session.execute(
                 _leaderboard_row_statement()
-                .where(*filters, LeaderboardEntry.account_id == requester_account_id)
-                .limit(1)
+                .add_columns(ranked_entries.c.rank)
+                .join(ranked_entries, ranked_entries.c.entry_id == LeaderboardEntry.id)
+                .where(
+                    or_(
+                        ranked_entries.c.rank <= limit,
+                        ranked_entries.c.account_id == requester_account_id,
+                    )
+                )
+                .order_by(ranked_entries.c.rank)
             )
-        ).one_or_none()
-        score_ids = {row.score_id for row in rows}
+        ).all()
+        top_rows = tuple(row for row in rows if row.rank <= limit)
+        personal_row = next(
+            (row for row in rows if row.account_id == requester_account_id),
+            None,
+        )
+        score_ids = {row.score_id for row in top_rows}
         if personal_row is not None:
             score_ids.add(personal_row.score_id)
         hits = await self._score_hits(score_ids)
         scores = tuple(
-            _leaderboard_view(row, rank=index + 1, ruleset=ruleset, hits=hits.get(row.score_id, {}))
-            for index, row in enumerate(rows)
+            _leaderboard_view(row, rank=row.rank, ruleset=ruleset, hits=hits.get(row.score_id, {})) for row in top_rows
         )
         personal_best = None
         if personal_row is not None:
-            personal_rank = next(
-                (score.rank for score in scores if score.score_id == personal_row.score_id),
-                None,
-            )
-            if personal_rank is None:
-                personal_rank = 1 + int(
-                    await self._session.scalar(
-                        select(func.count())
-                        .select_from(LeaderboardEntry)
-                        .where(
-                            *filters,
-                            or_(
-                                LeaderboardEntry.metric_value > personal_row.metric_value,
-                                and_(
-                                    LeaderboardEntry.metric_value == personal_row.metric_value,
-                                    LeaderboardEntry.tie_break_value > personal_row.tie_break_value,
-                                ),
-                                and_(
-                                    LeaderboardEntry.metric_value == personal_row.metric_value,
-                                    LeaderboardEntry.tie_break_value == personal_row.tie_break_value,
-                                    LeaderboardEntry.score_id < personal_row.score_id,
-                                ),
-                            ),
-                        )
-                    )
-                    or 0
-                )
             personal_best = _leaderboard_view(
                 personal_row,
-                rank=personal_rank,
+                rank=personal_row.rank,
                 ruleset=ruleset,
                 hits=hits.get(personal_row.score_id, {}),
             )

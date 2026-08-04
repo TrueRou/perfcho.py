@@ -9,6 +9,8 @@ import pytest
 from perfcho.modules.bot import BotCommandService, BotInvocation
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
 from perfcho.modules.multiplayer import (
+    MultiplayerMutationKind,
+    MultiplayerMutationResult,
     MultiplayerService,
     RoomRecord,
     RoomSettings,
@@ -55,17 +57,28 @@ class FakeMultiplayer:
     async def find_room_for_account(self, account_id: int) -> RoomState | None:
         return self.state if account_id == 10 else None
 
-    async def start_round(self, command: StartRound) -> RoomState:
+    async def start_round(self, command: StartRound) -> MultiplayerMutationResult:
         self.started = command
-        return self.state
+        self.state = replace(
+            self.state,
+            slots=(replace(self.state.slots[0], status=SlotStatus.PLAYING), *self.state.slots[1:]),
+            in_progress=True,
+            round_id=uuid.uuid7(),
+            round_participant_account_ids=(10,),
+        )
+        return MultiplayerMutationResult(
+            MultiplayerMutationKind.ROUND_STARTED,
+            self.state,
+            round_participant_account_ids=(10,),
+        )
 
-    async def update_settings(self, command: UpdateRoomSettings) -> RoomState:
+    async def update_settings(self, command: UpdateRoomSettings) -> MultiplayerMutationResult:
         self.updated = command
         self.state = replace(
             self.state,
             room=replace(self.state.room, version=self.state.room.version + 1, settings=command.settings),
         )
-        return self.state
+        return MultiplayerMutationResult(MultiplayerMutationKind.SETTINGS_UPDATED, self.state)
 
 
 def invocation(content: str) -> BotInvocation:
@@ -110,10 +123,14 @@ async def test_multiplayer_commands_call_canonical_service_commands() -> None:
     titled = await bot.try_execute(invocation('!mp title "Tournament Room"'))
 
     assert started is not None and started.response == "Starting match."
+    assert isinstance(started.effect, MultiplayerMutationResult)
+    assert started.effect.kind is MultiplayerMutationKind.ROUND_STARTED
     assert multiplayer.started is not None
     assert multiplayer.started.public_id == 7
     assert multiplayer.started.expected_version == 3
     assert titled is not None and titled.response == "Match title changed to Tournament Room."
+    assert isinstance(titled.effect, MultiplayerMutationResult)
+    assert titled.effect.kind is MultiplayerMutationKind.SETTINGS_UPDATED
     assert multiplayer.updated is not None
     assert multiplayer.updated.settings.name == "Tournament Room"
 

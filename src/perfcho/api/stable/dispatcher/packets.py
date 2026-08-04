@@ -13,6 +13,7 @@ from perfcho.api.stable.dispatcher.multiplayer import (
     _broadcast_lobby,
     _broadcast_state,
     _enqueue,
+    dispatch_multiplayer_mutation,
     dispatch_multiplayer_packet,
 )
 from perfcho.infra.glue.stable import StableServices
@@ -34,7 +35,7 @@ from perfcho.modules.community import (
     TargetAccountSilenced,
 )
 from perfcho.modules.identity import ResolvedStableSession
-from perfcho.modules.multiplayer import CleanupPresence
+from perfcho.modules.multiplayer import CleanupPresence, MultiplayerMutationResult
 from perfcho.modules.realtime import (
     InvalidFrame,
     MailboxOverflow,
@@ -428,8 +429,11 @@ async def broadcast_presence_update(payload: bytes, account_id: int, services: S
         at=services.clock.now(),
         limit=services.settings.stable_presence_batch_size,
     )
+    candidate_account_ids = tuple(snapshot.account_id for snapshot in snapshots if snapshot.account_id != account_id)
     followers = (
-        await services.social.list_follower_account_ids(account_id) if services.social is not None else frozenset()
+        await services.social.list_incoming_follower_account_ids(account_id, candidate_account_ids)
+        if services.social is not None and candidate_account_ids
+        else frozenset()
     )
 
     async def enqueue_snapshot(snapshot: PresenceSnapshot) -> BaseException | None:
@@ -1026,6 +1030,13 @@ async def _execute_bot_command(
     elif result.directive is BotDirective.QUIT:
         context.session_closed = True
         _extend_response(output, await _logout(context, services), services.settings.stable_max_response_bytes)
+
+    if isinstance(result.effect, MultiplayerMutationResult):
+        _extend_response(
+            output,
+            await dispatch_multiplayer_mutation(result.effect, context.identity.account_id, services),
+            services.settings.stable_max_response_bytes,
+        )
 
     log_event(
         "DEBUG",

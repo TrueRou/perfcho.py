@@ -365,7 +365,6 @@ class RankingQueryService:
         leaderboard_type: int,
         legacy_mod_bits: int,
         requester_account_id: int,
-        friend_account_ids: tuple[int, ...] = (),
         limit: int = 50,
     ) -> LeaderboardPage:
         """Return a validated Stable local, top, mods, friends, or country page."""
@@ -375,8 +374,6 @@ class RankingQueryService:
             raise ValueError("leaderboard_type must be between zero and four")
         if legacy_mod_bits < 0 or not 1 <= limit <= 100:
             raise ValueError("leaderboard mods or limit is invalid")
-        if any(identifier < 1 for identifier in friend_account_ids):
-            raise ValueError("friend account IDs must be positive")
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).get_leaderboard(
                 beatmap_id=beatmap_id,
@@ -385,7 +382,6 @@ class RankingQueryService:
                 leaderboard_type=leaderboard_type,
                 legacy_mod_bits=legacy_mod_bits,
                 requester_account_id=requester_account_id,
-                friend_account_ids=friend_account_ids,
                 limit=limit,
             )
 

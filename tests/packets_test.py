@@ -3,7 +3,16 @@ from __future__ import annotations
 import pytest
 
 from perfcho.modules.realtime.stable import builders as packets
-from perfcho.modules.realtime.stable.models import Channel, Message, ScoreFrame, UserPresence, UserStats
+from perfcho.modules.realtime.stable.codec import PacketReader
+from perfcho.modules.realtime.stable.models import (
+    Channel,
+    Message,
+    MultiplayerMatch,
+    ScoreFrame,
+    ServerPacket,
+    UserPresence,
+    UserStats,
+)
 
 
 @pytest.mark.parametrize(
@@ -117,12 +126,6 @@ def test_write_spectator_left(test_input: int, expected: bytes) -> None:
     assert packets.spectator_left(test_input) == expected
 
 
-@pytest.mark.xfail(reason="need to implement proper writing")
-@pytest.mark.parametrize(("test_input", "expected"), [({}, b"")])
-def test_write_spectate_frames(test_input: object, expected: bytes) -> None:
-    assert packets.spectate_frames(test_input) == expected  # type: ignore[arg-type]
-
-
 def test_write_version_update() -> None:
     assert packets.version_update() == b"\x13\x00\x00\x00\x00\x00\x00"
 
@@ -153,22 +156,24 @@ def test_write_notification(test_input: str, expected: bytes) -> None:
     assert packets.notification(test_input) == expected
 
 
-@pytest.mark.xfail(reason="need to remove bancho.py match object")
-@pytest.mark.parametrize(
-    ("test_input", "expected"),
-    [
-        ({"m": None, "send_pw": False}, b""),
-        ({"m": None, "send_pw": True}, b""),
-    ],
-)
-def test_write_update_match(test_input: dict[str, object], expected: bytes) -> None:
-    assert packets.update_match(**test_input) == expected  # type: ignore[arg-type]
+def _read_match_packet(encoded: bytes, packet_type: ServerPacket) -> MultiplayerMatch:
+    reader = PacketReader(encoded, packet_enum=ServerPacket)
+    packet = next(reader)
+    assert packet.packet_type is packet_type
+    match = packet.payload.read_multiplayer_match()
+    packet.payload.require_exhausted()
+    with pytest.raises(StopIteration):
+        next(reader)
+    return match
 
 
-@pytest.mark.xfail(reason="need to remove bancho.py match object")
-@pytest.mark.parametrize(("test_input", "expected"), [({}, b""), ({}, b"")])
-def test_write_new_match(test_input: object, expected: bytes) -> None:
-    assert packets.new_match(test_input) == expected  # type: ignore[arg-type]
+def test_write_new_match_hides_password() -> None:
+    match = MultiplayerMatch(password="secret")
+
+    encoded = packets.new_match(match)
+
+    decoded = _read_match_packet(encoded, ServerPacket.NEW_MATCH)
+    assert decoded == MultiplayerMatch()
 
 
 @pytest.mark.parametrize(
@@ -186,10 +191,10 @@ def test_write_toggle_block_non_friend_pm() -> None:
     assert packets.toggle_block_non_friend_dms() == b'"\x00\x00\x00\x00\x00\x00'
 
 
-@pytest.mark.xfail(reason="need to remove bancho.py match object")
-@pytest.mark.parametrize(("test_input", "expected"), [({}, b""), ({}, b"")])
-def test_write_match_join_success(test_input: object, expected: bytes) -> None:
-    assert packets.match_join_success(test_input) == expected  # type: ignore[arg-type]
+def test_write_match_join_success() -> None:
+    match = MultiplayerMatch(match_id=7, name="Room", password="secret")
+
+    assert _read_match_packet(packets.match_join_success(match), ServerPacket.MATCH_JOIN_SUCCESS) == match
 
 
 def test_write_match_join_fail() -> None:
@@ -218,10 +223,10 @@ def test_write_fellow_spectator_left(test_input: int, expected: bytes) -> None:
     assert packets.fellow_spectator_left(test_input) == expected
 
 
-@pytest.mark.xfail(reason="need to remove bancho.py match object")
-@pytest.mark.parametrize(("test_input", "expected"), [({}, b""), ({}, b"")])
-def test_write_match_start(test_input: object, expected: bytes) -> None:
-    assert packets.match_start(test_input) == expected  # type: ignore[arg-type]
+def test_write_match_start() -> None:
+    match = MultiplayerMatch(match_id=7, in_progress=True, name="Room")
+
+    assert _read_match_packet(packets.match_start(match), ServerPacket.MATCH_START) == match
 
 
 @pytest.mark.parametrize(
@@ -447,16 +452,14 @@ def test_write_restart_server(test_input: int, expected: bytes) -> None:
     assert packets.restart(test_input) == expected
 
 
-@pytest.mark.xfail(reason="need to remove bancho.py match object")
-@pytest.mark.parametrize(
-    ("test_input", "expected"),
-    [
-        ({"p": None, "t_name": "cover"}, b""),
-        ({"p": None, "t_name": "cover"}, b""),
-    ],
-)
-def test_write_match_invite(test_input: dict[str, object], expected: bytes) -> None:
-    assert packets.match_invite(**test_input) == expected  # type: ignore[arg-type]
+def test_write_match_invite() -> None:
+    message = Message("host", "Come join my game.", "target", 10)
+
+    reader = PacketReader(packets.match_invite(message), packet_enum=ServerPacket)
+    packet = next(reader)
+    assert packet.packet_type is ServerPacket.MATCH_INVITE
+    assert packet.payload.read_message() == message
+    packet.payload.require_exhausted()
 
 
 def test_channel_info_end() -> None:

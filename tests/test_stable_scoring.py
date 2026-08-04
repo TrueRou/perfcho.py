@@ -249,8 +249,13 @@ class FakeSocial:
         assert account_id == 3
         return (FollowView(7, "friend", None, NOW, True),)
 
-    async def list_follower_account_ids(self, account_id: int) -> frozenset[int]:
-        assert account_id == 3
+    async def list_incoming_follower_account_ids(
+        self,
+        target_account_id: int,
+        candidate_actor_account_ids: tuple[int, ...],
+    ) -> frozenset[int]:
+        assert target_account_id == 3
+        del candidate_actor_account_ids
         return frozenset()
 
 
@@ -643,7 +648,7 @@ async def test_stable_leaderboard_serializes_projection_and_friend_filter() -> N
     assert personal_fields[:3] == ["40", "friend", "1000000"]
     assert score_fields[-3:] == ["1", str(int(NOW.timestamp())), "1"]
     assert ranking.calls[0]["leaderboard_type"] == 3
-    assert ranking.calls[0]["friend_account_ids"] == (7,)
+    assert "friend_account_ids" not in ranking.calls[0]
     assert cast(FakeContentSync, services.content_sync).refreshes == [200]
 
 

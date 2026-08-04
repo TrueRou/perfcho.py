@@ -7,7 +7,7 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import NotRequired, Protocol, TypedDict
 
-from sqlalchemy import and_, delete, select
+from sqlalchemy import Numeric, String, and_, case, cast, delete, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
@@ -253,169 +253,220 @@ async def _rebuild_session_standings(
     *,
     team_mode: bool,
 ) -> None:
-    participant_rows = (
-        await session.execute(
-            select(RoundParticipant.account_id, RoundParticipant.team_number)
-            .join(Round, Round.id == RoundParticipant.round_id)
-            .where(Round.session_id == multiplayer_session.id)
-        )
-    ).all()
-    result_rows = (
-        await session.execute(
-            select(RoundResult.account_id, RoundResult.team_number, RoundResult.points)
-            .join(Round, Round.id == RoundResult.round_id)
-            .where(Round.session_id == multiplayer_session.id)
-        )
-    ).all()
     if team_mode:
-        keys = {str(row.team_number) for row in participant_rows if row.team_number > 0}
-        points = defaultdict(Decimal)
-        for row in result_rows:
-            if row.team_number is not None:
-                points[str(row.team_number)] += row.points
+        participant_subject = RoundParticipant.team_number
+        result_subject = RoundResult.team_number
+        participant_filter = RoundParticipant.team_number > 0
         subject_type = "team"
     else:
-        keys = {str(row.account_id) for row in participant_rows}
-        points = defaultdict(Decimal)
-        for row in result_rows:
-            if row.account_id is not None:
-                points[str(row.account_id)] += row.points
+        participant_subject = RoundParticipant.account_id
+        result_subject = RoundResult.account_id
+        participant_filter = RoundParticipant.account_id.is_not(None)
         subject_type = "account"
 
+    participant_keys = (
+        select(cast(participant_subject, String).label("subject_key"))
+        .join(Round, Round.id == RoundParticipant.round_id)
+        .where(Round.session_id == multiplayer_session.id, participant_filter)
+        .distinct()
+        .cte("session_participant_keys")
+    )
+    point_totals = (
+        select(
+            cast(result_subject, String).label("subject_key"),
+            func.sum(RoundResult.points).label("points"),
+        )
+        .join(Round, Round.id == RoundResult.round_id)
+        .where(Round.session_id == multiplayer_session.id, result_subject.is_not(None))
+        .group_by(result_subject)
+        .cte("session_point_totals")
+    )
+    subject_still_exists = (
+        select(participant_keys.c.subject_key)
+        .where(participant_keys.c.subject_key == SessionStanding.subject_key)
+        .exists()
+    )
     await session.execute(
         delete(SessionStanding).where(
             SessionStanding.session_id == multiplayer_session.id,
-            (SessionStanding.subject_type != subject_type) | SessionStanding.subject_key.not_in(keys),
+            or_(SessionStanding.subject_type != subject_type, ~subject_still_exists),
         )
     )
-    values = [
-        {
-            "session_id": multiplayer_session.id,
-            "subject_type": subject_type,
-            "subject_key": key,
-            "points": points[key],
-            "version": multiplayer_session.version,
-        }
-        for key in sorted(keys, key=int)
-    ]
-    if values:
-        statement = insert(SessionStanding).values(values)
-        await session.execute(
-            statement.on_conflict_do_update(
-                index_elements=(
-                    SessionStanding.session_id,
-                    SessionStanding.subject_type,
-                    SessionStanding.subject_key,
-                ),
-                set_={"points": statement.excluded.points, "version": statement.excluded.version},
-            )
+    statement = insert(SessionStanding).from_select(
+        ("session_id", "subject_type", "subject_key", "points", "version"),
+        select(
+            literal(multiplayer_session.id),
+            literal(subject_type),
+            participant_keys.c.subject_key,
+            func.coalesce(point_totals.c.points, Decimal(0)),
+            literal(multiplayer_session.version),
         )
+        .select_from(participant_keys)
+        .outerjoin(point_totals, point_totals.c.subject_key == participant_keys.c.subject_key),
+    )
+    await session.execute(
+        statement.on_conflict_do_update(
+            index_elements=(
+                SessionStanding.session_id,
+                SessionStanding.subject_type,
+                SessionStanding.subject_key,
+            ),
+            set_={"points": statement.excluded.points, "version": statement.excluded.version},
+        )
+    )
 
 
 async def _rebuild_playlist_summaries(session: AsyncSession, playlist_revision_id: uuid.UUID) -> None:
     item_id = await session.scalar(select(PlaylistRevision.item_id).where(PlaylistRevision.id == playlist_revision_id))
     if item_id is None:
         raise RuntimeError("multiplayer round references a missing playlist revision")
-    rows = (
-        await session.execute(
-            select(
-                MultiplayerAttempt.account_id,
-                Round.status,
-                PlaylistRevision.scoring_mode,
-                Score.id.label("score_id"),
-                Score.total_score,
-                Score.accuracy,
-                Score.max_combo,
+
+    metric_value = cast(
+        case(
+            (PlaylistRevision.scoring_mode == "accuracy", Score.accuracy),
+            (PlaylistRevision.scoring_mode == "combo", Score.max_combo),
+            else_=Score.total_score,
+        ),
+        Numeric(20, 5),
+    )
+    attempts = (
+        select(
+            MultiplayerAttempt.account_id,
+            Round.status,
+            Score.id.label("score_id"),
+            metric_value.label("metric_value"),
+        )
+        .join(Round, Round.id == MultiplayerAttempt.round_id)
+        .join(PlaylistRevision, PlaylistRevision.id == Round.playlist_revision_id)
+        .outerjoin(Score, Score.id == MultiplayerAttempt.score_id)
+        .where(PlaylistRevision.item_id == item_id)
+        .cte("playlist_attempts")
+    )
+    aggregates = (
+        select(
+            attempts.c.account_id,
+            func.count().label("attempt_count"),
+            func.count(attempts.c.score_id).filter(attempts.c.status == "completed").label("completion_count"),
+        )
+        .group_by(attempts.c.account_id)
+        .cte("playlist_aggregates")
+    )
+    ranked_scores = (
+        select(
+            attempts.c.account_id,
+            attempts.c.score_id,
+            attempts.c.metric_value,
+            func.row_number()
+            .over(
+                partition_by=attempts.c.account_id,
+                order_by=(attempts.c.metric_value.desc(), attempts.c.score_id.asc()),
             )
-            .join(Round, Round.id == MultiplayerAttempt.round_id)
-            .join(PlaylistRevision, PlaylistRevision.id == Round.playlist_revision_id)
-            .outerjoin(Score, Score.id == MultiplayerAttempt.score_id)
-            .where(PlaylistRevision.item_id == item_id)
+            .label("score_position"),
         )
-    ).all()
-    by_account: dict[int, list[_MetricRow]] = defaultdict(list)
-    for row in rows:
-        by_account[row.account_id].append(row)
-    values: list[dict[str, object]] = []
-    for account_id, attempts in by_account.items():
-        completed = [row for row in attempts if row.status == "completed" and row.score_id is not None]
-        best = max(completed, key=lambda row: (_score_metric(row, row.scoring_mode), -row.score_id), default=None)
-        values.append(
-            {
-                "playlist_item_id": item_id,
-                "account_id": account_id,
-                "attempt_count": len(attempts),
-                "completion_count": len(completed),
-                "best_score_id": best.score_id if best is not None else None,
-                "best_metric_value": _score_metric(best, best.scoring_mode) if best is not None else None,
-            }
+        .where(attempts.c.status == "completed", attempts.c.score_id.is_not(None))
+        .cte("playlist_ranked_scores")
+    )
+    best_scores = (
+        select(ranked_scores.c.account_id, ranked_scores.c.score_id, ranked_scores.c.metric_value)
+        .where(ranked_scores.c.score_position == 1)
+        .cte("playlist_best_scores")
+    )
+    statement = insert(PlaylistItemUserSummary).from_select(
+        (
+            "playlist_item_id",
+            "account_id",
+            "attempt_count",
+            "completion_count",
+            "best_score_id",
+            "best_metric_value",
+        ),
+        select(
+            literal(item_id),
+            aggregates.c.account_id,
+            aggregates.c.attempt_count,
+            aggregates.c.completion_count,
+            best_scores.c.score_id,
+            best_scores.c.metric_value,
         )
-    if values:
-        statement = insert(PlaylistItemUserSummary).values(values)
-        await session.execute(
-            statement.on_conflict_do_update(
-                index_elements=(PlaylistItemUserSummary.playlist_item_id, PlaylistItemUserSummary.account_id),
-                set_={
-                    "attempt_count": statement.excluded.attempt_count,
-                    "completion_count": statement.excluded.completion_count,
-                    "best_score_id": statement.excluded.best_score_id,
-                    "best_metric_value": statement.excluded.best_metric_value,
-                },
-            )
+        .select_from(aggregates)
+        .outerjoin(best_scores, best_scores.c.account_id == aggregates.c.account_id),
+    )
+    await session.execute(
+        statement.on_conflict_do_update(
+            index_elements=(PlaylistItemUserSummary.playlist_item_id, PlaylistItemUserSummary.account_id),
+            set_={
+                "attempt_count": statement.excluded.attempt_count,
+                "completion_count": statement.excluded.completion_count,
+                "best_score_id": statement.excluded.best_score_id,
+                "best_metric_value": statement.excluded.best_metric_value,
+            },
         )
+    )
 
 
 async def _rebuild_room_summaries(session: AsyncSession, room_id: uuid.UUID) -> None:
-    rows = (
-        await session.execute(
-            select(
-                MultiplayerAttempt.account_id,
-                Round.status,
-                Score.id.label("score_id"),
-                Score.total_score,
-                Score.accuracy,
-            )
-            .join(Round, Round.id == MultiplayerAttempt.round_id)
-            .join(MultiplayerSession, MultiplayerSession.id == Round.session_id)
-            .outerjoin(Score, Score.id == MultiplayerAttempt.score_id)
-            .where(MultiplayerSession.room_id == room_id)
+    attempts = (
+        select(
+            MultiplayerAttempt.account_id,
+            Round.status,
+            Score.id.label("score_id"),
+            Score.total_score,
+            Score.accuracy,
         )
-    ).all()
-    by_account: dict[int, list[_MetricRow]] = defaultdict(list)
-    for row in rows:
-        by_account[row.account_id].append(row)
-    values: list[dict[str, object]] = []
-    for account_id, attempts in by_account.items():
-        completed = [row for row in attempts if row.status == "completed" and row.score_id is not None]
-        total_score = sum((row.total_score for row in completed), start=0)
-        average_accuracy = (
-            sum((row.accuracy for row in completed), start=Decimal(0)) / len(completed) if completed else Decimal(0)
+        .join(Round, Round.id == MultiplayerAttempt.round_id)
+        .join(MultiplayerSession, MultiplayerSession.id == Round.session_id)
+        .outerjoin(Score, Score.id == MultiplayerAttempt.score_id)
+        .where(MultiplayerSession.room_id == room_id)
+        .cte("room_attempts")
+    )
+    completed = and_(attempts.c.status == "completed", attempts.c.score_id.is_not(None))
+    summaries = (
+        select(
+            attempts.c.account_id,
+            func.count().label("attempt_count"),
+            func.count(attempts.c.score_id).filter(completed).label("completion_count"),
+            func.coalesce(func.sum(attempts.c.total_score).filter(completed), 0).label("total_score"),
+            cast(literal(Decimal(0)), Numeric(14, 5)).label("total_performance"),
+            cast(
+                func.coalesce(func.avg(attempts.c.accuracy).filter(completed), Decimal(0)),
+                Numeric(10, 9),
+            ).label("average_accuracy"),
         )
-        values.append(
-            {
-                "room_id": room_id,
-                "account_id": account_id,
-                "attempt_count": len(attempts),
-                "completion_count": len(completed),
-                "total_score": total_score,
-                "total_performance": Decimal(0),
-                "average_accuracy": average_accuracy,
-            }
+        .group_by(attempts.c.account_id)
+        .cte("room_summaries")
+    )
+    statement = insert(RoomUserSummary).from_select(
+        (
+            "room_id",
+            "account_id",
+            "attempt_count",
+            "completion_count",
+            "total_score",
+            "total_performance",
+            "average_accuracy",
+        ),
+        select(
+            literal(room_id),
+            summaries.c.account_id,
+            summaries.c.attempt_count,
+            summaries.c.completion_count,
+            summaries.c.total_score,
+            summaries.c.total_performance,
+            summaries.c.average_accuracy,
+        ),
+    )
+    await session.execute(
+        statement.on_conflict_do_update(
+            index_elements=(RoomUserSummary.room_id, RoomUserSummary.account_id),
+            set_={
+                "attempt_count": statement.excluded.attempt_count,
+                "completion_count": statement.excluded.completion_count,
+                "total_score": statement.excluded.total_score,
+                "total_performance": statement.excluded.total_performance,
+                "average_accuracy": statement.excluded.average_accuracy,
+            },
         )
-    if values:
-        statement = insert(RoomUserSummary).values(values)
-        await session.execute(
-            statement.on_conflict_do_update(
-                index_elements=(RoomUserSummary.room_id, RoomUserSummary.account_id),
-                set_={
-                    "attempt_count": statement.excluded.attempt_count,
-                    "completion_count": statement.excluded.completion_count,
-                    "total_score": statement.excluded.total_score,
-                    "total_performance": statement.excluded.total_performance,
-                    "average_accuracy": statement.excluded.average_accuracy,
-                },
-            )
-        )
+    )
 
 
 def _score_metric(row: _MetricRow, scoring_mode: str) -> Decimal:

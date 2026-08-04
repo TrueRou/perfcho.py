@@ -7,6 +7,7 @@ from types import TracebackType
 from typing import cast
 
 import pytest
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -470,6 +471,16 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
     del postgres_database_url
     engine = await infra_db.create_engine()
     session_factory = infra_db.create_session_factory(engine)
+    leaderboard_statement_count = 0
+    counting_leaderboard_statements = False
+
+    def count_leaderboard_statement(*args: object) -> None:
+        del args
+        nonlocal leaderboard_statement_count
+        if counting_leaderboard_statements:
+            leaderboard_statement_count += 1
+
+    sqlalchemy_event.listen(engine.sync_engine, "before_cursor_execute", count_leaderboard_statement)
     try:
         async with session_factory.begin() as session:
             beatmapset = Beatmapset(
@@ -625,16 +636,32 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             for event in events:
                 await project_accepted_score(session, event, "account:1:scoreboard:1")
                 await project_scoring_stats(session, event, "account:1:scoreboard:1")
-            exact_mods = await SqlAlchemyScoringRepository(session).get_leaderboard(
+            scoring_repository = SqlAlchemyScoringRepository(session)
+            counting_leaderboard_statements = True
+            exact_mods = await scoring_repository.get_leaderboard(
                 beatmap_id=first.beatmap_id,
                 ruleset=Ruleset.OSU,
                 variant=ScoreboardVariant.VANILLA,
                 leaderboard_type=2,
                 legacy_mod_bits=1 << 3,
                 requester_account_id=1,
-                friend_account_ids=(),
                 limit=50,
             )
+            counting_leaderboard_statements = False
+            assert leaderboard_statement_count == 2
+            leaderboard_statement_count = 0
+            counting_leaderboard_statements = True
+            friends = await scoring_repository.get_leaderboard(
+                beatmap_id=first.beatmap_id,
+                ruleset=Ruleset.OSU,
+                variant=ScoreboardVariant.VANILLA,
+                leaderboard_type=3,
+                legacy_mod_bits=0,
+                requester_account_id=1,
+                limit=50,
+            )
+            counting_leaderboard_statements = False
+            assert leaderboard_statement_count == 2
 
         replay_query = ReplayQueryService(
             SqlAlchemyUnitOfWorkFactory(session_factory),
@@ -666,6 +693,8 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
 
         assert replayed == replace(first, new_achievement_unlocks=())
         assert len(exact_mods.scores) == 1
+        assert [score.account_id for score in friends.scores] == [1]
+        assert friends.personal_best is not None and friends.personal_best.account_id == 1
         async with session_factory() as session:
             assert await session.scalar(select(func.count()).select_from(PlayAttempt)) == 2
             assert await session.scalar(select(func.count()).select_from(Score)) == 2
@@ -854,4 +883,5 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             assert play_stat is not None and (play_stat.play_count, play_stat.total_hits) == (3, 25)
             assert user_beatmap is not None and (user_beatmap.attempt_count, user_beatmap.pass_count) == (3, 2)
     finally:
+        sqlalchemy_event.remove(engine.sync_engine, "before_cursor_execute", count_leaderboard_statement)
         await engine.dispose()

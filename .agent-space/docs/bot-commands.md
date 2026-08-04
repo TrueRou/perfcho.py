@@ -38,3 +38,5 @@ Bot 命令内核位于 `src/perfcho/modules/bot/`，是协议无关的注册与�
 公开频道中的命令消息先按普通公开消息持久化，再执行命令；回复发送给当前频道成员。发给 `BanchoBot` 的私信先通过 CommunityService 的权限、Block、Silence 和幂等检查，再执行命令。Bot 回复本身作为实时协议消息发送，不绕过应用服务写入数据库。
 
 `reconnect` 和 `quit` 通过结果中的生命周期指令交给 Stable 适配器处理。命令执行耗时只写结构化日志，不拼接到用户可见回复中。
+
+多人写命令通过 Bot Result 的不透明 `effect` 透传 Canonical `MultiplayerMutationResult`。Bot 内核和具体命令不选择协议数据包或收件人；Stable Adapter 与原生 Match Packet 共用 mutation 映射和 Mailbox 扇出，未来 Lazer Adapter 可独立消费同一结构化结果。该实时投递是请求进程内的 best-effort 行为，不创建 Worker Delivery。

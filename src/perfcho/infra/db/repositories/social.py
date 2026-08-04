@@ -189,10 +189,19 @@ class SqlAlchemySocialRepository:
             FollowView(row.target_account_id, row.display_name, row.remark, row.created_at, row.mutual) for row in rows
         )
 
-    async def list_follower_account_ids(self, account_id: int) -> frozenset[int]:
-        """Return incoming follow actor identifiers in one scalar query."""
+    async def list_incoming_follower_account_ids(
+        self,
+        target_account_id: int,
+        candidate_actor_account_ids: tuple[int, ...],
+    ) -> frozenset[int]:
+        """Return candidate actor identifiers with an incoming follow to the target."""
+        if not candidate_actor_account_ids:
+            return frozenset()
         values = await self._session.scalars(
-            select(Follow.actor_account_id).where(Follow.target_account_id == account_id)
+            select(Follow.actor_account_id).where(
+                Follow.target_account_id == target_account_id,
+                Follow.actor_account_id.in_(candidate_actor_account_ids),
+            )
         )
         return frozenset(values)
 

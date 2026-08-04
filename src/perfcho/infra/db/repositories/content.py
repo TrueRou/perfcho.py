@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import and_, delete, func, literal, or_, select, update
+from sqlalchemy import and_, case, delete, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import Select
@@ -189,50 +189,54 @@ class SqlAlchemyContentRepository:
 
     async def get_rating(self, beatmap_id: int, account_id: int | None) -> RatingSummary:
         """Return an aggregate and optional account rating by canonical logical beatmap ID."""
-        exists = await self._session.scalar(
-            select(Beatmap.id).where(Beatmap.id == beatmap_id, Beatmap.deleted_at.is_(None))
-        )
-        if exists is None:
-            return RatingSummary(beatmap_id, None, 0, None)
-        aggregate = (
-            await self._session.execute(
-                select(func.avg(RatingVote.rating), func.count(RatingVote.id)).where(
-                    RatingVote.beatmap_id == beatmap_id
-                )
-            )
-        ).one()
-        account_rating = None
-        if account_id is not None:
-            account_rating = await self._session.scalar(
-                select(RatingVote.rating).where(
-                    RatingVote.account_id == account_id,
-                    RatingVote.beatmap_id == beatmap_id,
-                )
-            )
-        return RatingSummary(
-            beatmap_id,
-            Decimal(aggregate[0]) if aggregate[0] is not None else None,
-            aggregate[1],
-            account_rating,
-        )
+        return await self._rating_summary(beatmap_id, account_id)
 
     async def rate(self, account_id: int, beatmap_id: int, rating: int) -> RatingSummary:
         """Upsert one rating by canonical logical beatmap ID."""
-        exists = await self._session.scalar(
-            select(Beatmap.id).where(Beatmap.id == beatmap_id, Beatmap.deleted_at.is_(None))
-        )
-        if exists is None:
-            return RatingSummary(beatmap_id, None, 0, None)
         await self._session.execute(
             insert(RatingVote)
-            .values(account_id=account_id, beatmap_id=beatmap_id, rating=rating)
+            .from_select(
+                (RatingVote.account_id, RatingVote.beatmap_id, RatingVote.rating),
+                select(literal(account_id), Beatmap.id, literal(rating)).where(
+                    Beatmap.id == beatmap_id,
+                    Beatmap.deleted_at.is_(None),
+                ),
+            )
             .on_conflict_do_update(
                 index_elements=(RatingVote.account_id, RatingVote.beatmap_id),
                 index_where=RatingVote.beatmap_id.is_not(None),
                 set_={"rating": rating},
             )
         )
-        return await self.get_rating(beatmap_id, account_id)
+        return await self._rating_summary(beatmap_id, account_id)
+
+    async def _rating_summary(self, beatmap_id: int, account_id: int | None) -> RatingSummary:
+        account_rating = (
+            func.max(RatingVote.rating).filter(RatingVote.account_id == account_id)
+            if account_id is not None
+            else literal(None)
+        )
+        row = (
+            await self._session.execute(
+                select(
+                    func.avg(RatingVote.rating),
+                    func.count(RatingVote.id),
+                    account_rating,
+                )
+                .select_from(Beatmap)
+                .outerjoin(RatingVote, RatingVote.beatmap_id == Beatmap.id)
+                .where(Beatmap.id == beatmap_id, Beatmap.deleted_at.is_(None))
+                .group_by(Beatmap.id)
+            )
+        ).one_or_none()
+        if row is None:
+            return RatingSummary(beatmap_id, None, 0, None)
+        return RatingSummary(
+            beatmap_id,
+            Decimal(row[0]) if row[0] is not None else None,
+            row[1],
+            row[2],
+        )
 
     async def list_comments(self, target: str, external_target_id: int) -> tuple[CommentView, ...]:
         """List visible comments for one external Stable target."""
@@ -404,105 +408,169 @@ class SqlAlchemyContentRepository:
             )
         ).all()
         existing = {row.external_id: row for row in existing_rows}
-        created_revision_count = 0
-        unchanged_revision_count = 0
-
-        for item in files:
-            beatmap = item.beatmap
-            previous = existing.get(beatmap.external_beatmap_id)
-            beatmap_id = await self._session.scalar(
+        beatmap_rows = (
+            await self._session.execute(
                 insert(Beatmap)
                 .values(
-                    beatmapset_id=beatmapset_id,
-                    source_id=source_id,
-                    external_id=beatmap.external_beatmap_id,
-                    ruleset=Ruleset(beatmap.ruleset),
-                    difficulty_name=beatmap.difficulty_name,
-                    status=BeatmapStatus(beatmap.status),
-                    deleted_at=None,
+                    [
+                        {
+                            "beatmapset_id": beatmapset_id,
+                            "source_id": source_id,
+                            "external_id": item.beatmap.external_beatmap_id,
+                            "ruleset": Ruleset(item.beatmap.ruleset),
+                            "difficulty_name": item.beatmap.difficulty_name,
+                            "status": BeatmapStatus(item.beatmap.status),
+                            "deleted_at": None,
+                        }
+                        for item in files
+                    ]
                 )
                 .on_conflict_do_update(
                     index_elements=(Beatmap.source_id, Beatmap.external_id),
                     set_={
                         "beatmapset_id": beatmapset_id,
-                        "ruleset": Ruleset(beatmap.ruleset),
-                        "difficulty_name": beatmap.difficulty_name,
-                        "status": BeatmapStatus(beatmap.status),
+                        "ruleset": insert(Beatmap).excluded.ruleset,
+                        "difficulty_name": insert(Beatmap).excluded.difficulty_name,
+                        "status": insert(Beatmap).excluded.status,
                         "deleted_at": None,
                     },
                 )
-                .returning(Beatmap.id)
+                .returning(Beatmap.id, Beatmap.external_id)
             )
-            if beatmap_id is None:
-                raise RuntimeError("database did not return the synchronized beatmap")
-            if previous is not None and previous.status.value != beatmap.status:
-                self._session.add(
-                    BeatmapStatusEvent(
-                        beatmap_id=beatmap_id,
-                        previous_status=previous.status,
-                        status=BeatmapStatus(beatmap.status),
-                        source="upstream_sync",
-                        effective_at=now,
-                    )
-                )
+        ).all()
+        beatmap_ids = {row.external_id: row.id for row in beatmap_rows}
+        if len(beatmap_ids) != len(files):
+            raise RuntimeError("database did not return every synchronized beatmap")
 
-            asset_id = await self._ensure_media_asset(item)
-            current = (
-                await self._session.execute(
-                    select(BeatmapRevision.id, BeatmapRevision.sha256)
-                    .where(BeatmapRevision.beatmap_id == beatmap_id, BeatmapRevision.is_current.is_(True))
-                    .with_for_update()
+        status_events = [
+            {
+                "beatmap_id": beatmap_ids[item.beatmap.external_beatmap_id],
+                "previous_status": previous.status,
+                "status": BeatmapStatus(item.beatmap.status),
+                "source": "upstream_sync",
+                "effective_at": now,
+            }
+            for item in files
+            if (previous := existing.get(item.beatmap.external_beatmap_id)) is not None
+            and previous.status.value != item.beatmap.status
+        ]
+        if status_events:
+            await self._session.execute(insert(BeatmapStatusEvent).values(status_events))
+
+        asset_values = []
+        requested_digests = set()
+        for item in files:
+            digest = item.stored_object.sha256
+            assert digest is not None
+            requested_digests.add(digest)
+            asset_values.append(
+                {
+                    "id": item.asset_id,
+                    "storage_key": item.stored_object.storage_key,
+                    "sha256": digest,
+                    "media_type": item.stored_object.media_type,
+                    "size_bytes": item.stored_object.size_bytes,
+                }
+            )
+        await self._session.execute(insert(MediaAsset).values(asset_values).on_conflict_do_nothing())
+        asset_rows = (
+            await self._session.execute(
+                select(MediaAsset.id, MediaAsset.sha256).where(MediaAsset.sha256.in_(requested_digests))
+            )
+        ).all()
+        assets_by_digest = {row.sha256: row.id for row in asset_rows}
+        if assets_by_digest.keys() != requested_digests:
+            raise RuntimeError("media asset conflict did not resolve by digest")
+
+        revision_rows = (
+            await self._session.execute(
+                select(
+                    BeatmapRevision.id,
+                    BeatmapRevision.beatmap_id,
+                    BeatmapRevision.sha256,
+                    BeatmapRevision.is_current,
                 )
-            ).one_or_none()
-            if current is not None and current.sha256 == item.stored_object.sha256:
+                .where(BeatmapRevision.beatmap_id.in_(beatmap_ids.values()))
+                .with_for_update()
+            )
+        ).all()
+        revisions_by_digest = {(row.beatmap_id, row.sha256): row for row in revision_rows}
+        current_by_beatmap = {row.beatmap_id: row for row in revision_rows if row.is_current}
+        changed_beatmap_ids = []
+        restored_assets: dict[int, uuid.UUID] = {}
+        new_revisions = []
+        unchanged_revision_count = 0
+
+        for item in files:
+            beatmap = item.beatmap
+            beatmap_id = beatmap_ids[beatmap.external_beatmap_id]
+            digest = item.stored_object.sha256
+            assert digest is not None
+            asset_id = assets_by_digest[digest]
+            current = current_by_beatmap.get(beatmap_id)
+            if current is not None and current.sha256 == digest:
                 unchanged_revision_count += 1
                 continue
 
+            changed_beatmap_ids.append(beatmap_id)
+            historical = revisions_by_digest.get((beatmap_id, digest))
+            if historical is not None:
+                restored_assets[historical.id] = asset_id
+                continue
+            new_revisions.append(
+                {
+                    "beatmap_id": beatmap_id,
+                    "file_asset_id": asset_id,
+                    "md5": beatmap.md5,
+                    "sha256": digest,
+                    "file_name": beatmap.file_name,
+                    "file_name_key": func.lower(beatmap.file_name),
+                    "source_updated_at": beatmap.source_updated_at,
+                    "total_length_ms": beatmap.total_length_ms,
+                    "drain_length_ms": beatmap.drain_length_ms,
+                    "bpm": beatmap.bpm,
+                    "circle_size": beatmap.circle_size,
+                    "overall_difficulty": beatmap.overall_difficulty,
+                    "approach_rate": beatmap.approach_rate,
+                    "health_drain": beatmap.health_drain,
+                    "object_count": beatmap.object_count,
+                    "circle_count": beatmap.circle_count,
+                    "slider_count": beatmap.slider_count,
+                    "spinner_count": beatmap.spinner_count,
+                    "max_combo": beatmap.max_combo,
+                    "has_storyboard": beatmap.has_storyboard,
+                    "has_video": beatmap.has_video,
+                    "is_current": True,
+                }
+            )
+
+        if changed_beatmap_ids:
             await self._session.execute(
                 update(BeatmapRevision)
-                .where(BeatmapRevision.beatmap_id == beatmap_id, BeatmapRevision.is_current.is_(True))
+                .where(
+                    BeatmapRevision.beatmap_id.in_(changed_beatmap_ids),
+                    BeatmapRevision.is_current.is_(True),
+                )
                 .values(is_current=False)
             )
-            historical_revision_id = await self._session.scalar(
-                select(BeatmapRevision.id).where(
-                    BeatmapRevision.beatmap_id == beatmap_id,
-                    BeatmapRevision.sha256 == item.stored_object.sha256,
+        if restored_assets:
+            await self._session.execute(
+                update(BeatmapRevision)
+                .where(BeatmapRevision.id.in_(restored_assets))
+                .values(
+                    is_current=True,
+                    file_asset_id=case(
+                        {
+                            revision_id: literal(asset_id, type_=MediaAsset.id.type)
+                            for revision_id, asset_id in restored_assets.items()
+                        },
+                        value=BeatmapRevision.id,
+                    ),
                 )
             )
-            if historical_revision_id is not None:
-                await self._session.execute(
-                    update(BeatmapRevision)
-                    .where(BeatmapRevision.id == historical_revision_id)
-                    .values(is_current=True, file_asset_id=asset_id)
-                )
-            else:
-                await self._session.execute(
-                    insert(BeatmapRevision).values(
-                        beatmap_id=beatmap_id,
-                        file_asset_id=asset_id,
-                        md5=beatmap.md5,
-                        sha256=item.stored_object.sha256,
-                        file_name=beatmap.file_name,
-                        file_name_key=func.lower(beatmap.file_name),
-                        source_updated_at=beatmap.source_updated_at,
-                        total_length_ms=beatmap.total_length_ms,
-                        drain_length_ms=beatmap.drain_length_ms,
-                        bpm=beatmap.bpm,
-                        circle_size=beatmap.circle_size,
-                        overall_difficulty=beatmap.overall_difficulty,
-                        approach_rate=beatmap.approach_rate,
-                        health_drain=beatmap.health_drain,
-                        object_count=beatmap.object_count,
-                        circle_count=beatmap.circle_count,
-                        slider_count=beatmap.slider_count,
-                        spinner_count=beatmap.spinner_count,
-                        max_combo=beatmap.max_combo,
-                        has_storyboard=beatmap.has_storyboard,
-                        has_video=beatmap.has_video,
-                        is_current=True,
-                    )
-                )
-            created_revision_count += 1
+        if new_revisions:
+            await self._session.execute(insert(BeatmapRevision).values(new_revisions))
+        created_revision_count = len(changed_beatmap_ids)
 
         removed_ids = tuple(
             await self._session.scalars(
@@ -667,30 +735,6 @@ class SqlAlchemyContentRepository:
         for row in rows:
             current[row.external_id] = None if row.deleted_at is not None else _current_beatmap_metadata(row)
         return _snapshot_extends_current_revision_set(current, snapshot)
-
-    async def _ensure_media_asset(self, item: SyncedBeatmapFile) -> uuid.UUID:
-        digest = item.stored_object.sha256
-        assert digest is not None
-        asset_id = await self._session.scalar(select(MediaAsset.id).where(MediaAsset.sha256 == digest))
-        if asset_id is not None:
-            return asset_id
-        asset_id = await self._session.scalar(
-            insert(MediaAsset)
-            .values(
-                id=item.asset_id,
-                storage_key=item.stored_object.storage_key,
-                sha256=digest,
-                media_type=item.stored_object.media_type,
-                size_bytes=item.stored_object.size_bytes,
-            )
-            .on_conflict_do_nothing()
-            .returning(MediaAsset.id)
-        )
-        if asset_id is None:
-            asset_id = await self._session.scalar(select(MediaAsset.id).where(MediaAsset.sha256 == digest))
-        if asset_id is None:
-            raise RuntimeError("media asset conflict did not resolve by digest")
-        return asset_id
 
 
 def _revision_statement() -> Select:

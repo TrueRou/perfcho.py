@@ -13,7 +13,7 @@ from perfcho.infra.db.projectors import (
     content,
     identity,
     management,
-    multiplayer_results,
+    multiplayer,
     ranking,
     scoring_stats,
     social,
@@ -88,9 +88,9 @@ DEFAULT_CONSUMER_CATALOG = ConsumerCatalog(
             scoring_stats.project_scoring_stats,
         ),
         ConsumerRegistration(
-            multiplayer_results.CONSUMER_NAME,
-            multiplayer_results.EVENT_TYPES,
-            multiplayer_results.project_multiplayer_results,
+            multiplayer.CONSUMER_NAME,
+            multiplayer.EVENT_TYPES,
+            multiplayer.project_multiplayer_results,
         ),
         ConsumerRegistration(
             management.AUTHORIZATION_CONSUMER_NAME,

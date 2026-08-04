@@ -101,6 +101,8 @@ class FakeSocial:
         self.blocked_recipients: frozenset[int] = frozenset()
         self.follow_error: Exception | None = None
         self.filtered: tuple[int, ...] | None = None
+        self.incoming_followers = frozenset({20})
+        self.incoming_follower_queries: list[tuple[int, tuple[int, ...]]] = []
 
     async def resolve_account_by_name(self, display_name: str) -> AccountIdentityView:
         if display_name.casefold() == "banchobot":
@@ -108,9 +110,13 @@ class FakeSocial:
         assert display_name == "target"
         return AccountIdentityView(20, "target")
 
-    async def list_follower_account_ids(self, account_id: int) -> frozenset[int]:
-        assert account_id == 10
-        return frozenset({20})
+    async def list_incoming_follower_account_ids(
+        self,
+        target_account_id: int,
+        candidate_actor_account_ids: tuple[int, ...],
+    ) -> frozenset[int]:
+        self.incoming_follower_queries.append((target_account_id, candidate_actor_account_ids))
+        return self.incoming_followers.intersection(candidate_actor_account_ids)
 
     async def filter_message_recipients(
         self,
@@ -625,6 +631,7 @@ async def test_dispatcher_logs_expected_application_code_and_propagates_unexpect
 @pytest.mark.asyncio
 async def test_change_action_normalizes_assistance_and_stores_consistent_presence() -> None:
     realtime = FakeRealtime((snapshot(10, "sender"), snapshot(20, "target")))
+    social = FakeSocial()
     status = ClientStatus(
         13,
         "playing",
@@ -634,7 +641,7 @@ async def test_change_action_normalizes_assistance_and_stores_consistent_presenc
         55,
     )
 
-    response = await dispatch_packets(status_packet(status), context(realtime), services(realtime))
+    response = await dispatch_packets(status_packet(status), context(realtime), services(realtime, social=social))
 
     response_stats = next(PacketReader(response, packet_enum=ServerPacket)).payload.read_user_stats()
     assert response_stats.mode == 3
@@ -645,6 +652,25 @@ async def test_change_action_normalizes_assistance_and_stores_consistent_presenc
     stored_presence = stored_packets[0].payload.read_user_presence()
     stored_stats = stored_packets[1].payload.read_user_stats()
     assert (stored_presence.mode, stored_presence.global_rank) == (stored_stats.mode, stored_stats.global_rank)
+    assert social.incoming_follower_queries == [(10, (20,))]
+    assert [recipient_account_id for recipient_account_id, _ in realtime.enqueued] == [20]
+
+
+@pytest.mark.asyncio
+async def test_presence_broadcast_bounds_follower_candidates_to_online_snapshot_batch() -> None:
+    realtime = FakeRealtime((snapshot(10, "sender"), snapshot(20, "first"), snapshot(30, "outside-batch")))
+    social = FakeSocial()
+    config = Settings(stable_presence_batch_size=2)
+    status = ClientStatus(1, "playing", "a" * 32, 0, 0, 0)
+
+    await dispatch_packets(
+        status_packet(status),
+        context(realtime),
+        services(realtime, social=social, settings=config),
+    )
+
+    assert social.incoming_follower_queries == [(10, (20,))]
+    assert [recipient_account_id for recipient_account_id, _ in realtime.enqueued] == [20]
 
 
 @pytest.mark.asyncio

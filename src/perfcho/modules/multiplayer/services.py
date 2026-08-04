@@ -33,6 +33,8 @@ from perfcho.modules.multiplayer.models import (
     JoinRoom,
     KickParticipant,
     LeaveRoom,
+    MultiplayerMutationKind,
+    MultiplayerMutationResult,
     ProjectionStatus,
     RoomRecord,
     RoomSettings,
@@ -308,7 +310,7 @@ class MultiplayerService:
             )
             return self._state_from_snapshot(snapshot, degraded=True) if snapshot is not None else None
 
-    async def kick_participant(self, command: KickParticipant) -> RoomState:
+    async def kick_participant(self, command: KickParticipant) -> MultiplayerMutationResult:
         """Persist a host-authorized kick before removing the target projection."""
         started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
@@ -323,7 +325,12 @@ class MultiplayerService:
                 replayed=True,
                 started_ns=started_ns,
             )
-            return await self._publish_snapshot(replay)
+            return MultiplayerMutationResult(
+                MultiplayerMutationKind.PARTICIPANT_KICKED,
+                await self._publish_snapshot(replay),
+                target_account_id=command.target_account_id,
+                replayed=True,
+            )
         current = await self._require_state(command.public_id)
         target_slot = current.slot_for(command.target_account_id)
         if target_slot is None:
@@ -363,7 +370,11 @@ class MultiplayerService:
                 durable_room=room,
             )
             if updated is not None:
-                return updated
+                return MultiplayerMutationResult(
+                    MultiplayerMutationKind.PARTICIPANT_KICKED,
+                    updated,
+                    target_account_id=command.target_account_id,
+                )
         except Exception as error:
             _log_projection_failure(
                 "kick_leave",
@@ -371,9 +382,13 @@ class MultiplayerService:
                 public_id=command.public_id,
                 version=room.version,
             )
-        return self._state_from_snapshot(snapshot, degraded=True)
+        return MultiplayerMutationResult(
+            MultiplayerMutationKind.PARTICIPANT_KICKED,
+            self._state_from_snapshot(snapshot, degraded=True),
+            target_account_id=command.target_account_id,
+        )
 
-    async def update_settings(self, command: UpdateRoomSettings) -> RoomState:
+    async def update_settings(self, command: UpdateRoomSettings) -> MultiplayerMutationResult:
         """Persist a host-authorized setting replacement and update its projection."""
         started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
@@ -388,7 +403,11 @@ class MultiplayerService:
                 replayed=True,
                 started_ns=started_ns,
             )
-            return await self._publish_snapshot(replay)
+            return MultiplayerMutationResult(
+                MultiplayerMutationKind.SETTINGS_UPDATED,
+                await self._publish_snapshot(replay),
+                replayed=True,
+            )
         current = await self._require_state(command.public_id)
         settings, transitioned_slots = _settings_transition(current, command.settings)
         async with self._uow_factory() as uow:
@@ -432,9 +451,12 @@ class MultiplayerService:
             round_participant_account_ids=(),
             expires_at=now + self._state_lifetime,
         )
-        return await self._replace_after_commit(updated, current, snapshot)
+        return MultiplayerMutationResult(
+            MultiplayerMutationKind.SETTINGS_UPDATED,
+            await self._replace_after_commit(updated, current, snapshot),
+        )
 
-    async def change_host(self, command: ChangeHost) -> RoomState:
+    async def change_host(self, command: ChangeHost) -> MultiplayerMutationResult:
         """Persist and project a host transfer to an active participant."""
         started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
@@ -449,7 +471,12 @@ class MultiplayerService:
                 replayed=True,
                 started_ns=started_ns,
             )
-            return await self._publish_snapshot(replay)
+            return MultiplayerMutationResult(
+                MultiplayerMutationKind.HOST_CHANGED,
+                await self._publish_snapshot(replay),
+                target_account_id=command.target_account_id,
+                replayed=True,
+            )
         current = await self._require_state(command.public_id)
         if current.slot_for(command.target_account_id) is None:
             raise MatchStateRejected("target account is not in the room")
@@ -480,9 +507,13 @@ class MultiplayerService:
             started_ns=started_ns,
         )
         updated = replace(current, room=room, state_revision=current.state_revision + 1)
-        return await self._replace_after_commit(updated, current, snapshot)
+        return MultiplayerMutationResult(
+            MultiplayerMutationKind.HOST_CHANGED,
+            await self._replace_after_commit(updated, current, snapshot),
+            target_account_id=command.target_account_id,
+        )
 
-    async def change_password(self, command: ChangeRoomPassword) -> RoomState:
+    async def change_password(self, command: ChangeRoomPassword) -> MultiplayerMutationResult:
         """Persist a host-authorized password replacement and preserve public secrecy."""
         started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
@@ -497,7 +528,11 @@ class MultiplayerService:
                 replayed=True,
                 started_ns=started_ns,
             )
-            return await self._publish_snapshot(replay)
+            return MultiplayerMutationResult(
+                MultiplayerMutationKind.PASSWORD_CHANGED,
+                await self._publish_snapshot(replay),
+                replayed=True,
+            )
         current = await self._require_state(command.public_id)
         async with self._uow_factory() as uow:
             await self._access_policy_factory(uow.session).require(
@@ -526,9 +561,12 @@ class MultiplayerService:
             started_ns=started_ns,
         )
         updated = replace(current, room=room, state_revision=current.state_revision + 1)
-        return await self._replace_after_commit(updated, current, snapshot)
+        return MultiplayerMutationResult(
+            MultiplayerMutationKind.PASSWORD_CHANGED,
+            await self._replace_after_commit(updated, current, snapshot),
+        )
 
-    async def start_round(self, command: StartRound) -> RoomState:
+    async def start_round(self, command: StartRound) -> MultiplayerMutationResult:
         """Freeze active participants, persist a start, and mark occupied slots playing."""
         started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
@@ -543,7 +581,13 @@ class MultiplayerService:
                 replayed=True,
                 started_ns=started_ns,
             )
-            return await self._publish_snapshot(replay)
+            state = await self._publish_snapshot(replay)
+            return MultiplayerMutationResult(
+                MultiplayerMutationKind.ROUND_STARTED,
+                state,
+                round_participant_account_ids=state.round_participant_account_ids,
+                replayed=True,
+            )
         current = await self._require_state(command.public_id)
         if current.in_progress:
             raise MatchStateRejected("room already has a round in progress")
@@ -595,9 +639,14 @@ class MultiplayerService:
             round_id=round_id,
             round_participant_account_ids=tuple(participant.account_id for participant in participants),
         )
-        return await self._replace_after_commit(updated, current, snapshot)
+        state = await self._replace_after_commit(updated, current, snapshot)
+        return MultiplayerMutationResult(
+            MultiplayerMutationKind.ROUND_STARTED,
+            state,
+            round_participant_account_ids=state.round_participant_account_ids,
+        )
 
-    async def complete_round(self, command: CompleteRound) -> RoomState:
+    async def complete_round(self, command: CompleteRound) -> MultiplayerMutationResult:
         """Persist round completion and reset occupied slots to not-ready."""
         started_ns = time.monotonic_ns()
         actor = _actor_id(command.meta)
@@ -613,7 +662,11 @@ class MultiplayerService:
                 replayed=True,
                 started_ns=started_ns,
             )
-            return await self._publish_snapshot(replay)
+            return MultiplayerMutationResult(
+                MultiplayerMutationKind.ROUND_ABORTED if command.aborted else MultiplayerMutationKind.ROUND_COMPLETED,
+                await self._publish_snapshot(replay),
+                replayed=True,
+            )
         current = await self._require_state(command.public_id)
         if not current.in_progress:
             raise MatchStateRejected("room has no round in progress")
@@ -676,7 +729,11 @@ class MultiplayerService:
             round_id=None,
             round_participant_account_ids=(),
         )
-        return await self._replace_after_commit(updated, current, snapshot)
+        return MultiplayerMutationResult(
+            MultiplayerMutationKind.ROUND_ABORTED if command.aborted else MultiplayerMutationKind.ROUND_COMPLETED,
+            await self._replace_after_commit(updated, current, snapshot),
+            round_participant_account_ids=current.round_participant_account_ids,
+        )
 
     async def get_room(self, public_id: int) -> RoomState:
         """Return one live room projection."""

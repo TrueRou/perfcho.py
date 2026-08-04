@@ -99,7 +99,6 @@ class ScoringRepository(Protocol):
         leaderboard_type: int,
         legacy_mod_bits: int,
         requester_account_id: int,
-        friend_account_ids: tuple[int, ...],
         limit: int,
     ) -> LeaderboardPage:
         """Return one bounded Stable leaderboard projection."""

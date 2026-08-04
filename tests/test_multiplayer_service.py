@@ -20,6 +20,7 @@ from perfcho.modules.multiplayer import (
     MatchPermissionDenied,
     MatchStateRejected,
     MultiplayerAccessPolicy,
+    MultiplayerMutationKind,
     MultiplayerRepository,
     MultiplayerService,
     MultiplayerStateRepository,
@@ -458,8 +459,10 @@ async def test_complete_round_writes_results_projection_event_in_command_transac
         round_participant_account_ids=(10,),
     )
 
-    await multiplayer.complete_round(CompleteRound(meta(10, "complete"), 7, created.room.version, False))
+    result = await multiplayer.complete_round(CompleteRound(meta(10, "complete"), 7, created.room.version, False))
 
+    assert result.kind is MultiplayerMutationKind.ROUND_COMPLETED
+    assert result.round_participant_account_ids == (10,)
     assert repository.result_outbox is not None
     event = repository.result_outbox.events[-1]
     assert event.event_type == "multiplayer.round-completed.v1"

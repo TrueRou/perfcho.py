@@ -20,10 +20,11 @@ class BotDirective(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class BotReply:
-    """Carry command output and an optional adapter lifecycle directive."""
+    """Carry command output and optional protocol-adapter instructions."""
 
     response: str | None = None
     directive: BotDirective | None = None
+    effect: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +113,7 @@ class CommandResult:
     hidden: bool
     execution_time_ms: float
     directive: BotDirective | None = None
+    effect: object | None = None
 
 
 @dataclass(slots=True)

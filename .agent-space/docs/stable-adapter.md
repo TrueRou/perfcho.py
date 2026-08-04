@@ -189,6 +189,9 @@ Stable Friend 对应单向 Follow。添加和删除具有自然幂等语义；Fr
 - Round 期间拒绝个人 Free Mod 变更；成绩提交按 Play Attempt 的开始/结束时间选择同图 Rematch 中正确的冻结 Attempt，再由 Scoring 事务执行最终校验和单次消费。
 - Stable 客户端在 `JOIN_LOBBY` 后仍发送 `CHANNEL_JOIN #lobby`，Adapter 必须确认该虚拟频道；创建或加入房间时由服务端先发送 `CHANNEL_KICK #lobby`，再发送 `CHANNEL_JOIN_SUCCESS #multiplayer`，避免客户端继续向已离开的 lobby 发消息。
 - `#multiplayer` 消息使用发送者当前权威 RoomState 解析实际房间，执行全局 Silence、Block 和长度校验，只投递给该房间当前 Slot 成员；客户端 target 本身不是持久公开频道名称。
+- Round 内的 `MATCH_SCORE_UPDATE` 将客户端提交的 Frame ID 覆盖为权威 Stable Slot 位置；发送者在当前 Poll 直接收到回显，其他本轮参与者通过 Mailbox 实时接收，不能把发送者的 Frame 延迟写回自身 Mailbox。`MATCH_PLAYER_FAILED` 发送 0 到 15 的 Slot ID，`MATCH_PLAYER_SKIPPED` 按 Stable 协议发送 Account ID。
+- Round 收尾的当前调用者在同一个 Poll 依次收到 `MATCH_COMPLETE` 和 `in_progress=false` 的 `UPDATE_MATCH`；其他本轮参与者通过 Mailbox 保持相同顺序，未参赛房间成员和 Lobby 同步收到最新房间状态。
+- `!mp` 写命令与原生 Match Packet 调用同一 Canonical Multiplayer Service。Service 返回带变更类型、最新 RoomState 和必要收件人事实的 `MultiplayerMutationResult`；Stable Adapter 统一映射为 `MATCH_UPDATE`、`MATCH_START`、`MATCH_ABORT`、Host 转移或 Kick Packet，并通过 fenced Mailbox 同步扇出。Bot 命令本身不编码 Packet，实时通知不进入 Outbox/Worker。
 - `MATCH_COMPLETE` 事务写入版本化完成事件和 `multiplayer-results-projector.v1` Delivery；Projector 从权威 Attempt/Score 生成 Round Result、Session Standing 和房间/谱单汇总。宽限期内迟到的 Stable 成绩通过多人 `score.accepted.v1` 再次幂等重建，Abort 不生成 Round Result。
 
 ## 8. 协议适配规则

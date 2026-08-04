@@ -9,8 +9,12 @@ from typing import cast
 
 import httpx
 import pytest
+from sqlalchemy import event, func, select
 
+from perfcho.infra.db import engine as infra_db
+from perfcho.infra.db.models.content import Beatmap, BeatmapRevision, BeatmapStatusEvent, RatingVote
 from perfcho.infra.db.repositories.content import (
+    SqlAlchemyContentRepository,
     _snapshot_beatmap_metadata,
     _snapshot_beatmapset_metadata,
     _snapshot_extends_current_revision_set,
@@ -274,6 +278,46 @@ def revision_view(item: SyncedBeatmapFile) -> BeatmapRevisionView:
     )
 
 
+def snapshot_files(
+    contents: tuple[bytes, ...],
+    *,
+    beatmapset_id: int,
+    updated_at: datetime = NOW,
+) -> tuple[UpstreamBeatmapsetSnapshot, tuple[SyncedBeatmapFile, ...]]:
+    template = snapshot(contents[0])
+    beatmaps = tuple(
+        replace(
+            template.beatmaps[0],
+            external_beatmap_id=beatmapset_id * 1000 + index,
+            md5=hashlib.md5(content, usedforsecurity=False).digest(),
+            file_name=f"Artist - Title (Creator) [Difficulty {index}].osu",
+            difficulty_name=f"Difficulty {index}",
+            source_updated_at=updated_at,
+        )
+        for index, content in enumerate(contents)
+    )
+    beatmapset = replace(
+        template,
+        external_beatmapset_id=beatmapset_id,
+        last_updated_at=updated_at,
+        beatmaps=beatmaps,
+    )
+    files = tuple(
+        SyncedBeatmapFile(
+            beatmap,
+            uuid.uuid7(),
+            StoredObject(
+                f"beatmaps/osu/{beatmapset_id}/{beatmap.external_beatmap_id}/{hashlib.sha256(content).hexdigest()}.osu",
+                len(content),
+                "application/x-osu-beatmap",
+                hashlib.sha256(content).digest(),
+            ),
+        )
+        for beatmap, content in zip(beatmaps, contents, strict=True)
+    )
+    return beatmapset, files
+
+
 def test_equal_version_snapshot_must_not_replace_or_remove_current_revisions() -> None:
     current_snapshot = snapshot()
     current_metadata = _snapshot_beatmap_metadata(current_snapshot.beatmaps[0])
@@ -304,6 +348,211 @@ def test_equal_version_snapshot_must_not_replace_or_remove_current_revisions() -
     assert _snapshot_beatmapset_metadata(current_snapshot) != _snapshot_beatmapset_metadata(
         replace(current_snapshot, status="loved")
     )
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_content_repository_sync_query_count_is_bounded_and_history_is_resurrected(
+    postgres_database_url: str,
+) -> None:
+    del postgres_database_url
+    engine = await infra_db.create_engine()
+    session_factory = infra_db.create_session_factory(engine)
+    statement_count = 0
+    counting = False
+
+    def count_statement(*args: object) -> None:
+        del args
+        nonlocal statement_count
+        if counting:
+            statement_count += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_statement)
+    try:
+        single_snapshot, single_files = snapshot_files((b"single",), beatmapset_id=201)
+        original_contents = tuple(f"bulk-{index}".encode() for index in range(32))
+        bulk_snapshot, bulk_files = snapshot_files(original_contents, beatmapset_id=202)
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyContentRepository(session)
+
+            counting = True
+            single_result = await repository.synchronize_beatmapset(
+                single_snapshot,
+                single_files,
+                now=NOW,
+                next_check_at=NOW + timedelta(hours=8),
+            )
+            counting = False
+            single_query_count = statement_count
+            statement_count = 0
+
+            counting = True
+            bulk_result = await repository.synchronize_beatmapset(
+                bulk_snapshot,
+                bulk_files,
+                now=NOW,
+                next_check_at=NOW + timedelta(hours=8),
+            )
+            counting = False
+            bulk_query_count = statement_count
+
+            assert single_result.created_revision_count == 1
+            assert bulk_result.created_revision_count == 32
+            assert single_query_count == bulk_query_count
+            assert bulk_query_count <= 13
+
+            replacement_contents = (b"bulk-replacement", *original_contents[1:-1])
+            replacement_snapshot, replacement_files = snapshot_files(
+                replacement_contents,
+                beatmapset_id=202,
+                updated_at=NOW + timedelta(seconds=1),
+            )
+            replacement_snapshot = replace(
+                replacement_snapshot,
+                beatmaps=(
+                    replace(replacement_snapshot.beatmaps[0], status="loved"),
+                    *replacement_snapshot.beatmaps[1:],
+                ),
+            )
+            replacement_files = tuple(
+                replace(file, beatmap=beatmap)
+                for file, beatmap in zip(replacement_files, replacement_snapshot.beatmaps, strict=True)
+            )
+            replacement_result = await repository.synchronize_beatmapset(
+                replacement_snapshot,
+                replacement_files,
+                now=NOW + timedelta(seconds=1),
+                next_check_at=NOW + timedelta(hours=8),
+            )
+            assert replacement_result.created_revision_count == 1
+            assert replacement_result.unchanged_revision_count == 30
+            assert replacement_result.removed_beatmap_count == 1
+
+            restored_contents = original_contents[:-1]
+            restored_snapshot, restored_files = snapshot_files(
+                restored_contents,
+                beatmapset_id=202,
+                updated_at=NOW + timedelta(seconds=2),
+            )
+            restored_snapshot = replace(
+                restored_snapshot,
+                beatmaps=(replace(restored_snapshot.beatmaps[0], status="loved"), *restored_snapshot.beatmaps[1:]),
+            )
+            restored_files = tuple(
+                replace(file, beatmap=beatmap)
+                for file, beatmap in zip(restored_files, restored_snapshot.beatmaps, strict=True)
+            )
+            restored_result = await repository.synchronize_beatmapset(
+                restored_snapshot,
+                restored_files,
+                now=NOW + timedelta(seconds=2),
+                next_check_at=NOW + timedelta(hours=8),
+            )
+            assert restored_result.created_revision_count == 1
+            assert restored_result.unchanged_revision_count == 30
+
+            first_beatmap_id = await session.scalar(
+                select(Beatmap.id).where(Beatmap.external_id == restored_snapshot.beatmaps[0].external_beatmap_id)
+            )
+            assert first_beatmap_id is not None
+            revisions = tuple(
+                await session.scalars(
+                    select(BeatmapRevision)
+                    .where(BeatmapRevision.beatmap_id == first_beatmap_id)
+                    .order_by(BeatmapRevision.id)
+                )
+            )
+            assert len(revisions) == 2
+            assert sum(revision.is_current for revision in revisions) == 1
+            assert (
+                next(revision for revision in revisions if revision.is_current).sha256
+                == hashlib.sha256(original_contents[0]).digest()
+            )
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(BeatmapStatusEvent)
+                    .where(BeatmapStatusEvent.beatmap_id == first_beatmap_id)
+                )
+                == 1
+            )
+
+            stale_result = await repository.synchronize_beatmapset(
+                bulk_snapshot,
+                bulk_files,
+                now=NOW + timedelta(seconds=3),
+                next_check_at=NOW + timedelta(hours=8),
+            )
+            assert not stale_result.published
+            assert stale_result.created_revision_count == 0
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_statement)
+        await engine.dispose()
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_content_repository_rating_uses_one_read_and_two_write_queries(postgres_database_url: str) -> None:
+    del postgres_database_url
+    engine = await infra_db.create_engine()
+    session_factory = infra_db.create_session_factory(engine)
+    statement_count = 0
+    counting = False
+
+    def count_statement(*args: object) -> None:
+        del args
+        nonlocal statement_count
+        if counting:
+            statement_count += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_statement)
+    try:
+        beatmapset, files = snapshot_files((b"rating",), beatmapset_id=203)
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyContentRepository(session)
+            synchronized = await repository.synchronize_beatmapset(
+                beatmapset,
+                files,
+                now=NOW,
+                next_check_at=NOW + timedelta(hours=8),
+            )
+            beatmap_id = await session.scalar(
+                select(Beatmap.id).where(Beatmap.beatmapset_id == synchronized.beatmapset_id)
+            )
+            assert beatmap_id is not None
+
+            counting = True
+            empty = await repository.get_rating(beatmap_id, 1)
+            counting = False
+            assert statement_count == 1
+            assert empty.average is None and empty.vote_count == 0 and empty.account_rating is None
+
+            statement_count = 0
+            counting = True
+            public = await repository.get_rating(beatmap_id, None)
+            counting = False
+            assert statement_count == 1
+            assert public == empty
+
+            statement_count = 0
+            counting = True
+            rated = await repository.rate(1, beatmap_id, 8)
+            counting = False
+            assert statement_count == 2
+            assert rated.average == Decimal(8)
+            assert rated.vote_count == 1
+            assert rated.account_rating == 8
+
+            statement_count = 0
+            counting = True
+            unknown = await repository.rate(1, beatmap_id + 100_000, 10)
+            counting = False
+            assert statement_count == 2
+            assert unknown.average is None and unknown.vote_count == 0 and unknown.account_rating is None
+            assert await session.scalar(select(func.count()).select_from(RatingVote)) == 1
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count_statement)
+        await engine.dispose()
 
 
 def sync_service(

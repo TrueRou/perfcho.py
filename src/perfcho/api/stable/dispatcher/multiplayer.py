@@ -17,6 +17,8 @@ from perfcho.modules.multiplayer import (
     KickParticipant,
     LeaveRoom,
     MultiplayerError,
+    MultiplayerMutationKind,
+    MultiplayerMutationResult,
     MultiplayerService,
     RoomSettings,
     RoomState,
@@ -31,6 +33,7 @@ from perfcho.modules.realtime.stable.builders import (
     channel_join,
     channel_kick,
     dispose_match,
+    match_abort,
     match_all_players_loaded,
     match_complete,
     match_invite,
@@ -148,6 +151,70 @@ async def dispatch_multiplayer_packet(
             return match_join_fail() + notification("The multiplayer request is invalid.")
         return notification("The multiplayer request is invalid.")
     return b""
+
+
+async def dispatch_multiplayer_mutation(
+    mutation: MultiplayerMutationResult,
+    caller_account_id: int,
+    services: StableServices,
+) -> bytes:
+    """Map one canonical multiplayer mutation to Stable responses and fanout."""
+    if mutation.replayed:
+        return b""
+    state = mutation.state
+    kind = mutation.kind
+    if kind in {MultiplayerMutationKind.SETTINGS_UPDATED, MultiplayerMutationKind.PASSWORD_CHANGED}:
+        return await _state_response(state, caller_account_id, services)
+    if kind is MultiplayerMutationKind.ROUND_STARTED:
+        wire = match_start(_wire_match(state))
+        failed = set(await _broadcast_playing(wire, state, caller_account_id, services))
+        failed.update(await _broadcast_lobby(update_match(_wire_match(state), send_password=False), None, services))
+        log_event(
+            "INFO",
+            "stable.multiplayer.round_started",
+            outcome="started",
+            account_id=caller_account_id,
+            room_id=state.room.public_id,
+            participant_count=len(mutation.round_participant_account_ids),
+            delivery_failure_count=len(failed),
+        )
+        return wire + _delivery_warning(failed)
+    if kind in {MultiplayerMutationKind.ROUND_COMPLETED, MultiplayerMutationKind.ROUND_ABORTED}:
+        wire = match_abort() if kind is MultiplayerMutationKind.ROUND_ABORTED else match_complete()
+        state_wire = update_match(_wire_match(state), send_password=False)
+        round_accounts = frozenset(mutation.round_participant_account_ids)
+        failed = set(await _broadcast_accounts(wire, state, round_accounts, caller_account_id, services))
+        failed.update(await _broadcast_state(state, caller_account_id, services))
+        log_event(
+            "INFO",
+            "stable.multiplayer.round_aborted"
+            if kind is MultiplayerMutationKind.ROUND_ABORTED
+            else "stable.multiplayer.round_completed",
+            outcome="aborted" if kind is MultiplayerMutationKind.ROUND_ABORTED else "completed",
+            account_id=caller_account_id,
+            room_id=state.room.public_id,
+            participant_count=len(round_accounts),
+            delivery_failure_count=len(failed),
+        )
+        return wire + state_wire + _delivery_warning(failed)
+    if kind is MultiplayerMutationKind.HOST_CHANGED:
+        target = mutation.target_account_id or state.room.host_account_id
+        delivered = await _enqueue(target, match_transfer_host(), state, services)
+        response = await _state_response(state, caller_account_id, services)
+        return response + _delivery_warning(() if delivered else (target,))
+    if kind is MultiplayerMutationKind.PARTICIPANT_KICKED:
+        target = mutation.target_account_id
+        if target is None:
+            raise ValueError("participant-kicked mutation requires a target account")
+        delivered = await _enqueue(
+            target,
+            channel_kick("#multiplayer") + match_join_fail(),
+            state,
+            services,
+        )
+        response = await _state_response(state, caller_account_id, services)
+        return response + _delivery_warning(() if delivered else (target,))
+    raise ValueError(f"unsupported multiplayer mutation kind: {kind}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,11 +354,17 @@ async def _dispatch_score_update(dispatch: _MultiplayerPacketContext) -> bytes:
     if slot is None or account_id not in cached.round_participant_account_ids:
         return b""
     wire = match_score_update(replace(frame, frame_id=slot.position))
-    failed = await _broadcast_match(wire, cached, account_id, dispatch.services)
+    failed = await _broadcast_accounts(
+        wire,
+        cached,
+        frozenset(cached.round_participant_account_ids),
+        account_id,
+        dispatch.services,
+    )
     _log_ephemeral_state(
         dispatch.packet_type, cached, dispatch.context, dispatch.services, delivery_failure_count=len(failed)
     )
-    return b""
+    return wire
 
 
 async def _dispatch_room_packet(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -441,7 +514,7 @@ async def _change_settings(dispatch: _MultiplayerPacketContext, current: RoomSta
     account_id = dispatch.context.identity.account_id
     if incoming.host_id != account_id:
         return b""
-    state = await dispatch.multiplayer.update_settings(
+    mutation = await dispatch.multiplayer.update_settings(
         UpdateRoomSettings(
             _meta(
                 "settings",
@@ -456,7 +529,7 @@ async def _change_settings(dispatch: _MultiplayerPacketContext, current: RoomSta
             _settings_from_wire(incoming),
         )
     )
-    return await _state_response(state, account_id, dispatch.services)
+    return await dispatch_multiplayer_mutation(mutation, account_id, dispatch.services)
 
 
 async def _change_password(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -465,7 +538,7 @@ async def _change_password(dispatch: _MultiplayerPacketContext, current: RoomSta
     account_id = dispatch.context.identity.account_id
     if incoming.host_id != account_id:
         return b""
-    state = await dispatch.multiplayer.change_password(
+    mutation = await dispatch.multiplayer.change_password(
         ChangeRoomPassword(
             _meta(
                 "password",
@@ -480,7 +553,7 @@ async def _change_password(dispatch: _MultiplayerPacketContext, current: RoomSta
             incoming.password,
         )
     )
-    return await _state_response(state, account_id, dispatch.services)
+    return await dispatch_multiplayer_mutation(mutation, account_id, dispatch.services)
 
 
 async def _change_mods(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -494,7 +567,7 @@ async def _change_mods(dispatch: _MultiplayerPacketContext, current: RoomState) 
         state = current
         if current.room.host_account_id == account_id:
             room_mods = tuple(mod for mod in mods if mod.acronym in _SPEED_MODS)
-            state = await dispatch.multiplayer.update_settings(
+            mutation = await dispatch.multiplayer.update_settings(
                 UpdateRoomSettings(
                     _meta(
                         "speed-mods",
@@ -509,9 +582,10 @@ async def _change_mods(dispatch: _MultiplayerPacketContext, current: RoomState) 
                     replace(current.room.settings, mods=room_mods, variant=variant),
                 )
             )
+            state = mutation.state
         state = await dispatch.multiplayer.set_slot_mods(public_id, account_id, slot_mods)
     elif current.room.host_account_id == account_id:
-        state = await dispatch.multiplayer.update_settings(
+        mutation = await dispatch.multiplayer.update_settings(
             UpdateRoomSettings(
                 _meta(
                     "mods",
@@ -526,6 +600,7 @@ async def _change_mods(dispatch: _MultiplayerPacketContext, current: RoomState) 
                 replace(current.room.settings, mods=mods, variant=variant),
             )
         )
+        state = mutation.state
     else:
         return b""
     _log_ephemeral_state(dispatch.packet_type, state, dispatch.context, dispatch.services)
@@ -568,7 +643,7 @@ async def _dispatch_room_round(dispatch: _MultiplayerPacketContext, current: Roo
 
 async def _start_round(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
     dispatch.packet.payload.require_exhausted()
-    state = await dispatch.multiplayer.start_round(
+    mutation = await dispatch.multiplayer.start_round(
         StartRound(
             _meta(
                 "start",
@@ -582,31 +657,20 @@ async def _start_round(dispatch: _MultiplayerPacketContext, current: RoomState) 
             current.room.version,
         )
     )
-    wire = match_start(_wire_match(state))
-    failed = set(await _broadcast_playing(wire, state, dispatch.context.identity.account_id, dispatch.services))
-    failed.update(
-        await _broadcast_lobby(update_match(_wire_match(state), send_password=False), None, dispatch.services)
+    return await dispatch_multiplayer_mutation(
+        mutation,
+        dispatch.context.identity.account_id,
+        dispatch.services,
     )
-    log_event(
-        "INFO",
-        "stable.multiplayer.round_started",
-        outcome="started",
-        account_id=dispatch.context.identity.account_id,
-        room_id=state.room.public_id,
-        participant_count=len(state.round_participant_account_ids),
-        delivery_failure_count=len(failed),
-    )
-    return wire + _delivery_warning(failed)
 
 
 async def _complete_round(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
     dispatch.packet.payload.require_exhausted()
     account_id = dispatch.context.identity.account_id
-    round_accounts = frozenset(current.round_participant_account_ids)
     state = await dispatch.multiplayer.set_slot_status(current.room.public_id, account_id, SlotStatus.COMPLETE)
     if any(slot.status is SlotStatus.PLAYING for slot in state.slots):
         return b""
-    completed = await dispatch.multiplayer.complete_round(
+    mutation = await dispatch.multiplayer.complete_round(
         CompleteRound(
             _meta(
                 "complete",
@@ -620,19 +684,7 @@ async def _complete_round(dispatch: _MultiplayerPacketContext, current: RoomStat
             state.room.version,
         )
     )
-    wire = match_complete()
-    failed = set(await _broadcast_accounts(wire, completed, round_accounts, account_id, dispatch.services))
-    failed.update(await _broadcast_state(completed, None, dispatch.services))
-    log_event(
-        "INFO",
-        "stable.multiplayer.round_completed",
-        outcome="completed",
-        account_id=account_id,
-        room_id=completed.room.public_id,
-        participant_count=len(round_accounts),
-        delivery_failure_count=len(failed),
-    )
-    return wire + _delivery_warning(failed)
+    return await dispatch_multiplayer_mutation(mutation, account_id, dispatch.services)
 
 
 async def _fail_round(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -683,7 +735,7 @@ async def _transfer_host(dispatch: _MultiplayerPacketContext, current: RoomState
     target = current.slots[position].account_id
     if target is None:
         return b""
-    state = await dispatch.multiplayer.change_host(
+    mutation = await dispatch.multiplayer.change_host(
         ChangeHost(
             _meta(
                 "host",
@@ -698,16 +750,11 @@ async def _transfer_host(dispatch: _MultiplayerPacketContext, current: RoomState
             target,
         )
     )
-    delivered = await _enqueue(target, match_transfer_host(), state, dispatch.services)
-    _log_ephemeral_state(
-        dispatch.packet_type,
-        state,
-        dispatch.context,
+    return await dispatch_multiplayer_mutation(
+        mutation,
+        dispatch.context.identity.account_id,
         dispatch.services,
-        delivery_failure_count=int(not delivered),
     )
-    response = await _state_response(state, dispatch.context.identity.account_id, dispatch.services)
-    return response + _delivery_warning(() if delivered else (target,))
 
 
 async def _invite_player(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:

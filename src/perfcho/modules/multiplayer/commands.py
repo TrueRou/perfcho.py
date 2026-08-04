@@ -4,13 +4,14 @@ import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 
-from perfcho.modules.bot import CommandContext, CommandDefinition, CommandGroup, ParsedArguments, command
+from perfcho.modules.bot import BotReply, CommandContext, CommandDefinition, CommandGroup, ParsedArguments, command
 from perfcho.modules.content import BeatmapRevisionView
 from perfcho.modules.multiplayer.models import (
     ChangeHost,
     ChangeRoomPassword,
     CompleteRound,
     KickParticipant,
+    MultiplayerMutationResult,
     RoomSettings,
     RoomState,
     StartRound,
@@ -38,54 +39,54 @@ class MultiplayerCommandDependencies:
 def build_multiplayer_commands(dependency: MultiplayerCommandDependencies) -> CommandGroup:
     """Build the room-control command group."""
 
-    async def start(context: CommandContext, _: ParsedArguments) -> str:
+    async def start(context: CommandContext, _: ParsedArguments) -> BotReply:
         state = await _room(context, dependency.service)
-        await dependency.service.start_round(
+        mutation = await dependency.service.start_round(
             StartRound(context.invocation.meta, state.room.public_id, state.room.version)
         )
-        return "Starting match."
+        return BotReply("Starting match.", effect=mutation)
 
-    async def abort(context: CommandContext, _: ParsedArguments) -> str:
+    async def abort(context: CommandContext, _: ParsedArguments) -> BotReply:
         state = await _room(context, dependency.service)
-        await dependency.service.complete_round(
+        mutation = await dependency.service.complete_round(
             CompleteRound(context.invocation.meta, state.room.public_id, state.room.version, aborted=True)
         )
-        return "Match aborted."
+        return BotReply("Match aborted.", effect=mutation)
 
-    async def host(context: CommandContext, parsed: ParsedArguments) -> str:
+    async def host(context: CommandContext, parsed: ParsedArguments) -> BotReply:
         state = await _room(context, dependency.service)
         target = await dependency.resolve_account(parsed.values["username"])
-        await dependency.service.change_host(
+        mutation = await dependency.service.change_host(
             ChangeHost(context.invocation.meta, state.room.public_id, state.room.version, target.account_id)
         )
-        return f"Match host changed to {target.display_name}."
+        return BotReply(f"Match host changed to {target.display_name}.", effect=mutation)
 
-    async def kick(context: CommandContext, parsed: ParsedArguments) -> str:
+    async def kick(context: CommandContext, parsed: ParsedArguments) -> BotReply:
         state = await _room(context, dependency.service)
         target = await dependency.resolve_account(parsed.values["username"])
-        await dependency.service.kick_participant(
+        mutation = await dependency.service.kick_participant(
             KickParticipant(context.invocation.meta, state.room.public_id, state.room.version, target.account_id)
         )
-        return f"{target.display_name} was kicked from the match."
+        return BotReply(f"{target.display_name} was kicked from the match.", effect=mutation)
 
-    async def password(context: CommandContext, parsed: ParsedArguments) -> str:
+    async def password(context: CommandContext, parsed: ParsedArguments) -> BotReply:
         value = " ".join(parsed.values["password"])
-        await _change_password(context, dependency.service, value)
-        return "Match password updated." if value else "Match password removed."
+        mutation = await _change_password(context, dependency.service, value)
+        return BotReply("Match password updated." if value else "Match password removed.", effect=mutation)
 
-    async def random_password(context: CommandContext, _: ParsedArguments) -> str:
+    async def random_password(context: CommandContext, _: ParsedArguments) -> BotReply:
         value = secrets.token_urlsafe(8)
-        await _change_password(context, dependency.service, value)
-        return f"Match password: {value}"
+        mutation = await _change_password(context, dependency.service, value)
+        return BotReply(f"Match password: {value}", effect=mutation)
 
-    async def title(context: CommandContext, parsed: ParsedArguments) -> str:
+    async def title(context: CommandContext, parsed: ParsedArguments) -> str | BotReply:
         value = " ".join(parsed.values["title"]).strip()
         if not value:
             return f"Usage: {context.registry.prefix}mp title <title>"
-        await _change_settings(context, dependency.service, lambda current: replace(current, name=value))
-        return f"Match title changed to {value}."
+        mutation = await _change_settings(context, dependency.service, lambda current: replace(current, name=value))
+        return BotReply(f"Match title changed to {value}.", effect=mutation)
 
-    async def condition(context: CommandContext, parsed: ParsedArguments) -> str:
+    async def condition(context: CommandContext, parsed: ParsedArguments) -> str | BotReply:
         values = {
             "score": WinCondition.SCORE,
             "accuracy": WinCondition.ACCURACY,
@@ -96,14 +97,14 @@ def build_multiplayer_commands(dependency: MultiplayerCommandDependencies) -> Co
         value = values.get(parsed.values["condition"].casefold())
         if value is None:
             return "Win condition must be score, accuracy, combo, or scorev2."
-        await _change_settings(
+        mutation = await _change_settings(
             context,
             dependency.service,
             lambda current: replace(current, win_condition=value),
         )
-        return f"Win condition changed to {value.value}."
+        return BotReply(f"Win condition changed to {value.value}.", effect=mutation)
 
-    async def team_type(context: CommandContext, parsed: ParsedArguments) -> str:
+    async def team_type(context: CommandContext, parsed: ParsedArguments) -> str | BotReply:
         values = {
             "headtohead": TeamMode.HEAD_TO_HEAD,
             "h2h": TeamMode.HEAD_TO_HEAD,
@@ -114,25 +115,30 @@ def build_multiplayer_commands(dependency: MultiplayerCommandDependencies) -> Co
         value = values.get(parsed.values["mode"].replace("_", "").casefold())
         if value is None:
             return "Team type must be headtohead, tagcoop, teamvs, or tagteamvs."
-        await _change_settings(context, dependency.service, lambda current: replace(current, team_mode=value))
-        return f"Team type changed to {value.value}."
+        mutation = await _change_settings(
+            context, dependency.service, lambda current: replace(current, team_mode=value)
+        )
+        return BotReply(f"Team type changed to {value.value}.", effect=mutation)
 
-    async def mods(context: CommandContext, parsed: ParsedArguments) -> str:
+    async def mods(context: CommandContext, parsed: ParsedArguments) -> BotReply:
         selected = _parse_mods(parsed.values["mods"])
-        await _change_settings(context, dependency.service, lambda current: replace(current, mods=selected))
-        return "Match mods updated."
+        mutation = await _change_settings(context, dependency.service, lambda current: replace(current, mods=selected))
+        return BotReply("Match mods updated.", effect=mutation)
 
-    async def free_mods(context: CommandContext, parsed: ParsedArguments) -> str:
+    async def free_mods(context: CommandContext, parsed: ParsedArguments) -> BotReply:
         requested = parsed.values["enabled"]
 
         def update(current: RoomSettings) -> RoomSettings:
             enabled = not current.free_mods if requested is None else requested
             return replace(current, free_mods=enabled)
 
-        state = await _change_settings(context, dependency.service, update)
-        return f"Free Mod {'enabled' if state.room.settings.free_mods else 'disabled'}."
+        mutation = await _change_settings(context, dependency.service, update)
+        return BotReply(
+            f"Free Mod {'enabled' if mutation.state.room.settings.free_mods else 'disabled'}.",
+            effect=mutation,
+        )
 
-    async def map_command(context: CommandContext, parsed: ParsedArguments) -> str:
+    async def map_command(context: CommandContext, parsed: ParsedArguments) -> BotReply:
         beatmap = await dependency.resolve_beatmap(parsed.values["id_or_hash"])
 
         def update(current: RoomSettings) -> RoomSettings:
@@ -144,8 +150,11 @@ def build_multiplayer_commands(dependency: MultiplayerCommandDependencies) -> Co
                 ruleset=Ruleset(beatmap.ruleset),
             )
 
-        await _change_settings(context, dependency.service, update)
-        return f"Changed map to {beatmap.artist} - {beatmap.title} [{beatmap.difficulty_name}]."
+        mutation = await _change_settings(context, dependency.service, update)
+        return BotReply(
+            f"Changed map to {beatmap.artist} - {beatmap.title} [{beatmap.difficulty_name}].",
+            effect=mutation,
+        )
 
     commands = (
         command("start").description("Start the match").action(start),
@@ -210,7 +219,7 @@ async def _change_settings(
     context: CommandContext,
     service: MultiplayerService,
     update: Callable[[RoomSettings], RoomSettings],
-) -> RoomState:
+) -> MultiplayerMutationResult:
     state = await _room(context, service)
     return await service.update_settings(
         UpdateRoomSettings(
@@ -222,9 +231,13 @@ async def _change_settings(
     )
 
 
-async def _change_password(context: CommandContext, service: MultiplayerService, password: str) -> None:
+async def _change_password(
+    context: CommandContext,
+    service: MultiplayerService,
+    password: str,
+) -> MultiplayerMutationResult:
     state = await _room(context, service)
-    await service.change_password(
+    return await service.change_password(
         ChangeRoomPassword(context.invocation.meta, state.room.public_id, state.room.version, password)
     )
 

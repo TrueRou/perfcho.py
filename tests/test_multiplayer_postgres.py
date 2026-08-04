@@ -31,7 +31,7 @@ from perfcho.infra.db.models.multiplayer import (
     SessionStanding,
 )
 from perfcho.infra.db.models.scoring import PlayAttempt, Score
-from perfcho.infra.db.projectors.multiplayer_results import CONSUMER_NAME, project_multiplayer_results
+from perfcho.infra.db.projectors.multiplayer import CONSUMER_NAME, project_multiplayer_results
 from perfcho.infra.db.repositories.multiplayer import SqlAlchemyMultiplayerRepository
 from perfcho.infra.db.repositories.outbox import append_outbox_event
 from perfcho.modules.common import PendingEvent
@@ -465,7 +465,7 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
                 session,
                 first_round_id,
                 1,
-                total_score=900_000,
+                total_score=950_000,
                 ended_at=NOW + timedelta(seconds=30),
             )
             room = await repository.complete_round(
@@ -498,7 +498,7 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
                 first_result.rank,
                 first_result.metric_value,
                 first_result.points,
-            ) == (1, first_score_id, 1, Decimal("900000.00000"), Decimal("1.0000"))
+            ) == (1, first_score_id, 1, Decimal("950000.00000"), Decimal("1.0000"))
             standings = {
                 standing.subject_key: standing.points
                 for standing in await session.scalars(
@@ -613,6 +613,14 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
                 RoomUserSummary,
                 {"room_id": room.room_id, "account_id": 1},
             )
+            empty_playlist_summary = await session.get(
+                PlaylistItemUserSummary,
+                {"playlist_item_id": playlist_item_id, "account_id": 2},
+            )
+            empty_room_summary = await session.get(
+                RoomUserSummary,
+                {"room_id": room.room_id, "account_id": 2},
+            )
             checkpoint = await session.get(
                 ProjectionCheckpoint,
                 {"projector": CONSUMER_NAME, "partition_key": f"account:1:scoreboard:{scoreboard_id}"},
@@ -624,7 +632,7 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
                 playlist_summary.completion_count,
                 playlist_summary.best_score_id,
                 playlist_summary.best_metric_value,
-            ) == (3, 2, late_score_id, Decimal("950000.00000"))
+            ) == (3, 2, first_score_id, Decimal("950000.00000"))
             assert room_summary is not None
             assert (
                 room_summary.attempt_count,
@@ -632,7 +640,22 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
                 room_summary.total_score,
                 room_summary.total_performance,
                 room_summary.average_accuracy,
-            ) == (3, 2, 1_850_000, Decimal("0.00000"), Decimal("0.980000000"))
+            ) == (3, 2, 1_900_000, Decimal("0.00000"), Decimal("0.980000000"))
+            assert empty_playlist_summary is not None
+            assert (
+                empty_playlist_summary.attempt_count,
+                empty_playlist_summary.completion_count,
+                empty_playlist_summary.best_score_id,
+                empty_playlist_summary.best_metric_value,
+            ) == (3, 0, None, None)
+            assert empty_room_summary is not None
+            assert (
+                empty_room_summary.attempt_count,
+                empty_room_summary.completion_count,
+                empty_room_summary.total_score,
+                empty_room_summary.total_performance,
+                empty_room_summary.average_accuracy,
+            ) == (3, 0, 0, Decimal("0.00000"), Decimal("0E-9"))
             assert checkpoint is not None and checkpoint.source_event_id == score_event_id
             assert (
                 await session.scalar(

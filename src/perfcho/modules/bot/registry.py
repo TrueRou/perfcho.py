@@ -125,6 +125,7 @@ class CommandRegistry:
                     response=reply.response,
                     hidden=definition.hidden,
                     directive=reply.directive,
+                    effect=reply.effect,
                 )
             return _result(started, response=reply, hidden=definition.hidden)
         except Exception:
@@ -152,6 +153,7 @@ def _result(
     response: str | None = None,
     hidden: bool = False,
     directive: object = None,
+    effect: object = None,
 ) -> CommandResult:
     elapsed = (time.perf_counter_ns() - started) / 1_000_000
-    return CommandResult(response, hidden, elapsed, directive)  # type: ignore[arg-type]
+    return CommandResult(response, hidden, elapsed, directive, effect)  # type: ignore[arg-type]

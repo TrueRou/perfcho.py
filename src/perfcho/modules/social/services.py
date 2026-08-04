@@ -294,11 +294,25 @@ class SocialService:
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).list_friends(account_id)
 
-    async def list_follower_account_ids(self, account_id: int) -> frozenset[int]:
-        """Return accounts currently following one account."""
-        _validate_account_id(account_id)
+    async def list_incoming_follower_account_ids(
+        self,
+        target_account_id: int,
+        candidate_actor_account_ids: tuple[int, ...],
+    ) -> frozenset[int]:
+        """Return candidate actors currently following the target account."""
+        _validate_account_id(target_account_id)
+        if not isinstance(candidate_actor_account_ids, tuple):
+            raise SocialRelationRejected("candidate follower account IDs must be a tuple")
+        candidates = tuple(dict.fromkeys(candidate_actor_account_ids))
+        for candidate_account_id in candidates:
+            _validate_account_id(candidate_account_id)
+        if not candidates:
+            return frozenset()
         async with self._uow_factory() as uow:
-            return await self._repository_factory(uow.session).list_follower_account_ids(account_id)
+            return await self._repository_factory(uow.session).list_incoming_follower_account_ids(
+                target_account_id,
+                candidates,
+            )
 
     async def list_blocks(self, account_id: int) -> tuple[BlockView, ...]:
         """Return outgoing block entries with current Stable names."""

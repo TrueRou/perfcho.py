@@ -23,7 +23,7 @@
 - Spectator：关系 Fence、Join/Leave/Fellow 通知、有界 Frame 历史和 Mailbox 扇出。
 - Stable Social/Presence：私信、离线通知、Away Reply、私信策略、Presence All/Filter、主动 Logout 和下线广播。
 - Realtime TTL：登录 Session expiry 由 Redis 原子脚本按 Redis 服务端时间截断，容忍应用与 Redis 的小幅时钟偏差；Stable Presence 使用脚本返回的实际 deadline。
-- Multiplayer：Canonical Room/Session/Slot/Round/Attempt、PostgreSQL 权威事实、Redis CAS Projection、Stable Lobby/Create/Join/Part/Settings/Ready/Start/Frame/Complete/Invite 全流程；完成事件和迟到成绩幂等生成 Round Result、Standing 与房间/谱单汇总。
+- Multiplayer：Canonical Room/Session/Slot/Round/Attempt、PostgreSQL 权威事实、Redis CAS Projection、Stable Lobby/Create/Join/Part/Settings/Ready/Start/Frame/Complete/Invite 全流程；Round Score Frame 覆盖为权威 Slot ID，发送者在当前 Poll 直接回显且其他参与者通过 Mailbox 接收；完成调用者在同一 Poll 收到 Complete 与重置状态；完成事件和迟到成绩幂等生成 Round Result、Standing 与房间/谱单汇总。
 - Management：Moderation 建案/条目/处罚施加/延期/撤销、Authorization Grant/Revoke、Audit、Receipt 与 Outbox 已由 `infra/wiring/management.py` 独立组合根装配；共享基础设施 wiring 位于 `infra/wiring/common.py`。
 - Stable 房间进入时同步发送 `CHANNEL_KICK #lobby` 与 `CHANNEL_JOIN_SUCCESS #multiplayer`；未加入频道发送公开消息返回稳定通知，不会穿透为 HTTP 500。
 - Stable Stats：按客户端当前 Ruleset/Variant 从 `UserPlayStat` 与默认 Policy 的 `UserRankedStat` 读取 Play Count、Total/Ranked Score、Accuracy、Global Rank 和 Performance；Level 由客户端根据 Total Score 推导，不跨模式聚合。
@@ -43,7 +43,7 @@
 - 日志基础设施、请求关联、API/Worker 生命周期、Outbox/Performance 状态、Stable 热路径和迁移阶段事件已接线；Taskiq Worker 日志标记具体 relay task name 且不输出 task id，Outbox Delivery 记录事件类型和完整 payload；生产 JSON 使用字段白名单，异常与协议载荷不写入日志。
 
 - Consumer 与生产者定向测试：`33 passed, 3 skipped`；Consumer 真实 PostgreSQL 全链路：`2 passed`。
-- 当前全量无外部依赖测试：`430 passed, 23 skipped, 11 xfailed`；本次未配置真实 PostgreSQL/Redis，相关集成用例显式跳过；上一轮外部依赖基线为 `288 passed`。
+- 当前全量无外部依赖测试：`454 passed, 25 skipped`；本次未配置真实 PostgreSQL/Redis，相关集成用例显式跳过；上一轮外部依赖基线为 `288 passed`。
 - Ruff format/check 和 Python compileall 通过。
 - 迁移工具单元与 PostgreSQL 全领域夹具：`11 passed`，覆盖账户、社交、私信、内容、成绩、Replay、Ranking、成就和赛事图池。
 - PostgreSQL、Redis 和 MinIO 的真实集成用例由 `TEST_DATABASE_URL`、`TEST_REDIS_URL` 和对应对象存储环境启用；未配置时显式跳过。

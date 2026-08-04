@@ -49,6 +49,18 @@ class ProjectionStatus(StrEnum):
     DURABLE_RECOVERY = "durable_recovery"
 
 
+class MultiplayerMutationKind(StrEnum):
+    """Describe a committed multiplayer change for protocol adapters."""
+
+    SETTINGS_UPDATED = "settings_updated"
+    HOST_CHANGED = "host_changed"
+    PASSWORD_CHANGED = "password_changed"
+    PARTICIPANT_KICKED = "participant_kicked"
+    ROUND_STARTED = "round_started"
+    ROUND_COMPLETED = "round_completed"
+    ROUND_ABORTED = "round_aborted"
+
+
 def _positive(name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
@@ -202,6 +214,26 @@ class RoomState:
     def slot_for(self, account_id: int) -> RoomSlot | None:
         """Return the slot occupied by an account."""
         return next((slot for slot in self.slots if slot.account_id == account_id), None)
+
+
+@dataclass(frozen=True, slots=True)
+class MultiplayerMutationResult:
+    """Return a committed room change without choosing a protocol response."""
+
+    kind: MultiplayerMutationKind
+    state: RoomState
+    target_account_id: int | None = None
+    round_participant_account_ids: tuple[int, ...] = ()
+    replayed: bool = False
+
+    def __post_init__(self) -> None:
+        """Freeze recipient facts and validate optional target identity."""
+        if self.target_account_id is not None:
+            _positive("target_account_id", self.target_account_id)
+        account_ids = tuple(self.round_participant_account_ids)
+        if len(account_ids) != len(set(account_ids)) or any(account_id < 1 for account_id in account_ids):
+            raise ValueError("round participant account IDs must be unique and positive")
+        object.__setattr__(self, "round_participant_account_ids", account_ids)
 
 
 @dataclass(frozen=True, slots=True)

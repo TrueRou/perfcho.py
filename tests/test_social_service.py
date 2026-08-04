@@ -60,6 +60,8 @@ class FakeSocialRepository:
         self.pair_queries = 0
         self.blocking_ids = frozenset[int]()
         self.blocking_queries: list[tuple[int, tuple[int, ...]]] = []
+        self.incoming_follower_ids = frozenset[int]()
+        self.incoming_follower_queries: list[tuple[int, tuple[int, ...]]] = []
 
     async def acquire_pair_lock(self, first_account_id: int, second_account_id: int) -> None:
         return None
@@ -96,6 +98,14 @@ class FakeSocialRepository:
     ) -> frozenset[int]:
         self.blocking_queries.append((target_account_id, actor_account_ids))
         return self.blocking_ids
+
+    async def list_incoming_follower_account_ids(
+        self,
+        target_account_id: int,
+        candidate_actor_account_ids: tuple[int, ...],
+    ) -> frozenset[int]:
+        self.incoming_follower_queries.append((target_account_id, candidate_actor_account_ids))
+        return self.incoming_follower_ids
 
 
 def _service(
@@ -202,6 +212,29 @@ async def test_message_recipient_filter_batches_recipient_blocks_and_preserves_o
 
 
 @pytest.mark.asyncio
+async def test_incoming_follower_filter_batches_candidates_and_preserves_direction() -> None:
+    repository = FakeSocialRepository(_pair())
+    repository.incoming_follower_ids = frozenset({10, 12})
+    service, _, _ = _service(repository)
+
+    result = await service.list_incoming_follower_account_ids(20, (10, 11, 10, 12))
+
+    assert result == frozenset({10, 12})
+    assert repository.incoming_follower_queries == [(20, (10, 11, 12))]
+
+
+@pytest.mark.asyncio
+async def test_empty_incoming_follower_candidates_skip_unit_of_work() -> None:
+    repository = FakeSocialRepository(_pair())
+    service, _, units = _service(repository)
+
+    assert await service.list_incoming_follower_account_ids(20, ()) == frozenset()
+
+    assert units == []
+    assert repository.incoming_follower_queries == []
+
+
+@pytest.mark.asyncio
 async def test_sqlalchemy_recipient_block_filter_uses_one_batch_query() -> None:
     session = MagicMock(spec=AsyncSession)
     session.scalars = AsyncMock(return_value=[10, 12])
@@ -217,3 +250,31 @@ async def test_sqlalchemy_recipient_block_filter_uses_one_batch_query() -> None:
     assert "social.blocks.actor_account_id IN" in sql
     assert 20 in parameters.values()
     assert [10, 11, 12] in parameters.values()
+
+
+@pytest.mark.asyncio
+async def test_sqlalchemy_incoming_follower_filter_uses_one_bounded_query() -> None:
+    session = MagicMock(spec=AsyncSession)
+    session.scalars = AsyncMock(return_value=[10, 12])
+    repository = SqlAlchemySocialRepository(session)
+
+    assert await repository.list_incoming_follower_account_ids(20, (10, 11, 12)) == frozenset({10, 12})
+
+    session.scalars.assert_awaited_once()
+    statement = session.scalars.await_args.args[0]
+    sql = str(statement)
+    parameters = statement.compile().params
+    assert "social.follows.target_account_id" in sql
+    assert "social.follows.actor_account_id IN" in sql
+    assert 20 in parameters.values()
+    assert [10, 11, 12] in parameters.values()
+
+
+@pytest.mark.asyncio
+async def test_sqlalchemy_incoming_follower_filter_skips_empty_candidates() -> None:
+    session = MagicMock(spec=AsyncSession)
+    repository = SqlAlchemySocialRepository(session)
+
+    assert await repository.list_incoming_follower_account_ids(20, ()) == frozenset()
+
+    session.scalars.assert_not_called()

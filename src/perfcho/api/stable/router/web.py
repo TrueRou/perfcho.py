@@ -1155,11 +1155,6 @@ async def get_scores(
     except ValueError:
         return Response(b"-1|false")
     ruleset = _GRADE_RULESETS[mode]
-    if leaderboard_type == 3:
-        friends = await social.list_friends(principal.account_id)
-        friend_ids = tuple(friend.account_id for friend in friends)
-    else:
-        friend_ids = ()
     page = (
         LeaderboardPage((), None)
         if requesting_from_editor
@@ -1170,7 +1165,6 @@ async def get_scores(
             leaderboard_type=leaderboard_type,
             legacy_mod_bits=legacy_mod_bits,
             requester_account_id=principal.account_id,
-            friend_account_ids=friend_ids,
         )
     )
     rating = await content_query.get_rating(beatmap.beatmap_id, principal.account_id)

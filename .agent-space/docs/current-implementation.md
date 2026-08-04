@@ -215,7 +215,7 @@ Session 登录 deadline 由 Redis Lua 在 Redis `TIME` 基准下限制为配置�
 
 当前共享工作树完整验证：
 
-- 无外部服务环境：`433 passed, 23 skipped, 11 xfailed`
+- 无外部服务环境：`454 passed, 25 skipped`
 - 启用本地真实 PostgreSQL 与 Redis：`288 passed`
 - Consumer 与生产者定向测试：`33 passed, 3 skipped`
 - Consumer 真实 PostgreSQL 全链路：`2 passed`
@@ -234,7 +234,7 @@ Session 登录 deadline 由 Redis Lua 在 Redis `TIME` 基准下限制为配置�
 - Multiplayer 完成事件与多人 Score Accepted 事件会幂等重建结果；Round 完成后宽限期内迟到的已验证成绩可修正 Result/Standing/Summary。Abort 不生成 Round Result。
 - Authorization/Moderation 管理命令和 Audit 已实现并有独立组合根，但没有对外管理 API；在认证、授权和错误映射完成前不能视为生产可调用入口。
 - `ContentSyncService` 已有 Stable 排行榜按需补全与响应后到期刷新，但仍没有主动 Scheduler、Worker 或管理命令入口。
-- 在线性能路径已完成首轮收敛：Stable 服务/Bot 在 API lifespan 组合一次；Poll 合并身份解析并按间隔持久化 touch，Stable Web 使用数据库事实校验后的短期 HMAC 验证缓存，Presence 列表消除 Redis N+1，登录与 Presence 扇出使用有界并发；Relay 有界并发入队并按批次事务写回 enqueue outcome；成绩统计主投影合并查询并补齐 Ranked Score 排名索引，Ranking 只在 Overall 最佳成绩变化后重算，`UserRankedStat` 通过 PostgreSQL CTE 和窗口聚合直接 Upsert，不把用户全部最佳成绩或 PP 序列加载到 Worker；Multiplayer 汇总使用批量 Upsert；Content Sync 外部文件 I/O 使用有界并发。
+- 在线性能路径已完成首轮收敛：Stable 服务/Bot 在 API lifespan 组合一次；Poll 合并身份解析并按间隔持久化 touch，Stable Web 使用数据库事实校验后的短期 HMAC 验证缓存，Presence 列表消除 Redis N+1，登录与 Presence 扇出使用有界并发且只向 PostgreSQL 查询在线候选中的粉丝；Relay 有界并发入队并按批次事务写回 enqueue outcome；成绩统计主投影合并查询并补齐 Ranked Score 排名索引，Ranking 只在 Overall 最佳成绩变化后重算，`UserRankedStat` 通过 PostgreSQL CTE 和窗口聚合直接 Upsert，不把用户全部最佳成绩或 PP 序列加载到 Worker；Stable 排行榜由一个 CTE 查询完成 Policy/好友/Exact-Mod 过滤、每账户去重及 Top/个人排名，命中统计使用第二个有界查询；Multiplayer Session/Playlist/Room 汇总通过 SQL 聚合直接 Upsert；Content Sync 使用批量 Beatmap/Asset/Revision 读写并保持历史 Revision 语义，Rating 读取合并为单条聚合查询；外部文件 I/O 使用有界并发。
 - Activity、Notification、Beatmapset Sync 和 Channel Read 投影已由 Outbox Consumer 生成，但尚无 Lazer Query API、分页读取服务或全量 Rebuild。
 - `NotificationDispatch` 当前只生成邮件/Push 待投递意图，尚无外部 Provider Sender；Stable Redis Mailbox 继续由同步适配器负责。
 - 中心应用不内嵌 Python PP 引擎；发布并配置外部 C#/Rust Calculator 制品前，当前不能输出真实 PP。

@@ -73,8 +73,12 @@ class SocialRepository(Protocol):
         """List outgoing follows and derive mutual friendship in one query."""
         ...
 
-    async def list_follower_account_ids(self, account_id: int) -> frozenset[int]:
-        """Return accounts whose presence-friend filter includes this account."""
+    async def list_incoming_follower_account_ids(
+        self,
+        target_account_id: int,
+        candidate_actor_account_ids: tuple[int, ...],
+    ) -> frozenset[int]:
+        """Return candidate actors that follow the target account."""
         ...
 
     async def get_block(self, actor_account_id: int, target_account_id: int) -> BlockRecord | None:

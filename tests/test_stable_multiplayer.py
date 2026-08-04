@@ -10,11 +10,14 @@ from perfcho.api.stable.dispatcher.multiplayer import _settings_from_wire
 from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
+from perfcho.modules.bot import BotCommandService
 from perfcho.modules.common import Clock, IdGenerator
 from perfcho.modules.community import CommunityService
 from perfcho.modules.identity import IdentityService, ResolvedStableSession
 from perfcho.modules.multiplayer import (
     CreateRoom,
+    MultiplayerMutationKind,
+    MultiplayerMutationResult,
     MultiplayerService,
     RoomRecord,
     RoomSettings,
@@ -24,7 +27,13 @@ from perfcho.modules.multiplayer import (
     TeamMode,
     WinCondition,
 )
-from perfcho.modules.realtime import RealtimeRepository, RealtimeSession
+from perfcho.modules.multiplayer.commands import (
+    AccountResolver,
+    BeatmapResolver,
+    MultiplayerCommandDependencies,
+    build_multiplayer_commands,
+)
+from perfcho.modules.realtime import PresenceSnapshot, RealtimeRepository, RealtimeSession
 from perfcho.modules.realtime.stable import (
     ClientPacket,
     Message,
@@ -35,6 +44,7 @@ from perfcho.modules.realtime.stable import (
     ServerPacket,
     UserPresence,
     UserStats,
+    user_presence,
 )
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant
 from perfcho.modules.social import SocialService
@@ -58,6 +68,8 @@ class FakeMultiplayer:
         self.state = state
         self.created: CreateRoom | None = None
         self.durable_find_calls = 0
+        self.started: object | None = None
+        self.admission: tuple[int, int, int] | None = None
 
     async def create_room(self, command: CreateRoom) -> RoomState:
         self.created = command
@@ -85,6 +97,128 @@ class FakeMultiplayer:
         )
         self.state = replace(self.state, state_revision=self.state.state_revision + 1, slots=slots)
         return self.state
+
+    async def mark_skipped(self, public_id: int, account_id: int) -> RoomState:
+        assert public_id == self.state.room.public_id
+        slots = tuple(
+            replace(slot, skipped=True) if slot.account_id == account_id else slot for slot in self.state.slots
+        )
+        self.state = replace(self.state, state_revision=self.state.state_revision + 1, slots=slots)
+        return self.state
+
+    async def start_round(self, command: object) -> MultiplayerMutationResult:
+        self.started = command
+        slots = tuple(
+            replace(slot, status=SlotStatus.PLAYING) if slot.account_id is not None else slot
+            for slot in self.state.slots
+        )
+        participants = tuple(slot.account_id for slot in slots if slot.account_id is not None)
+        self.state = replace(
+            self.state,
+            slots=slots,
+            in_progress=True,
+            round_id=uuid.uuid7(),
+            round_participant_account_ids=participants,
+        )
+        return MultiplayerMutationResult(
+            MultiplayerMutationKind.ROUND_STARTED,
+            self.state,
+            round_participant_account_ids=participants,
+        )
+
+    async def update_settings(self, command: object) -> MultiplayerMutationResult:
+        settings = command.settings  # type: ignore[attr-defined]
+        self.state = replace(
+            self.state,
+            room=replace(self.state.room, version=self.state.room.version + 1, settings=settings),
+        )
+        return MultiplayerMutationResult(MultiplayerMutationKind.SETTINGS_UPDATED, self.state)
+
+    async def complete_round(self, command: object) -> MultiplayerMutationResult:
+        participants = self.state.round_participant_account_ids
+        self.state = replace(
+            self.state,
+            slots=tuple(
+                replace(slot, status=SlotStatus.NOT_READY) if slot.account_id in participants else slot
+                for slot in self.state.slots
+            ),
+            in_progress=False,
+            round_id=None,
+            round_participant_account_ids=(),
+        )
+        kind = (
+            MultiplayerMutationKind.ROUND_ABORTED
+            if command.aborted  # type: ignore[attr-defined]
+            else MultiplayerMutationKind.ROUND_COMPLETED
+        )
+        return MultiplayerMutationResult(kind, self.state, round_participant_account_ids=participants)
+
+    async def issue_admission_token(
+        self,
+        public_id: int,
+        *,
+        inviter_account_id: int,
+        recipient_account_id: int,
+    ) -> str:
+        self.admission = (public_id, inviter_account_id, recipient_account_id)
+        return "token"
+
+
+class InviteRealtime:
+    def __init__(self) -> None:
+        self.delivered: list[tuple[int, bytes]] = []
+        self.target = PresenceSnapshot(
+            11,
+            1,
+            user_presence(UserPresence(11, "target", 0, 0, 1, 0, 0.0, 0.0, 0)),
+            EXPIRY,
+            uuid.uuid7(),
+        )
+
+    async def get_presence(self, account_id: int, *, at: datetime) -> PresenceSnapshot | None:
+        del at
+        return self.target if account_id == self.target.account_id else None
+
+    async def enqueue_mailbox(
+        self,
+        account_id: int,
+        payload: bytes,
+        *,
+        recipient_fence: object,
+        expires_at: datetime,
+    ) -> None:
+        del recipient_fence, expires_at
+        self.delivered.append((account_id, payload))
+
+
+class RoomRealtime:
+    def __init__(self, *account_ids: int) -> None:
+        self.presences = {
+            account_id: PresenceSnapshot(
+                account_id,
+                1,
+                user_presence(UserPresence(account_id, f"user-{account_id}", 0, 0, 1, 0, 0.0, 0.0, 0)),
+                EXPIRY,
+                uuid.uuid7(),
+            )
+            for account_id in account_ids
+        }
+        self.delivered: list[tuple[int, bytes]] = []
+
+    async def get_presence(self, account_id: int, *, at: datetime) -> PresenceSnapshot | None:
+        del at
+        return self.presences.get(account_id)
+
+    async def enqueue_mailbox(
+        self,
+        account_id: int,
+        payload: bytes,
+        *,
+        recipient_fence: object,
+        expires_at: datetime,
+    ) -> None:
+        del recipient_fence, expires_at
+        self.delivered.append((account_id, payload))
 
 
 class FakeCommunity:
@@ -144,18 +278,35 @@ def services(
     *,
     community: FakeCommunity | None = None,
     social: FakeSocial | None = None,
+    realtime: object | None = None,
+    bot: BotCommandService | None = None,
 ) -> StableServices:
     return StableServices(
         identity=cast(IdentityService, object()),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=cast(RealtimeRepository, object()),
+        realtime=cast(RealtimeRepository, realtime if realtime is not None else object()),
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, FakeIds()),
         settings=Settings(),
         multiplayer=cast(MultiplayerService, multiplayer),
         community=cast(CommunityService, community) if community is not None else None,
         social=cast(SocialService, social) if social is not None else None,
+        bot=bot,
     )
+
+
+def bot_service(multiplayer: FakeMultiplayer) -> BotCommandService:
+    bot = BotCommandService()
+    bot.register_group(
+        build_multiplayer_commands(
+            MultiplayerCommandDependencies(
+                service=cast(MultiplayerService, multiplayer),
+                resolve_account=cast(AccountResolver, object()),
+                resolve_beatmap=cast(BeatmapResolver, object()),
+            )
+        )
+    )
+    return bot
 
 
 def client_packet(packet_type: ClientPacket, write: object | None = None) -> bytes:
@@ -244,6 +395,147 @@ async def test_join_match_opens_virtual_multiplayer_channel_before_join_success(
 
 
 @pytest.mark.asyncio
+async def test_match_start_uses_canonical_state_and_returns_match_start() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+
+    response = await dispatch_packets(
+        client_packet(ClientPacket.MATCH_START),
+        context(),
+        services(multiplayer),
+    )
+
+    packet = next(PacketReader(response, packet_enum=ServerPacket))
+    assert packet.packet_type is ServerPacket.MATCH_START
+    assert packet.payload.read_multiplayer_match().in_progress
+    assert multiplayer.started is not None
+
+
+@pytest.mark.asyncio
+async def test_mp_start_immediately_notifies_command_sender_and_other_players() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+    multiplayer.state = replace(
+        multiplayer.state,
+        slots=(
+            multiplayer.state.slots[0],
+            RoomSlot(1, SlotStatus.NOT_READY, 20),
+            *multiplayer.state.slots[2:],
+        ),
+    )
+    realtime = RoomRealtime(20)
+
+    response = await dispatch_packets(
+        client_packet(ClientPacket.SEND_PUBLIC_MESSAGE, Message("", "!mp start", "#multiplayer", 0)),
+        context(),
+        services(multiplayer, social=FakeSocial(), realtime=realtime, bot=bot_service(multiplayer)),
+    )
+
+    assert [packet.packet_type for packet in PacketReader(response, packet_enum=ServerPacket)] == [
+        ServerPacket.SEND_MESSAGE,
+        ServerPacket.MATCH_START,
+    ]
+    delivered_types = [
+        next(PacketReader(payload, packet_enum=ServerPacket)).packet_type for _, payload in realtime.delivered
+    ]
+    assert delivered_types == [ServerPacket.SEND_MESSAGE, ServerPacket.SEND_MESSAGE, ServerPacket.MATCH_START]
+
+
+@pytest.mark.asyncio
+async def test_mp_mods_immediately_broadcasts_updated_match() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+    multiplayer.state = replace(
+        multiplayer.state,
+        slots=(
+            multiplayer.state.slots[0],
+            RoomSlot(1, SlotStatus.NOT_READY, 20),
+            *multiplayer.state.slots[2:],
+        ),
+    )
+    realtime = RoomRealtime(20)
+
+    response = await dispatch_packets(
+        client_packet(ClientPacket.SEND_PUBLIC_MESSAGE, Message("", "!mp mods HD", "#multiplayer", 0)),
+        context(),
+        services(multiplayer, social=FakeSocial(), realtime=realtime, bot=bot_service(multiplayer)),
+    )
+
+    packets = list(PacketReader(response, packet_enum=ServerPacket))
+    assert [packet.packet_type for packet in packets] == [ServerPacket.SEND_MESSAGE, ServerPacket.UPDATE_MATCH]
+    assert packets[1].payload.read_multiplayer_match().mods != 0
+    delivered = next(PacketReader(realtime.delivered[-1][1], packet_enum=ServerPacket))
+    assert delivered.packet_type is ServerPacket.UPDATE_MATCH
+
+
+@pytest.mark.asyncio
+async def test_mp_abort_immediately_notifies_active_round_players() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+    multiplayer.state = replace(
+        multiplayer.state,
+        slots=(
+            multiplayer.state.slots[0],
+            RoomSlot(1, SlotStatus.NOT_READY, 20),
+            *multiplayer.state.slots[2:],
+        ),
+    )
+    realtime = RoomRealtime(20)
+    stable_services = services(
+        multiplayer,
+        social=FakeSocial(),
+        realtime=realtime,
+        bot=bot_service(multiplayer),
+    )
+    await dispatch_packets(
+        client_packet(ClientPacket.SEND_PUBLIC_MESSAGE, Message("", "!mp start", "#multiplayer", 0)),
+        context(),
+        stable_services,
+    )
+    realtime.delivered.clear()
+
+    response = await dispatch_packets(
+        client_packet(ClientPacket.SEND_PUBLIC_MESSAGE, Message("", "!mp abort", "#multiplayer", 0)),
+        context(),
+        stable_services,
+    )
+
+    assert [packet.packet_type for packet in PacketReader(response, packet_enum=ServerPacket)] == [
+        ServerPacket.SEND_MESSAGE,
+        ServerPacket.MATCH_ABORT,
+        ServerPacket.UPDATE_MATCH,
+    ]
+    delivered_types = [
+        next(PacketReader(payload, packet_enum=ServerPacket)).packet_type for _, payload in realtime.delivered
+    ]
+    assert delivered_types == [
+        ServerPacket.SEND_MESSAGE,
+        ServerPacket.SEND_MESSAGE,
+        ServerPacket.MATCH_ABORT,
+        ServerPacket.UPDATE_MATCH,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_match_invite_builds_message_and_delivers_admission_token() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+    realtime = InviteRealtime()
+    writer = PacketWriter()
+    with writer.packet(ClientPacket.MATCH_INVITE):
+        writer.write_i32(11)
+
+    response = await dispatch_packets(writer.to_bytes(), context(), services(multiplayer, realtime=realtime))
+
+    assert response == b""
+    assert multiplayer.admission == (7, 10, 11)
+    assert len(realtime.delivered) == 1
+    account_id, payload = realtime.delivered[0]
+    assert account_id == 11
+    packet = next(PacketReader(payload, packet_enum=ServerPacket))
+    assert packet.packet_type is ServerPacket.MATCH_INVITE
+    message = packet.payload.read_message()
+    assert message.sender == "host"
+    assert message.recipient == "target"
+    assert "osump://7/token Room" in message.text
+
+
+@pytest.mark.asyncio
 async def test_multiplayer_public_message_uses_room_members_instead_of_persistent_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -321,23 +613,111 @@ def test_map_change_sentinel_is_preserved_in_canonical_settings() -> None:
 
 
 @pytest.mark.asyncio
-async def test_score_frame_hot_path_uses_only_cached_room_state() -> None:
+async def test_score_frame_hot_path_echoes_immediately_and_broadcasts_to_other_round_players() -> None:
     multiplayer = FakeMultiplayer(room_state())
     round_id = uuid.uuid7()
     multiplayer.state = replace(
         multiplayer.state,
         in_progress=True,
         round_id=round_id,
-        round_participant_account_ids=(10,),
-        slots=(replace(multiplayer.state.slots[0], status=SlotStatus.PLAYING), *multiplayer.state.slots[1:]),
+        round_participant_account_ids=(10, 20),
+        slots=(
+            replace(multiplayer.state.slots[0], status=SlotStatus.PLAYING),
+            RoomSlot(1, SlotStatus.PLAYING, 20),
+            RoomSlot(2, SlotStatus.NOT_READY, 30),
+            *multiplayer.state.slots[3:],
+        ),
     )
-    frame = ScoreFrame(100, 0, 1, 2, 3, 4, 5, 6, 1000, 10, 5, False, 200, 0, False)
+    realtime = RoomRealtime(10, 20, 30)
+    frame = ScoreFrame(100, 255, 1, 2, 3, 4, 5, 6, 1000, 10, 5, False, 200, 0, False)
 
     response = await dispatch_packets(
         client_packet(ClientPacket.MATCH_SCORE_UPDATE, frame),
         context(),
-        services(multiplayer),
+        services(multiplayer, realtime=realtime),
     )
 
-    assert response == b""
     assert multiplayer.durable_find_calls == 0
+    echoed = next(PacketReader(response, packet_enum=ServerPacket))
+    assert echoed.packet_type is ServerPacket.MATCH_SCORE_UPDATE
+    assert echoed.payload.read_score_frame() == replace(frame, frame_id=0)
+    echoed.payload.require_exhausted()
+    assert [account_id for account_id, _ in realtime.delivered] == [20]
+    for _, payload in realtime.delivered:
+        packet = next(PacketReader(payload, packet_enum=ServerPacket))
+        assert packet.packet_type is ServerPacket.MATCH_SCORE_UPDATE
+        forwarded = packet.payload.read_score_frame()
+        packet.payload.require_exhausted()
+        assert forwarded == replace(frame, frame_id=0)
+
+
+@pytest.mark.asyncio
+async def test_skip_update_uses_account_id_expected_by_stable_protocol() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+    multiplayer.state = replace(
+        multiplayer.state,
+        in_progress=True,
+        round_id=uuid.uuid7(),
+        round_participant_account_ids=(10, 20),
+        slots=(
+            replace(multiplayer.state.slots[0], status=SlotStatus.PLAYING),
+            RoomSlot(1, SlotStatus.PLAYING, 20),
+            *multiplayer.state.slots[2:],
+        ),
+    )
+    realtime = RoomRealtime(20)
+
+    response = await dispatch_packets(
+        client_packet(ClientPacket.MATCH_SKIP_REQUEST),
+        context(),
+        services(multiplayer, realtime=realtime),
+    )
+
+    packet = next(PacketReader(response, packet_enum=ServerPacket))
+    assert packet.packet_type is ServerPacket.MATCH_PLAYER_SKIPPED
+    assert packet.payload.read_i32() == 10
+    delivered = next(PacketReader(realtime.delivered[0][1], packet_enum=ServerPacket))
+    assert delivered.packet_type is ServerPacket.MATCH_PLAYER_SKIPPED
+    assert delivered.payload.read_i32() == 10
+
+
+@pytest.mark.asyncio
+async def test_round_completion_sends_complete_before_reset_state_to_other_players() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+    multiplayer.state = replace(
+        multiplayer.state,
+        in_progress=True,
+        round_id=uuid.uuid7(),
+        round_participant_account_ids=(10, 20),
+        slots=(
+            replace(multiplayer.state.slots[0], status=SlotStatus.PLAYING),
+            RoomSlot(1, SlotStatus.COMPLETE, 20),
+            RoomSlot(2, SlotStatus.NOT_READY, 30),
+            *multiplayer.state.slots[3:],
+        ),
+    )
+    realtime = RoomRealtime(10, 20, 30)
+
+    response = await dispatch_packets(
+        client_packet(ClientPacket.MATCH_COMPLETE),
+        context(),
+        services(multiplayer, realtime=realtime),
+    )
+
+    assert [packet.packet_type for packet in PacketReader(response, packet_enum=ServerPacket)] == [
+        ServerPacket.MATCH_COMPLETE,
+        ServerPacket.UPDATE_MATCH,
+    ]
+    delivered = {
+        account_id: [
+            next(PacketReader(payload, packet_enum=ServerPacket)).packet_type
+            for delivered_account_id, payload in realtime.delivered
+            if delivered_account_id == account_id
+        ]
+        for account_id in (10, 20, 30)
+    }
+    assert delivered == {
+        10: [],
+        20: [ServerPacket.MATCH_COMPLETE, ServerPacket.UPDATE_MATCH],
+        30: [ServerPacket.UPDATE_MATCH],
+    }
