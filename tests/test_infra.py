@@ -11,14 +11,16 @@ from loguru import logger
 from pydantic import ValidationError
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
-from taskiq import TaskiqEvents
+from taskiq import TaskiqEvents, TaskiqMessage
 from taskiq_redis import RedisStreamBroker
 
 from perfcho.infra.db import DbBase
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.models.events import OutboxDelivery
 from perfcho.infra.db.repositories.outbox import append_outbox_event
+from perfcho.infra.logging import current_relay_task
 from perfcho.infra.settings import Settings, settings
+from perfcho.infra.taskiq import RelayTaskLoggingMiddleware
 from perfcho.modules.common.models import PendingEvent
 from perfcho.tasks.outbox_delivery import dispatch_outbox_delivery
 from perfcho.tasks.performance_calculation import calculate_performance
@@ -41,6 +43,23 @@ def test_taskiq_uses_stream_broker_without_result_storage() -> None:
     assert calculate_performance.task_name in broker.get_all_tasks()
     assert broker.event_handlers[TaskiqEvents.WORKER_STARTUP] == [worker_startup]
     assert broker.event_handlers[TaskiqEvents.WORKER_SHUTDOWN] == [worker_shutdown]
+    assert any(isinstance(middleware, RelayTaskLoggingMiddleware) for middleware in broker.middlewares)
+
+
+def test_relay_task_logging_middleware_scopes_task_name() -> None:
+    middleware = RelayTaskLoggingMiddleware()
+    message = TaskiqMessage(
+        task_id="task-1",
+        task_name="perfcho.outbox.dispatch",
+        labels={},
+        args=[],
+        kwargs={},
+    )
+
+    assert middleware.pre_execute(message) is message
+    assert current_relay_task() == "perfcho.outbox.dispatch"
+    middleware.post_execute(message, MagicMock())
+    assert current_relay_task() is None
 
 
 def test_settings_reject_performance_timing_shorter_than_http_window() -> None:
@@ -77,12 +96,11 @@ async def test_worker_cleanup_continues_after_resource_close_failure() -> None:
     failure = next(record for record in records if record["extra"]["event"] == "runtime.worker.resource_close_failed")
     assert failure["extra"]["resource"] == "http"
     assert failure["extra"]["error_type"] == "RuntimeError"
-    assert failure["exception"] is None
-    assert "sensitive close detail" not in failure["message"]
+    assert failure["exception"].value.args == ("sensitive close detail",)
 
 
 @pytest.mark.asyncio
-async def test_task_payload_and_context_failures_log_only_safe_identifiers() -> None:
+async def test_task_payload_and_context_failures_include_exception_details() -> None:
     job_id = uuid.uuid4()
     event_id = uuid.uuid4()
     records: list[dict[str, Any]] = []
@@ -114,10 +132,11 @@ async def test_task_payload_and_context_failures_log_only_safe_identifiers() -> 
     assert unexpected["extra"]["event_id"] == str(event_id)
     assert unexpected["extra"]["consumer"] == "tests-projector.v1"
     assert all(
-        {"lease_token", "delivery_token", "owner", "error"}.isdisjoint(record["extra"]) and record["exception"] is None
+        {"lease_token", "delivery_token", "owner", "error"}.isdisjoint(record["extra"])
         for record in (malformed, unexpected)
     )
-    assert all("raw-lease-token" not in record["message"] for record in (malformed, unexpected))
+    assert malformed["exception"].value is not None
+    assert unexpected["exception"].value is not None
 
 
 @pytest.mark.postgres

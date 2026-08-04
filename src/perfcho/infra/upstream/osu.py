@@ -98,6 +98,7 @@ class OsuUpstreamContentSource:
                 started_ns,
                 status_code=response.status_code,
                 outcome="invalid_response",
+                exception=error,
                 error_type=type(error).__name__,
             )
             raise UpstreamContentUnavailable("upstream beatmapset response is invalid") from error
@@ -109,6 +110,45 @@ class OsuUpstreamContentSource:
             item_count=len(result.beatmaps),
         )
         return result
+
+    async def lookup_beatmapset_id(self, checksum: str, file_name: str) -> int:
+        """Resolve a set from a current beatmap checksum, falling back to its Stable filename."""
+        try:
+            digest = bytes.fromhex(checksum)
+        except ValueError as error:
+            raise ValueError("beatmap checksum must be hexadecimal") from error
+        if len(checksum) != 32 or len(digest) != 16:
+            raise ValueError("beatmap checksum must contain 32 hexadecimal characters")
+        if not file_name or len(file_name) > 255:
+            raise ValueError("beatmap filename is invalid")
+
+        started_ns = time.monotonic_ns()
+        for selector in ({"checksum": checksum.lower()}, {"filename": file_name}):
+            response = await self._authorized_get(f"{self._api_base_url}/beatmaps/lookup", params=selector)
+            if response.status_code == 404:
+                continue
+            if response.status_code != 200:
+                _log_upstream_result("beatmap_lookup", started_ns, status_code=response.status_code, outcome="failed")
+                raise UpstreamContentUnavailable("upstream beatmap lookup request failed")
+            try:
+                beatmapset_id = _integer(_mapping(response.json(), "beatmap"), "beatmapset_id")
+            except (TypeError, ValueError, KeyError) as error:
+                _log_upstream_result(
+                    "beatmap_lookup",
+                    started_ns,
+                    status_code=response.status_code,
+                    outcome="invalid_response",
+                    exception=error,
+                    error_type=type(error).__name__,
+                )
+                raise UpstreamContentUnavailable("upstream beatmap lookup response is invalid") from error
+            if beatmapset_id < 1:
+                raise UpstreamContentUnavailable("upstream beatmap lookup response is invalid")
+            _log_upstream_result("beatmap_lookup", started_ns, status_code=200, outcome="success")
+            return beatmapset_id
+
+        _log_upstream_result("beatmap_lookup", started_ns, status_code=404, outcome="not_found")
+        raise BeatmapNotFound("upstream beatmap was not found")
 
     async def fetch_beatmap_file(self, external_beatmap_id: int) -> bytes:
         """Stream one official .osu body into a strictly bounded buffer."""
@@ -144,6 +184,7 @@ class OsuUpstreamContentSource:
                 "beatmap_file",
                 started_ns,
                 outcome="failed",
+                exception=error,
                 error_type=type(error).__name__,
             )
             raise UpstreamContentUnavailable("upstream beatmap file request failed") from error
@@ -156,15 +197,15 @@ class OsuUpstreamContentSource:
         )
         return bytes(body)
 
-    async def _authorized_get(self, url: str) -> httpx.Response:
+    async def _authorized_get(self, url: str, *, params: Mapping[str, str] | None = None) -> httpx.Response:
         token = await self._access_token()
         try:
-            response = await self._client.get(url, headers={"Authorization": f"Bearer {token}"})
+            response = await self._client.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
             if response.status_code != 401:
                 return response
             self._token = None
             token = await self._access_token()
-            return await self._client.get(url, headers={"Authorization": f"Bearer {token}"})
+            return await self._client.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
         except httpx.HTTPError as error:
             raise UpstreamContentUnavailable("upstream beatmapset request failed") from error
 
@@ -190,6 +231,7 @@ class OsuUpstreamContentSource:
                 log_event(
                     "WARNING",
                     "upstream.osu.oauth.failed",
+                    exception=error,
                     error_type=type(error).__name__,
                 )
                 raise UpstreamContentUnavailable("osu! OAuth token request failed") from error
@@ -204,6 +246,7 @@ class OsuUpstreamContentSource:
                 log_event(
                     "ERROR",
                     "upstream.osu.oauth.invalid_response",
+                    exception=error,
                     error_type=type(error).__name__,
                 )
                 raise UpstreamContentUnavailable("osu! OAuth token response is invalid") from error
@@ -218,6 +261,7 @@ def _log_upstream_result(
     *,
     outcome: str,
     status_code: int | None = None,
+    exception: BaseException | None = None,
     error_type: str | None = None,
     item_count: int | None = None,
     size_bytes: int | None = None,
@@ -227,6 +271,7 @@ def _log_upstream_result(
     log_event(
         level,
         "upstream.osu.request.completed",
+        exception=exception,
         operation=operation,
         outcome=outcome,
         status_code=status_code,

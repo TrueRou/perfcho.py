@@ -1,4 +1,4 @@
-"""Project accepted score events into eligibility and leaderboard entries."""
+"""Project accepted score events into ranking and account statistics read models."""
 
 import uuid
 from datetime import UTC, datetime
@@ -19,8 +19,10 @@ from perfcho.infra.db.models.scoring import (
     Score,
     ScoreEligibility,
     ScorePerformance,
+    UserRankedStat,
 )
 from perfcho.infra.db.projectors.common import advance_checkpoint, payload_integer, require_event_context
+from perfcho.modules.scoring.models import weighted_total_performance
 
 CONSUMER_NAME = "ranking-projector.v1"
 EVENT_TYPES = frozenset({"score.accepted.v1", "score.performance-calculated.v1"})
@@ -78,7 +80,68 @@ async def project_accepted_score(session: AsyncSession, event: OutboxEvent, part
             mod_acronyms,
             mod_rules,
         )
+        await _project_user_ranked_stat(session, score.account_id, policy, event.id)
     await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+
+
+async def _project_user_ranked_stat(
+    session: AsyncSession,
+    account_id: int,
+    policy: RankingPolicy,
+    source_event_id: uuid.UUID,
+) -> None:
+    """Rebuild one account's policy-owned ranked statistics."""
+    rows = list(
+        await session.execute(
+            select(
+                LeaderboardEntry.metric_value,
+                Score.total_score,
+                Score.classic_score,
+                Score.accuracy,
+                Score.grade,
+            )
+            .join(Score, Score.id == LeaderboardEntry.score_id)
+            .where(
+                LeaderboardEntry.policy_id == policy.id,
+                LeaderboardEntry.scope == "overall",
+                LeaderboardEntry.filter_mod_set_id.is_(None),
+                LeaderboardEntry.account_id == account_id,
+            )
+            .order_by(LeaderboardEntry.metric_value.desc(), LeaderboardEntry.score_id.asc())
+        )
+    )
+    ranked_score = sum(row.classic_score if policy.metric == "classic_score" else row.total_score for row in rows)
+    performance = (
+        Decimal(weighted_total_performance([row.metric_value for row in rows])) if policy.metric == "pp" else Decimal(0)
+    )
+    accuracy = sum((Decimal(row.accuracy) for row in rows), Decimal(0)) / len(rows) if rows else Decimal(0)
+    grade_counts = {grade: 0 for grade in ("XH", "X", "SH", "S", "A")}
+    for row in rows:
+        if row.grade.value in grade_counts:
+            grade_counts[row.grade.value] += 1
+
+    statement = insert(UserRankedStat).values(
+        account_id=account_id,
+        policy_id=policy.id,
+        ranked_score=ranked_score,
+        performance=performance,
+        accuracy=accuracy,
+        grade_counts=grade_counts,
+        source_event_id=source_event_id,
+    )
+    excluded = statement.excluded
+    await session.execute(
+        statement.on_conflict_do_update(
+            index_elements=(UserRankedStat.account_id, UserRankedStat.policy_id),
+            set_={
+                "ranked_score": excluded.ranked_score,
+                "performance": excluded.performance,
+                "accuracy": excluded.accuracy,
+                "grade_counts": excluded.grade_counts,
+                "source_event_id": excluded.source_event_id,
+            },
+        )
+    )
 
 
 async def _project_policy(

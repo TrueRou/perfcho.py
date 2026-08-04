@@ -1,28 +1,41 @@
 """Provide canonical beatmap content queries and community writes."""
 
+import asyncio
 import hashlib
 import time
 from collections.abc import Callable
+from datetime import datetime, timedelta
 
 from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import Clock, IdGenerator, ObjectStorage, OutboxWriterFactory
-from perfcho.modules.content.errors import BeatmapNotFound, BeatmapsetNotFound, ContentInputRejected
+from perfcho.modules.content.errors import (
+    BeatmapNotFound,
+    BeatmapsetNotFound,
+    ContentInputRejected,
+    UpstreamContentUnavailable,
+)
 from perfcho.modules.content.models import (
     BeatmapRevisionView,
     BeatmapsetView,
+    CommentView,
     ContentSearch,
     ContentSearchPage,
     ContentSyncResult,
     FavouriteResult,
     RatingSummary,
     SyncedBeatmapFile,
+    UpstreamBeatmapsetSnapshot,
 )
 from perfcho.modules.content.ports import (
     ContentRepositoryFactory,
     ContentUnitOfWork,
     UpstreamContentSource,
 )
+
+_REFRESH_LEASE = timedelta(minutes=30)
+_REFRESH_RETRY = timedelta(minutes=5)
+_LEADERBOARD_STATUSES = frozenset({"ranked", "approved", "loved"})
 
 
 class ContentQueryService:
@@ -106,6 +119,13 @@ class ContentQueryService:
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).get_rating(beatmap_id, account_id)
 
+    async def list_comments(self, target: str, external_target_id: int) -> tuple[CommentView, ...]:
+        """List visible comments for one Stable timeline target."""
+        _comment_target(target)
+        _positive("external_target_id", external_target_id)
+        async with self._uow_factory() as uow:
+            return await self._repository_factory(uow.session).list_comments(target, external_target_id)
+
 
 class ContentService:
     """Mutate favourite and rating facts in explicit short transactions."""
@@ -158,6 +178,32 @@ class ContentService:
             )
             return result
 
+    async def create_comment(
+        self,
+        account_id: int,
+        target: str,
+        external_target_id: int,
+        position_ms: int,
+        body: str,
+    ) -> CommentView:
+        """Persist one bounded Stable timeline comment."""
+        _positive("account_id", account_id)
+        _positive("external_target_id", external_target_id)
+        _comment_target(target)
+        content = body.strip()
+        if not content or len(content) > 1000 or position_ms < 0:
+            raise ContentInputRejected("comment is invalid")
+        async with self._uow_factory() as uow:
+            result = await self._repository_factory(uow.session).create_comment(
+                account_id,
+                target,
+                external_target_id,
+                position_ms,
+                content,
+            )
+            await uow.commit()
+            return result
+
 
 class ContentSyncService:
     """Fetch, verify, store, and atomically publish immutable beatmap revisions."""
@@ -180,6 +226,105 @@ class ContentSyncService:
         self._object_storage = object_storage
         self._clock = clock
         self._id_generator = id_generator
+        self._inflight_lock = asyncio.Lock()
+        self._inflight: dict[int, asyncio.Task[ContentSyncResult]] = {}
+        self._closing = False
+
+    async def aclose(self) -> None:
+        """Cancel and drain process-owned synchronization tasks before infrastructure closes."""
+        async with self._inflight_lock:
+            self._closing = True
+            tasks = tuple(self._inflight.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                    log_event("ERROR", "content.sync.shutdown_failed", exception=outcome)
+
+    async def resolve_revision(
+        self,
+        md5: str | bytes,
+        file_name: str,
+        external_beatmapset_id: int | None,
+    ) -> BeatmapRevisionView:
+        """Resolve a local revision, synchronizing authoritative content only on a cache miss."""
+        digest = _md5_bytes(md5)
+        file_name_key = _filename_key(file_name)
+        local = await self._lookup_md5(digest)
+        if local is not None:
+            return local
+
+        set_id = external_beatmapset_id
+        if set_id is None:
+            set_id = await self._upstream.lookup_beatmapset_id(digest.hex(), file_name)
+        _positive("external_beatmapset_id", set_id)
+        await self._synchronize_once(set_id)
+
+        exact = await self._lookup_md5(digest)
+        if exact is not None:
+            return exact
+        beatmapset = await self._get_beatmapset(set_id)
+        if beatmapset is not None:
+            for beatmap in beatmapset.beatmaps:
+                if _filename_key(beatmap.file_name) == file_name_key:
+                    return beatmap
+        raise BeatmapNotFound("beatmap is unknown after upstream synchronization")
+
+    async def refresh_if_due(self, external_beatmapset_id: int) -> None:
+        """Refresh one known set after its response path, suppressing expected background failures."""
+        _positive("external_beatmapset_id", external_beatmapset_id)
+        now = self._clock.now()
+        lease_until = now + _REFRESH_LEASE
+        try:
+            async with self._uow_factory() as uow:
+                claimed = await self._repository_factory(uow.session).claim_beatmapset_refresh(
+                    external_beatmapset_id,
+                    now=now,
+                    lease_until=lease_until,
+                )
+                await uow.commit()
+        except Exception as error:
+            log_event(
+                "WARNING",
+                "content.sync.background_claim_failed",
+                exception=error,
+                external_beatmapset_id=external_beatmapset_id,
+                error_type=type(error).__name__,
+            )
+            return
+        if not claimed:
+            return
+        try:
+            await self._synchronize_once(external_beatmapset_id)
+        except Exception as error:
+            failed_at = self._clock.now()
+            try:
+                async with self._uow_factory() as uow:
+                    await self._repository_factory(uow.session).record_beatmapset_refresh_failure(
+                        external_beatmapset_id,
+                        expected_lease_until=lease_until,
+                        checked_at=failed_at,
+                        next_check_at=failed_at + _REFRESH_RETRY,
+                        error=getattr(error, "code", type(error).__name__),
+                    )
+                    await uow.commit()
+            except Exception as persistence_error:
+                log_event(
+                    "WARNING",
+                    "content.sync.background_failure_record_failed",
+                    exception=persistence_error,
+                    external_beatmapset_id=external_beatmapset_id,
+                    error_type=type(persistence_error).__name__,
+                )
+            log_event(
+                "WARNING",
+                "content.sync.background_failed",
+                exception=error,
+                external_beatmapset_id=external_beatmapset_id,
+                error_type=type(error).__name__,
+            )
 
     async def synchronize(self, external_beatmapset_id: int) -> ContentSyncResult:
         """Synchronize one upstream set without holding a database transaction during I/O."""
@@ -198,7 +343,7 @@ class ContentSyncService:
         for beatmap in snapshot.beatmaps:
             content = await self._upstream.fetch_beatmap_file(beatmap.external_beatmap_id)
             if hashlib.md5(content, usedforsecurity=False).digest() != beatmap.md5:
-                raise ContentInputRejected("upstream beatmap file does not match its MD5 metadata")
+                raise UpstreamContentUnavailable("upstream beatmap file does not match its MD5 metadata")
             sha256 = hashlib.sha256(content).digest()
             storage_key = (
                 f"beatmaps/{snapshot.source_code}/{snapshot.external_beatmapset_id}/"
@@ -213,12 +358,24 @@ class ContentSyncService:
             files.append(SyncedBeatmapFile(beatmap, self._id_generator.new(), stored))
 
         now = self._clock.now()
+        next_check_at = _next_check_at(snapshot, now)
         async with self._uow_factory() as uow:
             result = await self._repository_factory(uow.session).synchronize_beatmapset(
                 snapshot,
                 tuple(files),
                 now=now,
+                next_check_at=next_check_at,
             )
+            if not result.published:
+                await uow.commit()
+                log_event(
+                    "DEBUG",
+                    "content.sync.stale_ignored",
+                    beatmapset_id=result.beatmapset_id,
+                    external_beatmapset_id=result.external_beatmapset_id,
+                    duration_ms=duration_ms(started_ns),
+                )
+                return result
             await self._outbox_writer_factory(uow.session).append(
                 PendingEvent(
                     aggregate_type="beatmapset",
@@ -250,6 +407,40 @@ class ContentSyncService:
             )
             return result
 
+    async def _synchronize_once(self, external_beatmapset_id: int) -> ContentSyncResult:
+        async with self._inflight_lock:
+            if self._closing:
+                raise UpstreamContentUnavailable("content synchronization is shutting down")
+            task = self._inflight.get(external_beatmapset_id)
+            if task is None:
+                task = asyncio.create_task(
+                    self._run_synchronize(external_beatmapset_id),
+                    name=f"content-sync-{external_beatmapset_id}",
+                )
+                task.add_done_callback(_consume_task_result)
+                self._inflight[external_beatmapset_id] = task
+        return await asyncio.shield(task)
+
+    async def _run_synchronize(self, external_beatmapset_id: int) -> ContentSyncResult:
+        try:
+            return await self.synchronize(external_beatmapset_id)
+        finally:
+            current = asyncio.current_task()
+            async with self._inflight_lock:
+                if self._inflight.get(external_beatmapset_id) is current:
+                    del self._inflight[external_beatmapset_id]
+
+    async def _lookup_md5(self, digest: bytes) -> BeatmapRevisionView | None:
+        async with self._uow_factory() as uow:
+            return await self._repository_factory(uow.session).lookup_md5(digest)
+
+    async def _get_beatmapset(self, external_beatmapset_id: int) -> BeatmapsetView | None:
+        async with self._uow_factory() as uow:
+            return await self._repository_factory(uow.session).get_beatmapset(
+                external_beatmapset_id,
+                external=True,
+            )
+
 
 def _md5_bytes(value: str | bytes) -> bytes:
     if isinstance(value, bytes):
@@ -272,6 +463,25 @@ def _filename_key(value: str) -> str:
     return key
 
 
+def _next_check_at(snapshot: UpstreamBeatmapsetSnapshot, now: datetime) -> datetime:
+    newest_update = max(beatmap.source_updated_at for beatmap in snapshot.beatmaps)
+    update_age = max(0, (now - newest_update).days)
+    check_hours = 2 + (5 / 365) * update_age
+    if any(beatmap.status in _LEADERBOARD_STATUSES for beatmap in snapshot.beatmaps):
+        check_hours *= 4
+    return now + min(timedelta(hours=check_hours), timedelta(days=1))
+
+
+def _consume_task_result(task: asyncio.Task[ContentSyncResult]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 def _positive(name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ContentInputRejected(f"{name} must be a positive integer")
+
+
+def _comment_target(value: str) -> None:
+    if value not in {"map", "song", "replay"}:
+        raise ContentInputRejected("comment target is invalid")

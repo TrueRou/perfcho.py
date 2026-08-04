@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from perfcho.infra.db.enums import AccountStatus
+from perfcho.infra.db.enums import Ruleset as DbRuleset
 from perfcho.infra.db.locks import acquire_transaction_lock
 from perfcho.infra.db.models.core import Account, AccountName
 from perfcho.infra.db.models.social import (
@@ -26,6 +27,7 @@ from perfcho.modules.social.models import (
     AccountIdentityView,
     Achievement,
     AchievementDefinitionRecord,
+    AchievementEvaluationDefinition,
     AchievementUnlockResult,
     BlockRecord,
     BlockView,
@@ -372,6 +374,57 @@ class SqlAlchemySocialRepository:
         if row is None:
             return None
         return AchievementDefinitionRecord(row.id, row.evaluator_version, row.active)
+
+    async def list_score_achievement_definitions(
+        self,
+        *,
+        account_id: int,
+        ruleset: str,
+    ) -> tuple[AchievementEvaluationDefinition, ...]:
+        """Return active, still-locked score definitions with English display text."""
+        translation = aliased(AchievementTranslation)
+        rows = (
+            await self._session.execute(
+                select(
+                    AchievementDefinition.id,
+                    AchievementDefinition.slug,
+                    func.coalesce(translation.name, AchievementDefinition.slug).label("name"),
+                    func.coalesce(translation.description, "").label("description"),
+                    AchievementDefinition.evaluator_code,
+                    AchievementDefinition.evaluator_version,
+                    AchievementDefinition.parameters,
+                    AchievementDefinition.ruleset,
+                )
+                .outerjoin(
+                    translation,
+                    (translation.achievement_id == AchievementDefinition.id) & (translation.locale == "en"),
+                )
+                .outerjoin(
+                    AchievementUnlock,
+                    (AchievementUnlock.achievement_id == AchievementDefinition.id)
+                    & (AchievementUnlock.account_id == account_id),
+                )
+                .where(
+                    AchievementDefinition.active.is_(True),
+                    AchievementUnlock.achievement_id.is_(None),
+                    (AchievementDefinition.ruleset.is_(None)) | (AchievementDefinition.ruleset == DbRuleset(ruleset)),
+                )
+                .order_by(AchievementDefinition.id)
+            )
+        ).all()
+        return tuple(
+            AchievementEvaluationDefinition(
+                achievement_id=row.id,
+                slug=row.slug,
+                name=row.name,
+                description=row.description,
+                evaluator_code=row.evaluator_code,
+                evaluator_version=row.evaluator_version,
+                parameters=row.parameters,
+                ruleset=row.ruleset.value if row.ruleset is not None else None,
+            )
+            for row in rows
+        )
 
     async def unlock_achievement(
         self,

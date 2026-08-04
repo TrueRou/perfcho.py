@@ -173,12 +173,17 @@ OPEN_SESSION = (
     + _VIEWER_EXPIRY
     + """
 local now = now_ms()
-local expiry = tonumber(ARGV[3])
+local requested_expiry = tonumber(ARGV[3])
 local durable_expiry = tonumber(ARGV[4])
-if not expiry or not durable_expiry or expiry <= now or expiry > durable_expiry
-    or expiry - now > tonumber(ARGV[5]) then
+local ttl = tonumber(ARGV[5])
+if not requested_expiry or not durable_expiry or not ttl or ttl <= 0
+    or requested_expiry <= now or requested_expiry > durable_expiry then
     return {'INVALID_EXPIRY'}
 end
+-- Redis owns ephemeral TTLs. Clamp the application deadline to Redis time so
+-- small wall-clock skew cannot reject an otherwise valid login.
+local expiry = math.min(requested_expiry, durable_expiry, now + ttl)
+if expiry <= now then return {'INVALID_EXPIRY'} end
 if redis.call('GET', KEYS[17]) == ARGV[6] then return {'REVISION_OVERFLOW'} end
 local previous_account = redis.call('HGET', KEYS[1], 'account_id')
 if previous_account and previous_account ~= ARGV[1] then return {'FENCED'} end
@@ -225,13 +230,13 @@ redis.call('DEL', KEYS[3], KEYS[5], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[10]
 redis.call('ZREM', KEYS[4], ARGV[1])
 local revision = redis.call('INCR', KEYS[17])
 redis.call('PEXPIREAT', KEYS[17], durable_expiry)
-redis.call('HSET', KEYS[1], 'account_id', ARGV[1], 'revision', revision, 'expires_at', ARGV[3],
+redis.call('HSET', KEYS[1], 'account_id', ARGV[1], 'revision', revision, 'expires_at', expiry,
     'durable_expires_at', ARGV[4])
 redis.call('PEXPIREAT', KEYS[1], expiry)
 redis.call('SET', KEYS[2], ARGV[2] .. '|' .. revision)
 redis.call('PEXPIREAT', KEYS[2], expiry)
 refresh_expiring_index(KEYS[4])
-return {'OK', ARGV[1], tostring(revision), ARGV[3]}
+return {'OK', ARGV[1], tostring(revision), tostring(expiry)}
 """
 )
 
@@ -260,12 +265,15 @@ local now = now_ms()
 local status, current_expiry, durable_expiry = session_status(
     KEYS[1], KEYS[2], ARGV[1], ARGV[2], ARGV[3], now)
 if status ~= 'OK' then return {status} end
-local expiry = tonumber(ARGV[4])
-if not expiry or expiry < current_expiry or expiry > durable_expiry or expiry <= now
-    or expiry - now > tonumber(ARGV[5]) then
+local requested_expiry = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+if not requested_expiry or not ttl or ttl <= 0 or requested_expiry <= now then
     return {'INVALID_EXPIRY'}
 end
-redis.call('HSET', KEYS[1], 'expires_at', ARGV[4])
+-- The API and Redis clocks may differ slightly. Redis owns ephemeral TTLs, so
+-- clamp the requested wall-clock deadline instead of rejecting normal skew.
+local expiry = math.max(current_expiry, math.min(requested_expiry, durable_expiry, now + ttl))
+redis.call('HSET', KEYS[1], 'expires_at', tostring(expiry))
 redis.call('PEXPIREAT', KEYS[1], expiry)
 redis.call('PEXPIREAT', KEYS[2], expiry)
 local presence_expiry = math.min(expiry, now + tonumber(ARGV[6]))
@@ -336,7 +344,7 @@ for _, spectator in ipairs(redis.call('ZRANGE', KEYS[8], 0, -1)) do
     end
 end
 refresh_viewers(KEYS[8])
-return {'OK', ARGV[1], ARGV[3], ARGV[4]}
+return {'OK', ARGV[1], ARGV[3], tostring(expiry)}
 """
 )
 

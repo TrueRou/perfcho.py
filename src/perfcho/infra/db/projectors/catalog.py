@@ -7,7 +7,17 @@ from types import MappingProxyType
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.models.events import OutboxEvent
-from perfcho.infra.db.projectors import account, community, content, identity, ranking, social
+from perfcho.infra.db.projectors import (
+    account,
+    community,
+    content,
+    identity,
+    management,
+    multiplayer_results,
+    ranking,
+    scoring_stats,
+    social,
+)
 
 type ConsumerHandler = Callable[[AsyncSession, OutboxEvent, str], Awaitable[None]]
 
@@ -72,5 +82,25 @@ DEFAULT_CONSUMER_CATALOG = ConsumerCatalog(
             community.project_community_message,
         ),
         ConsumerRegistration(ranking.CONSUMER_NAME, ranking.EVENT_TYPES, ranking.project_accepted_score),
+        ConsumerRegistration(
+            scoring_stats.CONSUMER_NAME,
+            scoring_stats.EVENT_TYPES,
+            scoring_stats.project_scoring_stats,
+        ),
+        ConsumerRegistration(
+            multiplayer_results.CONSUMER_NAME,
+            multiplayer_results.EVENT_TYPES,
+            multiplayer_results.project_multiplayer_results,
+        ),
+        ConsumerRegistration(
+            management.AUTHORIZATION_CONSUMER_NAME,
+            management.AUTHORIZATION_EVENT_TYPES,
+            management.project_authorization_event,
+        ),
+        ConsumerRegistration(
+            management.MODERATION_CONSUMER_NAME,
+            management.MODERATION_EVENT_TYPES,
+            management.project_moderation_event,
+        ),
     )
 )

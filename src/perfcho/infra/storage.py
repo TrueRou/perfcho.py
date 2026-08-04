@@ -258,8 +258,10 @@ def _metadata_digest(value: object) -> bytes | None:
     try:
         digest = bytes.fromhex(encoded)
     except ValueError:
-        return None
-    return digest if len(digest) == 32 else None
+        raise ValueError("object storage sha256 metadata is not hexadecimal") from None
+    if len(digest) != 32:
+        raise ValueError("object storage sha256 metadata has an invalid length")
+    return digest
 
 
 def _etag(response: object) -> str | None:
@@ -280,6 +282,7 @@ def _log_storage_failure(operation: str, error: Exception, started_ns: int) -> N
     log_event(
         "WARNING",
         "object_storage.operation.failed",
+        exception=error,
         operation=operation,
         error_type=type(error).__name__,
         provider_code=provider_code,

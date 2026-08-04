@@ -10,11 +10,11 @@
 | --- | --- | --- |
 | ST30-PROTO-001 | `stable_max_response_bytes` 只限制 Dispatcher 本地输出，最终 Poll 直接追加整批 Mailbox，可能超过响应上限并确认未受预算约束的消息 | `api/stable/router/cho.py` 按剩余预算选择完整 Mailbox 项，只确认实际返回的最高序列；未返回项保留到后续 Poll |
 | ST30-AUTH-001 | 登录容量检查与 Presence 写入分离，并发登录可同时通过检查；成功并发登录还可能互相遗漏 Bootstrap Presence | Redis `SET_PRESENCE` 原子清理过期成员、检查容量并写入 Presence；登录写入后重新读取完整在线快照，容量竞态走精确 Session 补偿 |
-| ST30-AUTH-002 | Multiplayer Admission Token 与身份 Token 复用 `token_hmac_key` | 新增独立 `admission_hmac_key`，同步开发/生产环境示例和组合根测试 |
+| ST30-AUTH-002 | Multiplayer Admission Token 与身份 Token 复用 `token_hmac_key` | 新增独立 `admission_hmac_key`，同步 `.env.example` 和组合根测试 |
 | ST30-MP-001 | Public ID 复用 fence 依赖 UUIDv7 字符串顺序；该顺序只保证单进程生成器单调，不能作为多进程共享 epoch | PostgreSQL `Room.public_id_epoch` 使用数据库 Identity 分配全局单调值；Redis Room blob、Account Index 和 CAS 全部携带并比较该 epoch，逆序 UUID 不再影响新旧房间胜负 |
 | ST30-MP-002 | 同图快速 rematch 时，Submission Context 只取最新 Attempt，迟到但仍在宽限期的上一轮成绩可能错误绑定新一轮并被拒绝 | Resolver 接收成绩 `started_at/ended_at`，只选择时间区间包含该 Play Attempt 的 Round；Scoring 事务仍执行最终锁定、维度校验和单次消费 |
 | ST30-MP-003 | Active Round 期间仍允许修改个人 Free Mod，Redis 展示值可能与 PostgreSQL 冻结值分离 | Canonical `MultiplayerService` 在 Active Round 拒绝个人 Mod 变更 |
-| ST30-ARCH-001 | Stable Dispatcher 和 Multiplayer Packet Handler 位于 `modules/realtime/stable`，却导入 `infra.composition.StableServices` | 两个处理器移动到 `api/stable`；`modules/realtime/stable` 只保留 Wire Model、Codec 和 Builder，`modules/realtime` 不再导入 `infra` |
+| ST30-ARCH-001 | Stable Dispatcher 和 Multiplayer Packet Handler 位于 `modules/realtime/stable`，却导入 `infra.wiring.stable.StableServices` | 两个处理器移动到 `api/stable`；`modules/realtime/stable` 只保留 Wire Model、Codec 和 Builder，`modules/realtime` 不再导入 `infra` |
 | ST30-SCORE-001 | Replay 事务外上传的孤儿对象边界只记录在设计文档，代码现场不明显 | 上传点增加简短说明；仍坚持对象存储 I/O 不进入数据库事务，后续由对账/GC 清理孤儿对象 |
 
 ## 2. 核验后排除的误报

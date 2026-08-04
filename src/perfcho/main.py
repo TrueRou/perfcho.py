@@ -15,6 +15,7 @@ from perfcho.api.v1.middleware import cors, error
 from perfcho.infra import logging
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.base import DbSessionFactory
+from perfcho.infra.glue.content import ContentRuntime, create_content_runtime
 from perfcho.infra.redis import engine as infra_redis
 
 
@@ -24,6 +25,7 @@ class AppState(TypedDict):
     db_engine: AsyncEngine
     redis_engine: Redis
     db_session_factory: DbSessionFactory
+    content_runtime: ContentRuntime
 
 
 @asynccontextmanager
@@ -33,17 +35,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
     logging.log_event("INFO", "runtime.api.starting")
     db_engine: AsyncEngine | None = None
     redis_engine: Redis | None = None
+    content_runtime: ContentRuntime | None = None
     ready = False
 
     try:
         db_engine = await infra_db.create_engine()
         redis_engine = await infra_redis.create_redis()
+        session_factory = infra_db.create_session_factory(db_engine)
+        content_runtime = create_content_runtime(session_factory)
         logging.log_event("INFO", "runtime.api.ready", duration_ms=logging.duration_ms(started_ns))
         ready = True
         yield {
             "db_engine": db_engine,
             "redis_engine": redis_engine,
-            "db_session_factory": infra_db.create_session_factory(db_engine),
+            "db_session_factory": session_factory,
+            "content_runtime": content_runtime,
         }
     except Exception as error:
         logging.log_event(
@@ -56,6 +62,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
         raise
     finally:
         logging.log_event("INFO", "runtime.api.stopping")
+        if content_runtime is not None:
+            try:
+                await content_runtime.aclose()
+            except Exception as error:
+                logging.log_event(
+                    "ERROR",
+                    "runtime.api.resource_close_failed",
+                    exception=error,
+                    resource="content_upstream",
+                    error_type=type(error).__name__,
+                )
         if redis_engine is not None:
             try:
                 await redis_engine.close()

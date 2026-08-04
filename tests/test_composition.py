@@ -12,7 +12,7 @@ from perfcho.infra.settings import Settings
 @pytest.mark.asyncio
 async def test_stable_composition_wires_independent_security_keys() -> None:
     pytest.importorskip("perfcho.infra.redis.realtime", reason="realtime adapter is being changed in parallel")
-    from perfcho.infra import composition
+    from perfcho.infra.glue.stable import compose_stable_services
 
     token_key = "composition-token-hmac-key"
     match_password_key = "composition-match-password-hmac-key"
@@ -28,7 +28,18 @@ async def test_stable_composition_wires_independent_security_keys() -> None:
     session_factory = async_sessionmaker(expire_on_commit=False)
     redis = Redis()
     try:
-        async with composition.compose_stable_services(session_factory, redis, config=config) as services:
+        async with compose_stable_services(session_factory, redis, config=config) as services:
+            assert services.account is not None
+            assert services.bot is not None
+            assert services.bot.bot_name == "BanchoBot"
+            assert {command.name for command in services.bot.registry.get_commands()} == {
+                "roll",
+                "server",
+                "reconnect",
+                "quit",
+                "help",
+            }
+            assert {group.name for group in services.bot.registry.get_groups()} == {"mp", "pool", "clan"}
             assert services.identity._token_hmac_key == token_key.encode()
             assert services.identity._stable_session_stale_grace == timedelta(seconds=180)
             assert services.multiplayer is not None

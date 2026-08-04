@@ -27,8 +27,22 @@ def login_reply(user_id: int, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
 
 
 def pong(*, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
-    """Build a Stable ping response."""
+    """Build a server-initiated Bancho_Ping packet."""
     return _build(ServerPacket.PONG, limits=limits)
+
+
+def change_username(old: str, new: str, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build the legacy IRC username-change notification."""
+    return _build(
+        ServerPacket.HANDLE_IRC_CHANGE_USERNAME,
+        lambda writer: writer.write_string(f"{old}>>>>{new}"),
+        limits=limits,
+    )
+
+
+def get_attention(*, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build the legacy client attention marker."""
+    return _build(ServerPacket.GET_ATTENTION, limits=limits)
 
 
 def protocol_version(version: int, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
@@ -113,6 +127,31 @@ def user_presence_bundle(user_ids: Collection[int], *, limits: CodecLimits = DEF
 def restart(milliseconds: int = 0, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
     """Tell a Stable client to reconnect after the supplied delay."""
     return _build(ServerPacket.RESTART, lambda writer: writer.write_i32(milliseconds), limits=limits)
+
+
+def monitor(*, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build the deprecated Stable monitor marker."""
+    return _build(ServerPacket.MONITOR, limits=limits)
+
+
+def user_silenced(user_id: int, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build a notification that one user has been silenced."""
+    return _build(ServerPacket.USER_SILENCED, lambda writer: writer.write_i32(user_id), limits=limits)
+
+
+def switch_server(timeout: int, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build the Stable endpoint-switch timeout packet."""
+    return _build(ServerPacket.SWITCH_SERVER, lambda writer: writer.write_i32(timeout), limits=limits)
+
+
+def rtx(message: str, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build the deprecated Stable RTX effect request."""
+    return _build(ServerPacket.RTX, lambda writer: writer.write_string(message), limits=limits)
+
+
+def switch_tournament_server(address: str, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build a tournament-server endpoint switch packet."""
+    return _build(ServerPacket.SWITCH_TOURNAMENT_SERVER, lambda writer: writer.write_string(address), limits=limits)
 
 
 def send_message(message: Message, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:

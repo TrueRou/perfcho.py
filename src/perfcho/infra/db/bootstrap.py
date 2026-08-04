@@ -7,13 +7,20 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import FromClause
 
 from perfcho.infra.db.base import DbSessionFactory
-from perfcho.infra.db.enums import AccountStatus, AccountType, ChannelKind, Ruleset, ScoreboardVariant
+from perfcho.infra.db.enums import (
+    AccountStatus,
+    AccountType,
+    CalculationKind,
+    ChannelKind,
+    Ruleset,
+    ScoreboardVariant,
+)
 from perfcho.infra.db.locks import acquire_transaction_lock
 from perfcho.infra.db.models.authz import (
     AccountRoleGrant,
@@ -26,14 +33,26 @@ from perfcho.infra.db.models.community import Channel
 from perfcho.infra.db.models.content import ContentSource
 from perfcho.infra.db.models.core import Account, AccountName, UserPreference, UserProfile
 from perfcho.infra.db.models.iam import Scope
-from perfcho.infra.db.models.scoring import ModPolicy, ModSet, RankingPolicy, Scoreboard
-from perfcho.infra.db.models.system import ServerSetting
+from perfcho.infra.db.models.scoring import (
+    CalculationFormula,
+    CalculationFormulaScoreboard,
+    CalculationRelease,
+    ModPolicy,
+    ModSet,
+    RankingPolicy,
+    Scoreboard,
+)
 
 STABLE_PROTOCOL_VERSION = 19
 
 _BOOTSTRAP_VERSION = 1
 _BOOTSTRAP_EPOCH = datetime(2007, 9, 16, tzinfo=UTC)
 _BOOTSTRAP_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://perfcho.dev/database-bootstrap")
+_DEFAULT_CALCULATOR = "perfcho-pp"
+_DEFAULT_PERFORMANCE_FORMULA_CODE = "official"
+_DEFAULT_DIFFICULTY_FORMULA_CODE = "official-difficulty"
+_DEFAULT_RELEASE_VERSION = "2026.07.1"
+_EMPTY_TABLE_CACHE_KEY = "perfcho.bootstrap.empty_tables"
 
 OAUTH_SCOPES = (
     (1, "public", "Read public data."),
@@ -172,7 +191,10 @@ async def _upsert_catalog(
     *,
     conflict_columns: Sequence[str],
     update_columns: Sequence[str] = (),
-) -> None:
+) -> bool:
+    if not await _table_is_empty(session, table):
+        return False
+
     statement = insert(cast(Any, table)).values(list(rows))
     index_elements = [table.c[name] for name in conflict_columns]
     if update_columns:
@@ -183,6 +205,16 @@ async def _upsert_catalog(
     else:
         statement = statement.on_conflict_do_nothing(index_elements=index_elements)
     await session.execute(statement)
+    return True
+
+
+async def _table_is_empty(session: AsyncSession, table: FromClause) -> bool:
+    """Return the initial emptiness of a catalog table for this bootstrap transaction."""
+    empty_tables = cast(dict[str, bool], session.info.setdefault(_EMPTY_TABLE_CACHE_KEY, {}))
+    table_name = str(table)
+    if table_name not in empty_tables:
+        empty_tables[table_name] = await session.scalar(select(1).select_from(table).limit(1)) is None
+    return empty_tables[table_name]
 
 
 def _mod_policy_rules(scoreboard_code: str, variant: ScoreboardVariant) -> dict[str, object]:
@@ -210,8 +242,19 @@ def _mod_policy_rules(scoreboard_code: str, variant: ScoreboardVariant) -> dict[
     }
 
 
+def _default_release_configuration(kind: CalculationKind, ruleset: Ruleset) -> dict[str, object]:
+    """Describe the built-in release identity sent to the calculator."""
+    return {
+        "source": _DEFAULT_PERFORMANCE_FORMULA_CODE,
+        "calculator": _DEFAULT_CALCULATOR,
+        "kind": kind.value,
+        "ruleset": ruleset.value,
+        "bootstrap_version": _BOOTSTRAP_VERSION,
+    }
+
+
 async def _seed_identity(session: AsyncSession) -> None:
-    await _upsert_catalog(
+    account_seeded = await _upsert_catalog(
         session,
         Account.__table__,
         (
@@ -228,25 +271,27 @@ async def _seed_identity(session: AsyncSession) -> None:
         conflict_columns=("id",),
         update_columns=("type", "status", "country_code", "activated_at"),
     )
-    await session.execute(_ACCOUNT_IDENTITY_SQL)
+    if account_seeded:
+        await session.execute(_ACCOUNT_IDENTITY_SQL)
 
-    name_statement = insert(AccountName).values(
-        account_id=1,
-        display_name="BanchoBot",
-        name_key="banchobot",
-        started_at=_BOOTSTRAP_EPOCH,
-    )
-    await session.execute(
-        name_statement.on_conflict_do_update(
-            index_elements=(AccountName.account_id,),
-            index_where=AccountName.ended_at.is_(None),
-            set_={
-                "display_name": name_statement.excluded.display_name,
-                "name_key": name_statement.excluded.name_key,
-                "started_at": name_statement.excluded.started_at,
-            },
+    if await _table_is_empty(session, AccountName.__table__):
+        name_statement = insert(AccountName).values(
+            account_id=1,
+            display_name="BanchoBot",
+            name_key="banchobot",
+            started_at=_BOOTSTRAP_EPOCH,
         )
-    )
+        await session.execute(
+            name_statement.on_conflict_do_update(
+                index_elements=(AccountName.account_id,),
+                index_where=AccountName.ended_at.is_(None),
+                set_={
+                    "display_name": name_statement.excluded.display_name,
+                    "name_key": name_statement.excluded.name_key,
+                    "started_at": name_statement.excluded.started_at,
+                },
+            )
+        )
 
     await _upsert_catalog(
         session,
@@ -469,6 +514,101 @@ async def _seed_scoring_catalog(session: AsyncSession) -> None:
             "active",
         ),
     )
+    await _seed_default_calculations(session)
+
+
+async def _seed_default_calculations(session: AsyncSession) -> None:
+    """Install the default Perfcho PP catalog for vanilla rulesets."""
+    difficulty_formula_id = _bootstrap_uuid(f"calculation-formula:{_DEFAULT_DIFFICULTY_FORMULA_CODE}")
+    performance_formula_id = _bootstrap_uuid(f"calculation-formula:{_DEFAULT_PERFORMANCE_FORMULA_CODE}")
+    await _upsert_catalog(
+        session,
+        CalculationFormula.__table__,
+        (
+            {
+                "id": difficulty_formula_id,
+                "code": _DEFAULT_DIFFICULTY_FORMULA_CODE,
+                "name": "Perfcho Difficulty",
+                "kind": CalculationKind.DIFFICULTY,
+                "calculator": _DEFAULT_CALCULATOR,
+                "description": "Default difficulty formula used by perfcho-pp.",
+                "enabled": True,
+            },
+            {
+                "id": performance_formula_id,
+                "code": _DEFAULT_PERFORMANCE_FORMULA_CODE,
+                "name": "Perfcho PP",
+                "kind": CalculationKind.PERFORMANCE,
+                "calculator": _DEFAULT_CALCULATOR,
+                "description": "Default performance formula for vanilla rulesets.",
+                "enabled": True,
+            },
+        ),
+        conflict_columns=("id",),
+        update_columns=("code", "name", "kind", "calculator", "description", "enabled"),
+    )
+    await _upsert_catalog(
+        session,
+        CalculationFormulaScoreboard.__table__,
+        tuple(
+            {"formula_id": performance_formula_id, "scoreboard_id": scoreboard_id}
+            for scoreboard_id, _, _, variant in SCOREBOARDS
+            if variant is ScoreboardVariant.VANILLA
+        ),
+        conflict_columns=("formula_id", "scoreboard_id"),
+    )
+
+    for ruleset in Ruleset:
+        difficulty_release_id = _bootstrap_uuid(f"calculation-release:difficulty:{ruleset.value}")
+        performance_release_id = _bootstrap_uuid(f"calculation-release:performance:{ruleset.value}")
+        difficulty_configuration = _default_release_configuration(CalculationKind.DIFFICULTY, ruleset)
+        performance_configuration = _default_release_configuration(CalculationKind.PERFORMANCE, ruleset)
+        await _upsert_catalog(
+            session,
+            CalculationRelease.__table__,
+            (
+                {
+                    "id": difficulty_release_id,
+                    "formula_id": difficulty_formula_id,
+                    "ruleset": ruleset,
+                    "version": _DEFAULT_RELEASE_VERSION,
+                    "configuration": difficulty_configuration,
+                    "active": True,
+                },
+            ),
+            conflict_columns=("id",),
+            update_columns=(
+                "formula_id",
+                "ruleset",
+                "version",
+                "configuration",
+                "active",
+            ),
+        )
+        await _upsert_catalog(
+            session,
+            CalculationRelease.__table__,
+            (
+                {
+                    "id": performance_release_id,
+                    "formula_id": performance_formula_id,
+                    "ruleset": ruleset,
+                    "version": _DEFAULT_RELEASE_VERSION,
+                    "configuration": performance_configuration,
+                    "difficulty_release_id": difficulty_release_id,
+                    "active": True,
+                },
+            ),
+            conflict_columns=("id",),
+            update_columns=(
+                "formula_id",
+                "ruleset",
+                "version",
+                "configuration",
+                "difficulty_release_id",
+                "active",
+            ),
+        )
 
 
 async def _seed_community_catalog(session: AsyncSession) -> None:
@@ -510,7 +650,7 @@ async def _seed_community_catalog(session: AsyncSession) -> None:
     )
 
 
-async def _seed_runtime_settings(session: AsyncSession) -> None:
+async def _seed_content_source(session: AsyncSession) -> None:
     await _upsert_catalog(
         session,
         ContentSource.__table__,
@@ -526,26 +666,6 @@ async def _seed_runtime_settings(session: AsyncSession) -> None:
         conflict_columns=("id",),
         update_columns=("code", "name", "base_url", "official"),
     )
-    await _upsert_catalog(
-        session,
-        ServerSetting.__table__,
-        (
-            {
-                "key": "stable.protocol",
-                "value": {"version": STABLE_PROTOCOL_VERSION},
-                "description": "Negotiated Bancho protocol version.",
-                "secret": False,
-            },
-            {
-                "key": "stable.codec_limits",
-                "value": STABLE_CODEC_LIMITS,
-                "description": "Bounds applied while decoding and encoding Stable packets.",
-                "secret": False,
-            },
-        ),
-        conflict_columns=("key",),
-        update_columns=("value", "description", "secret"),
-    )
 
 
 async def bootstrap_database(session_factory: DbSessionFactory) -> None:
@@ -556,4 +676,4 @@ async def bootstrap_database(session_factory: DbSessionFactory) -> None:
         await _seed_access_catalog(session)
         await _seed_scoring_catalog(session)
         await _seed_community_catalog(session)
-        await _seed_runtime_settings(session)
+        await _seed_content_source(session)

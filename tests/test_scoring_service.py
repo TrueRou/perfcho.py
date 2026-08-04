@@ -13,25 +13,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.enums import BeatmapStatus as DbBeatmapStatus
 from perfcho.infra.db.enums import CalculationJobStatus
-from perfcho.infra.db.enums import CalculationKind as DbCalculationKind
 from perfcho.infra.db.enums import Ruleset as DbRuleset
 from perfcho.infra.db.models.content import Beatmap, BeatmapRevision, Beatmapset
 from perfcho.infra.db.models.events import OutboxEvent
 from perfcho.infra.db.models.scoring import (
+    BeatmapActivity,
+    BeatmapFailHistogram,
     CalculationFormula,
-    CalculationFormulaScoreboard,
     CalculationRelease,
     LeaderboardEntry,
     PerformanceCalculationJob,
     PlayAttempt,
+    RankingPolicy,
     Replay,
+    ReplayViewEvent,
     Score,
     ScoreHitStatistic,
+    UserBeatmapActivity,
+    UserMonthlyActivity,
+    UserPlayStat,
+    UserRankedStat,
 )
 from perfcho.infra.db.models.scoring import (
     ScoreAttestation as DbScoreAttestation,
 )
+from perfcho.infra.db.models.social import AchievementDefinition, AchievementTranslation, AchievementUnlock
 from perfcho.infra.db.projectors.ranking import project_accepted_score
+from perfcho.infra.db.projectors.scoring_stats import project_scoring_stats
 from perfcho.infra.db.relays.performance_job import SqlAlchemyPerformanceJobRelayStore
 from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
 from perfcho.infra.db.repositories.performance.scheduling import SqlAlchemyPerformanceJobScheduler
@@ -40,6 +48,7 @@ from perfcho.infra.db.repositories.scoring import (
     SqlAlchemyMultiplayerSubmissionValidator,
     SqlAlchemyScoringRepository,
 )
+from perfcho.infra.db.repositories.social import SqlAlchemySocialRepository
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
 from perfcho.modules.common import Actor, ClientContext, Clock, CommandMeta, IdGenerator, PendingEvent
 from perfcho.modules.scoring import (
@@ -49,7 +58,10 @@ from perfcho.modules.scoring import (
     CanonicalMod,
     ClientFamily,
     HitStatistic,
+    MultiplayerSubmissionContext,
     PlayAttemptSubmission,
+    ReplayQueryService,
+    ReplayService,
     Ruleset,
     ScoreAttestation,
     ScoreboardVariant,
@@ -59,6 +71,7 @@ from perfcho.modules.scoring import (
     ScoreSubmission,
     ScoringService,
     StagedReplayManifest,
+    weighted_total_performance,
 )
 from perfcho.modules.scoring.models import (
     AcceptanceClaim,
@@ -73,6 +86,15 @@ from perfcho.modules.scoring.models import (
 )
 from perfcho.modules.scoring.ports import ScoringRepository
 from perfcho.modules.scoring.validation import validate_score
+from perfcho.modules.social.achievements import default_achievement_evaluator_registry
+from perfcho.modules.social.services import TransactionAchievementAwarder
+
+
+def test_weighted_performance_uses_descending_personal_bests_and_bonus() -> None:
+    assert weighted_total_performance(()) == 0
+    assert weighted_total_performance((Decimal("100"),)) == 100
+    assert weighted_total_performance((Decimal("100"), Decimal("50"))) == 148
+
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 
@@ -174,12 +196,32 @@ class FakeMultiplayerValidator:
         raise AssertionError("single-player submission must not bind multiplayer")
 
 
+class FakeBoundMultiplayerValidator:
+    async def validate(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    async def bind_score(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
 class FakeTaskScheduler:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
 
     async def schedule(self, **kwargs: object) -> None:
         self.calls.append("schedule-performance")
+
+
+class FakeAchievementAwarder:
+    def __init__(self, calls: list[str], error: Exception | None = None) -> None:
+        self.calls = calls
+        self.error = error
+
+    async def award_for_score(self, *args: object, **kwargs: object) -> tuple[()]:
+        self.calls.append("achievements")
+        if self.error is not None:
+            raise self.error
+        return ()
 
 
 class FakeOutbox:
@@ -256,6 +298,7 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
         lambda session: account,
         lambda session: FakeMultiplayerValidator(),
         lambda session: FakeTaskScheduler(calls),
+        lambda session: FakeAchievementAwarder(calls),
         cast(Clock, FixedClock()),
         cast(IdGenerator, FakeIds()),
     )
@@ -277,6 +320,7 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
         "mod-set",
         "attempt",
         "score",
+        "achievements",
         "schedule-performance",
         "outbox",
         "complete",
@@ -287,11 +331,69 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
     assert repository.record is not None
     assert repository.record.validated.total_hits == 10
     assert outbox.events[0].event_type == "score.accepted.v1"
+    assert outbox.events[0].consumers == ("ranking-projector.v1", "scoring-stats-projector.v1")
     assert outbox.events[0].payload["country_code"] == "JP"
     assert "performance_release_ids" not in outbox.events[0].payload
     assert logged[0][:2] == ("INFO", "scoring.score.accepted")
     assert logged[0][2]["score_id"] == 40
     assert not {"replay", "checksum", "facts", "request_digest"} & logged[0][2].keys()
+
+
+@pytest.mark.asyncio
+async def test_scoring_service_does_not_commit_when_achievement_awarding_fails() -> None:
+    calls: list[str] = []
+    units: list[FakeUnitOfWork] = []
+
+    def uow_factory() -> FakeUnitOfWork:
+        unit = FakeUnitOfWork(calls)
+        units.append(unit)
+        return unit
+
+    service = ScoringService(
+        uow_factory,
+        lambda session: cast(ScoringRepository, FakeRepository(calls)),
+        lambda session: FakeOutbox(calls),
+        lambda session: FakeAccountValidator(calls),
+        lambda session: FakeMultiplayerValidator(),
+        lambda session: FakeTaskScheduler(calls),
+        lambda session: FakeAchievementAwarder(calls, RuntimeError("achievement storage failed")),
+        cast(Clock, FixedClock()),
+        cast(IdGenerator, FakeIds()),
+    )
+
+    with pytest.raises(RuntimeError, match="achievement storage failed"):
+        await service.accept(command())
+
+    assert calls[-2:] == ["achievements", "exit"]
+    assert "schedule-performance" not in calls
+    assert "complete" not in calls
+    assert not units[0].committed
+
+
+@pytest.mark.asyncio
+async def test_multiplayer_score_routes_results_projector_in_acceptance_transaction() -> None:
+    calls: list[str] = []
+    repository = FakeRepository(calls)
+    outbox = FakeOutbox(calls)
+    service = ScoringService(
+        lambda: FakeUnitOfWork(calls),
+        lambda session: cast(ScoringRepository, repository),
+        lambda session: outbox,
+        lambda session: FakeAccountValidator(calls),
+        lambda session: FakeBoundMultiplayerValidator(),
+        lambda session: FakeTaskScheduler(calls),
+        lambda session: FakeAchievementAwarder(calls),
+        cast(Clock, FixedClock()),
+        cast(IdGenerator, FakeIds()),
+    )
+
+    await service.accept(replace(command(), multiplayer=MultiplayerSubmissionContext(uuid.uuid7(), b"m" * 32)))
+
+    assert outbox.events[0].consumers == (
+        "ranking-projector.v1",
+        "scoring-stats-projector.v1",
+        "multiplayer-results-projector.v1",
+    )
 
 
 @pytest.mark.asyncio
@@ -316,6 +418,7 @@ async def test_scoring_replay_logs_only_stable_ids_at_debug(monkeypatch: pytest.
         lambda session: FakeAccountValidator(calls),
         lambda session: FakeMultiplayerValidator(),
         lambda session: FakeTaskScheduler(calls),
+        lambda session: FakeAchievementAwarder(calls),
         cast(Clock, FixedClock()),
         cast(IdGenerator, FakeIds()),
     )
@@ -411,45 +514,40 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                     is_current=True,
                 )
             )
-            difficulty_formula = CalculationFormula(
-                code="official-difficulty",
-                name="Official Difficulty",
-                kind=DbCalculationKind.DIFFICULTY,
-                calculator="osu-lazer-dotnet",
-                enabled=True,
+            session.add(
+                AchievementDefinition(
+                    slug="score-test-million-20260803",
+                    evaluator_code="score_total_at_least",
+                    evaluator_version=1,
+                    parameters={"minimum": 1_000_000},
+                    ruleset=DbRuleset.OSU,
+                    active=True,
+                )
             )
-            performance_formula = CalculationFormula(
-                code="official",
-                name="Official Performance",
-                kind=DbCalculationKind.PERFORMANCE,
-                calculator="osu-lazer-dotnet",
-                enabled=True,
-            )
-            session.add_all((difficulty_formula, performance_formula))
             await session.flush()
-            difficulty_release = CalculationRelease(
-                formula_id=difficulty_formula.id,
-                ruleset=DbRuleset.OSU,
-                version="2026.07.1-difficulty",
-                artifact_digest=b"d" * 32,
-                configuration={},
-                configuration_digest=b"e" * 32,
-                active=True,
+            achievement = await session.scalar(
+                select(AchievementDefinition).where(AchievementDefinition.slug == "score-test-million-20260803")
             )
-            session.add(difficulty_release)
-            await session.flush()
-            performance_release = CalculationRelease(
-                formula_id=performance_formula.id,
-                ruleset=DbRuleset.OSU,
-                version="2026.07.1",
-                artifact_digest=b"p" * 32,
-                configuration={},
-                configuration_digest=b"q" * 32,
-                difficulty_release_id=difficulty_release.id,
-                active=True,
+            assert achievement is not None
+            session.add(
+                AchievementTranslation(
+                    achievement_id=achievement.id,
+                    locale="en",
+                    name="Million Score",
+                    description="Reach one million",
+                )
             )
-            session.add(performance_release)
-            session.add(CalculationFormulaScoreboard(formula_id=performance_formula.id, scoreboard_id=1))
+        async with session_factory() as session:
+            performance_release = await session.scalar(
+                select(CalculationRelease)
+                .join(CalculationFormula, CalculationFormula.id == CalculationRelease.formula_id)
+                .where(
+                    CalculationFormula.code == "official",
+                    CalculationRelease.ruleset == DbRuleset.OSU,
+                    CalculationRelease.active.is_(True),
+                )
+            )
+            assert performance_release is not None
 
         uow_factory = SqlAlchemyUnitOfWorkFactory(session_factory)
         service = ScoringService(
@@ -459,6 +557,11 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             lambda session: SqlAlchemyAccountSubmissionValidator(cast(AsyncSession, session)),
             lambda session: SqlAlchemyMultiplayerSubmissionValidator(cast(AsyncSession, session)),
             lambda session: SqlAlchemyPerformanceJobScheduler(cast(AsyncSession, session)),
+            lambda session: TransactionAchievementAwarder(
+                SqlAlchemySocialRepository(cast(AsyncSession, session)),
+                SqlAlchemyOutboxWriter(cast(AsyncSession, session)),
+                default_achievement_evaluator_registry(),
+            ),
             cast(Clock, FixedClock()),
             cast(IdGenerator, FakeIds()),
         )
@@ -469,6 +572,8 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
         )
         first = await service.accept(submitted)
         replayed = await service.accept(submitted)
+        assert [unlock.slug for unlock in first.new_achievement_unlocks] == ["score-test-million-20260803"]
+        assert replayed.new_achievement_unlocks == ()
         shared_replay = replace(
             submitted,
             meta=replace(
@@ -500,6 +605,15 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
         await performance_relay.release(performance_claims[1], "tests:performance-owner")
 
         async with session_factory.begin() as session:
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(AchievementUnlock)
+                    .join(AchievementDefinition, AchievementDefinition.id == AchievementUnlock.achievement_id)
+                    .where(AchievementDefinition.slug == "score-test-million-20260803")
+                )
+                == 1
+            )
             events = (
                 await session.scalars(
                     select(OutboxEvent)
@@ -509,6 +623,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             ).all()
             for event in events:
                 await project_accepted_score(session, event, "scoreboard:1")
+                await project_scoring_stats(session, event, "scoreboard:1")
             exact_mods = await SqlAlchemyScoringRepository(session).get_leaderboard(
                 beatmap_id=first.beatmap_id,
                 ruleset=Ruleset.OSU,
@@ -519,6 +634,34 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 friend_account_ids=(),
                 limit=50,
             )
+
+        replay_query = ReplayQueryService(
+            SqlAlchemyUnitOfWorkFactory(session_factory),
+            lambda session: SqlAlchemyScoringRepository(cast(AsyncSession, session)),
+        )
+        replay_service = ReplayService(
+            SqlAlchemyUnitOfWorkFactory(session_factory),
+            lambda session: SqlAlchemyScoringRepository(cast(AsyncSession, session)),
+            lambda session: SqlAlchemyOutboxWriter(cast(AsyncSession, session)),
+        )
+        replay_reference = await replay_query.get(first.score_id)
+        replay_view_request = uuid.uuid7()
+        await replay_service.record_view(
+            request_id=replay_view_request,
+            replay=replay_reference,
+            viewer_account_id=None,
+        )
+        await replay_service.record_view(
+            request_id=replay_view_request,
+            replay=replay_reference,
+            viewer_account_id=None,
+        )
+        async with session_factory.begin() as session:
+            replay_events = (
+                await session.scalars(select(OutboxEvent).where(OutboxEvent.event_type == "score.replay-viewed.v1"))
+            ).all()
+            assert len(replay_events) == 1
+            await project_scoring_stats(session, replay_events[0], "scoreboard:1")
 
         assert replayed == first
         assert len(exact_mods.scores) == 1
@@ -534,7 +677,96 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 CalculationJobStatus.PENDING
             }
             assert set(await session.scalars(select(PerformanceCalculationJob.attempt_count))) == {0}
-            assert await session.scalar(select(func.count()).select_from(OutboxEvent)) == 2
+            assert await session.scalar(select(func.count()).select_from(OutboxEvent)) == 3
             assert await session.scalar(select(func.count()).select_from(LeaderboardEntry)) == 3
+            play_stat = await session.get(UserPlayStat, {"account_id": 1, "scoreboard_id": 1})
+            policy_id = await session.scalar(
+                select(RankingPolicy.id).where(RankingPolicy.scoreboard_id == 1, RankingPolicy.is_default.is_(True))
+            )
+            assert policy_id is not None
+            ranked_stat = await session.get(UserRankedStat, {"account_id": 1, "policy_id": policy_id})
+            assert play_stat is not None
+            assert ranked_stat is not None
+            assert (play_stat.play_count, play_stat.total_score, play_stat.total_hits) == (2, 2_000_000, 20)
+            assert play_stat.replay_views == 1
+            assert ranked_stat.ranked_score == 1_000_000
+            monthly = (
+                await session.scalars(
+                    select(UserMonthlyActivity)
+                    .where(UserMonthlyActivity.account_id == 1)
+                    .order_by(UserMonthlyActivity.month)
+                )
+            ).all()
+            user_beatmap = await session.get(
+                UserBeatmapActivity,
+                {"account_id": 1, "beatmap_id": first.beatmap_id, "scoreboard_id": 1},
+            )
+            beatmap_activity = await session.scalar(
+                select(BeatmapActivity).where(BeatmapActivity.beatmap_id == first.beatmap_id)
+            )
+            assert [(item.play_count, item.replay_views) for item in monthly] == [(2, 0), (0, 1)]
+            assert user_beatmap is not None and (user_beatmap.attempt_count, user_beatmap.pass_count) == (2, 2)
+            assert beatmap_activity is not None and (beatmap_activity.attempt_count, beatmap_activity.pass_count) == (
+                2,
+                2,
+            )
+            assert await session.scalar(select(func.count()).select_from(ReplayViewEvent)) == 1
+
+        failed_base = command()
+        failed_command = replace(
+            failed_base,
+            meta=replace(
+                failed_base.meta,
+                request_id=uuid.uuid7(),
+                idempotency_key="score:test:failed",
+                request_digest=hashlib.sha256(b"score:failed").digest(),
+            ),
+            attempt=replace(
+                failed_base.attempt,
+                idempotency_key="attempt:test:failed",
+                progress=Decimal("0.42"),
+            ),
+            score=replace(
+                failed_base.score,
+                total_score=0,
+                classic_score=0,
+                accuracy=Decimal("0.8"),
+                max_combo=4,
+                grade=ScoreGrade.F,
+                outcome=ScoreOutcome.FAILED,
+                perfect=False,
+                hits=(
+                    HitStatistic("great", 4),
+                    HitStatistic("ok", 0),
+                    HitStatistic("meh", 0),
+                    HitStatistic("miss", 1),
+                ),
+                online_checksum=b"f" * 16,
+            ),
+        )
+        failed_result = await service.accept(failed_command)
+        async with session_factory.begin() as session:
+            failed_event = await session.scalar(
+                select(OutboxEvent).where(
+                    OutboxEvent.event_type == "score.accepted.v1",
+                    OutboxEvent.aggregate_id == str(failed_result.score_id),
+                )
+            )
+            assert failed_event is not None
+            await project_accepted_score(session, failed_event, "scoreboard:1")
+            await project_scoring_stats(session, failed_event, "scoreboard:1")
+        async with session_factory() as session:
+            histogram = await session.get(
+                BeatmapFailHistogram,
+                {"beatmap_id": first.beatmap_id, "scoreboard_id": 1},
+            )
+            play_stat = await session.get(UserPlayStat, {"account_id": 1, "scoreboard_id": 1})
+            user_beatmap = await session.get(
+                UserBeatmapActivity,
+                {"account_id": 1, "beatmap_id": first.beatmap_id, "scoreboard_id": 1},
+            )
+            assert histogram is not None and histogram.failed[42] == 1 and sum(histogram.quit) == 0
+            assert play_stat is not None and (play_stat.play_count, play_stat.total_hits) == (3, 25)
+            assert user_beatmap is not None and (user_beatmap.attempt_count, user_beatmap.pass_count) == (3, 2)
     finally:
         await engine.dispose()

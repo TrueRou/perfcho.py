@@ -6,7 +6,7 @@ PostgreSQL 是 Stable 与 Lazer 协议适配器共用的持久事实存储。客
 
 系统只有一个可信中心应用。API 和 Taskiq Worker 是同一代码库的进程角色，均直接连接 PostgreSQL 与 Redis，不注册业务服务节点，也不存在边缘状态导入。Outbox 与 Calculation Relay 作为 Worker 后台循环运行，不是独立进程。
 
-初始结构包含 12 个 PostgreSQL Schema、129 张表。
+当前结构包含 12 个 PostgreSQL Schema、137 张表。表集合由 Metadata 契约测试按 Schema 精确锁定，新增或删除表必须同步审计业务入口、Consumer、测试和本文档。
 
 ## 领域清单
 
@@ -23,7 +23,7 @@ PostgreSQL 是 Stable 与 Lazer 协议适配器共用的持久事实存储。客
 | `multiplayer` | 房间、托管会话、谱单、回合、赛事图池、匹配与每日挑战。 |
 | `events` | Transactional Outbox、用户动态与投影水位。 |
 | `audit` | 敏感管理和安全操作的不可变审计日志。 |
-| `system` | 服务端结构化配置与可恢复维护任务状态。 |
+| `system` | 命令幂等回执与可恢复维护任务状态。运行时配置只来自进程 `Settings`，不在数据库中维护第二份配置。 |
 
 每张表的具体用途直接记录在对应 SQLAlchemy Model 的英文类级 Docstring 中，Model 是表用途说明的唯一代码来源。
 

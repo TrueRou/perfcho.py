@@ -6,11 +6,13 @@ from typing import cast
 import pytest
 
 from perfcho.api.stable.dispatcher import StableRuntimeContext, dispatch_packets
-from perfcho.infra.composition import StableServices
+from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
+from perfcho.modules.bot import BotCommandService, BotInvocation, CommandResult
 from perfcho.modules.common import Clock, IdGenerator
 from perfcho.modules.community import (
+    ChannelMembershipRequired,
     CommunityInputRejected,
     CommunityService,
     DirectMessageBlocked,
@@ -19,8 +21,15 @@ from perfcho.modules.community import (
     TargetAccountSilenced,
 )
 from perfcho.modules.identity import IdentityService, ResolvedStableSession
-from perfcho.modules.multiplayer import CleanupPresence
-from perfcho.modules.realtime import MailboxOverflow, MailboxPacket, PresenceSnapshot, RealtimeSession, SessionFence
+from perfcho.modules.multiplayer import CleanupPresence, MultiplayerService
+from perfcho.modules.realtime import (
+    MailboxOverflow,
+    MailboxPacket,
+    PresenceSnapshot,
+    RealtimeRepository,
+    RealtimeSession,
+    SessionFence,
+)
 from perfcho.modules.realtime.stable import (
     ClientPacket,
     ClientStatus,
@@ -75,6 +84,10 @@ class FakeMultiplayer:
         assert account_id == 10
         return None
 
+    async def list_public_rooms(self, *, limit: int) -> tuple[object, ...]:
+        assert limit == 100
+        return ()
+
     async def cleanup_presence(self, command: object) -> None:
         self.cleanup_commands.append(command)
         return None
@@ -87,6 +100,8 @@ class FakeSocial:
         self.filtered: tuple[int, ...] | None = None
 
     async def resolve_account_by_name(self, display_name: str) -> AccountIdentityView:
+        if display_name.casefold() == "banchobot":
+            return AccountIdentityView(1, "BanchoBot")
         assert display_name == "target"
         return AccountIdentityView(20, "target")
 
@@ -155,7 +170,10 @@ class FakeCommunity:
 
     async def get_public_channel_by_stable_name(self, account_id: int, name: str) -> StableChannel:
         assert account_id == 10
-        assert name.casefold() in {"#osu", "osu"}
+        assert name.casefold() in {
+            self.channel.name.casefold(),
+            self.channel.name.removeprefix("#").casefold(),
+        }
         return self.channel
 
     async def get_channel_member_count(self, account_id: int, channel_id: int) -> int:
@@ -178,6 +196,21 @@ class FakeCommunity:
         return MessageResult(
             2, self.channel.channel_id, 10, client_message_id, content, False, None, NOW, created=created
         )
+
+
+class FakeBot:
+    bot_account_id = 1
+    bot_name = "BanchoBot"
+
+    def __init__(self, response: str = "pong") -> None:
+        self.response = response
+        self.invocations: list[BotInvocation] = []
+
+    async def try_execute(self, invocation: BotInvocation) -> CommandResult | None:
+        self.invocations.append(invocation)
+        if not invocation.content.startswith("!"):
+            return None
+        return CommandResult(self.response, False, 1.0)
 
 
 class FakeRealtime:
@@ -322,17 +355,19 @@ def services(
     social: FakeSocial | None = None,
     settings: Settings | None = None,
     multiplayer: FakeMultiplayer | None = None,
+    bot: FakeBot | None = None,
 ) -> StableServices:
     return StableServices(
         identity=cast(IdentityService, identity or FakeIdentity()),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=realtime,
+        realtime=cast(RealtimeRepository, realtime),
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, FakeIds()),
         settings=settings or Settings(),
         social=cast(SocialService, social or FakeSocial()),
         community=cast(CommunityService, community or FakeCommunity()),
-        multiplayer=multiplayer,
+        multiplayer=cast(MultiplayerService, multiplayer),
+        bot=cast(BotCommandService, bot) if bot is not None else None,
     )
 
 
@@ -361,7 +396,7 @@ def id_request_packet(packet_type: ClientPacket, account_ids: tuple[int, ...]) -
 async def test_private_message_is_persisted_enqueued_and_returns_away_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher")
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -399,6 +434,46 @@ async def test_private_message_is_persisted_enqueued_and_returns_away_reply(monk
     }
     for secret in ("hello", "sender", "target", "Away for lunch"):
         assert secret not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_public_bot_command_returns_bot_message_and_fans_out_to_channel_members() -> None:
+    realtime = FakeRealtime((snapshot(10, "sender"), snapshot(20, "target")))
+    realtime.channel_members.update((10, 20))
+    bot = FakeBot()
+
+    response = await dispatch_packets(
+        message_packet(ClientPacket.SEND_PUBLIC_MESSAGE, Message("", "!ping", "#osu", 0)),
+        context(realtime),
+        services(realtime, bot=bot),
+    )
+
+    packet = next(PacketReader(response, packet_enum=ServerPacket))
+    assert packet.packet_type is ServerPacket.SEND_MESSAGE
+    assert packet.payload.read_message() == Message("BanchoBot", "pong", "#osu", 1)
+    assert bot.invocations[0].sender_name == "sender"
+    assert [account_id for account_id, _ in realtime.enqueued] == [20, 20]
+    delivered = next(PacketReader(realtime.enqueued[-1][1], packet_enum=ServerPacket))
+    assert delivered.payload.read_message() == Message("BanchoBot", "pong", "#osu", 1)
+
+
+@pytest.mark.asyncio
+async def test_private_message_to_banchobot_executes_without_bot_presence_lookup() -> None:
+    realtime = FakeRealtime((snapshot(10, "sender"),))
+    bot = FakeBot()
+    community = FakeCommunity()
+
+    response = await dispatch_packets(
+        message_packet(ClientPacket.SEND_PRIVATE_MESSAGE, Message("", "!ping", "BanchoBot", 0)),
+        context(realtime),
+        services(realtime, bot=bot, community=community),
+    )
+
+    packet = next(PacketReader(response, packet_enum=ServerPacket))
+    assert packet.packet_type is ServerPacket.SEND_MESSAGE
+    assert packet.payload.read_message() == Message("BanchoBot", "pong", "sender", 1)
+    assert community.sent == (10, 1, "!ping")
+    assert realtime.get_presence_calls == []
 
 
 @pytest.mark.asyncio
@@ -472,7 +547,7 @@ async def test_presence_requests_deduplicate_exclude_self_and_share_response_bud
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_cumulative_response_budget_keeps_complete_packets() -> None:
+async def test_dispatcher_client_keepalives_do_not_trigger_server_ping() -> None:
     realtime = FakeRealtime((snapshot(10, "sender"),))
 
     response = await dispatch_packets(
@@ -481,8 +556,7 @@ async def test_dispatcher_cumulative_response_budget_keeps_complete_packets() ->
         services(realtime, settings=Settings(stable_max_response_bytes=7)),
     )
 
-    assert [packet.packet_type for packet in PacketReader(response, packet_enum=ServerPacket)] == [ServerPacket.PONG]
-    assert len(response) == 7
+    assert response == b""
 
 
 @pytest.mark.asyncio
@@ -491,7 +565,7 @@ async def test_dispatcher_logs_expected_application_code_and_propagates_unexpect
 ) -> None:
     import importlib
 
-    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher")
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
     realtime = FakeRealtime((snapshot(10, "sender"),))
     current = context(realtime)
     stable_services = services(realtime)
@@ -514,7 +588,10 @@ async def test_dispatcher_logs_expected_application_code_and_propagates_unexpect
     rejection = next(fields for event, fields in events if event == "stable.packet.application_rejected")
     assert rejection["error_code"] == "community_input_rejected"
     assert rejection["error_type"] == "CommunityInputRejected"
-    assert "private detail" not in repr(events)
+    rejection_exception = rejection["exception"]
+    assert isinstance(rejection_exception, BaseException)
+    assert rejection_exception.args == ("private detail",)
+    assert "private detail" in repr(events)
     assert "sensitive packet bytes" not in repr(events)
 
     async def unexpected_error(*args: object) -> bytes:
@@ -585,6 +662,25 @@ async def test_public_message_replay_block_filter_and_overflow_are_recipient_iso
 
 
 @pytest.mark.asyncio
+async def test_public_message_without_active_membership_returns_actionable_notification() -> None:
+    realtime = FakeRealtime((snapshot(10, "sender"),))
+    packet = message_packet(ClientPacket.SEND_PUBLIC_MESSAGE, Message("", "hello", "#osu", 0))
+
+    response = await dispatch_packets(
+        packet,
+        context(realtime),
+        services(
+            realtime,
+            community=FakeCommunity(error=ChannelMembershipRequired("sender is not an active channel member")),
+        ),
+    )
+
+    packet = next(PacketReader(response, packet_enum=ServerPacket))
+    assert packet.packet_type is ServerPacket.NOTIFICATION
+    assert packet.payload.read_string() == "Join the channel before sending messages."
+
+
+@pytest.mark.asyncio
 async def test_direct_message_replay_does_not_enqueue_twice() -> None:
     realtime = FakeRealtime((snapshot(10, "sender"), snapshot(20, "target")))
     community = FakeCommunity()
@@ -628,25 +724,48 @@ async def test_target_silence_and_other_dm_application_errors_map_to_stable_pack
 
 
 @pytest.mark.asyncio
-async def test_channel_join_rejects_lobby_and_broadcasts_authoritative_counts() -> None:
+async def test_lobby_channel_join_requires_lobby_membership_and_confirms_client_sequence() -> None:
+    realtime = FakeRealtime((snapshot(10, "sender"),))
+    community = FakeCommunity()
+    community.channel = StableChannel(7, "#lobby", "Lobby", False, 2000, True, False)
+    community.member_count = 1
+    stable_services = services(realtime, community=community, multiplayer=FakeMultiplayer())
+
+    rejected = await dispatch_packets(
+        build_packet(ClientPacket.CHANNEL_JOIN, b"\x0b\x06#lobby"),
+        context(realtime),
+        stable_services,
+    )
+    joined = await dispatch_packets(
+        build_packet(ClientPacket.JOIN_LOBBY) + build_packet(ClientPacket.CHANNEL_JOIN, b"\x0b\x06#lobby"),
+        context(realtime),
+        stable_services,
+    )
+
+    assert next(PacketReader(rejected, packet_enum=ServerPacket)).packet_type is ServerPacket.NOTIFICATION
+    joined_packets = list(PacketReader(joined, packet_enum=ServerPacket))
+    assert [packet.packet_type for packet in joined_packets] == [
+        ServerPacket.CHANNEL_JOIN_SUCCESS,
+        ServerPacket.CHANNEL_INFO,
+    ]
+    assert joined_packets[0].payload.read_string() == "#lobby"
+    assert 10 in realtime.channel_members
+
+
+@pytest.mark.asyncio
+async def test_channel_join_broadcasts_authoritative_counts() -> None:
     realtime = FakeRealtime((snapshot(10, "sender"), snapshot(20, "target")))
     realtime.channel_members.add(20)
     community = FakeCommunity()
     community.member_count = 2
     stable_services = services(realtime, community=community)
 
-    lobby = await dispatch_packets(
-        build_packet(ClientPacket.CHANNEL_JOIN, b"\x0b\x06#lobby"),
-        context(realtime),
-        stable_services,
-    )
     joined = await dispatch_packets(
         build_packet(ClientPacket.CHANNEL_JOIN, b"\x0b\x04#osu"),
         context(realtime),
         stable_services,
     )
 
-    assert next(PacketReader(lobby, packet_enum=ServerPacket)).packet_type is ServerPacket.NOTIFICATION
     joined_packets = list(PacketReader(joined, packet_enum=ServerPacket))
     assert [packet.packet_type for packet in joined_packets] == [
         ServerPacket.CHANNEL_JOIN_SUCCESS,

@@ -1,6 +1,6 @@
 # 剩余设计与交付路线
 
-最后更新：2026-07-29。本文记录尚未完成的设计约束和建议实施顺序，不代表对应功能已经可用。
+最后更新：2026-08-03。本文记录尚未完成的设计约束和建议实施顺序，不代表对应功能已经可用。
 
 ## 1. 优先级
 
@@ -10,7 +10,7 @@
 2. Content Sync 生产任务、缺失 Outbox Consumer 和运维对账。
 3. Lazer OAuth/API Adapter，复用已完成的 Multiplayer/Scoring 共享 Command/Query。
 4. Multiplayer 并发/恢复集成验证和 Lazer Room Adapter；Tourney/Matchmaking 暂不实现。
-5. Moderation 与管理工具；反作弊仍只保留 Port。
+5. 为已实现的 Moderation/Authorization/Audit 服务增加认证管理 API、查询和运维工具；反作弊仍只保留 Port。
 
 Stable Multiplayer 主流程已经接入共享 Aggregate。后续 Lazer Room API 应直接复用该 Aggregate，不能复制 Stable Match 状态机；PP 继续保持 Deferred，直到获得可复现且支持当前运行时的计算引擎。
 
@@ -147,8 +147,8 @@ Lazer Attempt Token 只应返回给对应账户，数据库只保存 Digest。St
 
 - 全量 Rebuild：从权威 Score 和 Eligibility 重建 LeaderboardEntry。
 - Eligibility 反转：封禁、谱面状态、Policy 或 Attestation 变化时删除/替换最佳成绩。
-- User Stats：Play Count、Total Score、Ranked Score、Accuracy 和基础 Global Rank 已有只读聚合；仍需 PP、Country Rank、Grade Count 和可重建投影。
-- 失败进度：Beatmap Fail Histogram 和 Activity Projection。
+- User Stats：Play Count、Total Score、Ranked Score、Accuracy、默认 PP、Grade Count 和基础 Global Rank 已由 `UserPlayStat`/`UserRankedStat` 覆盖；每日 `RankSnapshot` 保存 Global/Country Rank 历史，仍需全量重建和对账工具。
+- 失败进度：Beatmap Fail Histogram 已接线；面向客户端的 Activity Query 尚未实现。
 - 对账：发现 Score 与 Ranking Projection 偏差并可重放指定 Partition。
 
 Rebuild 必须写入新 Projection Generation，完成后原子切换，不能在生产表上长时间原地清空重建。
@@ -172,7 +172,7 @@ Rebuild 必须写入新 Projection Generation，完成后原子切换，不能�
 
 ## 5. Outbox Consumer 后续
 
-Account、Identity、Content、Social、Achievement、Community 和 Ranking Consumer 已实现并由 Taskiq Worker 显式注册。当前副作用限定在 PostgreSQL：Activity、Notification/Recipient/Dispatch Intent、Beatmapset Sync Projection、Channel Read Projection、Eligibility 和 Leaderboard；Worker 不重复写 Stable Redis Mailbox。
+Account、Identity、Content、Social、Achievement、Community、Ranking、Multiplayer Results 和 Management Consumer 已实现并由 Taskiq Worker 显式注册。当前副作用限定在 PostgreSQL；Worker 不重复写 Stable Redis Mailbox。
 
 后续仍需：
 
@@ -204,7 +204,8 @@ Canonical Multiplayer 已可供 Stable 使用；Lazer Room API 应直接接入�
 
 ## 7. Moderation、反作弊与运维
 
-- Moderation 最先实现 Silence、Account Restriction、Score Eligibility 变更和审计 Command。
+- Moderation 建案、Case Entry、Silence/Restriction 等处罚施加/延期/撤销，Authorization Grant/Revoke、Audit、Receipt 与 Outbox 已实现并由独立 Management 组合根装配。
+- 尚需认证后的管理 API、处罚/审计查询、Score Eligibility 管理命令和保留策略任务；在协议入口完成前保持“已实现未接线”。
 - 权威授权在应用服务中执行，FastAPI Dependency 只负责认证和输入规范化。
 - 反作弊只定义 Attestation/Evidence 输入、Detector Port 和 Review 状态，不实现具体检测器。
 - 不引入 Circleguard，也不在请求事务内执行高成本 Replay 分析。

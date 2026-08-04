@@ -50,6 +50,7 @@ NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 
 def test_multi_formula_tables_preserve_release_owned_results() -> None:
     assert tuple(ScorePerformance.__table__.primary_key.columns.keys()) == ("score_id", "release_id")
+    assert PerformanceCalculationJob.__tablename__ == "calculation_jobs"
     assert tuple(PerformanceCalculationJob.__table__.primary_key.columns.keys()) == ("id",)
     assert any(
         isinstance(constraint, UniqueConstraint) and tuple(constraint.columns.keys()) == ("score_id", "release_id")
@@ -64,6 +65,7 @@ def test_multi_formula_tables_preserve_release_owned_results() -> None:
         and tuple(constraint.columns.keys()) == ("formula_id", "ruleset", "version")
         for constraint in CalculationRelease.__table__.constraints
     )
+    assert "configuration_digest" not in CalculationRelease.__table__.columns
     assert "calculator" in CalculationFormula.__table__.columns
     assert "difficulty_attribute_id" in ScorePerformance.__table__.columns
     assert "input_digest" in ScorePerformance.__table__.columns
@@ -159,11 +161,9 @@ async def test_http_calculator_routes_by_formula_calculator_and_verifies_release
             200,
             json={
                 "schema_version": 1,
-                "calculator": "osu-lazer-dotnet",
+                "calculator": "perfcho-pp",
                 "release_version": "2026.07.1",
-                "artifact_digest": (b"a" * 32).hex(),
                 "difficulty_release_version": "2026.07.1-difficulty",
-                "difficulty_artifact_digest": (b"d" * 32).hex(),
                 "input_digest": (b"i" * 32).hex(),
                 "difficulty": {
                     "star_rating": "6.543219",
@@ -177,7 +177,7 @@ async def test_http_calculator_routes_by_formula_calculator_and_verifies_release
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await HttpPerformanceCalculator(
             client,
-            {"osu-lazer-dotnet": "http://calculator.test/"},
+            {"perfcho-pp": "http://calculator.test/"},
         ).calculate(
             calculation,
             beatmap_url="http://s3.test/map.osu",
@@ -203,7 +203,7 @@ async def test_http_calculator_rejects_missing_formula_endpoint_without_fallback
 @pytest.mark.asyncio
 async def test_http_calculator_treats_failed_dependency_as_client_error() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(424))) as client:
-        calculator = HttpPerformanceCalculator(client, {"osu-lazer-dotnet": "http://calculator.test"})
+        calculator = HttpPerformanceCalculator(client, {"perfcho-pp": "http://calculator.test"})
         with pytest.raises(PerformanceCalculationError, match="HTTP 424") as caught:
             await calculator.calculate(
                 _calculation(),
@@ -298,8 +298,7 @@ async def test_calculation_service_dead_letters_nonretryable_engine_errors() -> 
     assert dead_event["level"].name == "ERROR"
     assert dead_event["extra"]["phase"] == "calculate"
     assert dead_event["extra"]["error_type"] == "PerformanceCalculationError"
-    assert dead_event["exception"] is None
-    assert "unsupported mods" not in dead_event["message"]
+    assert dead_event["exception"].value.args == ("unsupported mods",)
     assert {
         "lease_token",
         "beatmap_url",
@@ -311,7 +310,7 @@ async def test_calculation_service_dead_letters_nonretryable_engine_errors() -> 
 
 
 @pytest.mark.asyncio
-async def test_calculation_service_logs_retry_without_error_text_or_score_facts() -> None:
+async def test_calculation_service_logs_retry_with_full_exception_details() -> None:
     calls: list[str] = []
     calculation = _calculation()
     repository = _FakeCalculationRepository(calls, calculation)
@@ -338,8 +337,7 @@ async def test_calculation_service_logs_retry_without_error_text_or_score_facts(
     assert retry_event["level"].name == "WARNING"
     assert retry_event["extra"]["phase"] == "calculate"
     assert retry_event["extra"]["error_type"] == "RuntimeError"
-    assert retry_event["exception"] is None
-    assert "calculator secret detail" not in retry_event["message"]
+    assert retry_event["exception"].value.args == ("calculator secret detail",)
     assert {"lease_token", "beatmap_url", "beatmap_storage_key", "score_id", "error"}.isdisjoint(retry_event["extra"])
 
 
@@ -350,16 +348,14 @@ def _calculation() -> PerformanceCalculationInput:
         attempt_count=1,
         formula_id=uuid.uuid7(),
         formula_code="official",
-        calculator="osu-lazer-dotnet",
+        calculator="perfcho-pp",
         release_id=uuid.uuid7(),
         release_version="2026.07.1",
-        artifact_digest=b"a" * 32,
         release_configuration={},
         difficulty_formula_id=uuid.uuid7(),
         difficulty_formula_code="official-difficulty",
         difficulty_release_id=uuid.uuid7(),
         difficulty_release_version="2026.07.1-difficulty",
-        difficulty_artifact_digest=b"d" * 32,
         difficulty_release_configuration={},
         input_digest=b"i" * 32,
         beatmap_revision_id=1,

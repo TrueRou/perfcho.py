@@ -52,8 +52,7 @@ async def test_relay_records_each_enqueue_outcome_and_continues_batch() -> None:
     )
     assert enqueue_failure["level"].name == "WARNING"
     assert enqueue_failure["extra"]["error_type"] == "RuntimeError"
-    assert enqueue_failure["exception"] is None
-    assert "broker unavailable" not in enqueue_failure["message"]
+    assert enqueue_failure["exception"].value.args == ("broker unavailable",)
 
 
 @pytest.mark.asyncio

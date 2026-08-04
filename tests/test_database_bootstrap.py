@@ -1,7 +1,7 @@
 import asyncio
 
 import pytest
-from sqlalchemy import UniqueConstraint, func, select, text
+from sqlalchemy import UniqueConstraint, delete, func, select, text
 
 from perfcho.infra.db import DbBase
 from perfcho.infra.db import engine as infra_db
@@ -24,8 +24,15 @@ from perfcho.infra.db.models.community import Channel
 from perfcho.infra.db.models.content import ContentSource
 from perfcho.infra.db.models.core import Account, AccountName, UserPreference, UserProfile
 from perfcho.infra.db.models.iam import Scope
-from perfcho.infra.db.models.scoring import ModPolicy, ModSet, RankingPolicy, Scoreboard
-from perfcho.infra.db.models.system import ServerSetting
+from perfcho.infra.db.models.scoring import (
+    CalculationFormula,
+    CalculationFormulaScoreboard,
+    CalculationRelease,
+    ModPolicy,
+    ModSet,
+    RankingPolicy,
+    Scoreboard,
+)
 
 
 def test_bootstrap_catalog_has_stable_ids_and_complete_role_links() -> None:
@@ -96,7 +103,6 @@ def test_bootstrap_models_expose_every_conflict_key() -> None:
         isinstance(constraint, UniqueConstraint) and tuple(constraint.columns.keys()) == ("slug",)
         for constraint in channel_table.constraints
     )
-    assert ServerSetting.__table__.c.key.primary_key
 
 
 @pytest.mark.postgres
@@ -140,6 +146,9 @@ async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_databa
             assert await session.scalar(select(func.count()).select_from(ModSet)) == 8
             assert await session.scalar(select(func.count()).select_from(ModPolicy)) == 8
             assert await session.scalar(select(func.count()).select_from(RankingPolicy)) == 8
+            assert await session.scalar(select(func.count()).select_from(CalculationFormula)) == 2
+            assert await session.scalar(select(func.count()).select_from(CalculationRelease)) == 8
+            assert await session.scalar(select(func.count()).select_from(CalculationFormulaScoreboard)) == 4
             assert (
                 await session.scalar(
                     select(func.count()).select_from(RankingPolicy).where(RankingPolicy.active.is_(True))
@@ -156,11 +165,6 @@ async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_databa
             assert {channel.name for channel in channels} == {"#osu", "#announce", "#help", "#lobby"}
             assert all(channel.kind is ChannelKind.PUBLIC for channel in channels)
 
-            protocol = await session.get(ServerSetting, "stable.protocol")
-            limits = await session.get(ServerSetting, "stable.codec_limits")
-            assert protocol is not None and protocol.value == {"version": 19} and not protocol.secret
-            assert limits is not None and limits.value == STABLE_CODEC_LIMITS and not limits.secret
-
             policies = (await session.scalars(select(RankingPolicy))).all()
             assert all(policy.id.version == 5 and policy.mod_policy_id.version == 5 for policy in policies)
             vanilla_policies = [policy for policy in policies if policy.scoreboard_id <= 4]
@@ -176,6 +180,18 @@ async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_databa
                 and policy.configuration["performance_required"] is True
                 for policy in assistance_policies
             )
+            formulas = {formula.code: formula for formula in await session.scalars(select(CalculationFormula))}
+            assert formulas["official"].calculator == "perfcho-pp"
+            assert formulas["official"].enabled is True
+            assert formulas["official-difficulty"].calculator == "perfcho-pp"
+            assert formulas["official-difficulty"].enabled is True
+
+            releases = (await session.scalars(select(CalculationRelease))).all()
+            assert all(release.active for release in releases)
+            assert all(release.version == "2026.07.1" for release in releases)
+            performance_releases = [release for release in releases if release.formula_id == formulas["official"].id]
+            assert len(performance_releases) == 4
+            assert all(release.difficulty_release_id is not None for release in performance_releases)
             assert not await session.scalar(
                 select(func.count())
                 .select_from(AccountRoleGrant)
@@ -191,5 +207,34 @@ async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_databa
                 )
             )
             assert sequence_value is not None and sequence_value >= 2
+    finally:
+        await db_engine.dispose()
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_bootstrap_only_seeds_empty_tables(postgres_database_url: str) -> None:
+    del postgres_database_url
+    db_engine = await infra_db.create_engine()
+    session_factory = infra_db.create_session_factory(db_engine)
+    try:
+        async with session_factory.begin() as session:
+            account_name = await session.scalar(select(AccountName).where(AccountName.account_id == 1))
+            assert account_name is not None
+            account_name.display_name = "CustomBot"
+            account_name.name_key = "custombot"
+            await session.execute(delete(ContentSource))
+
+        await bootstrap_database(session_factory)
+
+        async with session_factory() as session:
+            account_name = await session.scalar(select(AccountName).where(AccountName.account_id == 1))
+            assert account_name is not None
+            assert account_name.display_name == "CustomBot"
+            assert account_name.name_key == "custombot"
+
+            content_source = await session.get(ContentSource, 1)
+            assert content_source is not None
+            assert content_source.code == "osu"
     finally:
         await db_engine.dispose()

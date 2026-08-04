@@ -15,6 +15,7 @@ dependencies = [
     "greenlet>=3.2.0",
     "httpx>=0.28.0",
     "loguru>=0.7.3",
+    "prompt-toolkit>=3.0.53",
     "py3rijndael",
     "pymysql>=1.1.2",
     "pydantic>=2.12.0",
@@ -29,6 +30,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "osu @ git+https://github.com/Lekuruu/osu.py.git@31a51dc323ae151fe711bb0cb22bd266abdaa500",
     "pytest>=9.0.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",

@@ -12,8 +12,8 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 
 from perfcho.infra.logging import duration_ms, log_event, rate_limit
-from perfcho.modules.common.models import CommandMeta
-from perfcho.modules.common.ports import Clock
+from perfcho.modules.common.models import CommandMeta, PendingEvent
+from perfcho.modules.common.ports import Clock, OutboxWriterFactory
 from perfcho.modules.multiplayer.errors import (
     MatchAlreadyJoined,
     MatchConcurrencyConflict,
@@ -59,6 +59,7 @@ _STATE_LIFETIME = timedelta(minutes=15)
 _ADMISSION_LIFETIME = timedelta(minutes=2)
 _COMMAND_NAMESPACE = uuid.UUID("d184efea-948d-5e23-80d2-0d66fa0e813a")
 _SPEED_MODS = frozenset({"DT", "NC", "HT"})
+_RESULTS_CONSUMER = "multiplayer-results-projector.v1"
 
 
 class MultiplayerService:
@@ -68,6 +69,7 @@ class MultiplayerService:
         self,
         uow_factory: Callable[[], MultiplayerUnitOfWork],
         repository_factory: MultiplayerRepositoryFactory,
+        outbox_writer_factory: OutboxWriterFactory,
         state: MultiplayerStateRepository,
         clock: Clock,
         password_key: bytes,
@@ -86,6 +88,7 @@ class MultiplayerService:
             raise ValueError("admission_lifetime must be positive")
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
+        self._outbox_writer_factory = outbox_writer_factory
         self._state = state
         self._access_policy_factory = access_policy_factory
         self._clock = clock
@@ -630,6 +633,23 @@ class MultiplayerService:
                 aborted=command.aborted,
                 now=self._clock.now(),
             )
+            assert current.round_id is not None
+            await self._outbox_writer_factory(uow.session).append(
+                PendingEvent(
+                    aggregate_type="multiplayer_round",
+                    aggregate_id=str(current.round_id),
+                    event_type="multiplayer.round-completed.v1",
+                    schema_version=1,
+                    payload={
+                        "round_id": str(current.round_id),
+                        "session_id": str(room.session_id),
+                        "room_id": str(room.room_id),
+                        "aborted": command.aborted,
+                    },
+                    consumers=(_RESULTS_CONSUMER,),
+                    partition_key=f"round:{current.round_id}",
+                )
+            )
             snapshot = await repository.load_snapshot(room)
             await uow.commit()
         _log_room_event(
@@ -1123,6 +1143,7 @@ def _log_projection_failure(
     log_event(
         "WARNING",
         "multiplayer.projection.degraded",
+        exception=error,
         operation=operation,
         public_id=public_id,
         version=version,

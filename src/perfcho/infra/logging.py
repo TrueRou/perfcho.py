@@ -12,9 +12,9 @@ import traceback
 import uuid
 from collections import OrderedDict
 from collections.abc import Iterable
+from contextvars import ContextVar, Token
 from datetime import date, datetime
 from enum import Enum
-from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Literal, TextIO, cast, override
 
@@ -31,18 +31,32 @@ _HUMAN_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
     "<level>{level: <8}</level> | "
     "<cyan>{extra[process_identity]}</cyan> | "
-    "<level>{message}</level> | {extra[human_extra]}"
+    "<level>{message}</level> | {extra[human_extra]}\n{exception}"
 )
 _HUMAN_HIDDEN_EXTRA_FIELDS = frozenset(
-    {"event", "library", "event_schema", "service", "process_role", "process_identity", "pid", "human_extra"}
+    {
+        "event",
+        "library",
+        "event_schema",
+        "service",
+        "process_role",
+        "process_identity",
+        "pid",
+        "human_extra",
+        "correlation_id",
+        "exception",
+    }
 )
 _BASE_FIELDS = frozenset({"event_schema", "service", "process_role", "pid", "event"})
 _NOISY_WORKER_LIBRARY_LOGS = frozenset({("taskiq.redis_broker", "Starting fetching new messages")})
+_relay_task_name: ContextVar[str | None] = ContextVar("perfcho_relay_task_name", default=None)
 _SAFE_EVENT_FIELDS = frozenset(
     {
         "account_id",
         "achievement_id",
         "action",
+        "aggregate_id",
+        "aggregate_type",
         "actor_account_id",
         "attempt",
         "attempt_count",
@@ -88,7 +102,7 @@ _SAFE_EVENT_FIELDS = frozenset(
         "error_type",
         "errors",
         "event_id",
-        "exception_frames",
+        "event_type",
         "exists",
         "external_beatmapset_id",
         "failed_checks",
@@ -128,8 +142,10 @@ _SAFE_EVENT_FIELDS = frozenset(
         "operation",
         "outcome",
         "output_bytes",
+        "outbox_payload",
         "packet_count",
         "packet_histogram",
+        "payload_fields",
         "participant_count",
         "phase",
         "policy",
@@ -159,6 +175,7 @@ _SAFE_EVENT_FIELDS = frozenset(
         "route",
         "rows_committed",
         "ruleset",
+        "schema_version",
         "schema_count",
         "scope",
         "score_id",
@@ -168,6 +185,7 @@ _SAFE_EVENT_FIELDS = frozenset(
         "size_bytes",
         "slow",
         "source_event_id",
+        "source_position",
         "spectator_account_id",
         "stage",
         "state_revision",
@@ -187,7 +205,7 @@ _rate_limit_deadlines: OrderedDict[str, float] = OrderedDict()
 
 
 class _JsonSink:
-    """Write a minimal JSON envelope without Loguru's source and exception fields."""
+    """Write an allow-listed JSON envelope with complete exception details."""
 
     def __init__(self, stream: TextIO) -> None:
         self._stream: TextIO = stream
@@ -226,12 +244,29 @@ class InterceptHandler(logging.Handler):
         message = record.getMessage()
         if self._process_role == "worker" and (record.name, message) in _NOISY_WORKER_LIBRARY_LOGS:
             return
+        if self._process_role == "worker" and record.name == "taskiq.worker" and message.startswith("Executing task "):
+            return
+        if (
+            self._process_role == "worker"
+            and record.name == "taskiq.redis_broker"
+            and message.startswith("Received message: ")
+        ):
+            return
         try:
             level = logger.level(record.levelname).name
         except ValueError:
             level = record.levelno
         exception = record.exc_info[1] if record.exc_info is not None else None
-        log_event(level, "library.log", exception=exception, library=record.name, msg=message)
+        relay_task = current_relay_task()
+        fields: dict[str, object] = {"library": record.name, "msg": message}
+        if relay_task is not None:
+            fields["relay_task"] = relay_task
+        log_event(
+            level,
+            relay_task or "library.log",
+            exception=exception,
+            **fields,
+        )
 
 
 def init_logger(process_role: ProcessRole, *, stream: TextIO | None = None) -> None:
@@ -253,7 +288,7 @@ def init_logger(process_role: ProcessRole, *, stream: TextIO | None = None) -> N
             _JsonSink(output),
             level=settings.log_level,
             enqueue=True,
-            backtrace=False,
+            backtrace=True,
             diagnose=False,
         )
     else:
@@ -263,7 +298,7 @@ def init_logger(process_role: ProcessRole, *, stream: TextIO | None = None) -> N
             format=_format_human,
             colorize=output.isatty(),
             enqueue=True,
-            backtrace=False,
+            backtrace=True,
             diagnose=False,
         )
 
@@ -284,10 +319,32 @@ def init_logger(process_role: ProcessRole, *, stream: TextIO | None = None) -> N
 def log_event(level: str | int, event: str, *, exception: BaseException | None = None, **fields: object) -> None:
     """Emit one named event after dropping fields outside the logging contract."""
     approved = {key: value for key, value in fields.items() if key in _SAFE_EVENT_FIELDS}
+    relay_task = current_relay_task()
+    if relay_task is not None:
+        approved.setdefault("relay_task", relay_task)
     if exception is not None:
         _ = approved.setdefault("error_type", type(exception).__name__)
-        approved["exception_frames"] = _exception_frames(exception)
-    _ = logger.bind(event=event, **approved).log(level, event)
+    _ = logger.bind(event=event, **approved).opt(exception=exception).log(level, event)
+
+
+def set_relay_task(task_name: str | None) -> Token[str | None]:
+    """Bind the concrete Taskiq task name to the current execution context."""
+    return _relay_task_name.set(task_name)
+
+
+def reset_relay_task(token: Token[str | None]) -> None:
+    """Restore the relay task context after one Taskiq task finishes."""
+    _relay_task_name.reset(token)
+
+
+def clear_relay_task() -> None:
+    """Clear the current Taskiq task context after worker execution."""
+    _ = _relay_task_name.set(None)
+
+
+def current_relay_task() -> str | None:
+    """Return the Taskiq task name bound to the current execution context."""
+    return _relay_task_name.get()
 
 
 def sampled(sample_key: object, rate: float) -> bool:
@@ -324,21 +381,15 @@ def _sanitize_record(record: Record) -> None:
     """Remove contextual fields not explicitly approved by the event schema."""
     extra = cast(dict[str, object], record["extra"])
     approved = {key: value for key, value in extra.items() if key in _BASE_FIELDS or key in _SAFE_EVENT_FIELDS}
+    exception = record["exception"]
+    if exception is not None and exception.type is not None and exception.value is not None:
+        approved["exception"] = {
+            "type": exception.type.__name__,
+            "message": str(exception.value),
+            "traceback": "".join(traceback.format_exception(exception.type, exception.value, exception.traceback)),
+        }
     approved["pid"] = record["process"].id
     record["extra"] = approved
-
-
-def _exception_frames(exception: BaseException) -> tuple[dict[str, object], ...]:
-    """Return bounded source locations without exception values or code text."""
-    extracted = traceback.extract_tb(exception.__traceback__)[-8:]
-    return tuple(
-        {
-            "file": Path(frame.filename).name,
-            "function": frame.name,
-            "line": frame.lineno,
-        }
-        for frame in extracted
-    )
 
 
 def _json_value(value: object) -> object:

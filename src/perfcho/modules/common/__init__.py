@@ -17,6 +17,11 @@ from perfcho.modules.common.errors import (
     SessionExpired,
     SessionRevoked,
 )
+from perfcho.modules.common.idempotency import (
+    CommandClaim,
+    CommandReceiptStore,
+    CommandReceiptStoreFactory,
+)
 from perfcho.modules.common.models import Actor, ClientContext, CommandMeta, JsonValue, PendingEvent, StoredObject
 from perfcho.modules.common.ports import (
     Clock,
@@ -38,7 +43,10 @@ __all__ = (
     "AuthorizationDenied",
     "ClientContext",
     "Clock",
+    "CommandClaim",
     "CommandMeta",
+    "CommandReceiptStore",
+    "CommandReceiptStoreFactory",
     "ConcurrentModification",
     "DependencyUnavailable",
     "IdGenerator",

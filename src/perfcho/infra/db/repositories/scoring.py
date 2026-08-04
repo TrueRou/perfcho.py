@@ -56,6 +56,8 @@ from perfcho.infra.db.models.scoring import (
     ScoreAttestation,
     Scoreboard,
     ScoreHitStatistic,
+    UserPlayStat,
+    UserRankedStat,
 )
 from perfcho.modules.common import AccountUnavailable
 from perfcho.modules.scoring.errors import AttemptIdempotencyConflict, MultiplayerContextRejected, ScoreRejected
@@ -359,6 +361,7 @@ class SqlAlchemyScoringRepository:
                 select(
                     Replay.score_id,
                     Score.account_id,
+                    Score.scoreboard_id,
                     Scoreboard.ruleset,
                     Replay.storage_key,
                     Replay.size_bytes,
@@ -375,6 +378,7 @@ class SqlAlchemyScoringRepository:
         return ReplayReference(
             score_id=row.score_id,
             owner_account_id=row.account_id,
+            scoreboard_id=row.scoreboard_id,
             ruleset=Ruleset(row.ruleset.value),
             storage_key=row.storage_key,
             size_bytes=row.size_bytes,
@@ -388,9 +392,9 @@ class SqlAlchemyScoringRepository:
         score_id: int,
         score_owner_account_id: int,
         viewer_account_id: int | None,
-    ) -> None:
+    ) -> bool:
         """Insert one replay view fact idempotently by request ID."""
-        await self._session.execute(
+        inserted = await self._session.scalar(
             insert(ReplayViewEvent)
             .values(
                 request_id=request_id,
@@ -399,7 +403,9 @@ class SqlAlchemyScoringRepository:
                 viewer_account_id=viewer_account_id,
             )
             .on_conflict_do_nothing(index_elements=(ReplayViewEvent.request_id,))
+            .returning(ReplayViewEvent.id)
         )
+        return inserted is not None
 
     async def get_leaderboard(
         self,
@@ -552,7 +558,7 @@ class SqlAlchemyScoringRepository:
         ruleset: Ruleset,
         variant: ScoreboardVariant,
     ) -> AccountStatsView:
-        """Aggregate play totals and active-policy best-score totals."""
+        """Compose factual play totals with default-policy ranked statistics."""
         scoreboard_id = await self._session.scalar(
             select(Scoreboard.id).where(
                 Scoreboard.ruleset == DbRuleset(ruleset.value),
@@ -562,64 +568,50 @@ class SqlAlchemyScoringRepository:
         )
         if scoreboard_id is None:
             return AccountStatsView(0, Decimal(0), 0, 0, 0)
-        play_row = (
-            await self._session.execute(
-                select(
-                    func.count(Score.id),
-                    func.coalesce(func.sum(Score.total_score), 0),
-                    func.coalesce(func.avg(Score.accuracy), 0),
-                ).where(Score.account_id == account_id, Score.scoreboard_id == scoreboard_id)
-            )
-        ).one()
-        policy_id = await self._session.scalar(
-            select(RankingPolicy.id).where(
-                RankingPolicy.scoreboard_id == scoreboard_id,
-                RankingPolicy.active.is_(True),
-                RankingPolicy.is_default.is_(True),
-            )
+        play_stat = await self._session.get(
+            UserPlayStat,
+            {"account_id": account_id, "scoreboard_id": scoreboard_id},
         )
-        ranked_score = 0
+        policy_row = (
+            await self._session.execute(
+                select(RankingPolicy.id, RankingPolicy.metric).where(
+                    RankingPolicy.scoreboard_id == scoreboard_id,
+                    RankingPolicy.active.is_(True),
+                    RankingPolicy.is_default.is_(True),
+                )
+            )
+        ).one_or_none()
+        ranked_stat = None
         global_rank = 0
-        if policy_id is not None:
-            ranked_score = int(
-                await self._session.scalar(
-                    select(func.coalesce(func.sum(Score.total_score), 0))
-                    .select_from(LeaderboardEntry)
-                    .join(Score, Score.id == LeaderboardEntry.score_id)
-                    .where(
-                        LeaderboardEntry.policy_id == policy_id,
-                        LeaderboardEntry.scope == "overall",
-                        LeaderboardEntry.filter_mod_set_id.is_(None),
-                        LeaderboardEntry.account_id == account_id,
+        if policy_row is not None:
+            policy_id, policy_metric = policy_row
+            ranked_stat = await self._session.get(
+                UserRankedStat,
+                {"account_id": account_id, "policy_id": policy_id},
+            )
+            if ranked_stat is not None:
+                rank_column = UserRankedStat.performance if policy_metric == "pp" else UserRankedStat.ranked_score
+                rank_value = ranked_stat.performance if policy_metric == "pp" else Decimal(ranked_stat.ranked_score)
+                higher = (
+                    await self._session.scalar(
+                        select(func.count())
+                        .select_from(UserRankedStat)
+                        .where(
+                            UserRankedStat.policy_id == policy_id,
+                            rank_column > rank_value,
+                        )
                     )
-                )
-                or 0
-            )
-            totals = (
-                select(
-                    LeaderboardEntry.account_id.label("account_id"),
-                    func.sum(Score.total_score).label("ranked_score"),
-                )
-                .join(Score, Score.id == LeaderboardEntry.score_id)
-                .where(
-                    LeaderboardEntry.policy_id == policy_id,
-                    LeaderboardEntry.scope == "overall",
-                    LeaderboardEntry.filter_mod_set_id.is_(None),
-                )
-                .group_by(LeaderboardEntry.account_id)
-                .subquery()
-            )
-            if ranked_score > 0:
-                higher = await self._session.scalar(
-                    select(func.count()).select_from(totals).where(totals.c.ranked_score > ranked_score)
+                    if rank_value > 0
+                    else 0
                 )
                 global_rank = int(higher or 0) + 1
         return AccountStatsView(
-            ranked_score=ranked_score,
-            accuracy=Decimal(play_row[2]),
-            play_count=int(play_row[0]),
-            total_score=int(play_row[1]),
+            ranked_score=ranked_stat.ranked_score if ranked_stat is not None else 0,
+            accuracy=ranked_stat.accuracy if ranked_stat is not None else Decimal(0),
+            play_count=play_stat.play_count if play_stat is not None else 0,
+            total_score=play_stat.total_score if play_stat is not None else 0,
             global_rank=global_rank,
+            performance=int(ranked_stat.performance) if ranked_stat is not None else 0,
         )
 
     async def get_beatmap_grades(

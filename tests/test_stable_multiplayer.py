@@ -6,11 +6,12 @@ from typing import cast
 import pytest
 
 from perfcho.api.stable.dispatcher import StableRuntimeContext, dispatch_packets
-from perfcho.api.stable.multiplayer import _settings_from_wire
-from perfcho.infra.composition import StableServices
+from perfcho.api.stable.dispatcher.multiplayer import _settings_from_wire
+from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator
+from perfcho.modules.community import CommunityService
 from perfcho.modules.identity import IdentityService, ResolvedStableSession
 from perfcho.modules.multiplayer import (
     CreateRoom,
@@ -26,6 +27,7 @@ from perfcho.modules.multiplayer import (
 from perfcho.modules.realtime import RealtimeRepository, RealtimeSession
 from perfcho.modules.realtime.stable import (
     ClientPacket,
+    Message,
     MultiplayerMatch,
     PacketReader,
     PacketWriter,
@@ -35,6 +37,7 @@ from perfcho.modules.realtime.stable import (
     UserStats,
 )
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant
+from perfcho.modules.social import SocialService
 
 NOW = datetime(2026, 7, 29, 12, tzinfo=UTC)
 EXPIRY = NOW + timedelta(minutes=5)
@@ -60,6 +63,14 @@ class FakeMultiplayer:
         self.created = command
         return self.state
 
+    async def join_room(self, command: object) -> RoomState:
+        del command
+        return self.state
+
+    async def leave_room(self, command: object) -> None:
+        del command
+        return None
+
     async def find_room_for_account(self, account_id: int) -> RoomState | None:
         self.durable_find_calls += 1
         return self.state if self.state.slot_for(account_id) is not None else None
@@ -74,6 +85,30 @@ class FakeMultiplayer:
         )
         self.state = replace(self.state, state_revision=self.state.state_revision + 1, slots=slots)
         return self.state
+
+
+class FakeCommunity:
+    def __init__(self) -> None:
+        self.public_message_calls = 0
+
+    async def get_global_silence_remaining_seconds(self, account_id: int) -> int:
+        assert account_id == 10
+        return 0
+
+    async def send_public_message(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        self.public_message_calls += 1
+        raise AssertionError("virtual multiplayer chat must not use a persistent public channel")
+
+
+class FakeSocial:
+    async def filter_message_recipients(
+        self,
+        sender_account_id: int,
+        recipient_account_ids: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        assert sender_account_id == 10
+        return recipient_account_ids
 
 
 def room_state() -> RoomState:
@@ -104,7 +139,12 @@ def context() -> StableRuntimeContext:
     )
 
 
-def services(multiplayer: FakeMultiplayer) -> StableServices:
+def services(
+    multiplayer: FakeMultiplayer,
+    *,
+    community: FakeCommunity | None = None,
+    social: FakeSocial | None = None,
+) -> StableServices:
     return StableServices(
         identity=cast(IdentityService, object()),
         authorization=cast(AuthorizationQueryService, object()),
@@ -113,6 +153,8 @@ def services(multiplayer: FakeMultiplayer) -> StableServices:
         id_generator=cast(IdGenerator, FakeIds()),
         settings=Settings(),
         multiplayer=cast(MultiplayerService, multiplayer),
+        community=cast(CommunityService, community) if community is not None else None,
+        social=cast(SocialService, social) if social is not None else None,
     )
 
 
@@ -123,6 +165,8 @@ def client_packet(packet_type: ClientPacket, write: object | None = None) -> byt
             writer.write_multiplayer_match(write)
         elif isinstance(write, ScoreFrame):
             writer.write_score_frame(write)
+        elif isinstance(write, Message):
+            writer.write_message(write)
     return writer.to_bytes()
 
 
@@ -130,7 +174,7 @@ def client_packet(packet_type: ClientPacket, write: object | None = None) -> byt
 async def test_create_match_maps_wire_settings_and_returns_join_success(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    multiplayer_module = importlib.import_module("perfcho.api.stable.multiplayer")
+    multiplayer_module = importlib.import_module("perfcho.api.stable.dispatcher.multiplayer")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -154,9 +198,15 @@ async def test_create_match_maps_wire_settings_and_returns_join_success(monkeypa
         services(multiplayer),
     )
 
-    packet = next(PacketReader(response, packet_enum=ServerPacket))
-    assert packet.packet_type is ServerPacket.MATCH_JOIN_SUCCESS
-    match = packet.payload.read_multiplayer_match()
+    packets = list(PacketReader(response, packet_enum=ServerPacket))
+    assert [packet.packet_type for packet in packets] == [
+        ServerPacket.CHANNEL_KICK,
+        ServerPacket.CHANNEL_JOIN_SUCCESS,
+        ServerPacket.MATCH_JOIN_SUCCESS,
+    ]
+    assert packets[0].payload.read_string() == "#lobby"
+    assert packets[1].payload.read_string() == "#multiplayer"
+    match = packets[2].payload.read_multiplayer_match()
     assert match.match_id == 7 and match.password == "secret"
     assert multiplayer.created is not None
     assert multiplayer.created.settings.external_beatmap_id == 42
@@ -171,6 +221,81 @@ async def test_create_match_maps_wire_settings_and_returns_join_success(monkeypa
     }
     for secret in ("Room", "secret", "Artist - Title [Hard]", (b"m" * 16).hex()):
         assert secret not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_join_match_opens_virtual_multiplayer_channel_before_join_success() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+    writer = PacketWriter()
+    with writer.packet(ClientPacket.JOIN_MATCH):
+        writer.write_i32(multiplayer.state.room.public_id)
+        writer.write_string("")
+
+    response = await dispatch_packets(writer.to_bytes(), context(), services(multiplayer))
+
+    packets = list(PacketReader(response, packet_enum=ServerPacket))
+    assert [packet.packet_type for packet in packets] == [
+        ServerPacket.CHANNEL_KICK,
+        ServerPacket.CHANNEL_JOIN_SUCCESS,
+        ServerPacket.MATCH_JOIN_SUCCESS,
+    ]
+    assert packets[0].payload.read_string() == "#lobby"
+    assert packets[1].payload.read_string() == "#multiplayer"
+
+
+@pytest.mark.asyncio
+async def test_multiplayer_public_message_uses_room_members_instead_of_persistent_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
+    multiplayer = FakeMultiplayer(room_state())
+    multiplayer.state = replace(
+        multiplayer.state,
+        slots=(
+            multiplayer.state.slots[0],
+            RoomSlot(1, SlotStatus.NOT_READY, 20),
+            *multiplayer.state.slots[2:],
+        ),
+    )
+    community = FakeCommunity()
+    delivered: list[tuple[int, bytes]] = []
+
+    async def capture(account_id: int, payload: bytes, stable_services: StableServices) -> bool:
+        del stable_services
+        delivered.append((account_id, payload))
+        return True
+
+    monkeypatch.setattr(dispatcher_module, "_enqueue_online_recipient", capture)
+
+    response = await dispatch_packets(
+        client_packet(ClientPacket.SEND_PUBLIC_MESSAGE, Message("", "hello", "#multiplayer", 0)),
+        context(),
+        services(multiplayer, community=community, social=FakeSocial()),
+    )
+
+    assert response == b""
+    assert community.public_message_calls == 0
+    assert [account_id for account_id, _ in delivered] == [20]
+    packet = next(PacketReader(delivered[0][1], packet_enum=ServerPacket))
+    assert packet.packet_type is ServerPacket.SEND_MESSAGE
+    assert packet.payload.read_message() == Message("host", "hello", "#multiplayer", 10)
+
+
+@pytest.mark.asyncio
+async def test_part_match_revokes_virtual_multiplayer_channel() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+
+    response = await dispatch_packets(
+        client_packet(ClientPacket.PART_MATCH),
+        context(),
+        services(multiplayer),
+    )
+
+    packet = next(PacketReader(response, packet_enum=ServerPacket))
+    assert packet.packet_type is ServerPacket.CHANNEL_KICK
+    assert packet.payload.read_string() == "#multiplayer"
 
 
 @pytest.mark.asyncio

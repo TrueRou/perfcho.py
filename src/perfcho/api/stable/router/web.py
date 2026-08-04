@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
@@ -12,8 +13,8 @@ from time import monotonic_ns
 from typing import Annotated, Literal
 from urllib.parse import parse_qs, quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request, Response, status
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from starlette.formparsers import MultiPartException
 
 from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
@@ -30,6 +31,14 @@ from perfcho.api.stable.canonize.scoring import (
 )
 from perfcho.api.stable.dependencies import StableServicesDependency
 from perfcho.infra.logging import duration_ms, log_event, rate_limit
+from perfcho.infra.security.password import preverify_lazer_password
+from perfcho.modules.account import (
+    AccountService,
+    EmailUnavailable,
+    NameUnavailable,
+    RegisterAccount,
+    RegistrationRejected,
+)
 from perfcho.modules.common import (
     Actor,
     ApplicationError,
@@ -38,21 +47,26 @@ from perfcho.modules.common import (
     ObjectStorage,
     ObjectUnavailable,
 )
+from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
 from perfcho.modules.community import CommunityService
 from perfcho.modules.content import (
     BeatmapNotFound,
     BeatmapRevisionView,
     BeatmapsetNotFound,
     BeatmapsetView,
+    ContentInputRejected,
     ContentQueryService,
     ContentSearch,
     ContentService,
+    ContentSyncService,
     RatingSummary,
+    UpstreamContentUnavailable,
 )
 from perfcho.modules.identity import InvalidCredentials, StableWebPrincipal
 from perfcho.modules.realtime import RealtimeSessionFenced, RealtimeSessionNotFound
 from perfcho.modules.scoring import (
     AcceptScore,
+    AccountStatsView,
     BeatmapReference,
     BeatmapRevisionNotFound,
     LeaderboardPage,
@@ -67,7 +81,7 @@ from perfcho.modules.scoring import (
     StagedReplayManifest,
 )
 from perfcho.modules.scoring.mods import parse_legacy_mods
-from perfcho.modules.social import SocialService
+from perfcho.modules.social import AchievementUnlockView, SocialService
 
 router = APIRouter(default_response_class=Response)
 
@@ -88,11 +102,20 @@ _GRADE_RULESETS = (Ruleset.OSU, Ruleset.TAIKO, Ruleset.FRUITS, Ruleset.MANIA)
 _RULESET_IDS = {ruleset.value: index for index, ruleset in enumerate(_GRADE_RULESETS)}
 _OFFICIAL_DOWNLOAD_BASE_URL = "https://osu.ppy.sh/beatmapsets"
 _PUBLIC_DOWNLOAD_BASE_URL = "https://api.nerinyan.moe/d"
+_REGISTRATION_PASSWORD_MIN_LENGTH = 8
+_REGISTRATION_PASSWORD_MAX_LENGTH = 32
+_REGISTRATION_PASSWORD_MIN_UNIQUE_CHARACTERS = 4
 
 
 @dataclass(frozen=True, slots=True)
 class _WebAuthentication:
     principal: StableWebPrincipal | None
+
+
+def _account(services: StableServicesDependency) -> AccountService:
+    if services.account is None:
+        raise RuntimeError("Stable account registration is not configured")
+    return services.account
 
 
 def _content_query(services: StableServicesDependency) -> ContentQueryService:
@@ -105,6 +128,12 @@ def _content(services: StableServicesDependency) -> ContentService:
     if services.content is None:
         raise RuntimeError("Stable content commands are not configured")
     return services.content
+
+
+def _content_sync(services: StableServicesDependency) -> ContentSyncService:
+    if services.content_sync is None:
+        raise RuntimeError("Stable content synchronization is not configured")
+    return services.content_sync
 
 
 def _social(services: StableServicesDependency) -> SocialService:
@@ -224,6 +253,7 @@ def _log_score_rejection(
     log_event(
         "INFO",
         "stable.score_submission.rejected",
+        exception=error,
         stage=stage,
         outcome="rejected",
         account_id=account_id,
@@ -231,6 +261,41 @@ def _log_score_rejection(
         error_type=error_type or (type(error).__name__ if error is not None else "SubmissionRejected"),
         duration_ms=duration_ms(started_ns),
     )
+
+
+def _registration_error(field: str, messages: list[str]) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"form_error": {"user": {field: ["\n".join(messages)]}}},
+    )
+
+
+def _registration_password_errors(password: str) -> list[str]:
+    errors: list[str] = []
+    if not _REGISTRATION_PASSWORD_MIN_LENGTH <= len(password) <= _REGISTRATION_PASSWORD_MAX_LENGTH:
+        errors.append("Must be 8-32 characters in length.")
+    if len(set(password)) < _REGISTRATION_PASSWORD_MIN_UNIQUE_CHARACTERS:
+        errors.append("Must have more than 3 unique characters.")
+    return errors
+
+
+def _registration_digest(
+    services: StableServicesDependency,
+    *,
+    display_name: str,
+    email: str,
+    password_preverification: str,
+) -> bytes:
+    payload = json.dumps(
+        {
+            "display_name": display_name,
+            "email": email,
+            "password_preverification": password_preverification,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hmac.digest(services.settings.device_hmac_key.get_secret_value().encode(), payload, hashlib.sha256)
 
 
 async def _read_limited_body(request: Request, maximum: int) -> bytes:
@@ -354,6 +419,103 @@ def _format_direct_set(beatmapset: BeatmapsetView) -> str:
 def _format_rating(summary: RatingSummary) -> str:
     average = summary.average if summary.average is not None else Decimal(0)
     return format(average, ".2f")
+
+
+def _comment_selector(
+    beatmap_id: str | None,
+    beatmapset_id: str | None,
+    replay_id: str | None,
+    requested_target: str | None,
+) -> tuple[str, int]:
+    selectors = {
+        "map": beatmap_id,
+        "song": beatmapset_id,
+        "replay": replay_id,
+    }
+    targets = (requested_target,) if requested_target is not None else ("map", "song", "replay")
+    for target in targets:
+        if target not in selectors:
+            continue
+        value = selectors[target]
+        if value is None or not value.isascii() or not value.isdigit():
+            continue
+        identifier = int(value)
+        if identifier > 0:
+            return target, identifier
+    raise ValueError("comment target is missing")
+
+
+@router.post("/users")
+async def register_account(
+    request: Request,
+    services: StableServicesDependency,
+    username: Annotated[str, Form(alias="user[username]", min_length=1, max_length=64)],
+    email: Annotated[str, Form(alias="user[user_email]", min_length=1, max_length=254)],
+    password: Annotated[str, Form(alias="user[password]", min_length=1, max_length=256)],
+    check: Annotated[int, Form()],
+) -> Response:
+    """Validate or atomically create one Stable-compatible account."""
+    try:
+        display_name = username.strip()
+        normalize_stable_name(display_name)
+    except ValueError as error:
+        return _registration_error("username", [str(error)])
+    try:
+        normalized_email = normalize_email(email)
+    except ValueError as error:
+        return _registration_error("user_email", [str(error)])
+    if password_errors := _registration_password_errors(password):
+        return _registration_error("password", password_errors)
+
+    account = _account(services)
+    if check != 0:
+        try:
+            await account.check_availability(display_name, normalized_email)
+        except NameUnavailable as error:
+            return _registration_error("username", [str(error)])
+        except EmailUnavailable as error:
+            return _registration_error("user_email", [str(error)])
+        except RegistrationRejected as error:
+            return _registration_error("username", [str(error)])
+        return Response(b"ok")
+
+    password_preverification = preverify_lazer_password(password)
+    request_id = services.id_generator.new()
+    request_digest = _registration_digest(
+        services,
+        display_name=display_name,
+        email=normalized_email,
+        password_preverification=password_preverification,
+    )
+    command = RegisterAccount(
+        meta=CommandMeta(
+            request_id=request_id,
+            idempotency_key=f"stable-registration:{request_digest.hex()}",
+            request_digest=request_digest,
+            actor=None,
+            client=ClientContext(
+                family="stable",
+                version=services.settings.stable_build,
+                variant=None,
+                ip_address=resolve_client_ip(request, services.settings.trusted_proxy_cidrs),
+                user_agent=request.headers.get("user-agent"),
+            ),
+            received_at=services.clock.now(),
+        ),
+        display_name=display_name,
+        email=normalized_email,
+        password_preverification=password_preverification,
+        activate_immediately=True,
+    )
+    try:
+        await account.register(command)
+    except NameUnavailable as error:
+        return _registration_error("username", [str(error)])
+    except EmailUnavailable as error:
+        return _registration_error("user_email", [str(error)])
+    except RegistrationRejected as error:
+        return _registration_error("password", [str(error)])
+    return Response(b"ok")
 
 
 @router.get("/web/osu-getfriends.php")
@@ -551,12 +713,121 @@ async def bancho_connect(
 
 @router.get("/web/check-updates.php")
 async def check_updates(
+    services: StableServicesDependency,
     action: Annotated[Literal["check", "path", "error"], Query()],
     stream: Annotated[Literal["cuttingedge", "stable40", "beta40", "stable"], Query()],
 ) -> Response:
-    """Accept the Stable updater probe for supported release streams."""
+    """Return a minimal valid manifest for the configured supported build."""
     del action, stream
-    return Response(b"")
+    return JSONResponse(
+        [
+            {
+                "file_version": services.settings.stable_build.removeprefix("b"),
+                "filename": "osu!.exe",
+                "file_hash": "0" * 32,
+                "filesize": 0,
+                "timestamp": 0,
+                "patch_id": 0,
+                "url_full": "",
+            }
+        ]
+    )
+
+
+@router.get("/web/osu-getseasonal.php")
+async def get_seasonal_backgrounds(services: StableServicesDependency) -> Response:
+    """Forward seasonal background retrieval to the configured public asset source."""
+    return RedirectResponse(services.settings.stable_seasonal_url, status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/menu-content.json")
+async def get_menu_content(services: StableServicesDependency) -> Response:
+    """Forward menu metadata retrieval to the configured public asset source."""
+    return RedirectResponse(services.settings.stable_menu_content_url, status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/{account_id:int}")
+async def get_avatar(services: StableServicesDependency, account_id: int) -> Response:
+    """Forward avatar retrieval without storing the asset locally."""
+    if account_id < 1:
+        return Response(b"", status_code=status.HTTP_404_NOT_FOUND)
+    target = f"{services.settings.stable_avatar_base_url.rstrip('/')}/{account_id}"
+    return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/thumb/{filename}")
+async def get_beatmap_thumbnail(services: StableServicesDependency, filename: str) -> Response:
+    """Forward beatmap thumbnail retrieval without storing the asset locally."""
+    target = f"{services.settings.stable_beatmap_asset_base_url.rstrip('/')}/thumb/{quote(filename, safe='')}"
+    return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/preview/{filename}")
+async def get_beatmap_preview(services: StableServicesDependency, filename: str) -> Response:
+    """Forward beatmap preview retrieval without storing the asset locally."""
+    target = f"{services.settings.stable_beatmap_asset_base_url.rstrip('/')}/preview/{quote(filename, safe='')}"
+    return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
+
+
+@router.post("/difficulty-rating")
+async def get_difficulty_rating(
+    request: Request,
+    services: StableServicesDependency,
+    content_query: Annotated[ContentQueryService, Depends(_content_query)],
+) -> Response:
+    """Return the locally projected base star rating used by osu.py."""
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError
+        beatmap_id = int(payload["beatmap_id"])
+        ruleset_id = int(payload["ruleset_id"])
+        beatmap = await content_query.lookup_beatmap(beatmap_id)
+    except BeatmapNotFound, KeyError, TypeError, ValueError:
+        return Response(b"", status_code=status.HTTP_404_NOT_FOUND)
+    if ruleset_id != _RULESET_IDS[beatmap.ruleset]:
+        return Response(b"", status_code=status.HTTP_404_NOT_FOUND)
+    return Response(str(beatmap.star_rating or 0))
+
+
+@router.post("/web/osu-comment.php")
+async def comments(
+    services: StableServicesDependency,
+    content_query: Annotated[ContentQueryService, Depends(_content_query)],
+    content: Annotated[ContentService, Depends(_content)],
+    username: Annotated[str, Form(alias="u", min_length=1, max_length=64)],
+    password_token: Annotated[str, Form(alias="p", min_length=32, max_length=32)],
+    action: Annotated[Literal["get", "post"], Form(alias="a")],
+    mode: Annotated[int, Form(alias="m", ge=0, le=3)],
+    beatmap_id: Annotated[str | None, Form(alias="b")] = None,
+    beatmapset_id: Annotated[str | None, Form(alias="s")] = None,
+    replay_id: Annotated[str | None, Form(alias="r")] = None,
+    position_ms: Annotated[int | None, Form(alias="starttime", ge=0)] = None,
+    body: Annotated[str | None, Form(alias="comment", max_length=1000)] = None,
+    requested_target: Annotated[str | None, Form(alias="target")] = None,
+) -> Response:
+    """Read or persist Stable timeline comments through canonical content services."""
+    del mode
+    authentication = await _authenticate(services, username, password_token)
+    if authentication.principal is None:
+        return _authentication_failed()
+    try:
+        target, external_id = _comment_selector(beatmap_id, beatmapset_id, replay_id, requested_target)
+        if action == "post":
+            if position_ms is None or body is None:
+                raise ValueError
+            await content.create_comment(
+                authentication.principal.account_id,
+                target,
+                external_id,
+                position_ms,
+                body,
+            )
+            return Response(b"")
+        items = await content_query.list_comments(target, external_id)
+    except ContentInputRejected, ValueError:
+        return Response(b"", status_code=status.HTTP_400_BAD_REQUEST)
+    return Response("\n".join(f"{item.position_ms}\t{item.target}\t0\t{item.body}" for item in items))
 
 
 @router.get("/web/maps/{map_filename}")
@@ -745,6 +1016,7 @@ async def submit_score(
                     ended_at=parsed.attempt.ended_at,
                 ),
             )
+        stats_before = await _account_stats(services, principal.account_id, parsed)
         result = await scoring.accept(command)
     except BeatmapRevisionNotFound as error:
         _log_score_rejection(started_ns, "canonical_accept", account_id=principal.account_id, error=error)
@@ -761,6 +1033,7 @@ async def submit_score(
             error_type=type(result.outcome).__name__,
         )
         return Response(b"error: no")
+    stats_after = await _account_stats(services, principal.account_id, parsed)
     log_event(
         "INFO",
         "stable.score_submission.completed",
@@ -772,7 +1045,16 @@ async def submit_score(
         ruleset=parsed.ruleset.value,
         duration_ms=duration_ms(started_ns),
     )
-    return Response(_submission_chart(result.score_id, beatmap, parsed))
+    return Response(
+        _submission_chart(
+            result.score_id,
+            beatmap,
+            parsed,
+            stats_before=stats_before,
+            stats_after=stats_after,
+            new_achievement_unlocks=result.new_achievement_unlocks,
+        )
+    )
 
 
 @router.get("/web/osu-getreplay.php")
@@ -822,8 +1104,10 @@ async def get_replay(
 
 @router.get("/web/osu-osz2-getscores.php")
 async def get_scores(
+    background_tasks: BackgroundTasks,
     authentication: Annotated[_WebAuthentication, Depends(_leaderboard_authentication)],
     content_query: Annotated[ContentQueryService, Depends(_content_query)],
+    content_sync: Annotated[ContentSyncService, Depends(_content_sync)],
     ranking_query: Annotated[RankingQueryService, Depends(_ranking_query)],
     social: Annotated[SocialService, Depends(_social)],
     requesting_from_editor: Annotated[bool, Query(alias="s")],
@@ -834,8 +1118,8 @@ async def get_scores(
     mode: Annotated[int, Query(alias="m", ge=0, le=3)],
     map_set_id: Annotated[int, Query(alias="i", ge=-1, le=2_147_483_647)],
     legacy_mod_bits: Annotated[int, Query(alias="mods", ge=0, le=2_147_483_647)],
-    map_package_hash: Annotated[str, Query(alias="h", max_length=512)],
     legacy_client_flag: Annotated[bool, Query(alias="a")],
+    map_package_hash: Annotated[str, Query(alias="h", max_length=512)] = "",
 ) -> Response:
     """Return one Stable leaderboard page from ranking projections."""
     del leaderboard_version, map_package_hash, legacy_client_flag
@@ -846,14 +1130,26 @@ async def get_scores(
         beatmap = await content_query.lookup_md5(map_md5)
     except BeatmapNotFound:
         try:
-            await content_query.lookup_filename(map_filename)
-        except BeatmapNotFound:
+            beatmap = await content_sync.resolve_revision(
+                map_md5,
+                map_filename,
+                map_set_id if map_set_id > 0 else None,
+            )
+        except BeatmapNotFound, BeatmapsetNotFound:
             return Response(b"-1|false")
-        return Response(b"1|false")
-    if not beatmap.is_current:
-        return Response(b"1|false")
+        except (ObjectUnavailable, UpstreamContentUnavailable) as error:
+            log_event(
+                "WARNING",
+                "stable.web.leaderboard.content_unavailable",
+                exception=error,
+                error_type=type(error).__name__,
+            )
+            return Response(b"", status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     if map_set_id > 0 and map_set_id != beatmap.external_beatmapset_id:
         return Response(b"-1|false")
+    background_tasks.add_task(content_sync.refresh_if_due, beatmap.external_beatmapset_id)
+    if not beatmap.is_current or beatmap.md5_hex != map_md5.lower():
+        return Response(b"1|false")
     try:
         _, variant = parse_legacy_mods(legacy_mod_bits)
     except ValueError:
@@ -893,8 +1189,40 @@ async def get_scores(
     return Response("\n".join(lines))
 
 
-def _submission_chart(score_id: int, beatmap: BeatmapRevisionView, parsed: ParsedStableScore) -> str:
+async def _account_stats(
+    services: StableServicesDependency,
+    account_id: int,
+    parsed: ParsedStableScore,
+) -> AccountStatsView | None:
+    """Read Stable account totals without making score acceptance depend on them."""
+    ranking_query = services.ranking_query
+    if ranking_query is None:
+        return None
+    try:
+        return await ranking_query.get_account_stats(account_id, parsed.ruleset, parsed.variant)
+    except Exception as error:
+        log_event(
+            "WARNING",
+            "stable.score_submission.stats_query_failed",
+            exception=error,
+            account_id=account_id,
+            ruleset=parsed.ruleset.value,
+            variant=parsed.variant.value,
+        )
+        return None
+
+
+def _submission_chart(
+    score_id: int,
+    beatmap: BeatmapRevisionView,
+    parsed: ParsedStableScore,
+    *,
+    stats_before: AccountStatsView | None = None,
+    stats_after: AccountStatsView | None = None,
+    new_achievement_unlocks: tuple[AchievementUnlockView, ...] = (),
+) -> str:
     accuracy = format(parsed.score.accuracy * 100, ".2f")
+    achievements = "/".join(f"{unlock.slug}+{unlock.name}+{unlock.description}" for unlock in new_achievement_unlocks)
     return "|".join(
         (
             f"beatmapId:{beatmap.external_beatmap_id}",
@@ -922,9 +1250,37 @@ def _submission_chart(score_id: int, beatmap: BeatmapRevisionView, parsed: Parse
             "\n",
             "chartId:overall",
             "chartName:Overall Ranking",
-            "achievements-new:",
+            f"rankBefore:{_chart_rank(stats_before)}",
+            f"rankAfter:{_chart_rank(stats_after)}",
+            f"rankedScoreBefore:{_chart_value(stats_before, 'ranked_score')}",
+            f"rankedScoreAfter:{_chart_value(stats_after, 'ranked_score')}",
+            f"totalScoreBefore:{_chart_value(stats_before, 'total_score')}",
+            f"totalScoreAfter:{_chart_value(stats_after, 'total_score')}",
+            f"accuracyBefore:{_chart_accuracy(stats_before)}",
+            f"accuracyAfter:{_chart_accuracy(stats_after)}",
+            f"ppBefore:{_chart_rank(stats_before, field='performance')}",
+            f"ppAfter:{_chart_rank(stats_after, field='performance')}",
+            f"achievements-new:{achievements}",
         )
     )
+
+
+def _chart_value(stats: AccountStatsView | None, field: Literal["ranked_score", "total_score"]) -> str:
+    """Render an account total for the Stable submission chart."""
+    return "" if stats is None else str(getattr(stats, field))
+
+
+def _chart_rank(stats: AccountStatsView | None, *, field: Literal["global_rank", "performance"] = "global_rank") -> str:
+    """Render rank-like values while leaving unknown or pending values blank."""
+    if stats is None:
+        return ""
+    value = getattr(stats, field)
+    return "" if value == 0 else str(value)
+
+
+def _chart_accuracy(stats: AccountStatsView | None) -> str:
+    """Render account accuracy in the percentage format expected by Stable."""
+    return "" if stats is None else format(stats.accuracy * 100, ".2f")
 
 
 def _format_leaderboard_score(score: LeaderboardScoreView) -> str:

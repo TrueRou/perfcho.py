@@ -25,13 +25,11 @@ class PerformanceCalculationInput:
     calculator: str
     release_id: uuid.UUID
     release_version: str
-    artifact_digest: bytes
     release_configuration: Mapping[str, JsonValue]
     difficulty_formula_id: uuid.UUID
     difficulty_formula_code: str
     difficulty_release_id: uuid.UUID
     difficulty_release_version: str
-    difficulty_artifact_digest: bytes
     difficulty_release_configuration: Mapping[str, JsonValue]
     input_digest: bytes
     beatmap_revision_id: int
@@ -56,12 +54,7 @@ class PerformanceCalculationInput:
             or not self.beatmap_storage_key
         ):
             raise ValueError("performance calculation release metadata must be non-empty")
-        if (
-            len(self.artifact_digest) != 32
-            or len(self.difficulty_artifact_digest) != 32
-            or len(self.input_digest) != 32
-            or len(self.beatmap_sha256) != 32
-        ):
+        if len(self.input_digest) != 32 or len(self.beatmap_sha256) != 32:
             raise ValueError("performance calculation digests must contain 32 bytes")
         configuration = _freeze_json(dict(self.release_configuration))
         difficulty_configuration = _freeze_json(dict(self.difficulty_release_configuration))
@@ -80,13 +73,11 @@ class PerformanceCalculationInput:
             "calculator": self.calculator,
             "release_id": str(self.release_id),
             "release_version": self.release_version,
-            "artifact_digest": self.artifact_digest.hex(),
             "release_configuration": _thaw_json(self.release_configuration),
             "difficulty_formula_id": str(self.difficulty_formula_id),
             "difficulty_formula_code": self.difficulty_formula_code,
             "difficulty_release_id": str(self.difficulty_release_id),
             "difficulty_release_version": self.difficulty_release_version,
-            "difficulty_artifact_digest": self.difficulty_artifact_digest.hex(),
             "difficulty_release_configuration": _thaw_json(self.difficulty_release_configuration),
             "beatmap_revision_id": self.beatmap_revision_id,
             "beatmap_sha256": self.beatmap_sha256.hex(),

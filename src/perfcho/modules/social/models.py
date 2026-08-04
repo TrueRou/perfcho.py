@@ -4,6 +4,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from types import MappingProxyType
 
 
@@ -155,6 +156,25 @@ class AchievementDefinitionRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class AchievementEvaluationDefinition:
+    """Carry one active, localized definition into a score evaluator."""
+
+    achievement_id: int
+    slug: str
+    name: str
+    description: str
+    evaluator_code: str
+    evaluator_version: int
+    parameters: Mapping[str, object]
+    ruleset: str | None
+
+    def __post_init__(self) -> None:
+        """Freeze definition parameters before evaluator dispatch."""
+        _require_positive_id("achievement_id", self.achievement_id)
+        object.__setattr__(self, "parameters", MappingProxyType(dict(self.parameters)))
+
+
+@dataclass(frozen=True, slots=True)
 class Achievement:
     """Describe a localized achievement and an optional account unlock."""
 
@@ -206,3 +226,41 @@ class AchievementUnlockResult:
 
     unlock: AchievementUnlock
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AchievementUnlockView:
+    """Expose only the display data for an unlock created by this command."""
+
+    achievement_id: int
+    slug: str
+    name: str
+    description: str
+    unlocked_at: datetime
+
+    def __post_init__(self) -> None:
+        """Validate the Stable chart projection."""
+        _require_positive_id("achievement_id", self.achievement_id)
+        _require_aware("unlocked_at", self.unlocked_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ScoreAchievementContext:
+    """Provide deterministic score facts to registered achievement evaluators."""
+
+    account_id: int
+    score_id: int
+    beatmap_id: int
+    beatmap_revision_id: int
+    ruleset: str
+    variant: str
+    beatmap_status: str
+    outcome: str
+    grade: str
+    total_score: int
+    classic_score: int
+    accuracy: Decimal
+    max_combo: int
+    perfect: bool
+    total_hits: int
+    mods: tuple[str, ...]

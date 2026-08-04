@@ -11,7 +11,7 @@ from fastapi import FastAPI
 
 from perfcho.api.stable import router
 from perfcho.api.stable.dependencies import get_stable_services
-from perfcho.infra.composition import StableServices
+from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage, StoredObject
@@ -19,6 +19,7 @@ from perfcho.modules.community import CommunityService
 from perfcho.modules.content import (
     BeatmapRevisionView,
     BeatmapsetView,
+    CommentView,
     ContentQueryService,
     ContentSearch,
     ContentSearchPage,
@@ -66,6 +67,7 @@ class FakeContentQuery:
         self.beatmapset = beatmapset
         self.search_query: ContentSearch | None = None
         self.account_rating: int | None = None
+        self.comments: list[CommentView] = []
 
     async def batch_lookup(
         self,
@@ -103,11 +105,16 @@ class FakeContentQuery:
         assert beatmap_id == 10 and account_id == 3
         return RatingSummary(10, Decimal("8.25"), 4, self.account_rating)
 
+    async def list_comments(self, target: str, external_target_id: int) -> tuple[CommentView, ...]:
+        assert target == "map" and external_target_id == 100
+        return tuple(self.comments)
+
 
 class FakeContent:
-    def __init__(self) -> None:
+    def __init__(self, comments: list[CommentView]) -> None:
         self.favourite_calls: list[tuple[int, int]] = []
         self.rating_calls: list[tuple[int, int, int]] = []
+        self.comments = comments
 
     async def set_favourite(
         self,
@@ -122,6 +129,19 @@ class FakeContent:
     async def rate(self, account_id: int, beatmap_id: int, rating: int) -> RatingSummary:
         self.rating_calls.append((account_id, beatmap_id, rating))
         return RatingSummary(beatmap_id, Decimal("8.50"), 5, rating)
+
+    async def create_comment(
+        self,
+        account_id: int,
+        target: str,
+        external_target_id: int,
+        position_ms: int,
+        body: str,
+    ) -> CommentView:
+        assert account_id == 3 and target == "map" and external_target_id == 100
+        comment = CommentView(1, account_id, target, position_ms, body, None, NOW)
+        self.comments.append(comment)
+        return comment
 
 
 class FakeRankingQuery:
@@ -228,7 +248,7 @@ def stable_services() -> tuple[StableServices, FakeContentQuery, FakeContent, Fa
         beatmaps=(map_view,),
     )
     content_query = FakeContentQuery(map_view, set_view)
-    content = FakeContent()
+    content = FakeContent(content_query.comments)
     community = FakeCommunity()
     services = StableServices(
         identity=cast(IdentityService, FakeIdentity()),
@@ -432,9 +452,72 @@ async def test_probes_and_direct_download_redirect() -> None:
         map_file = await client.get("/web/maps/Artist%20-%20Title%20(Creator)%20%5BInsane%5D.osu")
 
     assert connect.content == b""
-    assert update.content == b""
+    assert update.json()[0]["filename"] == "osu!.exe"
     assert download.status_code == 302
     assert download.headers["location"] == "https://api.nerinyan.moe/d/200"
     assert no_video_download.headers["location"] == "https://api.nerinyan.moe/d/200?nv=1"
     assert map_file.content == b"osu file v1"
     assert map_file.headers["content-type"] == "application/x-osu-beatmap"
+
+
+@pytest.mark.asyncio
+async def test_public_assets_are_forwarded_without_local_storage() -> None:
+    services, _, _, _ = stable_services()
+    object.__setattr__(
+        services,
+        "settings",
+        Settings(
+            stable_avatar_base_url="https://avatar.test",
+            stable_beatmap_asset_base_url="https://asset.test",
+            stable_seasonal_url="https://asset.test/seasonal.json",
+            stable_menu_content_url="https://asset.test/menu.json",
+        ),
+    )
+    app = stable_app(services)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://c.test",
+        follow_redirects=False,
+    ) as client:
+        avatar = await client.get("/3")
+        thumbnail = await client.get("/thumb/200l.jpg")
+        preview = await client.get("/preview/200.mp3")
+        seasonal = await client.get("/web/osu-getseasonal.php")
+        menu = await client.get("/menu-content.json")
+
+    assert avatar.headers["location"] == "https://avatar.test/3"
+    assert thumbnail.headers["location"] == "https://asset.test/thumb/200l.jpg"
+    assert preview.headers["location"] == "https://asset.test/preview/200.mp3"
+    assert seasonal.headers["location"] == "https://asset.test/seasonal.json"
+    assert menu.headers["location"] == "https://asset.test/menu.json"
+
+
+@pytest.mark.asyncio
+async def test_stable_comments_round_trip_through_content_services() -> None:
+    services, _, content, _ = stable_services()
+    app = stable_app(services)
+    common = {
+        "u": (None, "player"),
+        "p": (None, PASSWORD_MD5),
+        "b": (None, "100"),
+        "m": (None, "0"),
+    }
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        posted = await client.post(
+            "/web/osu-comment.php",
+            files={
+                **common,
+                "a": (None, "post"),
+                "starttime": (None, "1234"),
+                "comment": (None, "hello timeline"),
+                "target": (None, "map"),
+            },
+        )
+        listed = await client.post(
+            "/web/osu-comment.php",
+            files={**common, "a": (None, "get")},
+        )
+
+    assert posted.status_code == 200
+    assert listed.text == "1234\tmap\t0\thello timeline"
+    assert content.comments[0].body == "hello timeline"

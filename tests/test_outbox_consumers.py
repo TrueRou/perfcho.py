@@ -1,6 +1,7 @@
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -32,6 +33,7 @@ from perfcho.infra.db.projectors.catalog import (
 from perfcho.infra.db.relays.outbox_delivery import (
     OutboxDeliveryProcessor,
     SqlAlchemyOutboxDeliveryRelayStore,
+    _outbox_event_fields,
 )
 from perfcho.infra.db.repositories.outbox import append_outbox_event
 from perfcho.infra.settings import settings
@@ -58,6 +60,23 @@ EXPECTED_CONSUMERS = {
     },
     "community-message-projector.v1": {"community.message-sent.v1"},
     "ranking-projector.v1": {"score.accepted.v1", "score.performance-calculated.v1"},
+    "scoring-stats-projector.v1": {"score.accepted.v1", "score.replay-viewed.v1"},
+    "multiplayer-results-projector.v1": {"multiplayer.round-completed.v1", "score.accepted.v1"},
+    "authorization-projector.v1": {
+        "authorization.role-granted.v1",
+        "authorization.role-revoked.v1",
+        "authorization.permission-granted.v1",
+        "authorization.permission-revoked.v1",
+        "authorization.entitlement-granted.v1",
+        "authorization.entitlement-revoked.v1",
+    },
+    "moderation-projector.v1": {
+        "moderation.case.opened.v1",
+        "moderation.case.entry_added.v1",
+        "moderation.sanction.imposed.v1",
+        "moderation.sanction.extended.v1",
+        "moderation.sanction.revoked.v1",
+    },
 }
 
 TEST_CONSUMER = "tests-projector.v1"
@@ -104,6 +123,26 @@ def test_outbox_task_registers_every_declared_consumer() -> None:
         assert DEFAULT_CONSUMER_CATALOG[name].event_types == event_types
 
 
+def test_outbox_event_log_fields_include_complete_payload() -> None:
+    event = cast(
+        OutboxEvent,
+        SimpleNamespace(
+            event_type=TEST_EVENT_TYPE,
+            aggregate_type="test",
+            aggregate_id="1",
+            schema_version=1,
+            position=7,
+            payload={"detail": "outbox body", "nested": {"value": 1}},
+        ),
+    )
+
+    fields = _outbox_event_fields(event)
+
+    assert fields.get("event_type") == TEST_EVENT_TYPE
+    assert fields.get("payload_fields") == ("detail", "nested")
+    assert fields.get("outbox_payload") == {"detail": "outbox body", "nested": {"value": 1}}
+
+
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_outbox_dead_delivery_blocks_later_partition_events(postgres_database_url: str) -> None:
@@ -127,7 +166,15 @@ async def test_outbox_dead_delivery_blocks_later_partition_events(postgres_datab
         async with session_factory.begin() as session:
             first = await append_outbox_event(
                 session,
-                PendingEvent("test", "1", TEST_EVENT_TYPE, 1, {}, (TEST_CONSUMER,), "test:partition"),
+                PendingEvent(
+                    "test",
+                    "1",
+                    TEST_EVENT_TYPE,
+                    1,
+                    {"detail": "outbox body"},
+                    (TEST_CONSUMER,),
+                    "test:partition",
+                ),
             )
             second = await append_outbox_event(
                 session,
@@ -147,10 +194,17 @@ async def test_outbox_dead_delivery_blocks_later_partition_events(postgres_datab
         assert dead_event["level"].name == "ERROR"
         assert dead_event["extra"]["event_id"] == str(first.id)
         assert dead_event["extra"]["consumer"] == TEST_CONSUMER
+        assert dead_event["extra"]["event_type"] == TEST_EVENT_TYPE
+        assert dead_event["extra"]["aggregate_type"] == "test"
+        assert dead_event["extra"]["aggregate_id"] == "1"
+        assert dead_event["extra"]["schema_version"] == 1
+        assert dead_event["extra"]["source_position"] == first.position
+        assert dead_event["extra"]["payload_fields"] == ("detail",)
+        assert dead_event["extra"]["outbox_payload"] == {"detail": "outbox body"}
         assert dead_event["extra"]["error_type"] == "RuntimeError"
-        assert dead_event["exception"] is None
+        assert dead_event["exception"] is not None
         assert "projector failed" not in dead_event["message"]
-        assert {"payload", "partition_key", "delivery_token", "lease_owner", "error"}.isdisjoint(dead_event["extra"])
+        assert {"partition_key", "delivery_token", "lease_owner", "error"}.isdisjoint(dead_event["extra"])
         assert await store.claim("tests:next-owner") == ()
 
         async with session_factory() as session:
@@ -193,7 +247,15 @@ async def test_outbox_stale_token_and_enqueue_failure_do_not_consume_attempt(
         async with session_factory.begin() as session:
             event = await append_outbox_event(
                 session,
-                PendingEvent("test", "1", TEST_EVENT_TYPE, 1, {}, (TEST_CONSUMER,), "test:1"),
+                PendingEvent(
+                    "test",
+                    "1",
+                    TEST_EVENT_TYPE,
+                    1,
+                    {"detail": "outbox body"},
+                    (TEST_CONSUMER,),
+                    "test:1",
+                ),
             )
 
         reference = (await store.claim("tests:enqueue-owner"))[0]
@@ -207,6 +269,13 @@ async def test_outbox_stale_token_and_enqueue_failure_do_not_consume_attempt(
         assert stale_event["level"].name == "DEBUG"
         assert stale_event["extra"]["event_id"] == str(event.id)
         assert stale_event["extra"]["consumer"] == TEST_CONSUMER
+        assert stale_event["extra"]["event_type"] == TEST_EVENT_TYPE
+        assert stale_event["extra"]["aggregate_type"] == "test"
+        assert stale_event["extra"]["aggregate_id"] == "1"
+        assert stale_event["extra"]["schema_version"] == 1
+        assert stale_event["extra"]["source_position"] == event.position
+        assert stale_event["extra"]["payload_fields"] == ("detail",)
+        assert stale_event["extra"]["outbox_payload"] == {"detail": "outbox body"}
         assert {"partition_key", "delivery_token", "lease_owner", "error"}.isdisjoint(stale_event["extra"])
         await store.mark_enqueue_failed(reference, "tests:enqueue-owner", RuntimeError("Redis unavailable"))
 

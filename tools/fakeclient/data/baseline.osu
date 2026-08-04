@@ -1,0 +1,26 @@
+osu file format v14
+
+[General]
+AudioFilename: baseline.mp3
+Mode: 0
+
+[Metadata]
+Title:Perfcho E2E
+Artist:Perfcho
+Creator:fakeclient
+Version:Normal
+
+[Difficulty]
+HPDrainRate:5
+CircleSize:4
+OverallDifficulty:7
+ApproachRate:9
+SliderMultiplier:1.4
+
+[TimingPoints]
+0,500,4,2,1,60,1,0
+
+[HitObjects]
+256,192,1000,1,0,0:0:0:0:
+256,192,2000,1,0,0:0:0:0:
+256,192,3000,1,0,0:0:0:0:

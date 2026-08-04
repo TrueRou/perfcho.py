@@ -31,6 +31,7 @@ async def dispatch_outbox_delivery(
             log_event(
                 "ERROR",
                 "task.outbox_delivery.malformed_payload",
+                exception=error,
                 consumer=consumer,
                 error_type=type(error).__name__,
             )
@@ -38,6 +39,7 @@ async def dispatch_outbox_delivery(
             log_event(
                 "ERROR",
                 "task.outbox_delivery.malformed_payload",
+                exception=error,
                 event_id=str(parsed_event_id),
                 consumer=consumer,
                 error_type=type(error).__name__,
@@ -58,6 +60,7 @@ async def dispatch_outbox_delivery(
             log_event(
                 "ERROR",
                 "task.outbox_delivery.failed",
+                exception=error,
                 event_id=str(parsed_event_id),
                 consumer=consumer,
                 error_type=type(error).__name__,

@@ -54,6 +54,7 @@ async def create_engine() -> AsyncEngine:
         log_event(
             "ERROR",
             "database.bootstrap.failed",
+            exception=e,
             phase=phase,
             error_type=type(e).__name__,
             duration_ms=duration_ms(started_ns),

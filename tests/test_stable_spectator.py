@@ -6,7 +6,7 @@ from typing import cast
 import pytest
 
 from perfcho.api.stable.dispatcher import StableRuntimeContext, dispatch_packets
-from perfcho.infra.composition import StableServices
+from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator
@@ -281,7 +281,7 @@ def packet_types(payloads: list[bytes] | bytes) -> list[ServerPacket]:
 async def test_spectator_join_frames_and_stop_notify_host_and_fellows(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher")
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
     events: list[tuple[str, str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:

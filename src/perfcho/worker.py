@@ -15,6 +15,7 @@ from taskiq import TaskiqEvents, TaskiqState
 
 from perfcho.infra import logging
 from perfcho.infra.db import engine as infra_db
+from perfcho.infra.db.maintenance import RankSnapshotMaintenance
 from perfcho.infra.db.projectors.catalog import DEFAULT_CONSUMER_CATALOG
 from perfcho.infra.db.relays.outbox_delivery import (
     OutboxDeliveryProcessor,
@@ -158,6 +159,14 @@ async def worker_startup(state: TaskiqState) -> None:
             name="perfcho-performance-relay",
         )
         relay_tasks = (outbox_relay_task, performance_relay_task)
+        rank_snapshot_task = asyncio.create_task(
+            _run_rank_snapshot_loop(
+                RankSnapshotMaintenance(session_factory),
+                poll_interval=settings.rank_snapshot_poll_interval_seconds,
+            ),
+            name="perfcho-rank-snapshot-maintenance",
+        )
+        relay_tasks = (outbox_relay_task, performance_relay_task, rank_snapshot_task)
         state.worker_resources = _WorkerResources(
             db_engine=db_engine,
             http_client=http_client,
@@ -169,6 +178,7 @@ async def worker_startup(state: TaskiqState) -> None:
         logging.log_event(
             "ERROR",
             "runtime.worker.startup_failed",
+            exception=error,
             error_type=type(error).__name__,
             duration_ms=logging.duration_ms(started_ns),
         )
@@ -212,6 +222,7 @@ async def _cleanup_worker_resources(
             logging.log_event(
                 "ERROR",
                 "runtime.worker.resource_close_failed",
+                exception=error,
                 resource="relay",
                 error_type=type(error).__name__,
             )
@@ -221,6 +232,7 @@ async def _cleanup_worker_resources(
                     logging.log_event(
                         "ERROR",
                         "runtime.worker.resource_close_failed",
+                        exception=outcome,
                         resource="relay",
                         relay_task=task.get_name(),
                         error_type=type(outcome).__name__,
@@ -232,6 +244,7 @@ async def _cleanup_worker_resources(
             logging.log_event(
                 "ERROR",
                 "runtime.worker.resource_close_failed",
+                exception=error,
                 resource="http",
                 error_type=type(error).__name__,
             )
@@ -242,6 +255,7 @@ async def _cleanup_worker_resources(
             logging.log_event(
                 "ERROR",
                 "runtime.worker.resource_close_failed",
+                exception=error,
                 resource="postgres",
                 error_type=type(error).__name__,
             )
@@ -269,6 +283,7 @@ async def _relay_once[Reference](
                     logging.log_event(
                         "ERROR",
                         "runtime.worker.relay.release_failed",
+                        exception=error,
                         relay=relay,
                         error_type=type(error).__name__,
                         **_reference_fields(unattempted),
@@ -280,6 +295,7 @@ async def _relay_once[Reference](
             logging.log_event(
                 "WARNING",
                 "runtime.worker.relay.enqueue_failed",
+                exception=error,
                 relay=relay,
                 error_type=type(error).__name__,
                 **_reference_fields(reference),
@@ -315,6 +331,7 @@ async def _run_relay_loop[Reference](
                     logging.log_event(
                         "ERROR",
                         "runtime.worker.relay.iteration_failed",
+                        exception=error,
                         relay=name,
                         error_type=type(error).__name__,
                     )
@@ -336,6 +353,48 @@ async def _run_relay_loop[Reference](
             "INFO",
             "runtime.worker.relay.stopped",
             relay=name,
+            duration_ms=logging.duration_ms(started_ns),
+        )
+
+
+async def _run_rank_snapshot_loop(
+    maintenance: RankSnapshotMaintenance,
+    *,
+    poll_interval: float,
+) -> None:
+    """Poll durable state and materialize one complete rank snapshot per day."""
+    started_ns = monotonic_ns()
+    logging.log_event("INFO", "runtime.worker.maintenance.started", maintenance="rank-snapshot")
+    try:
+        while True:
+            iteration_started_ns = monotonic_ns()
+            try:
+                completed = await maintenance.run_due()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if logging.rate_limit("worker-maintenance:rank-snapshot:iteration-failed"):
+                    logging.log_event(
+                        "ERROR",
+                        "runtime.worker.maintenance.iteration_failed",
+                        exception=error,
+                        maintenance="rank-snapshot",
+                        error_type=type(error).__name__,
+                    )
+            else:
+                if completed:
+                    logging.log_event(
+                        "INFO",
+                        "runtime.worker.maintenance.completed",
+                        maintenance="rank-snapshot",
+                        duration_ms=logging.duration_ms(iteration_started_ns),
+                    )
+            await asyncio.sleep(poll_interval)
+    finally:
+        logging.log_event(
+            "INFO",
+            "runtime.worker.maintenance.stopped",
+            maintenance="rank-snapshot",
             duration_ms=logging.duration_ms(started_ns),
         )
 

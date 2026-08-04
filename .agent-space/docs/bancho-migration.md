@@ -1,6 +1,6 @@
 # bancho.py v5.2.2 迁移
 
-`tools/bancho_migration/` 是一次性、可恢复的离线迁移工具。它从 bancho.py v5.2.2 MySQL 读取事实，写入当前 PostgreSQL Canonical Model，并将 `.data/osu` 与 `.data/osr` 的有效文件写入当前 S3。
+`tools/migration/` 是一次性、可恢复的离线迁移工具。它从 bancho.py v5.2.2 MySQL 读取事实，写入当前 PostgreSQL Canonical Model，并将 `.data/osu` 与 `.data/osr` 的有效文件写入当前 S3。
 
 ## 边界
 
@@ -30,7 +30,7 @@ export DATABASE_URL='postgresql+asyncpg://perfcho:secret@127.0.0.1/perfcho'
 先运行不写 PostgreSQL 业务数据的预检。预检会在 S3 的 `migration-probes/` 下写入并立即删除一个小对象，用于验证 Bucket 的写入和删除权限：
 
 ```bash
-uv run python -m tools.bancho_migration preflight \
+uv run python -m tools.migration preflight \
   --migration-id prod-2026-07-29 \
   --data-dir /srv/bancho \
   --source-timezone Asia/Shanghai \
@@ -54,7 +54,7 @@ Override 文件只支持经过审核的账户决定：
 预检通过后执行迁移：
 
 ```bash
-uv run python -m tools.bancho_migration apply \
+uv run python -m tools.migration apply \
   --migration-id prod-2026-07-29 \
   --data-dir /srv/bancho \
   --source-timezone Asia/Shanghai \
@@ -72,7 +72,7 @@ uv run python -m tools.bancho_migration apply \
 完成后再次对账：
 
 ```bash
-uv run python -m tools.bancho_migration verify \
+uv run python -m tools.migration verify \
   --migration-id prod-2026-07-29 \
   --data-dir /srv/bancho \
   --source-timezone Asia/Shanghai \

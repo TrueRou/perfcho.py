@@ -20,7 +20,7 @@
 - Calculator 不连接 perfcho PostgreSQL 或 Redis，不直接写 `score_performances`；它只通过短期签名 URL 读取 S3 Beatmap，也可以自行按 SHA-256 缓存。
 - Calculator 不消费 Taskiq/Redis 消息，也不主动扫描未完成 Job。
 - 不在 C# 与 Rust 之间对同一 Release 自动降级；不同实现必须使用不同 Formula 或 Release。
-- 当前不提供 Formula/Release 管理 HTTP API，也不 Bootstrap 虚假的默认 Release。
+- 当前不提供 Formula/Release 管理 HTTP API。数据库 Bootstrap 会安装 `official`/`official-difficulty` 默认 Formula 及其四个 vanilla ruleset 的默认 Release 身份；真实 Calculator 部署必须使用 `perfcho-pp` Calculator Code、`2026.07.1` Performance Release 和对应的 Release 配置。
 
 ## 2. 核心方法论
 
@@ -52,7 +52,7 @@ Formula 通过 `calculation_formula_scoreboards` 声明适用 Scoreboard。Relea
 - Difficulty 算法或其配置改变。
 - OCI Image、Native Binary 或依赖锁文件改变。
 
-禁止使用可变的 `latest` 表示 Release。`version` 是可读标识，`artifact_digest` 和 `configuration_digest` 才是不可变制品身份；二者均保存原始 32 字节 SHA-256。
+禁止使用可变的 `latest` 表示 Release。Release Version 和配置在创建后不可变，算法或配置变化必须创建新 Release。
 
 ### 2.3 多值与唯一性
 
@@ -190,7 +190,6 @@ curl --fail-with-body \
   "calculator": "osu-lazer-dotnet",
   "release_id": "019f0000-0000-7000-8000-000000000003",
   "release_version": "2026.07.1",
-  "artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "release_configuration": {
     "score_system": "lazer"
   },
@@ -198,7 +197,6 @@ curl --fail-with-body \
   "difficulty_formula_code": "official-difficulty",
   "difficulty_release_id": "019f0000-0000-7000-8000-000000000005",
   "difficulty_release_version": "2026.07.1-difficulty",
-  "difficulty_artifact_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
   "difficulty_release_configuration": {},
   "input_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "beatmap_revision_id": 501,
@@ -246,7 +244,7 @@ curl --fail-with-body \
 | --- | --- |
 | `schema_version` | 当前必须为整数 `1` |
 | UUID 字段 | 标准 UUID 字符串；Calculator 不应把它们转换为业务主键 |
-| Digest 字段 | 32 字节 SHA-256 的 64 字符小写 Hex，不带 `sha256:` 前缀 |
+| `input_digest`、`beatmap_sha256` | 32 字节 SHA-256 的 64 字符小写 Hex，不带 `sha256:` 前缀 |
 | `ruleset` | `osu`、`taiko`、`fruits`、`mania` |
 | `variant` | `vanilla`、`relax`、`autopilot` |
 | `mods` | Lazer-first Canonical Mod JSON；`settings` 缺失等价于空对象 |
@@ -281,9 +279,7 @@ perfcho 使用 UTF-8、JSON Key 排序、无额外空白和 ASCII Escape 生成�
   "schema_version": 1,
   "calculator": "osu-lazer-dotnet",
   "release_version": "2026.07.1",
-  "artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "difficulty_release_version": "2026.07.1-difficulty",
-  "difficulty_artifact_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
   "input_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "difficulty": {
     "star_rating": "6.543219",
@@ -307,8 +303,8 @@ perfcho 会逐项验证：
 
 - `schema_version`
 - `calculator`
-- `release_version` 和 `artifact_digest`
-- `difficulty_release_version` 和 `difficulty_artifact_digest`
+- `release_version`
+- `difficulty_release_version`
 - `input_digest`
 
 任一字段缺失或不匹配均为不可重试的无效响应。`pp` 和 `star_rating` 必须是非空十进制字符串、有限且非负；`max_combo` 必须是非负整数；`attributes` 和 `breakdown` 必须是 JSON Object。
@@ -353,14 +349,14 @@ Calculator 不返回 Output Digest。perfcho 对已经校验和五位量化的�
 1. 限制 Multipart 总大小和 Part 数，只接受唯一的 `metadata` Part。
 2. 严格解析 Metadata v1，拒绝未知 Formula、Ruleset、Variant 或不支持的 Mod Settings。
 3. 验证 `calculator` 与当前进程身份一致。
-4. 验证 Performance/Difficulty Version 和 Artifact Digest 与当前部署制品一致。
+4. 验证 Performance/Difficulty Version 与当前部署身份一致。
 5. 先按 SHA-256 查询本地 Cache；Cache Miss 时读取 `beatmap_url` 并验证内容 SHA-256。
 6. 临时 S3 或网络故障返回 `502/503`，对象缺失或摘要不匹配返回 `422`，不得请求 Worker 上传字节。
 7. 按 `formula_code` 和两个 Release Configuration 构造算法输入。
 8. 在同一次请求中产生 Difficulty 和 Performance，避免不同 Parser/依赖组合。
 9. 返回有限非负值和版本指纹，不保存 Job、Score 或用户状态；Beatmap Cache 只能按内容摘要保存可重建内容。
 
-C# 官方实现应锁定 osu! ruleset 源码/NuGet 依赖和运行时版本，并把最终容器或发布制品 SHA-256 登记为 Artifact Digest。Rust 自研实现应锁定 Cargo.lock、Feature、Target 和二进制/容器 Digest。仅记录 Git Branch 或 SemVer 不足以证明运行制品。
+C# 官方实现应锁定 osu! ruleset 源码/NuGet 依赖和运行时版本。Rust 自研实现应锁定 Cargo.lock、Feature、Target 和二进制/容器版本。仅记录 Git Branch 或 SemVer 不足以证明运行制品。
 
 同一 Formula 的不同 Release 应保持相同 Breakdown 字段语义；必须改变字段语义时，应升级 Release Configuration 中的 Breakdown Schema 标识。不同 Formula 的 Breakdown 可以不同，调用方不得跨 Formula 假设字段相同。
 
@@ -383,7 +379,7 @@ C# 官方实现应锁定 osu! ruleset 源码/NuGet 依赖和运行时版本，�
 | 路由 | 用途 |
 | --- | --- |
 | `GET /healthz` | 仅表示进程可接受请求，不检查 perfcho 数据库 |
-| `GET /v1/capabilities` | 返回 Calculator Code、支持的 Formula/Ruleset/Variant、Release Version 和 Artifact Digest |
+| `GET /v1/capabilities` | 返回 Calculator Code、支持的 Formula/Ruleset/Variant 和 Release Version |
 
 Capabilities 可用于部署前探测，但不能替代每个计算响应中的指纹回显。健康检查不得动态下载“最新版算法”或改变进程内算法版本。
 
@@ -399,7 +395,7 @@ Capabilities 可用于部署前探测，但不能替代每个计算响应中的�
 
 ## 9. Release 发布流程
 
-1. 构建固定依赖的 C# 或 Rust 制品，计算 Artifact SHA-256。
+1. 构建固定依赖的 C# 或 Rust 制品并记录 Release Version 和配置。
 2. 使用金样本验证 Beatmap Parsing、Mods、Difficulty、PP、舍入和 Breakdown。
 3. 创建或确认 Formula，固定 Calculator Code，并关联适用 Scoreboard。
 4. 创建 Difficulty Release，再创建引用它的 Performance Release；初始保持非活动。
@@ -416,7 +412,7 @@ Capabilities 可用于部署前探测，但不能替代每个计算响应中的�
 - Calculator 能处理 v1 Multipart 请求并拒绝多余/缺失 Part。
 - 请求只通过 `beatmap_url` 拉取并按 SHA-256 Cache，不接受 perfcho 上传字节。
 - S3 临时故障返回 `502/503`，对象缺失或 Digest 不匹配返回 `422`。
-- C#/Rust 返回的 Calculator、Release、Difficulty 和 Artifact 指纹完全匹配。
+- C#/Rust 返回的 Calculator、Release 和 Difficulty 身份完全匹配。
 - Calculator 校验 Beatmap SHA-256，不依赖文件名识别谱面。
 - Stable/Lazer Canonical Mods 和带 Settings 的 Mod 均有合同测试。
 - 四个 Ruleset 的动态 Hit Result Name 不被错误截断或硬编码。

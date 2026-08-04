@@ -1,6 +1,6 @@
 # perfcho.py 文档索引
 
-最后更新：2026-07-30。
+最后更新：2026-08-03。
 
 本目录记录项目的架构约束、已经落地的事实、协议适配范围和后续设计。阅读时应区分以下三类状态：
 
@@ -21,12 +21,14 @@
 7. [Stable 实现复核与修复记录](stable-review-2026-07-29.md)：2026-07-29 首轮复核发现、修复位置、测试与残余边界。
 8. [Stable 二次复核与修复记录](stable-review-2026-07-30.md)：2026-07-30 对 subagent 结论的代码核验、实际修复和误报排除。
 9. [运行日志与可观测性](observability.md)：事件字段、级别、采样、脱敏和事务边界。
+10. [数据库表 Wire 审计](database-wire-audit-2026-08-03.md)：137 张表的 Stable 使用分类、已修复缺口和排除边界。
 
 ## 深入设计
 
 - [业务层架构](business-layer.md)：Command、Query、Actor、Unit of Work、Outbox 和模块依赖规则。
 - [运行时架构](runtime-architecture.md)：API、Worker 内 Relay、PostgreSQL、Redis 和对象存储的进程关系。
 - [Performance 计算规范](performance-calculation.md)：多 Formula 数据身份、任务恢复、外部 Calculator 合同、安全和发布流程。
+- [Bot 命令系统](bot-commands.md)：协议无关命令注册、参数解析、默认命令和 Stable 接入语义。
 - [数据库架构](database/architecture.md)：Schema、标识符、不可变事实和数据库设计原则。
 - [数据库关系](database/relationships.md)：核心实体关系和跨 Schema 依赖。
 - [数据库运维](database/operations.md)：Bootstrap、迁移、备份、恢复和维护约束。

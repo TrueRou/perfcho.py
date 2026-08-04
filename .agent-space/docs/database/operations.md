@@ -2,14 +2,15 @@
 
 ## 本地依赖
 
-启动 PostgreSQL 17、Redis 8 与 MinIO，并初始化对象存储桶：
+根目录 `compose.yaml` 是唯一运行环境，包含 PostgreSQL、Redis、MinIO、API 与 Taskiq Worker 的完整拓扑。本地开发只启动基础设施，应用角色由宿主机进程运行。启动前先复制环境变量：
 
 ```bash
+cp .env.example .env
 docker compose up -d --wait postgres redis minio
 docker compose run --rm --no-deps minio-init
 ```
 
-PostgreSQL 监听 `127.0.0.1:55432`。Redis 监听 `127.0.0.1:56379`，DB 0 保存在线状态，DB 1 承载 Taskiq Stream。MinIO API 监听 `127.0.0.1:59000`，控制台监听 `127.0.0.1:59001`。开发库为 `perfcho`，集成测试库为 `perfcho_test`。只有需要覆盖本地默认值时才创建 `.env`。
+PostgreSQL 监听 `127.0.0.1:55432`。Redis 监听 `127.0.0.1:56379`（启用 `requirepass`），DB 0 保存在线状态，DB 1 承载 Taskiq Stream。MinIO API 监听 `127.0.0.1:59000`，控制台监听 `127.0.0.1:59001`。开发库为 `perfcho`，集成测试库为 `perfcho_test`，均由 Compose 初始化脚本创建；宿主机进程通过 `.env` 读取与容器一致的 `POSTGRES_PASSWORD`、`REDIS_PASSWORD` 和 MinIO 凭据。
 
 VS Code 中选择 `perfcho: all processes` 后按 F5，会并行执行依赖同步与 Compose 基础设施启动，待 PostgreSQL、Redis、MinIO 健康后幂等初始化对象存储桶，最后同时调试 API 和 Taskiq Worker。Worker 内部运行 Outbox 与 Performance 持久任务 Relay。结束调试只停止两个应用进程，基础设施保持运行；不再需要时执行 `docker compose down`。
 
@@ -17,7 +18,7 @@ SQLAlchemy Metadata 是应用内数据库结构契约。API、Relay、Taskiq 任
 
 `create_all()` 不会修改已存在的列、约束或索引。涉及现有结构的模型变更仍需制定显式 SQL 发布与回滚方案，不能把自动建表当作结构演进工具。
 
-Multi-PP 基线新增 `calculation_formulas`、`calculation_formula_scoreboards`、`performance_calculation_jobs`，并修改 `calculation_releases`、`score_performances`、`ranking_policies`。服务尚未部署，开发数据库直接删除并按当前 Metadata 重建，不保留旧 Schema 的 ALTER/回填兼容逻辑。Formula/Release 当前不由 Bootstrap 伪造，首次部署必须使用真实 Calculator 制品 SHA-256 和配置摘要登记后才能产生 Job。
+Multi-PP 基线新增 `calculation_formulas`、`calculation_formula_scoreboards`、`calculation_jobs`，并修改 `calculation_releases`、`score_performances`、`ranking_policies`。服务尚未部署，开发数据库直接删除并按当前 Metadata 重建，不保留旧 Schema 的 ALTER/回填兼容逻辑。Formula/Release 当前由 Bootstrap 安装默认配置后才能产生 Job。
 
 ## 集成验证
 
@@ -38,18 +39,18 @@ uv run taskiq worker perfcho.worker:broker --ack-type when_executed
 
 API 和 Worker 是同一可信中心应用的进程角色。Worker 内部后台循环领取并投递持久任务，使用 PostgreSQL `SKIP LOCKED` 和 Fencing 支持多个 Worker 并行。进程使用相同代码和数据库结构，不注册业务节点身份。
 
-## 生产 Compose
+## 部署
 
-`compose.prod.yaml` 是独立生产拓扑，禁止与包含本地端口和测试库初始化脚本的 `compose.yaml` 合并。根据 `.env.production.example` 创建不提交到 Git 的 `.env.production`，使用 `openssl rand -hex 32` 分别生成数据库、Redis、Password Pepper、Token HMAC 与 Device HMAC 密钥，并配置外部 S3 兼容对象存储凭据，然后执行：
+根目录 `compose.yaml` 就是生产拓扑：PostgreSQL、带认证的 Redis、内部 MinIO 与两个应用角色运行在同一 Compose 网络，MinIO bucket 由一次性初始化容器幂等创建。根据 `.env.production.example` 创建不提交到 Git 的 `.env.production`，使用 `openssl rand -hex 32` 分别生成数据库、Redis、Password Pepper、Token HMAC、Device HMAC、Admission HMAC 与 MinIO 凭据，然后执行：
 
 ```bash
-docker compose --env-file .env.production -f compose.prod.yaml up -d --build
-docker compose --env-file .env.production -f compose.prod.yaml ps
+docker compose --env-file .env.production up -d --build
+docker compose --env-file .env.production ps
 ```
 
-生产拓扑等待 PostgreSQL/Redis 健康后启动 API/Taskiq，最先获得数据库初始化锁的角色通过 SQLAlchemy 创建缺失的 Schema 和表。两个应用角色使用同一 Python 3.14t 镜像并独立监管；API 提供 HTTP 健康检查，Taskiq 由主进程退出状态触发重启，并结合最老 Delivery 延迟、Dead Letter 和 Redis Pending Entry 监控判断业务健康。
+部署拓扑等待 PostgreSQL/Redis/MinIO 健康，并由 MinIO 初始化容器创建 bucket 后启动 API/Taskiq。最先获得数据库初始化锁的角色通过 SQLAlchemy 创建缺失的 Schema 和表。两个应用角色复用同一 Python 3.14t 镜像并独立监管；API 提供 HTTP 健康检查，Taskiq 由主进程退出状态触发重启，并结合最老 Delivery 延迟、Dead Letter 和 Redis Pending Entry 监控判断业务健康。
 
-PostgreSQL 与 Redis 不发布宿主机端口。生产对象存储是 Compose 外部依赖，必须与 PostgreSQL Manifest 的事务点一致备份。API 默认只发布到 `127.0.0.1:8000`，由同机反向代理终止 TLS；必须显式修改 `APP_BIND_ADDRESS` 才能监听其他地址。`perfcho-postgres` 和 `perfcho-redis` 是生产持久卷，执行 `down` 时禁止附带 `--volumes`，除非已确认永久删除数据。
+依赖只发布到宿主机回环地址。MinIO 的 `perfcho-minio` volume 必须与 PostgreSQL Manifest 的事务点一致备份。API 默认只发布到 `127.0.0.1:10727`，由同机反向代理终止 TLS；必须显式修改 `APP_BIND_ADDRESS` 才能监听其他地址。`perfcho-postgres`、`perfcho-redis` 和 `perfcho-minio` 是持久卷，执行 `down` 时禁止附带 `--volumes`，除非已确认永久删除数据。
 
 ## Redis 运维
 

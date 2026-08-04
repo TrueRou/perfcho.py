@@ -1,3 +1,4 @@
+from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
@@ -48,14 +49,28 @@ def _column_names(items: Iterable[Column[Any]]) -> tuple[str, ...]:
     return tuple(item.name for item in items)
 
 
-def test_metadata_preserves_baseline_and_adds_only_lifecycle_tables() -> None:
-    assert len(DbBase.metadata.tables) >= 133
+def test_metadata_preserves_the_reviewed_table_inventory() -> None:
+    assert Counter(table.schema for table in DbBase.metadata.tables.values()) == {
+        "audit": 1,
+        "authz": 7,
+        "community": 11,
+        "content": 15,
+        "core": 8,
+        "events": 4,
+        "iam": 18,
+        "moderation": 8,
+        "multiplayer": 29,
+        "scoring": 26,
+        "social": 8,
+        "system": 2,
+    }
     assert {
         "iam.auth_token_families",
         "iam.auth_challenge_scopes",
         "scoring.play_attempt_tokens",
         "system.command_receipts",
     } <= set(DbBase.metadata.tables)
+    assert "system.server_settings" not in DbBase.metadata.tables
 
 
 def test_postgresql_ddl_and_mappers_are_coherent() -> None:

@@ -15,6 +15,15 @@
             "problemMatcher": []
         },
         {
+            "label": "dev: ensure .env",
+            "type": "shell",
+            "command": "test -f .env || cp .env.example .env",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
             "label": "dev: start infrastructure",
             "type": "process",
             "command": "docker",
@@ -53,6 +62,7 @@
             "label": "dev: prepare",
             "dependsOn": [
                 "dev: sync dependencies",
+                "dev: ensure .env",
                 "dev: initialize object storage"
             ],
             "dependsOrder": "parallel",

@@ -5,7 +5,7 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 
-from perfcho.infra.composition import StableServices, compose_stable_services
+from perfcho.infra.glue.stable import StableServices, compose_stable_services
 
 
 async def get_stable_services(request: Request) -> AsyncIterator[StableServices]:
@@ -13,6 +13,7 @@ async def get_stable_services(request: Request) -> AsyncIterator[StableServices]
     async with compose_stable_services(
         request.state.db_session_factory,
         request.state.redis_engine,
+        content_runtime=request.state.content_runtime,
     ) as services:
         yield services
 

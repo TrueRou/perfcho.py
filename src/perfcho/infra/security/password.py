@@ -11,6 +11,8 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from argon2.low_level import Type
 
+from perfcho.infra.logging import log_event
+
 _STABLE_PASSWORD_TOKEN = re.compile(r"[0-9a-f]{32}")
 _DUMMY_PASSWORD_TOKEN = "0" * 32
 _DUMMY_PASSWORD_MISMATCH = "1" * 32
@@ -121,7 +123,10 @@ def verify_password(
     hasher = _make_hasher(policy)
     try:
         hasher.verify(password_hash.verifier, _append_pepper(token, pepper))
-    except InvalidHashError, VerificationError:
+    except InvalidHashError as error:
+        log_event("ERROR", "identity.password.invalid_verifier", exception=error)
+        return PasswordVerification(PasswordVerificationStatus.MISMATCH)
+    except VerificationError:
         return PasswordVerification(PasswordVerificationStatus.MISMATCH)
 
     return PasswordVerification(
@@ -134,8 +139,15 @@ def verify_legacy_bcrypt_md5(preverification: str, verifier: str) -> PasswordVer
     """Verify a legacy bancho.py bcrypt hash of a Stable MD5 password token."""
     try:
         token = validate_stable_password_token(preverification)
-        matched = bcrypt.checkpw(token.encode("ascii"), verifier.encode("ascii"))
     except TypeError, UnicodeError, ValueError:
+        return PasswordVerification(PasswordVerificationStatus.MISMATCH)
+    try:
+        matched = bcrypt.checkpw(token.encode("ascii"), verifier.encode("ascii"))
+    except (TypeError, UnicodeError) as error:
+        log_event("ERROR", "identity.password.invalid_legacy_verifier", exception=error)
+        return PasswordVerification(PasswordVerificationStatus.MISMATCH)
+    except ValueError as error:
+        log_event("ERROR", "identity.password.invalid_legacy_verifier", exception=error)
         return PasswordVerification(PasswordVerificationStatus.MISMATCH)
     return PasswordVerification(
         PasswordVerificationStatus.MATCH if matched else PasswordVerificationStatus.MISMATCH,

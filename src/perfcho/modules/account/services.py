@@ -50,6 +50,21 @@ class AccountService:
         self._clock = clock
         self._receipt_ttl = receipt_ttl
 
+    async def check_availability(self, display_name: str, email_address: str) -> None:
+        """Validate account identifiers and report their current availability."""
+        try:
+            name_key = normalize_stable_name(unicodedata.normalize("NFKC", display_name))
+            email_key = normalize_email(email_address)
+        except ValueError as error:
+            raise RegistrationRejected(str(error)) from error
+
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            if await repository.name_exists(name_key):
+                raise NameUnavailable("account name is already in use")
+            if await repository.email_exists(email_key):
+                raise EmailUnavailable("account email is already in use")
+
     async def register(self, command: RegisterAccount) -> RegistrationResult:
         """Validate, hash, and atomically persist one account registration."""
         started_ns = time.monotonic_ns()

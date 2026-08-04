@@ -1,6 +1,8 @@
+import asyncio
 import hashlib
 import uuid
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import TracebackType
 from typing import cast
@@ -8,15 +10,22 @@ from typing import cast
 import httpx
 import pytest
 
+from perfcho.infra.db.repositories.content import (
+    _snapshot_beatmap_metadata,
+    _snapshot_beatmapset_metadata,
+    _snapshot_extends_current_revision_set,
+)
 from perfcho.infra.upstream.osu import OsuUpstreamContentSource
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage, PendingEvent, StoredObject
 from perfcho.modules.content import (
-    ContentInputRejected,
+    BeatmapRevisionView,
+    BeatmapsetView,
     ContentSyncResult,
     ContentSyncService,
     SyncedBeatmapFile,
     UpstreamBeatmapsetSnapshot,
     UpstreamBeatmapSnapshot,
+    UpstreamContentUnavailable,
 )
 from perfcho.modules.content.ports import ContentRepository
 
@@ -68,6 +77,10 @@ class FakeSource:
         assert external_beatmapset_id == self.snapshot.external_beatmapset_id
         return self.snapshot
 
+    async def lookup_beatmapset_id(self, checksum: str, file_name: str) -> int:
+        del checksum, file_name
+        return self.snapshot.external_beatmapset_id
+
     async def fetch_beatmap_file(self, external_beatmap_id: int) -> bytes:
         self.calls.append(external_beatmap_id)
         return self.content
@@ -98,6 +111,42 @@ class FakeRepository:
         self.calls = calls
         self.snapshot: UpstreamBeatmapsetSnapshot | None = None
         self.files: tuple[SyncedBeatmapFile, ...] = ()
+        self.revisions: dict[bytes, BeatmapRevisionView] = {}
+        self.beatmapset: BeatmapsetView | None = None
+        self.refresh_claimed = False
+        self.refresh_claims: list[int] = []
+        self.refresh_failures: list[tuple[datetime, datetime, datetime, str]] = []
+        self.published = True
+
+    async def lookup_md5(self, md5: bytes) -> BeatmapRevisionView | None:
+        return self.revisions.get(md5)
+
+    async def get_beatmapset(self, beatmapset_id: int, *, external: bool) -> BeatmapsetView | None:
+        assert external and beatmapset_id == 200
+        return self.beatmapset
+
+    async def claim_beatmapset_refresh(
+        self,
+        external_beatmapset_id: int,
+        *,
+        now: datetime,
+        lease_until: datetime,
+    ) -> bool:
+        assert now == NOW and lease_until == NOW + timedelta(minutes=30)
+        self.refresh_claims.append(external_beatmapset_id)
+        return self.refresh_claimed
+
+    async def record_beatmapset_refresh_failure(
+        self,
+        external_beatmapset_id: int,
+        *,
+        expected_lease_until: datetime,
+        checked_at: datetime,
+        next_check_at: datetime,
+        error: str,
+    ) -> None:
+        assert external_beatmapset_id == 200
+        self.refresh_failures.append((expected_lease_until, checked_at, next_check_at, error))
 
     async def synchronize_beatmapset(
         self,
@@ -105,12 +154,28 @@ class FakeRepository:
         files: tuple[SyncedBeatmapFile, ...],
         *,
         now: datetime,
+        next_check_at: datetime,
     ) -> ContentSyncResult:
         assert now == NOW
+        assert next_check_at == NOW + timedelta(hours=8)
         self.calls.append("repository")
         self.snapshot = snapshot
         self.files = files
-        return ContentSyncResult(20, snapshot.external_beatmapset_id, len(files), 0, 0)
+        revisions = tuple(revision_view(item) for item in files)
+        self.revisions = {revision.md5: revision for revision in revisions}
+        self.beatmapset = BeatmapsetView(
+            beatmapset_id=20,
+            external_beatmapset_id=snapshot.external_beatmapset_id,
+            artist=snapshot.artist,
+            title=snapshot.title,
+            creator=snapshot.creator_name,
+            status=snapshot.status,
+            last_updated_at=snapshot.last_updated_at,
+            available=snapshot.available,
+            has_video=any(revision.has_video for revision in revisions),
+            beatmaps=revisions,
+        )
+        return ContentSyncResult(20, snapshot.external_beatmapset_id, len(files), 0, 0, self.published)
 
 
 class FakeOutbox:
@@ -173,6 +238,74 @@ def snapshot(content: bytes = BEATMAP_FILE) -> UpstreamBeatmapsetSnapshot:
     )
 
 
+def revision_view(item: SyncedBeatmapFile) -> BeatmapRevisionView:
+    beatmap = item.beatmap
+    return BeatmapRevisionView(
+        beatmap_id=10,
+        external_beatmap_id=beatmap.external_beatmap_id,
+        beatmapset_id=20,
+        external_beatmapset_id=200,
+        revision_id=30,
+        md5=beatmap.md5,
+        sha256=item.stored_object.sha256 or b"",
+        file_name=beatmap.file_name,
+        artist="Artist",
+        title="Title",
+        creator="Creator",
+        difficulty_name=beatmap.difficulty_name,
+        ruleset=beatmap.ruleset,
+        status=beatmap.status,
+        source_updated_at=beatmap.source_updated_at,
+        total_length_ms=beatmap.total_length_ms,
+        drain_length_ms=beatmap.drain_length_ms,
+        bpm=beatmap.bpm,
+        circle_size=beatmap.circle_size,
+        overall_difficulty=beatmap.overall_difficulty,
+        approach_rate=beatmap.approach_rate,
+        health_drain=beatmap.health_drain,
+        object_count=beatmap.object_count,
+        max_combo=beatmap.max_combo,
+        star_rating=beatmap.star_rating,
+        has_video=beatmap.has_video,
+        is_current=True,
+        file_storage_key=item.stored_object.storage_key,
+        file_media_type=item.stored_object.media_type,
+        file_size_bytes=item.stored_object.size_bytes,
+    )
+
+
+def test_equal_version_snapshot_must_not_replace_or_remove_current_revisions() -> None:
+    current_snapshot = snapshot()
+    current_metadata = _snapshot_beatmap_metadata(current_snapshot.beatmaps[0])
+    conflicting = replace(
+        current_snapshot,
+        beatmaps=(replace(current_snapshot.beatmaps[0], md5=b"x" * 16),),
+    )
+    extended = replace(
+        current_snapshot,
+        beatmaps=(
+            current_snapshot.beatmaps[0],
+            replace(current_snapshot.beatmaps[0], external_beatmap_id=102, md5=b"z" * 16),
+        ),
+    )
+
+    assert _snapshot_extends_current_revision_set({}, current_snapshot)
+    assert _snapshot_extends_current_revision_set({100: current_metadata}, current_snapshot)
+    assert not _snapshot_extends_current_revision_set({100: current_metadata}, conflicting)
+    assert not _snapshot_extends_current_revision_set({100: None}, current_snapshot)
+    assert _snapshot_extends_current_revision_set(
+        {100: current_metadata, 101: None},
+        extended,
+    )
+    assert not _snapshot_extends_current_revision_set(
+        {100: current_metadata, 101: current_metadata},
+        current_snapshot,
+    )
+    assert _snapshot_beatmapset_metadata(current_snapshot) != _snapshot_beatmapset_metadata(
+        replace(current_snapshot, status="loved")
+    )
+
+
 def sync_service(
     source: FakeSource,
     calls: list[str],
@@ -229,12 +362,114 @@ async def test_content_sync_verifies_and_stores_files_before_short_transaction(
 
 
 @pytest.mark.asyncio
+async def test_content_sync_resolves_unknown_revision_after_blocking_fill() -> None:
+    calls: list[str] = []
+    source = FakeSource(snapshot(), BEATMAP_FILE)
+    service, repository, _, _, _ = sync_service(source, calls)
+    checksum = hashlib.md5(BEATMAP_FILE, usedforsecurity=False).hexdigest()
+
+    resolved = await service.resolve_revision(
+        checksum,
+        "Artist - Title (Creator) [Insane].osu",
+        200,
+    )
+
+    assert resolved.md5_hex == checksum
+    assert resolved.is_current
+    assert repository.snapshot is not None
+    assert source.calls == [100]
+
+
+@pytest.mark.asyncio
+async def test_content_sync_does_not_emit_event_for_rejected_stale_snapshot() -> None:
+    calls: list[str] = []
+    source = FakeSource(snapshot(), BEATMAP_FILE)
+    service, repository, _, outbox, _ = sync_service(source, calls)
+    repository.published = False
+
+    result = await service.synchronize(200)
+
+    assert not result.published
+    assert outbox.events == []
+    assert calls == ["object-put", "transaction-enter", "repository", "commit", "transaction-exit"]
+
+
+@pytest.mark.asyncio
+async def test_content_refresh_skips_upstream_when_watermark_is_not_due() -> None:
+    calls: list[str] = []
+    source = FakeSource(snapshot(), BEATMAP_FILE)
+    service, repository, storage, _, _ = sync_service(source, calls)
+
+    await service.refresh_if_due(200)
+
+    assert repository.refresh_claims == [200]
+    assert source.calls == []
+    assert storage.keys == []
+
+
+@pytest.mark.asyncio
+async def test_content_refresh_failure_is_fenced_to_claimed_lease() -> None:
+    calls: list[str] = []
+    source = FakeSource(snapshot(), b"different")
+    service, repository, _, _, _ = sync_service(source, calls)
+    repository.refresh_claimed = True
+
+    await service.refresh_if_due(200)
+
+    assert repository.refresh_failures == [
+        (
+            NOW + timedelta(minutes=30),
+            NOW,
+            NOW + timedelta(minutes=5),
+            "upstream_content_unavailable",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_content_sync_shutdown_cancels_and_drains_inflight_work() -> None:
+    class BlockingSource(FakeSource):
+        def __init__(self) -> None:
+            super().__init__(snapshot(), BEATMAP_FILE)
+            self.started = asyncio.Event()
+            self.cancelled = False
+
+        async def fetch_beatmapset(self, external_beatmapset_id: int) -> UpstreamBeatmapsetSnapshot:
+            del external_beatmapset_id
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            raise AssertionError("unreachable")
+
+    calls: list[str] = []
+    source = BlockingSource()
+    service, _, _, _, _ = sync_service(source, calls)
+    resolution = asyncio.create_task(
+        service.resolve_revision(
+            hashlib.md5(BEATMAP_FILE, usedforsecurity=False).hexdigest(),
+            "Artist - Title (Creator) [Insane].osu",
+            200,
+        )
+    )
+    await source.started.wait()
+
+    await service.aclose()
+    result = (await asyncio.gather(resolution, return_exceptions=True))[0]
+
+    assert source.cancelled
+    assert isinstance(result, asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
 async def test_content_sync_rejects_mismatched_file_before_storage_or_transaction() -> None:
     calls: list[str] = []
     source = FakeSource(snapshot(), b"different")
     service, _, storage, outbox, units = sync_service(source, calls)
 
-    with pytest.raises(ContentInputRejected, match="MD5"):
+    with pytest.raises(UpstreamContentUnavailable, match="MD5"):
         await service.synchronize(200)
 
     assert storage.keys == []
@@ -326,3 +561,39 @@ async def test_osu_upstream_source_normalizes_metadata_and_bounds_file_body() ->
     assert result.beatmaps[0].file_name == "Artist_Name - Title (Creator) [Insane_Diff].osu"
     assert file_content == BEATMAP_FILE
     assert requests[1].headers["authorization"] == "Bearer token"
+
+
+@pytest.mark.asyncio
+async def test_osu_upstream_lookup_falls_back_from_checksum_to_filename() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/oauth/token":
+            return httpx.Response(200, json={"access_token": "token", "expires_in": 3600})
+        if request.url.path == "/api/v2/beatmaps/lookup":
+            if "checksum" in request.url.params:
+                return httpx.Response(404)
+            return httpx.Response(200, json={"id": 100, "beatmapset_id": 200})
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    source = OsuUpstreamContentSource(
+        api_base_url="https://osu.test/api/v2",
+        token_url="https://osu.test/oauth/token",
+        client_id=1,
+        client_secret="secret",
+        beatmap_file_base_url="https://osu.test/osu",
+        max_beatmap_file_bytes=1024,
+        client=client,
+    )
+    try:
+        beatmapset_id = await source.lookup_beatmapset_id("a" * 32, "Artist - Title (Creator) [Diff].osu")
+    finally:
+        await client.aclose()
+
+    assert beatmapset_id == 200
+    assert [request.url.params for request in requests[1:]] == [
+        httpx.QueryParams({"checksum": "a" * 32}),
+        httpx.QueryParams({"filename": "Artist - Title (Creator) [Diff].osu"}),
+    ]

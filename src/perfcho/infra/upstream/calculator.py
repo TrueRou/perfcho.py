@@ -72,6 +72,7 @@ class HttpPerformanceCalculator:
             log_event(
                 "WARNING",
                 "calculator.request.failed",
+                exception=error,
                 job_id=str(calculation.job_id),
                 calculator=calculation.calculator,
                 release_version=calculation.release_version,
@@ -103,9 +104,7 @@ class HttpPerformanceCalculator:
             _expect(payload, "schema_version", 1)
             _expect(payload, "calculator", calculation.calculator)
             _expect(payload, "release_version", calculation.release_version)
-            _expect(payload, "artifact_digest", calculation.artifact_digest.hex())
             _expect(payload, "difficulty_release_version", calculation.difficulty_release_version)
-            _expect(payload, "difficulty_artifact_digest", calculation.difficulty_artifact_digest.hex())
             _expect(payload, "input_digest", calculation.input_digest.hex())
             difficulty = _mapping(payload.get("difficulty"), "difficulty")
             performance = _mapping(payload.get("performance"), "performance")
@@ -124,6 +123,7 @@ class HttpPerformanceCalculator:
             log_event(
                 "ERROR",
                 "calculator.response.invalid",
+                exception=error,
                 job_id=str(calculation.job_id),
                 calculator=calculation.calculator,
                 release_version=calculation.release_version,

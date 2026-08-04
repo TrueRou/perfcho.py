@@ -10,12 +10,15 @@ from perfcho.modules.social.models import (
     AccountIdentityView,
     Achievement,
     AchievementDefinitionRecord,
+    AchievementEvaluationDefinition,
     AchievementUnlockResult,
+    AchievementUnlockView,
     BlockRecord,
     BlockView,
     FollowRecord,
     FollowView,
     PairRelationship,
+    ScoreAchievementContext,
 )
 
 
@@ -119,6 +122,15 @@ class SocialRepository(Protocol):
         """List localized definitions and optional unlocks in one query."""
         ...
 
+    async def list_score_achievement_definitions(
+        self,
+        *,
+        account_id: int,
+        ruleset: str,
+    ) -> tuple[AchievementEvaluationDefinition, ...]:
+        """Return active, still-locked definitions applicable to one score."""
+        ...
+
     async def get_achievement_definition(self, achievement_id: int) -> AchievementDefinitionRecord | None:
         """Return the definition facts needed for an unlock."""
         ...
@@ -142,4 +154,25 @@ class SocialRepositoryFactory(Protocol):
 
     def __call__(self, session: object) -> SocialRepository:
         """Return a transaction-bound repository."""
+        ...
+
+
+class AchievementAwarder(Protocol):
+    """Award deterministic social achievements inside a caller-owned transaction."""
+
+    async def award_for_score(
+        self,
+        context: ScoreAchievementContext,
+        *,
+        at: datetime,
+    ) -> tuple[AchievementUnlockView, ...]:
+        """Evaluate definitions and return only unlocks created by this invocation."""
+        ...
+
+
+class AchievementAwarderFactory(Protocol):
+    """Bind achievement evaluation to the current scoring transaction."""
+
+    def __call__(self, session: object) -> AchievementAwarder:
+        """Return an awarder sharing the scoring session."""
         ...

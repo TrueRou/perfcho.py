@@ -72,11 +72,27 @@ class Settings(BaseSettings):
         min_length=1,
         max_length=512,
     )
+    stable_avatar_base_url: str = Field(default="https://a.ppy.sh", min_length=1, max_length=512)
+    stable_beatmap_asset_base_url: str = Field(default="https://b.ppy.sh", min_length=1, max_length=512)
+    stable_seasonal_url: str = Field(
+        default="https://osu.ppy.sh/web/osu-getseasonal.php",
+        min_length=1,
+        max_length=512,
+    )
+    stable_menu_content_url: str = Field(
+        default="https://assets.ppy.sh/menu-content.json",
+        min_length=1,
+        max_length=512,
+    )
     stable_score_submission_max_bytes: int = Field(default=20 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
     stable_replay_max_bytes: int = Field(default=16 * 1024 * 1024, ge=0, le=64 * 1024 * 1024)
     stable_spectator_frame_batch_size: int = Field(default=256, ge=1, le=4096)
     stable_lobby_match_limit: int = Field(default=100, ge=1, le=256)
     stable_presence_batch_size: int = Field(default=2048, ge=1, le=8192)
+
+    bot_account_id: int = Field(default=1, ge=1)
+    bot_name: str = Field(default="BanchoBot", min_length=1, max_length=32)
+    bot_command_prefix: str = Field(default="!", min_length=1, max_length=8)
 
     s3_endpoint_url: str = Field(default="http://127.0.0.1:59000")
     s3_presign_endpoint_url: str | None = Field(default=None)
@@ -112,6 +128,7 @@ class Settings(BaseSettings):
     performance_calculation_lease_seconds: int = Field(default=300, ge=30)
     performance_calculation_max_attempts: int = Field(default=5, ge=1)
     performance_calculation_max_retry_seconds: int = Field(default=300, ge=1)
+    rank_snapshot_poll_interval_seconds: float = Field(default=60.0, ge=1)
 
     cors_origins: list[str] = Field(default=["http://localhost:3000", "http://localhost:5173"])
 

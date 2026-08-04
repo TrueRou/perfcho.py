@@ -581,7 +581,11 @@ class PacketReader(Iterator[Packet]):
         except ValueError as error:
             raise InvalidStructureError(f"invalid replay action {action_value}") from error
         score_frame = self.read_score_frame()
-        sequence = self.read_u16()
+        # Older virtual clients omit the sequence that newer Stable builds append.
+        # Only accept the exact legacy boundary; every other truncation failed above.
+        sequence = self.read_u16() if self.remaining == 2 else None
+        if self.remaining:
+            raise TrailingDataError(f"{self.remaining} trailing replay bundle bytes remain")
         return ReplayFrameBundle(
             frames=frames,
             score_frame=score_frame,
@@ -997,7 +1001,8 @@ class PacketWriter:
             self.write_replay_frame(frame)
         self.write_u8(bundle.action)
         self.write_score_frame(bundle.score_frame)
-        self.write_u16(bundle.sequence)
+        if bundle.sequence is not None:
+            self.write_u16(bundle.sequence)
 
 
 def build_packet(

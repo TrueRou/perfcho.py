@@ -8,9 +8,11 @@ from typing import cast
 import pytest
 
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
+from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import Clock
 from perfcho.modules.multiplayer import (
     ChangeHost,
+    CompleteRound,
     CreateRoom,
     DurableRoomSnapshot,
     JoinRoom,
@@ -62,6 +64,15 @@ class FakeUnitOfWork:
         self.committed = True
 
 
+class FakeOutbox:
+    def __init__(self) -> None:
+        self.events: list[PendingEvent] = []
+
+    async def append(self, event: PendingEvent) -> uuid.UUID:
+        self.events.append(event)
+        return uuid.uuid7()
+
+
 class FakeRepository:
     def __init__(self) -> None:
         self.room: RoomRecord | None = None
@@ -71,6 +82,7 @@ class FakeRepository:
         self.submission_query: tuple[int, int, datetime, datetime, datetime] | None = None
         self.round_id: uuid.UUID | None = None
         self.round_participants: tuple[RoundParticipantSelection, ...] = ()
+        self.result_outbox: FakeOutbox | None = None
 
     async def create_room(self, **values: object) -> RoomRecord:
         actor = cast(int, values["actor_account_id"])
@@ -131,6 +143,11 @@ class FakeRepository:
         self.room = replace(room, version=room.version + 1, host_account_id=target_account_id)
         self.command_rooms[cast(uuid.UUID, values["command_id"])] = self.room
         return self.room
+
+    async def complete_round(self, room: RoomRecord, **values: object) -> RoomRecord:
+        self.round_id = None
+        self.round_participants = ()
+        return replace(room, version=room.version + 1)
 
     async def resolve_submission_context(
         self,
@@ -225,9 +242,12 @@ def service(
     *,
     access_policy: object | None = None,
 ) -> MultiplayerService:
+    outbox = FakeOutbox()
+    repository.result_outbox = outbox
     return MultiplayerService(
         FakeUnitOfWork,
         lambda session: cast(MultiplayerRepository, repository),
+        lambda session: outbox,
         cast(MultiplayerStateRepository, state),
         cast(Clock, FixedClock()),
         b"room-password-key",
@@ -324,13 +344,17 @@ async def test_committed_create_returns_durable_snapshot_when_redis_is_down(
     assert created.slot_for(10) is not None
     assert logged[0][:2] == ("INFO", "multiplayer.room.created")
     assert logged[1][:2] == ("WARNING", "multiplayer.projection.degraded")
-    assert logged[1][2] == {
+    projection_fields = logged[1][2]
+    projection_exception = projection_fields["exception"]
+    assert isinstance(projection_exception, BaseException)
+    assert projection_fields == {
         "operation": "publish_create",
         "public_id": 7,
         "version": 1,
         "error_type": "ConnectionError",
+        "exception": projection_exception,
     }
-    assert "redis unavailable" not in repr(logged[1])
+    assert projection_exception.args == ("redis unavailable",)
 
 
 @pytest.mark.asyncio
@@ -416,6 +440,37 @@ async def test_personal_free_mods_cannot_change_during_an_active_round() -> None
 
     with pytest.raises(MatchStateRejected, match="active round"):
         await multiplayer.set_slot_mods(7, 10, (CanonicalMod("HD"),))
+
+
+@pytest.mark.asyncio
+async def test_complete_round_writes_results_projection_event_in_command_transaction() -> None:
+    repository = FakeRepository()
+    state = FakeState()
+    multiplayer = service(repository, state)
+    created = await multiplayer.create_room(CreateRoom(meta(10, "create-complete"), settings()))
+    round_id = uuid.uuid7()
+    repository.round_id = round_id
+    repository.round_participants = (RoundParticipantSelection(10, 0, 0),)
+    state.state = replace(
+        created,
+        in_progress=True,
+        round_id=round_id,
+        round_participant_account_ids=(10,),
+    )
+
+    await multiplayer.complete_round(CompleteRound(meta(10, "complete"), 7, created.room.version, False))
+
+    assert repository.result_outbox is not None
+    event = repository.result_outbox.events[-1]
+    assert event.event_type == "multiplayer.round-completed.v1"
+    assert event.payload == {
+        "round_id": str(round_id),
+        "session_id": str(created.room.session_id),
+        "room_id": str(created.room.room_id),
+        "aborted": False,
+    }
+    assert event.consumers == ("multiplayer-results-projector.v1",)
+    assert event.partition_key == f"round:{round_id}"
 
 
 def test_stable_settings_transition_migrates_free_mods_and_team_defaults() -> None:

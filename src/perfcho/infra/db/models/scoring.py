@@ -136,20 +136,11 @@ class CalculationFormulaScoreboard(DbBase):
 
 
 class CalculationRelease(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
-    """Pins one formula to an immutable calculator artifact and configuration."""
+    """Pins one formula to an immutable release configuration."""
 
     __tablename__ = "calculation_releases"
     __table_args__ = (
-        CheckConstraint("octet_length(artifact_digest) = 32", name="artifact_digest_length"),
-        CheckConstraint("octet_length(configuration_digest) = 32", name="configuration_digest_length"),
         UniqueConstraint("formula_id", "ruleset", "version", name="uq_calculation_releases_formula_version"),
-        UniqueConstraint(
-            "formula_id",
-            "ruleset",
-            "artifact_digest",
-            "configuration_digest",
-            name="uq_calculation_releases_formula_artifact_configuration",
-        ),
         Index("ix_calculation_releases_active", "formula_id", "ruleset", "active"),
         Index(
             "uq_calculation_releases_active_formula_ruleset",
@@ -166,9 +157,7 @@ class CalculationRelease(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     )
     ruleset: Mapped[Ruleset] = mapped_column(enum_type(Ruleset, "calculation_ruleset", 16), nullable=False)
     version: Mapped[str] = mapped_column(String(64), nullable=False)
-    artifact_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
     configuration: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
-    configuration_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
     difficulty_release_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("scoring.calculation_releases.id", ondelete="RESTRICT")
     )
@@ -410,7 +399,7 @@ class ScorePerformance(CreatedAtMixin, DbBase):
 class PerformanceCalculationJob(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     """Tracks durable at-least-once execution for one score and formula release."""
 
-    __tablename__ = "performance_calculation_jobs"
+    __tablename__ = "calculation_jobs"
     __table_args__ = (
         CheckConstraint("attempt_count >= 0 AND enqueue_count >= 0", name="nonnegative_attempt_counts"),
         CheckConstraint("input_digest IS NULL OR octet_length(input_digest) = 32", name="input_digest_length"),
@@ -434,14 +423,14 @@ class PerformanceCalculationJob(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
         CheckConstraint("status != 'pending' OR attempt_started_at IS NULL", name="pending_attempt_forbidden"),
         UniqueConstraint("score_id", "release_id"),
         Index(
-            "ix_performance_calculation_jobs_due",
+            "ix_calculation_jobs_due",
             "available_at",
             "lease_expires_at",
             "created_at",
             postgresql_where=text("status IN ('pending', 'running')"),
         ),
-        Index("ix_performance_calculation_jobs_release", "release_id", "status"),
-        Index("ix_performance_calculation_jobs_broker_task", "broker_task_id"),
+        Index("ix_calculation_jobs_release", "release_id", "status"),
+        Index("ix_calculation_jobs_broker_task", "broker_task_id"),
         {"schema": "scoring"},
     )
 

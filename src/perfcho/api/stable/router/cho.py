@@ -11,7 +11,7 @@ from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
 from perfcho.api.stable.canonize.login import StableLoginParseError, parse_stable_login
 from perfcho.api.stable.dependencies import StableServicesDependency
 from perfcho.api.stable.dispatcher import StableRuntimeContext, account_stats, dispatch_packets, realtime_expiry
-from perfcho.infra.composition import StableServices
+from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.logging import duration_ms, log_event, rate_limit, sampled
 from perfcho.modules.authorization import StablePrivilege
 from perfcho.modules.common import ClientContext, CommandMeta
@@ -81,6 +81,7 @@ async def bancho(
             log_event(
                 "INFO",
                 "stable.bancho.request_rejected",
+                exception=error,
                 operation="poll" if osu_token is not None else "login",
                 stage="body_limit",
                 outcome="input_rejected",
@@ -104,6 +105,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             log_event(
                 "INFO",
                 "stable.login.rejected",
+                exception=error,
                 stage="parse",
                 outcome=outcome,
                 error_type=type(error).__name__,
@@ -148,6 +150,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             log_event(
                 "INFO",
                 "stable.login.rejected",
+                exception=error,
                 stage="authentication",
                 outcome="invalid_credentials",
                 error_code=error.code,
@@ -162,6 +165,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         log_event(
             "INFO",
             "stable.login.rejected",
+            exception=error,
             stage="active_session",
             outcome="already_active",
             error_code=error.code,
@@ -250,7 +254,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
                 account_id=result.account_id,
                 revision=realtime.revision,
                 payload=own_presence_payload,
-                expires_at=online_expiry,
+                expires_at=realtime.expires_at,
                 session_id=result.session_id,
             ),
             session_id=result.session_id,
@@ -265,6 +269,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             if snapshot.account_id != result.account_id
         )
         presence_broadcast_failure_count = 0
+        presence_broadcast_error: BaseException | None = None
         for snapshot in online_presences:
             try:
                 await services.realtime.enqueue_mailbox(
@@ -273,8 +278,9 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
                     recipient_fence=snapshot.fence,
                     expires_at=snapshot.expires_at,
                 )
-            except MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound:
+            except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
                 presence_broadcast_failure_count += 1
+                presence_broadcast_error = presence_broadcast_error or error
 
         online_packets = tuple(_presence_projection(snapshot) for snapshot in online_presences)
         offline_packets = tuple(
@@ -307,6 +313,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         log_event(
             "INFO",
             "stable.login.completed",
+            exception=presence_broadcast_error,
             outcome="success",
             account_id=result.account_id,
             channel_count=len(channel_packets),
@@ -323,6 +330,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         log_event(
             "INFO",
             "stable.login.rejected",
+            exception=error,
             stage="capacity",
             outcome="capacity_reached",
             account_id=result.account_id,
@@ -339,6 +347,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         log_event(
             "ERROR",
             "stable.login.bootstrap_failed",
+            exception=error,
             outcome="failed",
             account_id=result.account_id,
             error_type=type(error).__name__,
@@ -445,6 +454,7 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
             log_event(
                 "INFO",
                 "stable.poll.mailbox_lease_conflict",
+                exception=error,
                 stage="lease",
                 outcome="conflict",
                 account_id=identity.account_id,
@@ -492,6 +502,7 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
         log_event(
             "INFO",
             "stable.poll.protocol_rejected",
+            exception=error,
             stage="dispatch",
             outcome="malformed",
             account_id=identity.account_id,
@@ -504,6 +515,10 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
     except BaseException:
         await _release_mailbox(identity.account_id, realtime, lease_id, services)
         raise
+    if context.session_closed:
+        # Logout fences the realtime session and removes its mailbox lease.
+        # There is nothing left for this Poll to acknowledge or release.
+        return _binary_response(local_output)
 
     mailbox_packets = _mailbox_packets_within_budget(
         batch.packets,
@@ -529,6 +544,7 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
         log_event(
             "INFO",
             "stable.poll.mailbox_lease_conflict",
+            exception=error,
             stage=mailbox_stage,
             outcome="conflict",
             account_id=identity.account_id,
@@ -644,6 +660,7 @@ async def _compensate_failed_login(
             log_event(
                 "ERROR",
                 "stable.login.cleanup_failed",
+                exception=error,
                 operation="fence_realtime_session",
                 error_code=getattr(error, "code", "cleanup_failed"),
                 error_type=type(error).__name__,
@@ -654,6 +671,7 @@ async def _compensate_failed_login(
         log_event(
             "ERROR",
             "stable.login.cleanup_failed",
+            exception=error,
             operation="close_durable_session",
             error_code=getattr(error, "code", "cleanup_failed"),
             error_type=type(error).__name__,
@@ -683,6 +701,7 @@ async def _realtime_lost(
         log_event(
             "ERROR",
             "stable.poll.cleanup_failed",
+            exception=cleanup_error,
             operation="close_durable_session",
             account_id=account_id,
             error_code=getattr(cleanup_error, "code", "cleanup_failed"),
@@ -707,6 +726,7 @@ async def _release_mailbox(
         log_event(
             "WARNING",
             "stable.poll.cleanup_failed",
+            exception=error,
             operation="release_mailbox",
             account_id=account_id,
             error_code=getattr(error, "code", "cleanup_failed"),

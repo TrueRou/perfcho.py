@@ -93,6 +93,11 @@ def test_repository_registers_v2_atomic_consistency_scripts(repository_double: R
     assert "SMEMBERS" in heartbeat
     assert "spectator_session_id" in heartbeat
     assert "durable_expires_at" in heartbeat
+    assert "math.min(requested_expiry, durable_expiry, now + ttl)" in heartbeat
+    assert "return {'OK', ARGV[1], ARGV[3], tostring(expiry)}" in heartbeat
+    open_session = sources["-- perfcho:open-session:v2"]
+    assert "math.min(requested_expiry, durable_expiry, now + ttl)" in open_session
+    assert "return {'OK', ARGV[1], tostring(revision), tostring(expiry)}" in open_session
     publish = sources["-- perfcho:publish-frame:v2"]
     assert "ZPOPMIN" in publish
     assert "% 65536" in publish
@@ -359,6 +364,36 @@ async def test_real_redis_presence_capacity_is_atomic() -> None:
                 session_id=second.session_id,
                 capacity=1,
             )
+    finally:
+        await redis.aclose()
+
+
+@pytest.mark.skipif(not os.getenv("TEST_REDIS_URL"), reason="TEST_REDIS_URL is not configured")
+@pytest.mark.asyncio
+async def test_real_redis_open_session_tolerates_application_clock_skew() -> None:
+    redis = Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=False)
+    repository = RedisRealtimeRepository(
+        redis,
+        prefix=f"tests:realtime-clock-skew:{uuid.uuid4()}",
+        session_ttl=timedelta(seconds=30),
+        presence_ttl=timedelta(seconds=30),
+        mailbox_ttl=timedelta(seconds=30),
+        max_packet_count=8,
+        max_packet_bytes=64,
+        max_frame_count=2,
+        max_frame_bytes=12,
+    )
+    application_now = datetime.now(UTC) + timedelta(seconds=5)
+    requested_expiry = application_now + timedelta(seconds=30)
+    try:
+        session = await repository.open_session(
+            session_id=uuid.uuid7(),
+            account_id=42,
+            expires_at=requested_expiry,
+            durable_expires_at=application_now + timedelta(minutes=5),
+        )
+        assert session.expires_at < requested_expiry
+        assert session.expires_at <= datetime.now(UTC) + timedelta(seconds=31)
     finally:
         await redis.aclose()
 

@@ -17,18 +17,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.api.stable import router
 from perfcho.api.stable.dependencies import get_stable_services
-from perfcho.infra.composition import StableServices
 from perfcho.infra.db.models.scoring import RankingPolicy, Score
 from perfcho.infra.db.projectors.ranking import _metric_value, _tie_break_value
+from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage, StoredObject
-from perfcho.modules.content import BeatmapRevisionView, ContentQueryService, RatingSummary
+from perfcho.modules.content import (
+    BeatmapNotFound,
+    BeatmapRevisionView,
+    ContentQueryService,
+    ContentSyncService,
+    RatingSummary,
+    UpstreamContentUnavailable,
+)
 from perfcho.modules.identity import IdentityService, InvalidCredentials, StableWebPrincipal
 from perfcho.modules.realtime import RealtimeRepository, RealtimeSession, RealtimeSessionNotFound
 from perfcho.modules.scoring import (
     AcceptedScoreResult,
     AcceptScore,
+    AccountStatsView,
     LeaderboardPage,
     LeaderboardScoreView,
     RankingQueryService,
@@ -36,10 +44,11 @@ from perfcho.modules.scoring import (
     ReplayReference,
     ReplayService,
     Ruleset,
+    ScoreboardVariant,
     ScoreRejected,
     ScoringService,
 )
-from perfcho.modules.social import FollowView, SocialService
+from perfcho.modules.social import AchievementUnlockView, FollowView, SocialService
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 PASSWORD_MD5 = "c" * 32
@@ -85,9 +94,12 @@ class FakeRealtime:
 class FakeContentQuery:
     def __init__(self, beatmap: BeatmapRevisionView) -> None:
         self.beatmap = beatmap
+        self.missing = False
 
     async def lookup_md5(self, md5: str | bytes) -> BeatmapRevisionView:
         assert md5 in {BEATMAP_MD5, bytes.fromhex(BEATMAP_MD5)}
+        if self.missing:
+            raise BeatmapNotFound()
         return self.beatmap
 
     async def get_rating(self, beatmap_id: int, account_id: int | None = None) -> RatingSummary:
@@ -95,15 +107,41 @@ class FakeContentQuery:
         return RatingSummary(10, None, 0, None)
 
 
+class FakeContentSync:
+    def __init__(self, resolved: BeatmapRevisionView) -> None:
+        self.resolved = resolved
+        self.error: Exception | None = None
+        self.resolve_calls: list[tuple[str | bytes, str, int | None]] = []
+        self.refreshes: list[int] = []
+
+    async def resolve_revision(
+        self,
+        md5: str | bytes,
+        file_name: str,
+        external_beatmapset_id: int | None,
+    ) -> BeatmapRevisionView:
+        self.resolve_calls.append((md5, file_name, external_beatmapset_id))
+        if self.error is not None:
+            raise self.error
+        return self.resolved
+
+    async def refresh_if_due(self, external_beatmapset_id: int) -> None:
+        self.refreshes.append(external_beatmapset_id)
+
+
 class FakeScoring:
     def __init__(self) -> None:
         self.commands: list[AcceptScore] = []
         self.error: Exception | None = None
+        self.new_unlocks: tuple[AchievementUnlockView, ...] = ()
+        self._returned_unlocks = False
 
     async def accept(self, command: AcceptScore) -> AcceptedScoreResult:
         self.commands.append(command)
         if self.error is not None:
             raise self.error
+        unlocks = () if self._returned_unlocks else self.new_unlocks
+        self._returned_unlocks = True
         return AcceptedScoreResult(
             attempt_id=uuid.uuid7(),
             score_id=40,
@@ -112,6 +150,7 @@ class FakeScoring:
             scoreboard_id=1,
             mod_set_id=30,
             outcome=command.score.outcome,
+            new_achievement_unlocks=unlocks,
         )
 
 
@@ -148,7 +187,7 @@ class FakeStorage:
 class FakeReplayQuery:
     async def get(self, score_id: int) -> ReplayReference:
         assert score_id == 40
-        return ReplayReference(40, 7, Ruleset.OSU, "replays/stable/3/replay.osr", len(REPLAY_CONTENT), "stable")
+        return ReplayReference(40, 7, 1, Ruleset.OSU, "replays/stable/3/replay.osr", len(REPLAY_CONTENT), "stable")
 
 
 class FakeReplayService:
@@ -168,6 +207,10 @@ class FakeReplayService:
 class FakeRankingQuery:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.stats = [
+            AccountStatsView(100, Decimal("0.95"), 4, 1_000, 8, 120),
+            AccountStatsView(200, Decimal("0.96"), 5, 2_000, 6, 130),
+        ]
 
     async def get_stable_leaderboard(self, **kwargs: object) -> LeaderboardPage:
         self.calls.append(kwargs)
@@ -191,11 +234,24 @@ class FakeRankingQuery:
         )
         return LeaderboardPage((score,), score)
 
+    async def get_account_stats(
+        self,
+        account_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant,
+    ) -> AccountStatsView:
+        del account_id, ruleset, variant
+        return self.stats.pop(0)
+
 
 class FakeSocial:
     async def list_friends(self, account_id: int) -> tuple[FollowView, ...]:
         assert account_id == 3
         return (FollowView(7, "friend", None, NOW, True),)
+
+    async def list_follower_account_ids(self, account_id: int) -> frozenset[int]:
+        assert account_id == 3
+        return frozenset()
 
 
 def beatmap() -> BeatmapRevisionView:
@@ -243,6 +299,7 @@ def stable_services() -> tuple[StableServices, FakeScoring, FakeStorage, FakeRep
         id_generator=cast(IdGenerator, FakeIds()),
         settings=Settings(),
         content_query=cast(ContentQueryService, FakeContentQuery(beatmap())),
+        content_sync=cast(ContentSyncService, FakeContentSync(beatmap())),
         object_storage=cast(ObjectStorage, storage),
         scoring=cast(ScoringService, scoring),
         replay_query=cast(ReplayQueryService, FakeReplayQuery()),
@@ -279,7 +336,8 @@ def encrypted_score(*, checksum: str | None = None, play_time: str = "2607291230
         "True",
         "0",
         play_time,
-        "b20260711.1",
+        OSU_VERSION,
+        "0",
     ]
     checksum_payload = (
         f"chickenmcnuggets10o1500smustard00uu{BEATMAP_MD5}10Trueplayer1000000X0QTrue0"
@@ -302,6 +360,7 @@ def submission_files(
     password: str = PASSWORD_MD5,
     *,
     checksum: str | None = None,
+    storyboard_hash: str = "",
     replay: bytes = REPLAY_CONTENT,
     unique_ids: str = "uninstall-id|disk-id",
     play_time: str = "260729123000",
@@ -318,7 +377,7 @@ def submission_files(
         ("s", (None, client_hash)),
         ("iv", (None, iv)),
         ("bmk", (None, BEATMAP_MD5)),
-        ("sbk", (None, "")),
+        ("sbk", (None, storyboard_hash)),
         ("c1", (None, unique_ids)),
     ]
 
@@ -345,6 +404,32 @@ async def test_stable_score_submission_stages_replay_and_calls_canonical_service
     assert command.attestation.checksum == command.score.online_checksum
     assert command.attestation.checksum != command.meta.request_digest
     assert command.attestation.verification_state == "pending"
+    assert "rankedScoreBefore:100" in response.text
+    assert "rankedScoreAfter:200" in response.text
+    assert "totalScoreBefore:1000" in response.text
+    assert "totalScoreAfter:2000" in response.text
+    assert "ppBefore:120" in response.text
+    assert "ppAfter:130" in response.text
+
+
+@pytest.mark.asyncio
+async def test_stable_score_chart_renders_only_unlocks_created_by_this_submission() -> None:
+    services, scoring, _, _, _ = stable_services()
+    scoring.new_unlocks = (
+        AchievementUnlockView(7, "million-score", "Million Score", "Reach one million", NOW),
+        AchievementUnlockView(8, "full-combo", "Full Combo", "Complete a full combo", NOW),
+    )
+    app = stable_app(services)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        first = await client.post("/web/osu-submit-modular-selector.php", files=submission_files())
+        second = await client.post("/web/osu-submit-modular-selector.php", files=submission_files())
+
+    assert (
+        "achievements-new:million-score+Million Score+Reach one million/full-combo+Full Combo+Complete a full combo"
+    ) in first.text
+    assert "achievements-new:" in second.text
+    assert "million-score+Million Score+Reach one million" not in second.text
+    assert "full-combo+Full Combo+Complete a full combo" not in second.text
 
 
 @pytest.mark.asyncio
@@ -415,7 +500,7 @@ async def test_stable_score_submission_rejects_checksum_timing_and_short_replay_
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
         checksum = await client.post(
             "/web/osu-submit-modular-selector.php",
-            files=submission_files(checksum="b" * 32),
+            files=submission_files(checksum="b" * 32, storyboard_hash="c" * 32),
         )
         timing = await client.post(
             "/web/osu-submit-modular-selector.php",
@@ -561,6 +646,122 @@ async def test_stable_leaderboard_serializes_projection_and_friend_filter() -> N
     assert score_fields[-3:] == ["1", str(int(NOW.timestamp())), "1"]
     assert ranking.calls[0]["leaderboard_type"] == 3
     assert ranking.calls[0]["friend_account_ids"] == (7,)
+    assert cast(FakeContentSync, services.content_sync).refreshes == [200]
+
+
+@pytest.mark.asyncio
+async def test_stable_leaderboard_blocks_to_complete_unknown_current_beatmap() -> None:
+    services, _, _, _, ranking = stable_services()
+    cast(FakeContentQuery, services.content_query).missing = True
+    app = stable_app(services)
+    params = {
+        "us": "player",
+        "ha": PASSWORD_MD5,
+        "s": "false",
+        "vv": "4",
+        "v": "1",
+        "c": BEATMAP_MD5,
+        "f": "Artist - Title (Creator) [Test].osu",
+        "m": "0",
+        "i": "200",
+        "mods": "0",
+        "h": "package-hash",
+        "a": "false",
+    }
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.get("/web/osu-osz2-getscores.php", params=params)
+
+    assert response.text.startswith("2|false|100|200|1|0|")
+    assert ranking.calls
+    sync = cast(FakeContentSync, services.content_sync)
+    assert sync.resolve_calls == [(BEATMAP_MD5, params["f"], 200)]
+    assert sync.refreshes == [200]
+
+
+@pytest.mark.asyncio
+async def test_stable_leaderboard_reports_update_only_for_confirmed_replacement() -> None:
+    services, _, _, _, ranking = stable_services()
+    cast(FakeContentQuery, services.content_query).missing = True
+    cast(FakeContentSync, services.content_sync).resolved = replace(
+        beatmap(),
+        md5=bytes.fromhex("b" * 32),
+    )
+    app = stable_app(services)
+    params = {
+        "us": "player",
+        "ha": PASSWORD_MD5,
+        "s": "false",
+        "vv": "4",
+        "v": "1",
+        "c": BEATMAP_MD5,
+        "f": "Artist - Title (Creator) [Test].osu",
+        "m": "0",
+        "i": "200",
+        "mods": "0",
+        "h": "package-hash",
+        "a": "false",
+    }
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.get("/web/osu-osz2-getscores.php", params=params)
+
+    assert response.text == "1|false"
+    assert ranking.calls == []
+
+
+@pytest.mark.asyncio
+async def test_stable_leaderboard_reports_known_historical_revision_as_client_update() -> None:
+    services, _, _, _, ranking = stable_services()
+    cast(FakeContentQuery, services.content_query).beatmap = replace(beatmap(), is_current=False)
+    app = stable_app(services)
+    params = {
+        "us": "player",
+        "ha": PASSWORD_MD5,
+        "s": "false",
+        "vv": "4",
+        "v": "1",
+        "c": BEATMAP_MD5,
+        "f": "Artist - Title (Creator) [Test].osu",
+        "m": "0",
+        "i": "200",
+        "mods": "0",
+        "h": "package-hash",
+        "a": "false",
+    }
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.get("/web/osu-osz2-getscores.php", params=params)
+
+    assert response.text == "1|false"
+    assert ranking.calls == []
+    sync = cast(FakeContentSync, services.content_sync)
+    assert sync.resolve_calls == []
+    assert sync.refreshes == [200]
+
+
+@pytest.mark.asyncio
+async def test_stable_leaderboard_does_not_misreport_upstream_failure_as_missing() -> None:
+    services, _, _, _, _ = stable_services()
+    cast(FakeContentQuery, services.content_query).missing = True
+    cast(FakeContentSync, services.content_sync).error = UpstreamContentUnavailable()
+    app = stable_app(services)
+    params = {
+        "us": "player",
+        "ha": PASSWORD_MD5,
+        "s": "false",
+        "vv": "4",
+        "v": "1",
+        "c": BEATMAP_MD5,
+        "f": "Artist - Title (Creator) [Test].osu",
+        "m": "0",
+        "i": "200",
+        "mods": "0",
+        "h": "package-hash",
+        "a": "false",
+    }
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.get("/web/osu-osz2-getscores.php", params=params)
+
+    assert response.status_code == 503
+    assert response.content == b""
 
 
 @pytest.mark.asyncio

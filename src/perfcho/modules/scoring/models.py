@@ -3,14 +3,15 @@
 import math
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
 from types import MappingProxyType
 
 from perfcho.modules.common.models import CommandMeta, JsonValue
+from perfcho.modules.social.models import AchievementUnlockView
 
 _MOD_ACRONYM = re.compile(r"^[A-Z0-9]{1,8}$")
 
@@ -349,6 +350,7 @@ class AcceptedScoreResult:
     scoreboard_id: int
     mod_set_id: int
     outcome: ScoreOutcome
+    new_achievement_unlocks: tuple[AchievementUnlockView, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,6 +406,7 @@ class ReplayReference:
 
     score_id: int
     owner_account_id: int
+    scoreboard_id: int
     ruleset: Ruleset
     storage_key: str
     size_bytes: int
@@ -411,7 +414,7 @@ class ReplayReference:
 
     def __post_init__(self) -> None:
         """Require usable score and object identities."""
-        if self.score_id < 1 or self.owner_account_id < 1:
+        if self.score_id < 1 or self.owner_account_id < 1 or self.scoreboard_id < 1:
             raise ValueError("replay reference identifiers must be positive")
         if not self.storage_key or self.size_bytes < 0 or not self.format:
             raise ValueError("replay reference object metadata is invalid")
@@ -473,6 +476,13 @@ class AccountStatsView:
             raise ValueError("account statistics must be non-negative")
         if not Decimal(0) <= self.accuracy <= Decimal(1):
             raise ValueError("account statistics accuracy must be between zero and one")
+
+
+def weighted_total_performance(values: Sequence[Decimal]) -> int:
+    """Calculate Stable's integer total PP from descending personal bests."""
+    weighted = sum((value * Decimal("0.95") ** index for index, value in enumerate(values)), Decimal(0))
+    bonus = (Decimal(1) - Decimal("0.9994") ** len(values)) * Decimal("416.6667")
+    return int((weighted + bonus).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 @dataclass(frozen=True, slots=True)

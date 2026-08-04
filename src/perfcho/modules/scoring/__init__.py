@@ -30,6 +30,7 @@ from perfcho.modules.scoring.models import (
     ScoreOutcome,
     ScoreSubmission,
     StagedReplayManifest,
+    weighted_total_performance,
 )
 from perfcho.modules.scoring.services import (
     RankingQueryService,
@@ -70,4 +71,5 @@ __all__ = (
     "ScoreboardVariant",
     "ScoringService",
     "StagedReplayManifest",
+    "weighted_total_performance",
 )

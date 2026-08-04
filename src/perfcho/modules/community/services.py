@@ -13,6 +13,7 @@ from perfcho.modules.common.ports import Clock, OutboxWriterFactory
 from perfcho.modules.community.errors import (
     AccountSilenced,
     ChannelAccessDenied,
+    ChannelMembershipRequired,
     ChannelMembershipUnavailable,
     ChannelNotFound,
     CommunityInputRejected,
@@ -196,7 +197,7 @@ class CommunityService:
                 sender_account_id,
                 at=now,
             ):
-                raise ChannelAccessDenied("sender is not an active channel member")
+                raise ChannelMembershipRequired("sender is not an active channel member")
             await self._require_not_silenced(uow.session, sender_account_id, channel.channel_id, now)
             await _require_reply_target(repository, channel.channel_id, reply_to_id)
             message = await repository.insert_message(

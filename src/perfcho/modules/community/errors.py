@@ -35,6 +35,12 @@ class ChannelAccessDenied(AuthorizationDenied):
     code = "channel_access_denied"
 
 
+class ChannelMembershipRequired(ChannelAccessDenied):
+    """Reject a message from an account that has not joined the channel."""
+
+    code = "channel_membership_required"
+
+
 class DirectMessageBlocked(AuthorizationDenied):
     """Reject a direct message while either participant blocks the other."""
 

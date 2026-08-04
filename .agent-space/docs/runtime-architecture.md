@@ -7,15 +7,15 @@ perfcho 是一个可信中心应用，不拆分微服务，也不接受外部状
 | 角色 | 职责 | 连接 |
 | --- | --- | --- |
 | API/实时网关 | Stable、Lazer 与实时协议适配，认证、命令和查询 | PostgreSQL、Redis DB 0 |
-| Taskiq Worker | 通过两个独立 Relay Loop 扫描到期 Delivery/Calculation Job 并投递 Taskiq，同时执行投影、外部 Calculator 编排、通知和维护任务 | PostgreSQL、Redis DB 1、S3，按任务访问 Calculator HTTP、权威内容上游或 DB 0 |
+| Taskiq Worker | 通过两个独立 Relay Loop 扫描到期 Delivery/Calculation Job，并运行 PostgreSQL 排名快照维护循环，同时执行投影、外部 Calculator 编排和通知任务 | PostgreSQL、Redis DB 1、S3，按任务访问 Calculator HTTP、权威内容上游或 DB 0 |
 
 这些角色共享应用服务、SQLAlchemy Model 和部署密钥。进程数量不构成业务节点身份；数据库只保存持久工作的短期 Lease/Fencing Token，不把 Worker 进程登记为长期业务节点。
 
 ## 部署映射
 
-本地开发由 VS Code Compound 同时启动 API 和 Taskiq Worker。启动前任务负责同步锁定依赖、启动并等待开发 Compose 中的 PostgreSQL/Redis/MinIO，以及幂等初始化对象存储桶；两个应用角色连接 PostgreSQL 时通过共享 Advisory Lock 串行执行 SQLAlchemy 自动建表。`perfcho.worker` 是唯一 Worker 组合根，启动后创建 Outbox 与 Performance 两个相互隔离的 Relay Loop，调试结束不自动销毁基础设施和开发数据卷。
+本地开发由 VS Code Compound 同时启动 API 和 Taskiq Worker。启动前任务负责同步锁定依赖、启动并等待开发 Compose 中的 PostgreSQL/Redis/MinIO，以及幂等初始化对象存储桶；两个应用角色连接 PostgreSQL 时通过共享 Advisory Lock 串行执行 SQLAlchemy 自动建表。`perfcho.worker` 是唯一 Worker 组合根，启动后创建 Outbox 与 Performance 两个相互隔离的 Relay Loop，以及由 `system.maintenance_states` 去重的每日 Rank Snapshot 循环；调试结束不自动销毁基础设施和开发数据卷。
 
-生产使用独立的 `compose.prod.yaml`，两个进程角色复用同一个 Python 3.14t 镜像但分别运行和重启。PostgreSQL 与带认证的 Redis 只存在于 Compose 内部网络，S3 兼容对象存储作为外部持久依赖；应用角色等待 PostgreSQL 与 Redis 健康后启动，并通过 SQLAlchemy `create_all()` 创建缺失的 Schema 和表。API 默认仅向宿主机回环地址发布端口，由同机反向代理提供 TLS；开发 Compose 的端口映射、MinIO 与 `perfcho_test` 初始化脚本不得进入生产。
+根目录 `compose.yaml` 是唯一的运行环境与生产拓扑。PostgreSQL、带认证的 Redis 与本地 MinIO 只发布到宿主机回环地址；MinIO 使用独立持久卷并由一次性初始化容器幂等创建 bucket。应用角色等待 PostgreSQL、Redis 与 MinIO bucket 初始化完成后启动，并通过 SQLAlchemy `create_all()` 创建缺失的 Schema 和表。Calculator 服务必须加入同一 Compose 网络，才能通过 `http://minio:9000` 访问 Worker 生成的短期签名 URL。API 默认仅向宿主机回环地址发布端口，由同机反向代理提供 TLS；部署凭据由 `.env.production.example` 模板提供，本地开发用 `.env` 覆盖同一套变量。
 
 ## Redis 约定
 
@@ -43,6 +43,8 @@ perfcho:state:ratelimit:{scope}:{subject}
 Taskiq 使用 `when_executed` 确认和 Redis Stream Pending Entry 降低运输损失，但业务恢复不依赖 Broker Ack。Relay 会重新领取租约过期且未完成的 Delivery，因此消费者必须幂等。
 
 Performance Calculation 不作为普通 Outbox Consumer 执行，避免在 Delivery 行锁事务内等待 HTTP。成绩事务直接写 PostgreSQL Job；独立 Relay 租赁 Job 并投递 `(job_id, lease_token)`。Worker 用第一个短事务保证同一 Token 只开始一次业务 Attempt、固化 Input Digest，并从任务真正开始时刷新执行 Lease；事务外生成 S3 签名 URL 并按 Formula Calculator Code 调用 C#/Rust。第二个短事务只有在 Fence 与执行 Lease 仍有效时才写 Difficulty、PP、完成事件和 Job 状态。相同 `(score_id, release_id)` 重复计算必须得到相同 Output Digest。
+
+每日 Rank Snapshot 只在 `ranking-projector.v1` 没有未完成 Delivery 时执行。多个 Worker 使用事务级 Advisory Lock 串行检查 `system.maintenance_states`，再以单个集合查询和窗口函数原子写入当天所有活动 Policy 的 Global/Country Rank；失败事务整体回滚，下一轮继续尝试。
 
 ## 故障语义
 

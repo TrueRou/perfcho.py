@@ -11,7 +11,7 @@ from loguru import logger
 from starlette.responses import StreamingResponse
 
 from perfcho.api.v1.middleware.error import ExceptionHandlerMiddleware
-from perfcho.infra.logging import init_logger, log_event
+from perfcho.infra.logging import init_logger, log_event, reset_relay_task, set_relay_task
 from perfcho.infra.settings import settings
 
 
@@ -76,6 +76,30 @@ def test_worker_human_output_includes_pid_and_suppresses_empty_fetch_poll(monkey
     assert "library.log | {'msg': 'Redis broker detail'}" in output
 
 
+def test_worker_task_execution_log_does_not_expose_task_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    stream = StringIO()
+    monkeypatch.setattr(settings, "log_format", "human")
+    monkeypatch.setattr(settings, "log_level", "DEBUG")
+    token = set_relay_task("perfcho.outbox.dispatch")
+
+    try:
+        init_logger("worker", stream=stream)
+        logging.getLogger("taskiq.worker").info(
+            "Executing task perfcho.outbox.dispatch with ID: sensitive-task-id",
+        )
+        logging.getLogger("taskiq.redis_broker").debug("Received message: sensitive-task-id")
+        logger.complete()
+    finally:
+        reset_relay_task(token)
+        logger.remove()
+        logger.configure(extra={}, patcher=None)
+        logger.add(sys.stderr)
+
+    output = stream.getvalue()
+    assert "Executing task perfcho.outbox.dispatch" not in output
+    assert "sensitive-task-id" not in output
+
+
 def test_json_output_keeps_event_and_library_in_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     stream = StringIO()
     monkeypatch.setattr(settings, "log_format", "json")
@@ -95,13 +119,13 @@ def test_json_output_keeps_event_and_library_in_extra(monkeypatch: pytest.Monkey
     assert payload["request_id"] == "request-1"
 
 
-def test_json_event_is_allow_listed_and_exception_text_free(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_json_event_is_allow_listed_and_includes_full_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     stream = StringIO()
     monkeypatch.setattr(settings, "log_format", "json")
     try:
         init_logger("test", stream=stream)
         try:
-            raise RuntimeError("postgresql://user:password@db.test/app secret-message")
+            raise RuntimeError("database connection failed after 30 seconds")
         except RuntimeError as error:
             log_event(
                 "ERROR",
@@ -124,10 +148,32 @@ def test_json_event_is_allow_listed_and_exception_text_free(monkeypatch: pytest.
     assert payload["process_role"] == "test"
     assert payload["account_id"] == 42
     assert payload["error_type"] == "RuntimeError"
-    assert payload["exception_frames"]
-    assert "password" not in output
-    assert "secret-message" not in output
+    assert payload["exception"]["type"] == "RuntimeError"
+    assert payload["exception"]["message"] == "database connection failed after 30 seconds"
+    assert "raise RuntimeError" in payload["exception"]["traceback"]
+    assert "database connection failed after 30 seconds" in payload["exception"]["traceback"]
     assert "should-not-appear" not in output
+
+
+def test_human_event_includes_full_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    stream = StringIO()
+    monkeypatch.setattr(settings, "log_format", "human")
+    try:
+        init_logger("test", stream=stream)
+        try:
+            raise ValueError("invalid calculation response")
+        except ValueError as error:
+            log_event("ERROR", "test.failure", exception=error)
+        logger.complete()
+    finally:
+        logger.remove()
+        logger.configure(extra={}, patcher=None)
+        logger.add(sys.stderr)
+
+    output = stream.getvalue()
+    assert "Traceback (most recent call last)" in output
+    assert 'raise ValueError("invalid calculation response")' in output
+    assert "ValueError: invalid calculation response" in output
 
 
 @pytest.mark.asyncio

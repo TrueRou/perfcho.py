@@ -86,8 +86,8 @@ class ScoringRepository(Protocol):
         score_id: int,
         score_owner_account_id: int,
         viewer_account_id: int | None,
-    ) -> None:
-        """Idempotently append one replay view fact."""
+    ) -> bool:
+        """Idempotently append one replay view fact and report whether it was new."""
         ...
 
     async def get_leaderboard(

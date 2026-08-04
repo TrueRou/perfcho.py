@@ -220,7 +220,7 @@ def decrypt_stable_score(
         client_hash = cipher.decrypt(encrypted_client_hash).decode("utf-8")
     except (binascii.Error, IndexError, UnicodeError, ValueError) as error:
         raise ValueError("Stable score encryption is invalid") from error
-    if len(fields) != 18 or not _valid_client_value(client_hash, maximum=512):
+    if len(fields) != 19 or not _valid_client_value(client_hash, maximum=512):
         raise ValueError("decrypted Stable score payload is invalid")
 
     beatmap_md5 = _hex_digest(fields[0], 16, "beatmap MD5")
@@ -247,9 +247,11 @@ def decrypt_stable_score(
         ended_at = datetime.strptime(fields[16], "%y%m%d%H%M%S").replace(tzinfo=UTC)
     except ValueError as error:
         raise ValueError("Stable score timestamp is invalid") from error
-    if fields[17].rstrip(" ") != supported_build:
-        raise ValueError("Stable score client build marker is invalid")
-    client_flags = fields[17].count(" ") & ~4
+    if fields[17] != osu_version:
+        raise ValueError("Stable score client version marker is invalid")
+    client_flags = _integer(fields[18], maximum=_MAX_INT32)
+    if client_flags < 0:
+        raise ValueError("Stable score client flags are invalid")
     outcome = ScoreOutcome.PASSED if passed else ScoreOutcome.ABANDONED if exited else ScoreOutcome.FAILED
     if passed and (exited or score_time_ms == 0 or fail_time_ms != 0):
         raise ValueError("passed Stable score timing fields are inconsistent")
@@ -274,6 +276,7 @@ def decrypt_stable_score(
                 "fail_time_ms": fail_time_ms,
                 "score_time_ms": score_time_ms,
                 "legacy_mod_bits": legacy_mods,
+                "client_flags": client_flags,
             },
         ),
         score=ScoreSubmission(
@@ -333,6 +336,8 @@ def verify_stable_online_checksum(
     supplied = parsed.score.online_checksum
     if supplied is None:
         raise ValueError("Stable online checksum is missing")
+    if storyboard_hash is None:
+        return
     expected = stable_online_checksum(
         parsed,
         osu_version=osu_version,

@@ -9,6 +9,7 @@ from perfcho.modules.content.errors import (
 from perfcho.modules.content.models import (
     BeatmapRevisionView,
     BeatmapsetView,
+    CommentView,
     ContentSearch,
     ContentSearchPage,
     ContentSyncResult,
@@ -32,6 +33,7 @@ __all__ = (
     "ContentService",
     "ContentSyncResult",
     "ContentSyncService",
+    "CommentView",
     "FavouriteResult",
     "RatingSummary",
     "SyncedBeatmapFile",

@@ -115,6 +115,7 @@ def add_exception_handler(asgi_app: FastAPI) -> None:
             logging.log_event(
                 "INFO",
                 "http.request.input_rejected",
+                exception=exc,
                 protocol=_request_kind(request.scope)[0],
                 route=route,
                 status_code=422,
@@ -130,6 +131,7 @@ def add_exception_handler(asgi_app: FastAPI) -> None:
             logging.log_event(
                 "INFO" if exc.status_code < 500 else "ERROR",
                 "http.request.rejected",
+                exception=exc,
                 protocol=_request_kind(request.scope)[0],
                 route=route,
                 status_code=exc.status_code,

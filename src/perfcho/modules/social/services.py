@@ -3,11 +3,13 @@
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from datetime import datetime
 
 from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.normalization import normalize_stable_name
-from perfcho.modules.common.ports import Clock, OutboxWriterFactory
+from perfcho.modules.common.ports import Clock, OutboxWriter, OutboxWriterFactory
+from perfcho.modules.social.achievements import AchievementEvaluatorRegistry
 from perfcho.modules.social.errors import (
     AchievementNotFound,
     SocialAccountNotFound,
@@ -17,12 +19,15 @@ from perfcho.modules.social.errors import (
 from perfcho.modules.social.models import (
     AccountIdentityView,
     Achievement,
+    AchievementDefinitionRecord,
     AchievementUnlockResult,
+    AchievementUnlockView,
     BlockResult,
     BlockView,
     FollowRecord,
     FollowView,
     PairRelationship,
+    ScoreAchievementContext,
 )
 from perfcho.modules.social.ports import (
     SocialRepository,
@@ -404,6 +409,79 @@ class SocialService:
                 duration_ms=duration_ms(started_ns),
             )
             return result
+
+
+class TransactionAchievementAwarder:
+    """Evaluate and persist score achievements using the caller's transaction."""
+
+    def __init__(
+        self,
+        repository: SocialRepository,
+        outbox: OutboxWriter,
+        registry: AchievementEvaluatorRegistry,
+    ) -> None:
+        """Bind repository, outbox, and a safe evaluator registry."""
+        self._repository = repository
+        self._outbox = outbox
+        self._registry = registry
+
+    async def award_for_score(
+        self,
+        context: ScoreAchievementContext,
+        *,
+        at: datetime,
+    ) -> tuple[AchievementUnlockView, ...]:
+        """Create first unlocks and preserve achievement projector outbox semantics."""
+        definitions = await self._repository.list_score_achievement_definitions(
+            account_id=context.account_id,
+            ruleset=context.ruleset,
+        )
+        created: list[AchievementUnlockView] = []
+        for definition in definitions:
+            snapshot = self._registry.evaluate(definition, context)
+            if snapshot is None:
+                continue
+            result = await self._repository.unlock_achievement(
+                account_id=context.account_id,
+                definition=AchievementDefinitionRecord(
+                    definition.achievement_id,
+                    definition.evaluator_version,
+                    True,
+                ),
+                score_id=context.score_id,
+                source_event_id=None,
+                snapshot=dict(snapshot),
+                now=at,
+            )
+            if not result.created:
+                continue
+            await self._outbox.append(
+                PendingEvent(
+                    aggregate_type="account",
+                    aggregate_id=str(context.account_id),
+                    event_type="social.achievement-unlocked.v1",
+                    schema_version=1,
+                    payload={
+                        "account_id": context.account_id,
+                        "achievement_id": definition.achievement_id,
+                        "definition_version": result.unlock.definition_version,
+                        "score_id": context.score_id,
+                        "unlocked_at": result.unlock.created_at.isoformat(),
+                    },
+                    consumers=_ACHIEVEMENT_CONSUMERS,
+                    partition_key=f"account:{context.account_id}",
+                )
+            )
+            created.append(
+                AchievementUnlockView(
+                    achievement_id=definition.achievement_id,
+                    slug=definition.slug,
+                    name=definition.name,
+                    description=definition.description,
+                    unlocked_at=result.unlock.created_at,
+                )
+            )
+        return tuple(created)
 
 
 async def _require_accounts(repository: SocialRepository, *account_ids: int) -> None:

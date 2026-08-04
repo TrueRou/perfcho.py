@@ -3,6 +3,7 @@
 from perfcho.modules.community.errors import (
     AccountSilenced,
     ChannelAccessDenied,
+    ChannelMembershipRequired,
     ChannelMembershipUnavailable,
     ChannelNotFound,
     CommunityInputRejected,
@@ -34,6 +35,7 @@ __all__ = (
     "ActiveSilence",
     "ActiveSilencePolicy",
     "ChannelAccessDenied",
+    "ChannelMembershipRequired",
     "ChannelMembershipResult",
     "ChannelMembershipUnavailable",
     "ChannelNotFound",

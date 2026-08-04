@@ -12,23 +12,48 @@ outbox runtime. Stable/Lazer protocol services will be implemented against this 
 - Docker Compose V2
 - PostgreSQL 17, Redis 8, and S3-compatible object storage, normally started through Docker Compose
 
-## Development dependencies
+## Runtime Environment
+
+The repository has one Compose stack. `compose.yaml` is the deployable topology: PostgreSQL, authenticated Redis,
+internal MinIO with an idempotent bucket initializer, the API, and the Taskiq Worker. Dependencies are exposed only on
+loopback addresses so host-run development processes can reach them; API and Worker run inside Compose for deployment
+and share one Python image. All state lives in named volumes.
+
+### Environment files
+
+- `.env.example` — complete local contract with working development values. Copy it to `.env` for local development.
 
 ```bash
+openssl rand -hex 32
+docker compose --env-file .env up -d --build
+docker compose --env-file .env ps
+```
+
+The stack waits for PostgreSQL/Redis/MinIO to become healthy and for the MinIO bucket to be created before starting the
+application roles. The first application role to connect creates missing PostgreSQL schemas and mapped tables through
+SQLAlchemy `MetaData.create_all()`; a PostgreSQL advisory lock serializes concurrent initialization. Only the API is
+published to the host, on `127.0.0.1:10727` by default for a same-host reverse proxy; change `APP_BIND_ADDRESS` to
+listen elsewhere. `create_all()` does not alter existing columns, constraints, or indexes, so model changes that affect
+an existing database still require an explicit operational rollout.
+
+## Local development
+
+Start only the infrastructure (PostgreSQL, Redis, MinIO) and run the application roles as host processes:
+
+```bash
+cp .env.example .env
 docker compose up -d --wait postgres redis minio
 docker compose run --rm --no-deps minio-init
 ```
 
-PostgreSQL listens on `127.0.0.1:55432`; Redis listens on `127.0.0.1:56379`; MinIO listens on `127.0.0.1:59000`, with its
-console on `127.0.0.1:59001`. Copy `.env.example` to `.env` only when local values need to be overridden.
-The first application role to connect creates missing PostgreSQL schemas and mapped tables through SQLAlchemy
-`MetaData.create_all()`.
+PostgreSQL listens on `127.0.0.1:55432`; Redis on `127.0.0.1:56379`; MinIO on `127.0.0.1:59000`, with its console on
+`127.0.0.1:59001`. The host processes read the same secrets from `.env`.
 
 ### VS Code
 
 Select `perfcho: all processes` in Run and Debug and press F5. The compound launch configuration synchronizes locked
-dependencies, starts and waits for PostgreSQL, Redis, and MinIO, initializes the object-storage bucket, and then debugs
-these roles in parallel:
+dependencies, creates `.env` from `.env.example` when it is missing, starts and waits for PostgreSQL, Redis, and MinIO,
+initializes the object-storage bucket, and then debugs these roles in parallel:
 
 - API
 - Taskiq Worker, including the durable Outbox and Performance relay loop
@@ -43,30 +68,30 @@ uv run uvicorn perfcho.main:asgi_app --host 127.0.0.1 --port 8000
 uv run taskiq worker perfcho.worker:broker --ack-type when_executed
 ```
 
-## Production Compose
+## Verification
 
-`compose.prod.yaml` is a standalone production topology; do not merge it with the development `compose.yaml`. Create a
-production environment file from `.env.production.example`, replace every credential and signing key, configure the
-external S3-compatible object store, and start the deployment:
+### osu.py end-to-end client
+
+The fake client runs the pinned `osu.py` 1.5.4 implementation against real Uvicorn and Taskiq processes. It creates an
+isolated Compose project for PostgreSQL, Redis, and MinIO, synchronizes a deterministic beatmap through the production
+content service, and tears down only resources owned by that run:
 
 ```bash
-openssl rand -hex 32
-docker compose --env-file .env.production -f compose.prod.yaml up -d --build
-docker compose --env-file .env.production -f compose.prod.yaml ps
+uv run python -m tools.fakeclient run --artifacts .fakeclient/latest --timeout 15
 ```
 
-The production topology runs PostgreSQL, authenticated Redis, API, and Taskiq Worker. The Worker also relays durable
-Outbox and Performance jobs before consuming them. Each application role
-ensures missing schemas and tables exist at startup; a PostgreSQL advisory lock serializes concurrent initialization.
-S3-compatible object storage remains an external production dependency. Only the API is published, on `127.0.0.1:8000`
-by default, for a same-host reverse proxy to terminate TLS. PostgreSQL and Redis use named volumes and are not published
-to the host. Back up PostgreSQL and object storage consistently; Redis AOF is only an availability aid and is not the
-source of durable task truth.
+The suite covers ordinary Stable login and Poll, presence, friends, chat, spectator frames, the non-Tourney multiplayer
+flow, Direct and Web APIs, comments, score submission, ranking projection, and replay download. Public avatars, covers,
+previews, seasonal backgrounds, menu metadata, and `.osz` files are forwarded to a local upstream fixture during E2E;
+perfcho does not store those public resources in MinIO. Tourney clients are intentionally outside this suite and server
+support boundary.
 
-`create_all()` does not alter existing columns, constraints, or indexes. Model changes that affect existing databases
-still require an explicit operational rollout.
+Connect one existing account to an already running API with:
 
-## Verification
+```bash
+uv run python -m tools.fakeclient smoke --base-url http://127.0.0.1:8000 \
+  --username player --password 'plain-text-password'
+```
 
 ```bash
 uv run ruff format .
@@ -78,7 +103,7 @@ TEST_DATABASE_URL=postgresql+asyncpg://perfcho:perfcho@127.0.0.1:55432/perfcho_t
 ## Bancho Migration
 
 The offline bancho.py v5.2.2 MySQL and asset migration is available through
-`python -m tools.bancho_migration`. Run `preflight` before `apply`; the operational prerequisites, exclusions, override
+`python -m tools.migration`. Run `preflight` before `apply`; the operational prerequisites, exclusions, override
 format, recovery rules, and verification procedure are documented in
 [the migration runbook](.agent-space/docs/bancho-migration.md).
 

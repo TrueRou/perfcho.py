@@ -5,21 +5,36 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db import engine as infra_db
-from perfcho.infra.db.enums import AccountStatus, AccountType, BeatmapStatus
+from perfcho.infra.db.enums import AccountStatus, AccountType, AttemptStatus, BeatmapStatus
+from perfcho.infra.db.enums import ClientFamily as DbClientFamily
 from perfcho.infra.db.enums import Ruleset as DbRuleset
+from perfcho.infra.db.enums import ScoreGrade as DbScoreGrade
+from perfcho.infra.db.enums import ScoreOutcome as DbScoreOutcome
 from perfcho.infra.db.models.content import Beatmap, BeatmapRevision, Beatmapset
 from perfcho.infra.db.models.core import Account
+from perfcho.infra.db.models.events import OutboxDelivery, OutboxEvent, ProjectionCheckpoint
 from perfcho.infra.db.models.multiplayer import (
     MultiplayerAttempt,
     MultiplayerEvent,
     MultiplayerSession,
+    PlaylistItemUserSummary,
+    PlaylistRevision,
     Room,
+    RoomUserSummary,
     Round,
+    RoundParticipant,
+    RoundResult,
     SessionPresence,
+    SessionStanding,
 )
+from perfcho.infra.db.models.scoring import PlayAttempt, Score
+from perfcho.infra.db.projectors.multiplayer_results import CONSUMER_NAME, project_multiplayer_results
 from perfcho.infra.db.repositories.multiplayer import SqlAlchemyMultiplayerRepository
+from perfcho.infra.db.repositories.outbox import append_outbox_event
+from perfcho.modules.common import PendingEvent
 from perfcho.modules.multiplayer import (
     MatchAlreadyJoined,
     MatchStateRejected,
@@ -32,6 +47,124 @@ from perfcho.modules.multiplayer import (
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant
 
 NOW = datetime(2099, 7, 29, 12, tzinfo=UTC)
+
+
+async def _bind_round_score(
+    session: AsyncSession,
+    round_id: uuid.UUID,
+    account_id: int,
+    *,
+    total_score: int,
+    ended_at: datetime,
+) -> tuple[int, int]:
+    row = (
+        await session.execute(
+            select(
+                MultiplayerAttempt,
+                Round.started_at,
+                PlaylistRevision.beatmap_revision_id,
+                PlaylistRevision.scoreboard_id,
+                RoundParticipant.mod_set_id,
+                BeatmapRevision.beatmap_id,
+            )
+            .join(Round, Round.id == MultiplayerAttempt.round_id)
+            .join(PlaylistRevision, PlaylistRevision.id == Round.playlist_revision_id)
+            .join(
+                RoundParticipant,
+                (RoundParticipant.round_id == round_id) & (RoundParticipant.account_id == account_id),
+            )
+            .join(BeatmapRevision, BeatmapRevision.id == PlaylistRevision.beatmap_revision_id)
+            .where(MultiplayerAttempt.round_id == round_id, MultiplayerAttempt.account_id == account_id)
+            .with_for_update(of=MultiplayerAttempt)
+        )
+    ).one()
+    multiplayer_attempt, round_started_at, revision_id, scoreboard_id, mod_set_id, beatmap_id = row
+    play_attempt = PlayAttempt(
+        id=uuid.uuid7(),
+        account_id=account_id,
+        beatmap_id=beatmap_id,
+        beatmap_revision_id=revision_id,
+        scoreboard_id=scoreboard_id,
+        mod_set_id=mod_set_id,
+        protocol=DbClientFamily.STABLE,
+        idempotency_key=f"round:{round_id}:{account_id}",
+        status=AttemptStatus.VERIFIED,
+        started_at=round_started_at,
+        ended_at=ended_at,
+        outcome=DbScoreOutcome.PASSED,
+        progress=Decimal(1),
+    )
+    session.add(play_attempt)
+    await session.flush()
+    score = Score(
+        attempt_id=play_attempt.id,
+        account_id=account_id,
+        beatmap_id=beatmap_id,
+        beatmap_revision_id=revision_id,
+        scoreboard_id=scoreboard_id,
+        mod_set_id=mod_set_id,
+        total_score=total_score,
+        classic_score=total_score,
+        accuracy=Decimal("0.98"),
+        max_combo=100,
+        grade=DbScoreGrade.A,
+        outcome=DbScoreOutcome.PASSED,
+        perfect=False,
+        client_flags=0,
+        started_at=play_attempt.started_at,
+        ended_at=ended_at,
+        processed_at=ended_at,
+    )
+    session.add(score)
+    await session.flush()
+    multiplayer_attempt.play_attempt_id = play_attempt.id
+    multiplayer_attempt.score_id = score.id
+    multiplayer_attempt.status = AttemptStatus.VERIFIED
+    multiplayer_attempt.consumed_at = ended_at
+    return score.id, scoreboard_id
+
+
+async def _append_round_completed(
+    session: AsyncSession,
+    room: RoomRecord,
+    round_id: uuid.UUID,
+    *,
+    aborted: bool,
+) -> uuid.UUID:
+    event = await append_outbox_event(
+        session,
+        PendingEvent(
+            aggregate_type="multiplayer_round",
+            aggregate_id=str(round_id),
+            event_type="multiplayer.round-completed.v1",
+            schema_version=1,
+            payload={
+                "round_id": str(round_id),
+                "session_id": str(room.session_id),
+                "room_id": str(room.room_id),
+                "aborted": aborted,
+            },
+            consumers=(CONSUMER_NAME,),
+            partition_key=f"round:{round_id}",
+        ),
+    )
+    return event.id
+
+
+async def _append_score_accepted(session: AsyncSession, score_id: int, scoreboard_id: int) -> uuid.UUID:
+    event = await append_outbox_event(
+        session,
+        PendingEvent(
+            aggregate_type="score",
+            aggregate_id=str(score_id),
+            event_type="score.accepted.v1",
+            schema_version=1,
+            payload={"score_id": score_id, "scoreboard_id": scoreboard_id},
+            consumers=(CONSUMER_NAME,),
+            partition_key=f"scoreboard:{scoreboard_id}",
+        ),
+    )
+    return event.id
 
 
 def test_multiplayer_partial_unique_indexes_cover_global_presence_and_active_round() -> None:
@@ -229,6 +362,280 @@ async def test_postgres_multiplayer_lifecycle_and_known_map_attempts(postgres_da
             assert all(
                 attempt.expires_at <= NOW.replace(microsecond=0) + timedelta(minutes=2, seconds=32)
                 for attempt in attempts
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abort(
+    postgres_database_url: str,
+) -> None:
+    del postgres_database_url
+    engine = await infra_db.create_engine()
+    session_factory = infra_db.create_session_factory(engine)
+    try:
+        async with session_factory.begin() as session:
+            session.add(
+                Account(
+                    id=2,
+                    type=AccountType.USER,
+                    status=AccountStatus.ACTIVE,
+                    registered_at=NOW,
+                    activated_at=NOW,
+                )
+            )
+            beatmapset = Beatmapset(
+                source_id=1,
+                external_id=201,
+                creator_name="Creator",
+                artist="Artist",
+                title="Projection",
+                status=BeatmapStatus.RANKED,
+                available=True,
+            )
+            session.add(beatmapset)
+            await session.flush()
+            beatmap = Beatmap(
+                beatmapset_id=beatmapset.id,
+                source_id=1,
+                external_id=100,
+                ruleset=DbRuleset.OSU,
+                difficulty_name="Hard",
+                status=BeatmapStatus.RANKED,
+            )
+            session.add(beatmap)
+            await session.flush()
+            session.add(
+                BeatmapRevision(
+                    beatmap_id=beatmap.id,
+                    md5=b"m" * 16,
+                    sha256=b"p" * 32,
+                    file_name="Artist - Projection (Creator) [Hard].osu",
+                    file_name_key="artist - projection (creator) [hard].osu",
+                    source_updated_at=NOW,
+                    total_length_ms=60_000,
+                    drain_length_ms=55_000,
+                    bpm=Decimal(180),
+                    circle_size=Decimal(4),
+                    overall_difficulty=Decimal(8),
+                    approach_rate=Decimal(9),
+                    health_drain=Decimal(6),
+                    object_count=100,
+                    circle_count=80,
+                    slider_count=20,
+                    spinner_count=0,
+                    max_combo=120,
+                    is_current=True,
+                )
+            )
+
+        participants = (RoundParticipantSelection(1, 0, 0), RoundParticipantSelection(2, 1, 0))
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyMultiplayerRepository(session)
+            room = await repository.create_room(
+                command_id=uuid.uuid7(),
+                actor_account_id=1,
+                connection_session_id=uuid.uuid7(),
+                settings=settings(),
+                capacity=16,
+                password_salt=None,
+                password_verifier=None,
+                now=NOW,
+            )
+            room = await repository.join_room(
+                room,
+                command_id=uuid.uuid7(),
+                account_id=2,
+                connection_session_id=uuid.uuid7(),
+                now=NOW,
+            )
+            room, first_round_id = await repository.start_round(
+                room,
+                command_id=uuid.uuid7(),
+                actor_account_id=1,
+                participants=participants,
+                now=NOW,
+            )
+            assert first_round_id is not None
+            first_score_id, _ = await _bind_round_score(
+                session,
+                first_round_id,
+                1,
+                total_score=900_000,
+                ended_at=NOW + timedelta(seconds=30),
+            )
+            room = await repository.complete_round(
+                room,
+                command_id=uuid.uuid7(),
+                actor_account_id=1,
+                round_id=first_round_id,
+                aborted=False,
+                now=NOW + timedelta(seconds=31),
+            )
+            first_event_id = await _append_round_completed(session, room, first_round_id, aborted=False)
+            playlist_item_id = await session.scalar(
+                select(PlaylistRevision.item_id)
+                .join(Round, Round.playlist_revision_id == PlaylistRevision.id)
+                .where(Round.id == first_round_id)
+            )
+            assert playlist_item_id is not None
+
+        async with session_factory.begin() as session:
+            first_event = await session.get(OutboxEvent, first_event_id)
+            assert first_event is not None
+            await project_multiplayer_results(session, first_event, f"round:{first_round_id}")
+
+        async with session_factory() as session:
+            first_result = await session.scalar(select(RoundResult).where(RoundResult.round_id == first_round_id))
+            assert first_result is not None
+            assert (
+                first_result.account_id,
+                first_result.score_id,
+                first_result.rank,
+                first_result.metric_value,
+                first_result.points,
+            ) == (1, first_score_id, 1, Decimal("900000.00000"), Decimal("1.0000"))
+            standings = {
+                standing.subject_key: standing.points
+                for standing in await session.scalars(
+                    select(SessionStanding).where(SessionStanding.session_id == room.session_id)
+                )
+            }
+            assert standings == {"1": Decimal("1.0000"), "2": Decimal("0.0000")}
+
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyMultiplayerRepository(session)
+            room, second_round_id = await repository.start_round(
+                room,
+                command_id=uuid.uuid7(),
+                actor_account_id=1,
+                participants=participants,
+                now=NOW + timedelta(seconds=60),
+            )
+            assert second_round_id is not None
+            room = await repository.complete_round(
+                room,
+                command_id=uuid.uuid7(),
+                actor_account_id=1,
+                round_id=second_round_id,
+                aborted=False,
+                now=NOW + timedelta(seconds=90),
+            )
+            second_event_id = await _append_round_completed(session, room, second_round_id, aborted=False)
+
+        async with session_factory.begin() as session:
+            second_event = await session.get(OutboxEvent, second_event_id)
+            assert second_event is not None
+            await project_multiplayer_results(session, second_event, f"round:{second_round_id}")
+
+        async with session_factory() as session:
+            assert (
+                await session.scalar(
+                    select(func.count()).select_from(RoundResult).where(RoundResult.round_id == second_round_id)
+                )
+                == 0
+            )
+            no_score_summary = await session.get(
+                PlaylistItemUserSummary,
+                {"playlist_item_id": playlist_item_id, "account_id": 1},
+            )
+            assert no_score_summary is not None
+            assert (no_score_summary.attempt_count, no_score_summary.completion_count) == (2, 1)
+
+        async with session_factory.begin() as session:
+            late_score_id, scoreboard_id = await _bind_round_score(
+                session,
+                second_round_id,
+                1,
+                total_score=950_000,
+                ended_at=NOW + timedelta(seconds=91),
+            )
+            score_event_id = await _append_score_accepted(session, late_score_id, scoreboard_id)
+
+        async with session_factory.begin() as session:
+            score_event = await session.get(OutboxEvent, score_event_id)
+            assert score_event is not None
+            await project_multiplayer_results(session, score_event, f"scoreboard:{scoreboard_id}")
+            late_result = await session.scalar(select(RoundResult).where(RoundResult.round_id == second_round_id))
+            assert late_result is not None
+            digest = late_result.result_digest
+            await project_multiplayer_results(session, score_event, f"scoreboard:{scoreboard_id}")
+            assert late_result.result_digest == digest
+
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyMultiplayerRepository(session)
+            room, aborted_round_id = await repository.start_round(
+                room,
+                command_id=uuid.uuid7(),
+                actor_account_id=1,
+                participants=participants,
+                now=NOW + timedelta(seconds=120),
+            )
+            assert aborted_round_id is not None
+            room = await repository.complete_round(
+                room,
+                command_id=uuid.uuid7(),
+                actor_account_id=1,
+                round_id=aborted_round_id,
+                aborted=True,
+                now=NOW + timedelta(seconds=150),
+            )
+            aborted_event_id = await _append_round_completed(session, room, aborted_round_id, aborted=True)
+
+        async with session_factory.begin() as session:
+            aborted_event = await session.get(OutboxEvent, aborted_event_id)
+            assert aborted_event is not None
+            await project_multiplayer_results(session, aborted_event, f"round:{aborted_round_id}")
+
+        async with session_factory() as session:
+            assert (
+                await session.scalar(
+                    select(func.count()).select_from(RoundResult).where(RoundResult.round_id == aborted_round_id)
+                )
+                == 0
+            )
+            late_result = await session.scalar(select(RoundResult).where(RoundResult.round_id == second_round_id))
+            assert late_result is not None and late_result.score_id == late_score_id
+            standing = await session.get(
+                SessionStanding,
+                {"session_id": room.session_id, "subject_type": "account", "subject_key": "1"},
+            )
+            playlist_summary = await session.get(
+                PlaylistItemUserSummary,
+                {"playlist_item_id": playlist_item_id, "account_id": 1},
+            )
+            room_summary = await session.get(
+                RoomUserSummary,
+                {"room_id": room.room_id, "account_id": 1},
+            )
+            checkpoint = await session.get(
+                ProjectionCheckpoint,
+                {"projector": CONSUMER_NAME, "partition_key": f"scoreboard:{scoreboard_id}"},
+            )
+            assert standing is not None and standing.points == Decimal("2.0000")
+            assert playlist_summary is not None
+            assert (
+                playlist_summary.attempt_count,
+                playlist_summary.completion_count,
+                playlist_summary.best_score_id,
+                playlist_summary.best_metric_value,
+            ) == (3, 2, late_score_id, Decimal("950000.00000"))
+            assert room_summary is not None
+            assert (
+                room_summary.attempt_count,
+                room_summary.completion_count,
+                room_summary.total_score,
+                room_summary.total_performance,
+                room_summary.average_accuracy,
+            ) == (3, 2, 1_850_000, Decimal("0.00000"), Decimal("0.980000000"))
+            assert checkpoint is not None and checkpoint.source_event_id == score_event_id
+            assert (
+                await session.scalar(
+                    select(func.count()).select_from(OutboxDelivery).where(OutboxDelivery.consumer == CONSUMER_NAME)
+                )
+                == 4
             )
     finally:
         await engine.dispose()

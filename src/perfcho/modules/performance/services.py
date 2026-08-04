@@ -77,6 +77,7 @@ class PerformanceCalculationService:
                 job_id,
                 phase,
                 phase_started_ns,
+                exception=error,
                 error_type=type(error).__name__,
             )
             return
@@ -133,6 +134,7 @@ class PerformanceCalculationService:
                 job_id,
                 phase,
                 phase_started_ns,
+                exception=error,
                 error_type=type(error).__name__,
             )
             return
@@ -208,6 +210,7 @@ def _log_calculation_outcome(
     phase: str,
     started_ns: int,
     *,
+    exception: BaseException | None = None,
     error_type: str | None = None,
 ) -> None:
     level = {
@@ -221,6 +224,7 @@ def _log_calculation_outcome(
         log_event(
             level,
             f"performance.calculation.{outcome}",
+            exception=exception,
             job_id=str(job_id),
             phase=phase,
             duration_ms=duration_ms(started_ns),
@@ -229,6 +233,7 @@ def _log_calculation_outcome(
         log_event(
             level,
             f"performance.calculation.{outcome}",
+            exception=exception,
             job_id=str(job_id),
             phase=phase,
             error_type=error_type,

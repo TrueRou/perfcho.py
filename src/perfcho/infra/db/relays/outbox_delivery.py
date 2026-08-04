@@ -6,7 +6,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from time import monotonic_ns
-from typing import Literal
+from typing import Literal, TypedDict
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,6 +30,18 @@ class OutboxDeliveryReference:
     event_id: uuid.UUID
     consumer: str
     delivery_token: uuid.UUID
+
+
+class _OutboxEventLogFields(TypedDict, total=False):
+    """Describe the complete outbox event context emitted by delivery logs."""
+
+    event_type: str
+    aggregate_type: str
+    aggregate_id: str
+    schema_version: int
+    source_position: int
+    payload_fields: tuple[str, ...]
+    outbox_payload: dict[str, object]
 
 
 class SqlAlchemyOutboxDeliveryRelayStore:
@@ -217,11 +229,15 @@ class OutboxDeliveryProcessor:
         started_ns = monotonic_ns()
         outcome: Literal["stale", "succeeded"] = "stale"
         attempt_count: int | None = None
+        event_fields: _OutboxEventLogFields = {}
         try:
             async with self._session_factory.begin() as session:
                 delivery = await _locked_delivery(session, reference)
                 if delivery is None:
                     raise LookupError(f"Outbox delivery does not exist: {reference.event_id}/{reference.consumer}")
+                event = await session.get(OutboxEvent, reference.event_id)
+                if event is not None:
+                    event_fields = _outbox_event_fields(event)
                 if delivery.status not in {OutboxDeliveryStatus.SUCCEEDED, OutboxDeliveryStatus.DEAD}:
                     now = await _database_now(session)
                     if (
@@ -233,7 +249,6 @@ class OutboxDeliveryProcessor:
                         registration = self._consumer_catalog.get(reference.consumer)
                         if registration is None:
                             raise LookupError(f"Outbox consumer is not registered: {reference.consumer}")
-                        event = await session.get(OutboxEvent, reference.event_id)
                         if event is None:
                             raise LookupError(f"Outbox event does not exist: {reference.event_id}")
                         if event.event_type not in registration.event_types:
@@ -258,22 +273,25 @@ class OutboxDeliveryProcessor:
             log_event(
                 "ERROR" if failure_outcome == "dead" else "WARNING",
                 f"outbox.delivery.{failure_outcome}",
+                exception=error,
                 event_id=str(reference.event_id),
                 consumer=reference.consumer,
                 attempt_count=failure_attempt_count,
                 error_type=type(error).__name__,
                 duration_ms=duration_ms(started_ns),
+                **event_fields,
             )
             raise
         if outcome == "succeeded":
             assert attempt_count is not None
             log_event(
-                "DEBUG",
+                "INFO",
                 "outbox.delivery.succeeded",
                 event_id=str(reference.event_id),
                 consumer=reference.consumer,
                 attempt_count=attempt_count,
                 duration_ms=duration_ms(started_ns),
+                **event_fields,
             )
         else:
             log_event(
@@ -282,6 +300,7 @@ class OutboxDeliveryProcessor:
                 event_id=str(reference.event_id),
                 consumer=reference.consumer,
                 duration_ms=duration_ms(started_ns),
+                **event_fields,
             )
 
     async def _record_failure(
@@ -373,3 +392,16 @@ def _retry_delay(attempt_count: int, max_seconds: int) -> timedelta:
 
 def _error_message(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"[:4000]
+
+
+def _outbox_event_fields(event: OutboxEvent) -> _OutboxEventLogFields:
+    """Return event identity and its complete payload for delivery diagnostics."""
+    return {
+        "event_type": event.event_type,
+        "aggregate_type": event.aggregate_type,
+        "aggregate_id": event.aggregate_id,
+        "schema_version": event.schema_version,
+        "source_position": event.position,
+        "payload_fields": tuple(sorted(event.payload)),
+        "outbox_payload": event.payload,
+    }

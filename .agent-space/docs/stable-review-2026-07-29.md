@@ -22,7 +22,7 @@
 | ST-AUTH-006 | Redis Session 丢失后静默重建不完整状态 | 已修复 | Poll 关闭对应持久 Session 并返回 Restart，要求客户端重新登录；Bancho 测试 |
 | ST-AUTH-007 | Stable 登录后 300-800ms 伪 Logout 会立即关闭会话 | 已修复 | `ResolvedStableSession.opened_at` 和首秒 Logout 抑制；`test_stable_remainder.py` |
 | ST-AUTH-008 | 并发 Poll 在业务副作用后才争用 Mailbox Lease，可能 500 并重复消息 | 已修复 | Dispatch 前获取 fenced Poll Lease；冲突返回受控空 Poll；Bancho 测试 |
-| ST-AUTH-009 | Token HMAC Key 与 Match Password HMAC Key 在组合根接反 | 已修复 | `composition.py` 分离 Token、Match Password 与 Admission Token Key；composition 测试 |
+| ST-AUTH-009 | Token HMAC Key 与 Match Password HMAC Key 在组合根接反 | 已修复 | `wiring/stable.py` 分离 Token、Match Password 与 Admission Token Key；wiring 测试 |
 | ST-AUTH-010 | Redis Mailbox 按账户跨 Session 复用，旧包会泄漏到新 Session | 已修复 | Mailbox enqueue/lease/ack/release 全部要求 `SessionFence`，relogin 清理旧 epoch；Redis 测试 |
 | ST-AUTH-011 | Stable Web 只检查 PostgreSQL Session，断线后 MD5 Token 仍可用 | 已修复 | Web、Scoring、Replay 和 Ranking 同时验证匹配的 Redis realtime epoch；Web/Scoring 测试 |
 | ST-AUTH-012 | 不存在账户跳过 KDF，可按响应时间枚举账户 | 已修复 | Dummy Argon2 verification，且 Web 先查活动 Session candidate；identity/security 测试 |

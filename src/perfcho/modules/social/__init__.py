@@ -1,5 +1,6 @@
 """Expose protocol-neutral social and achievement operations."""
 
+from perfcho.modules.social.commands import build_clan_commands
 from perfcho.modules.social.errors import (
     AchievementNotFound,
     AchievementUnlockConflict,
@@ -10,25 +11,32 @@ from perfcho.modules.social.errors import (
 from perfcho.modules.social.models import (
     AccountIdentityView,
     Achievement,
+    AchievementEvaluationDefinition,
     AchievementUnlock,
     AchievementUnlockResult,
+    AchievementUnlockView,
     BlockResult,
     BlockView,
     FollowView,
     PairRelationship,
+    ScoreAchievementContext,
 )
-from perfcho.modules.social.ports import SocialRepository
-from perfcho.modules.social.services import SocialService
+from perfcho.modules.social.ports import AchievementAwarder, SocialRepository
+from perfcho.modules.social.services import SocialService, TransactionAchievementAwarder
 
 __all__ = (
     "Achievement",
+    "AchievementAwarder",
+    "AchievementEvaluationDefinition",
     "AccountIdentityView",
     "AchievementNotFound",
     "AchievementUnlock",
     "AchievementUnlockConflict",
     "AchievementUnlockResult",
+    "AchievementUnlockView",
     "BlockResult",
     "BlockView",
+    "build_clan_commands",
     "FollowView",
     "PairRelationship",
     "SocialAccountNotFound",
@@ -36,4 +44,6 @@ __all__ = (
     "SocialRelationRejected",
     "SocialRepository",
     "SocialService",
+    "ScoreAchievementContext",
+    "TransactionAchievementAwarder",
 )

@@ -11,7 +11,7 @@ from perfcho.api.stable import router
 from perfcho.api.stable.canonize.login import StableLoginParseError, parse_stable_login
 from perfcho.api.stable.dependencies import get_stable_services
 from perfcho.api.stable.dispatcher import StableRuntimeContext
-from perfcho.infra.composition import StableServices
+from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService, StablePrivilege
 from perfcho.modules.common import Clock, IdGenerator
@@ -115,6 +115,7 @@ class FakeRealtime:
         self.fenced: list[SessionFence] = []
         self.lease_fences: list[SessionFence] = []
         self.active_lease = False
+        self.release_calls = 0
         self.lease_conflict = False
         self.fail_set_presence = False
         self.fail_presence_capacity = False
@@ -230,6 +231,7 @@ class FakeRealtime:
         through_sequence: int,
     ) -> None:
         del account_id, lease_id
+        self.release_calls += 1
         assert self.session is not None
         assert recipient_fence == self.session.fence
         self.mailbox = [packet for packet in self.mailbox if packet.sequence > through_sequence]
@@ -247,11 +249,22 @@ class FakeRealtime:
         assert recipient_fence == self.session.fence
         self.active_lease = False
 
+    async def get_spectator_relation(
+        self,
+        account_id: int,
+        *,
+        spectator_fence: SessionFence,
+        at: datetime,
+    ) -> None:
+        del account_id, spectator_fence, at
+        return None
+
     async def fence_session(self, session_id: uuid.UUID, *, expected_revision: int) -> None:
         assert self.session is not None
         assert (session_id, expected_revision) == (self.session.session_id, self.session.revision)
         self.fenced.append(self.session.fence)
         self.online_presences.pop(self.session.account_id, None)
+        self.active_lease = False
         self.session = None
 
 
@@ -385,7 +398,7 @@ async def test_old_build_and_non_osu_user_agent_fail_in_protocol() -> None:
 
 
 @pytest.mark.asyncio
-async def test_authenticated_ping_poll_drains_mailbox() -> None:
+async def test_authenticated_client_keepalive_drains_mailbox_without_server_ping() -> None:
     services, identity, realtime = stable_services()
     await realtime.open_session(
         session_id=identity.session_id,
@@ -406,7 +419,6 @@ async def test_authenticated_ping_poll_drains_mailbox() -> None:
         )
 
     assert [packet.packet_type for packet in PacketReader(response.content, packet_enum=ServerPacket)] == [
-        ServerPacket.PONG,
         ServerPacket.NOTIFICATION,
     ]
     assert realtime.mailbox == []
@@ -415,11 +427,65 @@ async def test_authenticated_ping_poll_drains_mailbox() -> None:
 
 
 @pytest.mark.asyncio
+async def test_authenticated_client_keepalive_returns_empty_success() -> None:
+    services, identity, realtime = stable_services()
+    await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/octet-stream")
+    assert response.content == b""
+    assert identity.touch_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_logout_poll_does_not_cleanup_fenced_mailbox_again() -> None:
+    services, identity, realtime = stable_services()
+    await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/",
+            content=build_packet(ClientPacket.LOGOUT, (0).to_bytes(4, "little", signed=True)),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert identity.close_calls == [("stable-token-value", "client_logout")]
+    assert realtime.fenced == [SessionFence(identity.session_id, 1)]
+    assert realtime.release_calls == 0
+    assert not realtime.active_lease
+
+
+@pytest.mark.asyncio
 async def test_login_and_sampled_poll_logs_are_structured_and_secret_free(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
     cho_module = importlib.import_module("perfcho.api.stable.router.cho")
-    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher")
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
     events: list[tuple[str, str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -453,7 +519,8 @@ async def test_login_and_sampled_poll_logs_are_structured_and_secret_free(monkey
 @pytest.mark.asyncio
 async def test_poll_response_budget_defers_mailbox_packets_without_acknowledging_them() -> None:
     services, identity, realtime = stable_services()
-    object.__setattr__(services, "settings", Settings(stable_max_response_bytes=7))
+    stats_packet_size = len(user_stats(UserStats(3, 0, "", "", 0, 0, 0, 0, 0.0, 0, 0, 0, 0)))
+    object.__setattr__(services, "settings", Settings(stable_max_response_bytes=stats_packet_size))
     await realtime.open_session(
         session_id=identity.session_id,
         account_id=3,
@@ -468,7 +535,7 @@ async def test_poll_response_budget_defers_mailbox_packets_without_acknowledging
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
         full = await client.post(
             "/",
-            content=build_packet(ClientPacket.PING),
+            content=build_packet(ClientPacket.REQUEST_STATUS_UPDATE),
             headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
         )
         drained = await client.post(
@@ -479,7 +546,7 @@ async def test_poll_response_budget_defers_mailbox_packets_without_acknowledging
 
     assert len(full.content) == services.settings.stable_max_response_bytes
     assert [packet.packet_type for packet in PacketReader(full.content, packet_enum=ServerPacket)] == [
-        ServerPacket.PONG
+        ServerPacket.USER_STATS
     ]
     assert [packet.packet_type for packet in PacketReader(drained.content, packet_enum=ServerPacket)] == [
         ServerPacket.PONG
@@ -488,7 +555,18 @@ async def test_poll_response_budget_defers_mailbox_packets_without_acknowledging
 
 
 @pytest.mark.asyncio
-async def test_invalid_token_and_malformed_packet_request_reconnect() -> None:
+async def test_invalid_token_and_malformed_packet_request_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        del level
+        events.append((event, fields))
+
+    monkeypatch.setattr(cho_module, "log_event", capture)
+    monkeypatch.setattr(cho_module, "rate_limit", lambda *args, **kwargs: True)
     services, identity, realtime = stable_services()
     await realtime.open_session(
         session_id=identity.session_id,
@@ -509,6 +587,10 @@ async def test_invalid_token_and_malformed_packet_request_reconnect() -> None:
     assert list(PacketReader(expired.content, packet_enum=ServerPacket))[-1].packet_type is ServerPacket.RESTART
     assert list(PacketReader(malformed.content, packet_enum=ServerPacket))[-1].packet_type is ServerPacket.RESTART
     assert not realtime.active_lease
+    invalid_session = next(fields for event, fields in events if event == "stable.poll.invalid_session")
+    assert invalid_session["error_code"] == "invalid_stable_session"
+    assert invalid_session["error_type"] == "InvalidStableSession"
+    assert "exception" not in invalid_session
 
 
 @pytest.mark.asyncio
@@ -529,7 +611,7 @@ async def test_login_bootstrap_failure_closes_durable_session_and_fences_realtim
 
 
 @pytest.mark.asyncio
-async def test_login_cleanup_failure_is_logged_without_token_or_exception_text(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_login_cleanup_failure_is_logged_with_exception_details(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
     cho_module = importlib.import_module("perfcho.api.stable.router.cho")
@@ -547,22 +629,35 @@ async def test_login_cleanup_failure_is_logged_without_token_or_exception_text(m
         expires_at=NOW + timedelta(minutes=5),
         durable_expires_at=NOW + timedelta(hours=1),
     )
-    identity.close_error = RuntimeError("stable-token-value must remain private")
+    identity.close_error = RuntimeError("durable session close failed")
 
     await cho_module._compensate_failed_login("stable-token-value", realtime_session, services)
 
     cleanup = next(fields for event, fields in events if event == "stable.login.cleanup_failed")
-    assert cleanup == {
-        "operation": "close_durable_session",
-        "error_code": "cleanup_failed",
-        "error_type": "RuntimeError",
-    }
+    assert cleanup["operation"] == "close_durable_session"
+    assert cleanup["error_code"] == "cleanup_failed"
+    assert cleanup["error_type"] == "RuntimeError"
+    cleanup_exception = cleanup["exception"]
+    assert isinstance(cleanup_exception, BaseException)
+    assert cleanup_exception.args == ("durable session close failed",)
+    assert "durable session close failed" in repr(events)
     assert "stable-token-value" not in repr(events)
-    assert "must remain private" not in repr(events)
 
 
 @pytest.mark.asyncio
-async def test_poll_with_lost_redis_epoch_closes_durable_session_and_restarts() -> None:
+async def test_poll_with_lost_redis_epoch_closes_durable_session_and_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        del level
+        events.append((event, fields))
+
+    monkeypatch.setattr(cho_module, "log_event", capture)
     services, identity, realtime = stable_services()
     app = FastAPI()
     app.include_router(router)
@@ -579,6 +674,10 @@ async def test_poll_with_lost_redis_epoch_closes_durable_session_and_restarts() 
     assert identity.close_calls == [("stable-token-value", "realtime_state_lost")]
     assert realtime.open_calls == 0
     assert identity.touch_calls == 0
+    session_lost = next(fields for event, fields in events if event == "stable.poll.session_lost")
+    assert session_lost["error_code"] == "realtime_session_not_found"
+    assert session_lost["error_type"] == "RealtimeSessionNotFound"
+    assert "exception" not in session_lost
 
 
 @pytest.mark.asyncio

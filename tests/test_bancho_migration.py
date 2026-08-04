@@ -14,25 +14,25 @@ from sqlalchemy import select, text
 from perfcho.infra.db.enums import BeatmapStatus, Ruleset, ScoreboardVariant
 from perfcho.infra.db.models.scoring import CalculationFormula, CalculationRelease
 from perfcho.modules.common import ObjectStorage, ObjectUnavailable, StoredObject
-from tools.bancho_migration import cli as migration_cli
-from tools.bancho_migration import observability as migration_observability
-from tools.bancho_migration import runner as migration_runner
-from tools.bancho_migration import storage as migration_storage
-from tools.bancho_migration.config import MigrationConfig, MigrationOverrides
-from tools.bancho_migration.domains.common import run_batched_phase
-from tools.bancho_migration.domains.community import migrate_community
-from tools.bancho_migration.domains.content import migrate_content
-from tools.bancho_migration.domains.identity import migrate_identity
-from tools.bancho_migration.domains.multiplayer import migrate_multiplayer
-from tools.bancho_migration.domains.scoring import migrate_scoring
-from tools.bancho_migration.domains.social import migrate_social
-from tools.bancho_migration.models import DiagnosticSeverity, MigrationRuntime, MigrationStatus, SourceSchema
-from tools.bancho_migration.observability import PhaseObserver
-from tools.bancho_migration.report import MigrationReport
-from tools.bancho_migration.schema import EXCLUDED_TABLES, REQUIRED_COLUMNS, validate_source_schema
-from tools.bancho_migration.source import BanchoSource
-from tools.bancho_migration.state import MigrationCheckpoint, MigrationStateStore
-from tools.bancho_migration.storage import (
+from tools.migration import cli as migration_cli
+from tools.migration import observability as migration_observability
+from tools.migration import runner as migration_runner
+from tools.migration import storage as migration_storage
+from tools.migration.config import MigrationConfig, MigrationOverrides
+from tools.migration.domains.common import run_batched_phase
+from tools.migration.domains.community import migrate_community
+from tools.migration.domains.content import migrate_content
+from tools.migration.domains.identity import migrate_identity
+from tools.migration.domains.multiplayer import migrate_multiplayer
+from tools.migration.domains.scoring import migrate_scoring
+from tools.migration.domains.social import migrate_social
+from tools.migration.models import DiagnosticSeverity, MigrationRuntime, MigrationStatus, SourceSchema
+from tools.migration.observability import PhaseObserver
+from tools.migration.report import MigrationReport
+from tools.migration.schema import EXCLUDED_TABLES, REQUIRED_COLUMNS, validate_source_schema
+from tools.migration.source import BanchoSource
+from tools.migration.state import MigrationCheckpoint, MigrationStateStore
+from tools.migration.storage import (
     BeatmapChecksumMismatch,
     ObjectUploadFailed,
     ReplayFileMetadata,
@@ -42,8 +42,8 @@ from tools.bancho_migration.storage import (
     upload_beatmap_file,
     upload_replay_file,
 )
-from tools.bancho_migration.target import create_target_engine, prepare_target
-from tools.bancho_migration.transforms import (
+from tools.migration.target import create_target_engine, prepare_target
+from tools.migration.transforms import (
     beatmap_status,
     mod_set,
     normalized_accuracy,
@@ -391,7 +391,7 @@ async def test_rolled_back_batch_restores_report_accounting(
 
         async def __aexit__(self, *args: object) -> None:
             del args
-            raise RuntimeError("commit failed at postgresql://user:credential@endpoint/database")
+            raise RuntimeError("target transaction commit failed")
 
     class SessionFactory:
         def begin(self) -> Transaction:
@@ -431,7 +431,9 @@ async def test_rolled_back_batch_restores_report_accounting(
         ("INFO", "migration.phase.started"),
         ("ERROR", "migration.phase.failed"),
     ]
-    assert "credential" not in json.dumps(events)
+    phase_exception = events[1][2]["exception"]
+    assert isinstance(phase_exception, BaseException)
+    assert phase_exception.args == ("target transaction commit failed",)
 
 
 @pytest.mark.asyncio
@@ -455,9 +457,7 @@ async def test_storage_retry_events_are_bounded_and_secret_free(monkeypatch: pyt
             expected_sha256: bytes | None = None,
         ) -> StoredObject:
             del storage_key, content, media_type, expected_sha256
-            raise ObjectUnavailable(
-                "s3://access:credential@storage.internal/private/object-key at /private/migration/source/44.osr"
-            )
+            raise ObjectUnavailable("object storage upload unavailable")
 
         async def delete(self, storage_key: str) -> None:
             del storage_key
@@ -487,12 +487,14 @@ async def test_storage_retry_events_are_bounded_and_secret_free(monkeypatch: pyt
     assert all(event[2]["object_kind"] == "replay" for event in events)
     assert all(event[2]["size_bytes"] == len(payload) for event in events)
     assert all("digest_prefix" not in event[2] for event in events)
-    serialized = json.dumps(events)
+    assert all(isinstance(event[2]["exception"], ObjectUnavailable) for event in events)
+    assert all(str(event[2]["exception"]) == "object storage upload unavailable" for event in events)
+    serialized = repr(events)
     for secret in ("credential", "storage.internal", "/private/", "object-key", "replays/stable"):
         assert secret not in serialized
 
 
-def test_cli_initializes_logging_preserves_summary_and_redacts_fatal_error(
+def test_cli_initializes_logging_preserves_summary_and_exception_details(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -503,10 +505,7 @@ def test_cli_initializes_logging_preserves_summary_and_redacts_fatal_error(
 
     async def fail(config: MigrationConfig, *, invocation_id: str | None = None) -> MigrationReport:
         del config, invocation_id
-        raise RuntimeError(
-            "mysql://bancho:source-secret@source.internal/bancho "
-            "postgresql://perfcho:target-secret@target.internal/perfcho"
-        )
+        raise RuntimeError("source and target connection failed")
 
     def capture(level: str, event: str, **fields: object) -> None:
         events.append((level, event, fields))
@@ -543,7 +542,10 @@ def test_cli_initializes_logging_preserves_summary_and_redacts_fatal_error(
     output = capsys.readouterr()
     assert f"report: {report_path}" in output.out
     assert "diagnostics: 1, errors: True" in output.out
-    serialized = json.dumps(events) + output.err
+    command_exception = events[1][2]["exception"]
+    assert isinstance(command_exception, BaseException)
+    assert command_exception.args == ("source and target connection failed",)
+    serialized = repr(events) + output.err
     for secret in ("source-secret", "target-secret", "source.internal", "target.internal", str(tmp_path)):
         assert secret not in serialized
 
@@ -627,7 +629,10 @@ async def test_runner_fatal_exception_writes_failed_report_and_safe_lifecycle(
         ("INFO", "migration.apply.started"),
         ("ERROR", "migration.apply.failed"),
     ]
-    serialized = json.dumps(events)
+    apply_exception = events[1][2]["exception"]
+    assert isinstance(apply_exception, BaseException)
+    assert apply_exception.args == ("apply requires --confirm-offline after stopping bancho and perfcho writers",)
+    serialized = repr(events)
     for secret in ("source-secret", "target-secret", "source.internal", "target.internal", str(tmp_path)):
         assert secret not in serialized
 

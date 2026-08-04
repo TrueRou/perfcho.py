@@ -3,6 +3,7 @@
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import timedelta
 
 from perfcho.infra.logging import duration_ms, log_event
@@ -36,9 +37,13 @@ from perfcho.modules.scoring.ports import (
     ScoringUnitOfWork,
 )
 from perfcho.modules.scoring.validation import validate_score
+from perfcho.modules.social.models import ScoreAchievementContext
+from perfcho.modules.social.ports import AchievementAwarderFactory
 
 _RECEIPT_TTL = timedelta(days=7)
 _RANKING_CONSUMER = "ranking-projector.v1"
+_STATS_CONSUMER = "scoring-stats-projector.v1"
+_MULTIPLAYER_RESULTS_CONSUMER = "multiplayer-results-projector.v1"
 
 
 class ScoringService:
@@ -52,6 +57,7 @@ class ScoringService:
         account_validator_factory: AccountSubmissionValidatorFactory,
         multiplayer_validator_factory: MultiplayerSubmissionValidatorFactory,
         task_scheduler_factory: ScoreAcceptedTaskSchedulerFactory,
+        achievement_awarder_factory: AchievementAwarderFactory,
         clock: Clock,
         id_generator: IdGenerator,
         *,
@@ -66,6 +72,7 @@ class ScoringService:
         self._account_validator_factory = account_validator_factory
         self._multiplayer_validator_factory = multiplayer_validator_factory
         self._task_scheduler_factory = task_scheduler_factory
+        self._achievement_awarder_factory = achievement_awarder_factory
         self._clock = clock
         self._id_generator = id_generator
         self._receipt_ttl = receipt_ttl
@@ -182,6 +189,28 @@ class ScoringService:
                     processed_at=now,
                 )
             )
+            new_unlocks = await self._achievement_awarder_factory(uow.session).award_for_score(
+                ScoreAchievementContext(
+                    account_id=account_context.account_id,
+                    score_id=result.score_id,
+                    beatmap_id=result.beatmap_id,
+                    beatmap_revision_id=result.beatmap_revision_id,
+                    ruleset=command.ruleset.value,
+                    variant=command.variant.value,
+                    beatmap_status=revision.status,
+                    outcome=result.outcome.value,
+                    grade=command.score.grade.value,
+                    total_score=command.score.total_score,
+                    classic_score=command.score.classic_score,
+                    accuracy=validated.accuracy,
+                    max_combo=command.score.max_combo,
+                    perfect=command.score.perfect,
+                    total_hits=validated.total_hits,
+                    mods=tuple(mod.acronym for mod in normalized_mods.mods),
+                ),
+                at=now,
+            )
+            result = replace(result, new_achievement_unlocks=new_unlocks)
             await self._task_scheduler_factory(uow.session).schedule(
                 score_id=result.score_id,
                 scoreboard=scoreboard,
@@ -196,6 +225,9 @@ class ScoringService:
                 )
 
             outbox_writer = self._outbox_writer_factory(uow.session)
+            consumers = (_RANKING_CONSUMER, _STATS_CONSUMER)
+            if command.multiplayer is not None:
+                consumers += (_MULTIPLAYER_RESULTS_CONSUMER,)
             await outbox_writer.append(
                 PendingEvent(
                     aggregate_type="score",
@@ -221,7 +253,7 @@ class ScoringService:
                         "ended_at": command.attempt.ended_at.isoformat(),
                         "request_id": str(command.meta.request_id),
                     },
-                    consumers=(_RANKING_CONSUMER,),
+                    consumers=consumers,
                     partition_key=f"scoreboard:{scoreboard.scoreboard_id}",
                 )
             )
@@ -266,10 +298,12 @@ class ReplayService:
         self,
         uow_factory: Callable[[], ScoringUnitOfWork],
         repository_factory: ScoringRepositoryFactory,
+        outbox_writer_factory: OutboxWriterFactory,
     ) -> None:
-        """Bind transaction and scoring repository factories."""
+        """Bind transaction, scoring persistence, and durable events."""
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
+        self._outbox_writer_factory = outbox_writer_factory
 
     async def record_view(
         self,
@@ -284,12 +318,29 @@ class ReplayService:
         if viewer_account_id == replay.owner_account_id:
             return
         async with self._uow_factory() as uow:
-            await self._repository_factory(uow.session).record_replay_view(
+            inserted = await self._repository_factory(uow.session).record_replay_view(
                 request_id=request_id,
                 score_id=replay.score_id,
                 score_owner_account_id=replay.owner_account_id,
                 viewer_account_id=viewer_account_id,
             )
+            if inserted:
+                await self._outbox_writer_factory(uow.session).append(
+                    PendingEvent(
+                        aggregate_type="score",
+                        aggregate_id=str(replay.score_id),
+                        event_type="score.replay-viewed.v1",
+                        schema_version=1,
+                        payload={
+                            "score_id": replay.score_id,
+                            "account_id": replay.owner_account_id,
+                            "scoreboard_id": replay.scoreboard_id,
+                            "request_id": str(request_id),
+                        },
+                        consumers=(_STATS_CONSUMER,),
+                        partition_key=f"scoreboard:{replay.scoreboard_id}",
+                    )
+                )
             await uow.commit()
 
 

@@ -51,7 +51,8 @@ def score_fields(*, mods: int = 0, mode: int = 0) -> list[str]:
         "True",
         str(mode),
         "260729123000",
-        "b20260711.1    ",
+        OSU_VERSION,
+        "54645451",
     ]
 
 
@@ -90,7 +91,9 @@ def test_stable_score_decryption_normalizes_identity_hits_and_timing() -> None:
     assert result.score.grade is ScoreGrade.X
     assert result.score.outcome is ScoreOutcome.PASSED
     assert result.score.accuracy == Decimal(1)
-    assert result.score.client_flags == 0
+    assert result.score.client_flags == 54_645_451
+    assert result.attestation.client_flags == 54_645_451
+    assert result.attempt.client_metadata["client_flags"] == 54_645_451
     assert result.attempt.started_at == datetime(2026, 7, 29, 12, 29, tzinfo=UTC)
     assert result.attempt.ended_at - result.attempt.started_at == timedelta(minutes=1)
     assert result.attestation.verification_state == "pending"
@@ -119,6 +122,9 @@ def test_stable_score_decryption_rejects_wrong_build_and_malformed_payload() -> 
             supported_build="b20250101",
         )
 
+    with pytest.raises(ValueError, match="payload"):
+        decrypt(score_fields()[:-1])
+
 
 def test_stable_online_checksum_matches_bancho_formula_and_rejects_mismatch() -> None:
     fields = score_fields()
@@ -141,6 +147,10 @@ def test_stable_online_checksum_matches_bancho_formula_and_rejects_mismatch() ->
     with pytest.raises(ValueError, match="checksum"):
         verify_stable_online_checksum(parsed, osu_version=OSU_VERSION, storyboard_hash=storyboard_hash)
 
+    fields[2] = "0" * 32
+    parsed_without_storyboard = decrypt(fields)
+    verify_stable_online_checksum(parsed_without_storyboard, osu_version=OSU_VERSION, storyboard_hash=None)
+
 
 def test_stable_score_decryption_rejects_unbounded_time_and_client_marker() -> None:
     score, client_hash, iv = encrypted_fields(score_fields())
@@ -157,8 +167,8 @@ def test_stable_score_decryption_rejects_unbounded_time_and_client_marker() -> N
         )
 
     fields = score_fields()
-    fields[17] = "b20260711.2"
-    with pytest.raises(ValueError, match="build marker"):
+    fields[17] = "20260712"
+    with pytest.raises(ValueError, match="version marker"):
         decrypt(fields)
     with pytest.raises(ValueError, match="encryption"):
         decrypt_stable_score(

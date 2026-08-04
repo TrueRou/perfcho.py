@@ -1,5 +1,10 @@
 """Expose protocol-neutral multiplayer commands, values, ports, and services."""
 
+from .commands import (
+    MultiplayerCommandDependencies,
+    build_multiplayer_commands,
+    build_pool_commands,
+)
 from .errors import (
     MatchAlreadyJoined,
     MatchConcurrencyConflict,
@@ -57,6 +62,7 @@ __all__ = [
     "MultiplayerError",
     "MultiplayerRepository",
     "MultiplayerAccessPolicy",
+    "MultiplayerCommandDependencies",
     "MultiplayerService",
     "MultiplayerStateRepository",
     "RoomRecord",
@@ -70,4 +76,6 @@ __all__ = [
     "TeamMode",
     "UpdateRoomSettings",
     "WinCondition",
+    "build_multiplayer_commands",
+    "build_pool_commands",
 ]

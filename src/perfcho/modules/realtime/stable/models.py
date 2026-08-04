@@ -17,7 +17,7 @@ class ClientPacket(IntEnum):
     SEND_PUBLIC_MESSAGE = 1
     LOGOUT = 2
     REQUEST_STATUS_UPDATE = 3
-    PING = 4
+    PING = 4  # Named Osu_Pong in the client; a keepalive, not a request.
     START_SPECTATING = 16
     STOP_SPECTATING = 17
     SPECTATE_FRAMES = 18
@@ -70,7 +70,7 @@ class ServerPacket(IntEnum):
 
     USER_ID = 5
     SEND_MESSAGE = 7
-    PONG = 8
+    PONG = 8  # Named Bancho_Ping in the client; requests an Osu_Pong.
     HANDLE_IRC_CHANGE_USERNAME = 9
     HANDLE_IRC_QUIT = 10
     USER_STATS = 11
@@ -300,7 +300,7 @@ class ReplayFrameBundle:
     score_frame: ScoreFrame
     action: ReplayAction
     extra: int
-    sequence: int
+    sequence: int | None
     raw_data: memoryview
 
     def __post_init__(self) -> None:

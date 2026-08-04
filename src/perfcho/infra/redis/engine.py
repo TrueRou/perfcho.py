@@ -29,6 +29,7 @@ async def create_redis() -> Redis:
         log_event(
             "ERROR",
             "redis.state.connection_failed",
+            exception=e,
             endpoint_label="state",
             error_type=type(e).__name__,
             duration_ms=duration_ms(started_ns),

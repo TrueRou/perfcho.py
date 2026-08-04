@@ -539,6 +539,19 @@ def test_score_v2_frame_and_replay_bundle_round_trip_with_exact_raw_view() -> No
     reader.require_exhausted()
 
 
+def test_replay_bundle_accepts_legacy_payload_without_sequence() -> None:
+    score = ScoreFrame(100, 0, 1, 0, 0, 0, 0, 0, 300, 1, 1, True, 255, 0, False)
+    bundle = ReplayFrameBundle((), score, ReplayAction.STANDARD, 0, None, memoryview(b""))
+    writer = payload_writer()
+    writer.write_replay_frame_bundle(bundle)
+
+    reader = PacketReader(writer.to_bytes())
+    parsed = reader.read_replay_frame_bundle()
+
+    assert parsed.sequence is None
+    reader.require_exhausted()
+
+
 def test_replay_bundle_rejects_actions_outside_stable_inventory() -> None:
     score = ScoreFrame(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, False, 0, 0, False)
     with pytest.raises(ValueError, match="between 0 and 8"):

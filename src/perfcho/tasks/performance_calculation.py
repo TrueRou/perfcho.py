@@ -26,12 +26,14 @@ async def calculate_performance(
             log_event(
                 "ERROR",
                 "task.performance_calculation.malformed_payload",
+                exception=error,
                 error_type=type(error).__name__,
             )
         else:
             log_event(
                 "ERROR",
                 "task.performance_calculation.malformed_payload",
+                exception=error,
                 job_id=str(parsed_job_id),
                 error_type=type(error).__name__,
             )
@@ -44,6 +46,7 @@ async def calculate_performance(
         log_event(
             "ERROR",
             "task.performance_calculation.failed",
+            exception=error,
             job_id=str(parsed_job_id),
             error_type=type(error).__name__,
         )

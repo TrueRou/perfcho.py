@@ -7,6 +7,7 @@ from perfcho.modules.common.ports import UnitOfWork
 from perfcho.modules.content.models import (
     BeatmapRevisionView,
     BeatmapsetView,
+    CommentView,
     ContentSearch,
     ContentSearchPage,
     ContentSyncResult,
@@ -73,14 +74,56 @@ class ContentRepository(Protocol):
         """Upsert an account rating for one logical beatmap."""
         ...
 
+    async def list_comments(
+        self,
+        target: str,
+        external_target_id: int,
+    ) -> tuple[CommentView, ...]:
+        """List visible comments for one public Stable target."""
+        ...
+
+    async def create_comment(
+        self,
+        account_id: int,
+        target: str,
+        external_target_id: int,
+        position_ms: int,
+        body: str,
+    ) -> CommentView:
+        """Persist one visible comment for a public Stable target."""
+        ...
+
     async def synchronize_beatmapset(
         self,
         snapshot: UpstreamBeatmapsetSnapshot,
         files: tuple[SyncedBeatmapFile, ...],
         *,
         now: datetime,
+        next_check_at: datetime,
     ) -> ContentSyncResult:
         """Persist one complete immutable upstream snapshot."""
+        ...
+
+    async def claim_beatmapset_refresh(
+        self,
+        external_beatmapset_id: int,
+        *,
+        now: datetime,
+        lease_until: datetime,
+    ) -> bool:
+        """Atomically claim one due upstream refresh lease."""
+        ...
+
+    async def record_beatmapset_refresh_failure(
+        self,
+        external_beatmapset_id: int,
+        *,
+        expected_lease_until: datetime,
+        checked_at: datetime,
+        next_check_at: datetime,
+        error: str,
+    ) -> None:
+        """Record one failed refresh and its bounded retry time."""
         ...
 
 
@@ -89,6 +132,10 @@ class UpstreamContentSource(Protocol):
 
     async def fetch_beatmapset(self, external_beatmapset_id: int) -> UpstreamBeatmapsetSnapshot:
         """Fetch one complete upstream beatmapset snapshot."""
+        ...
+
+    async def lookup_beatmapset_id(self, checksum: str, file_name: str) -> int:
+        """Resolve a beatmapset by current checksum or filename."""
         ...
 
     async def fetch_beatmap_file(self, external_beatmap_id: int) -> bytes:

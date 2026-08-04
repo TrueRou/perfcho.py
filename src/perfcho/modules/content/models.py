@@ -122,6 +122,19 @@ class RatingSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class CommentView:
+    """Describe one visible Stable timeline comment."""
+
+    comment_id: int
+    author_account_id: int
+    target: str
+    position_ms: int
+    body: str
+    color: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class UpstreamBeatmapSnapshot:
     """Describe one upstream beatmap and the immutable revision to synchronize."""
 
@@ -232,3 +245,4 @@ class ContentSyncResult:
     created_revision_count: int
     unchanged_revision_count: int
     removed_beatmap_count: int
+    published: bool = True
