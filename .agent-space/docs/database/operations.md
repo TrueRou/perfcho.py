@@ -2,7 +2,7 @@
 
 ## 本地依赖
 
-根目录 `compose.yaml` 是唯一运行环境，包含 PostgreSQL、Redis、MinIO、API 与 Taskiq Worker 的完整拓扑。本地开发只启动基础设施，应用角色由宿主机进程运行。启动前先复制环境变量：
+开发使用根目录 `compose.yaml` 启动 PostgreSQL、Redis、MinIO 基础设施，应用角色由宿主机进程运行。启动前先复制环境变量：
 
 ```bash
 cp .env.example .env
@@ -10,7 +10,7 @@ docker compose up -d --wait postgres redis minio
 docker compose run --rm --no-deps minio-init
 ```
 
-PostgreSQL 监听 `127.0.0.1:55432`。Redis 监听 `127.0.0.1:56379`（启用 `requirepass`），DB 0 保存在线状态，DB 1 承载 Taskiq Stream。MinIO API 监听 `127.0.0.1:59000`，控制台监听 `127.0.0.1:59001`。开发库为 `perfcho`，集成测试库为 `perfcho_test`，均由 Compose 初始化脚本创建；宿主机进程通过 `.env` 读取与容器一致的 `POSTGRES_PASSWORD`、`REDIS_PASSWORD` 和 MinIO 凭据。
+PostgreSQL 监听 `127.0.0.1:55432`。开发 Redis 监听 `127.0.0.1:56379`，DB 0 保存在线状态，DB 1 承载 Taskiq Stream；生产 Redis 单独启用 `requirepass`。MinIO API 监听 `127.0.0.1:59000`，控制台监听 `127.0.0.1:59001`。开发库为 `perfcho`，集成测试库为 `perfcho_test`，均由 Compose 初始化脚本创建；宿主机进程通过 `.env` 读取与开发 Compose 一致的连接 URL 和 MinIO 凭据。
 
 VS Code 中选择 `perfcho: all processes` 后按 F5，会并行执行依赖同步与 Compose 基础设施启动，待 PostgreSQL、Redis、MinIO 健康后幂等初始化对象存储桶，最后同时调试 API 和 Taskiq Worker。Worker 内部运行 Outbox 与 Performance 持久任务 Relay。结束调试只停止两个应用进程，基础设施保持运行；不再需要时执行 `docker compose down`。
 
@@ -41,16 +41,16 @@ API 和 Worker 是同一可信中心应用的进程角色。Worker 内部后台�
 
 ## 部署
 
-根目录 `compose.yaml` 就是生产拓扑：PostgreSQL、带认证的 Redis、内部 MinIO 与两个应用角色运行在同一 Compose 网络，MinIO bucket 由一次性初始化容器幂等创建。根据 `.env.production.example` 创建不提交到 Git 的 `.env.production`，使用 `openssl rand -hex 32` 分别生成数据库、Redis、Password Pepper、Token HMAC、Device HMAC、Admission HMAC 与 MinIO 凭据，然后执行：
+生产使用独立的 `compose.prod.yaml`：PostgreSQL、带认证的 Redis、内部 MinIO 与两个应用角色运行在同一 Compose 网络，MinIO bucket 由一次性初始化容器幂等创建。根据 `.env.production.example` 创建不提交到 Git 的 `.env.production`，使用 `openssl rand -hex 32` 分别生成数据库、Redis、Password Pepper、Token HMAC、Device HMAC 与 MinIO 凭据，然后执行：
 
 ```bash
-docker compose --env-file .env.production up -d --build
-docker compose --env-file .env.production ps
+docker compose --env-file .env.production -f compose.prod.yaml up -d --build
+docker compose --env-file .env.production -f compose.prod.yaml ps
 ```
 
 部署拓扑等待 PostgreSQL/Redis/MinIO 健康，并由 MinIO 初始化容器创建 bucket 后启动 API/Taskiq。最先获得数据库初始化锁的角色通过 SQLAlchemy 创建缺失的 Schema 和表。两个应用角色复用同一标准 Python 3.14 镜像并独立监管；API 提供 HTTP 健康检查，Taskiq 由主进程退出状态触发重启，并结合最老 Delivery 延迟、Dead Letter 和 Redis Pending Entry 监控判断业务健康。
 
-依赖只发布到宿主机回环地址。MinIO 的 `perfcho-minio` volume 必须与 PostgreSQL Manifest 的事务点一致备份。API 默认只发布到 `127.0.0.1:10727`，由同机反向代理终止 TLS；必须显式修改 `APP_BIND_ADDRESS` 才能监听其他地址。`perfcho-postgres`、`perfcho-redis` 和 `perfcho-minio` 是持久卷，执行 `down` 时禁止附带 `--volumes`，除非已确认永久删除数据。
+开发依赖只发布到宿主机回环地址。生产 API 默认只发布到 `127.0.0.1:10727`，由同机反向代理终止 TLS；必须显式修改 `APP_BIND_ADDRESS` 才能监听其他地址。`perfcho-postgres`、`perfcho-redis` 和 `perfcho-minio` 是持久卷，执行 `down` 时禁止附带 `--volumes`，除非已确认永久删除数据。
 
 ## Redis 运维
 

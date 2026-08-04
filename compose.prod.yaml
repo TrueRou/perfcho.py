@@ -1,0 +1,184 @@
+name: perfcho-production
+
+x-app-environment: &app-environment
+  APP_HOST: 0.0.0.0
+  APP_PORT: 8000
+  APP_DEBUG: ${APP_DEBUG:-false}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_FORMAT: ${LOG_FORMAT:-json}
+  LOG_HTTP_SUCCESS_SAMPLE_RATE: ${LOG_HTTP_SUCCESS_SAMPLE_RATE:-0.05}
+  LOG_STABLE_POLL_SAMPLE_RATE: ${LOG_STABLE_POLL_SAMPLE_RATE:-0.01}
+  LOG_HOT_PATH_SAMPLE_RATE: ${LOG_HOT_PATH_SAMPLE_RATE:-0.001}
+  LOG_SLOW_REQUEST_MS: ${LOG_SLOW_REQUEST_MS:-1000}
+  CORS_ORIGINS: '${CORS_ORIGINS:-[]}'
+  TRUSTED_PROXY_CIDRS: '${TRUSTED_PROXY_CIDRS:-[]}'
+  DATABASE_URL: postgresql+asyncpg://perfcho:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/perfcho
+  DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
+  DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-5}
+  REDIS_STATE_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379/0
+  TASKIQ_BROKER_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379/1
+  PERFORMANCE_CALCULATOR_URLS: '${PERFORMANCE_CALCULATOR_URLS:-{}}'
+  PASSWORD_PEPPER: ${PASSWORD_PEPPER:?PASSWORD_PEPPER must be set}
+  TOKEN_HMAC_KEY: ${TOKEN_HMAC_KEY:?TOKEN_HMAC_KEY must be set}
+  DEVICE_HMAC_KEY: ${DEVICE_HMAC_KEY:?DEVICE_HMAC_KEY must be set}
+  MATCH_PASSWORD_HMAC_KEY: ${MATCH_PASSWORD_HMAC_KEY:?MATCH_PASSWORD_HMAC_KEY must be set}
+  ADMISSION_HMAC_KEY: ${ADMISSION_HMAC_KEY:?ADMISSION_HMAC_KEY must be set}
+  STABLE_SESSION_STALE_GRACE_SECONDS: ${STABLE_SESSION_STALE_GRACE_SECONDS:-120}
+  STABLE_SESSION_TOUCH_INTERVAL_SECONDS: ${STABLE_SESSION_TOUCH_INTERVAL_SECONDS:-30}
+  STABLE_WEB_AUTH_CACHE_TTL_SECONDS: ${STABLE_WEB_AUTH_CACHE_TTL_SECONDS:-60}
+  STABLE_PRESENCE_FANOUT_CONCURRENCY: ${STABLE_PRESENCE_FANOUT_CONCURRENCY:-32}
+  DURABLE_RELAY_ENQUEUE_CONCURRENCY: ${DURABLE_RELAY_ENQUEUE_CONCURRENCY:-16}
+  RANK_SNAPSHOT_POLL_INTERVAL_SECONDS: ${RANK_SNAPSHOT_POLL_INTERVAL_SECONDS:-60}
+  BOT_ACCOUNT_ID: ${BOT_ACCOUNT_ID:-1}
+  BOT_NAME: ${BOT_NAME:-BanchoBot}
+  BOT_COMMAND_PREFIX: ${BOT_COMMAND_PREFIX:-!}
+  S3_ENDPOINT_URL: http://minio:9000
+  S3_PRESIGN_ENDPOINT_URL: http://minio:9000
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+  S3_BUCKET: ${S3_BUCKET:-perfcho}
+  S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-path}
+  OSU_API_CLIENT_ID: ${OSU_API_CLIENT_ID:?OSU_API_CLIENT_ID must be set}
+  OSU_API_CLIENT_SECRET: ${OSU_API_CLIENT_SECRET:?OSU_API_CLIENT_SECRET must be set}
+  CONTENT_SYNC_MAX_CONCURRENCY: ${CONTENT_SYNC_MAX_CONCURRENCY:-8}
+  STABLE_AVATAR_BASE_URL: ${STABLE_AVATAR_BASE_URL:-https://a.ppy.sh}
+  STABLE_BEATMAP_ASSET_BASE_URL: ${STABLE_BEATMAP_ASSET_BASE_URL:-https://b.ppy.sh}
+  STABLE_SEASONAL_URL: ${STABLE_SEASONAL_URL:-https://osu.ppy.sh/web/osu-getseasonal.php}
+  STABLE_MENU_CONTENT_URL: ${STABLE_MENU_CONTENT_URL:-https://assets.ppy.sh/menu-content.json}
+
+x-app: &app
+  image: ${PERFCHO_IMAGE:-perfcho:latest}
+  environment: *app-environment
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: perfcho
+      POSTGRES_USER: perfcho
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - perfcho-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U perfcho -d perfcho" ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  redis:
+    image: redis:8-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    volumes:
+      - perfcho-redis:/data
+    healthcheck:
+      test: [ "CMD-SHELL", "REDISCLI_AUTH=$${REDIS_PASSWORD} redis-cli ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  minio:
+    image: minio/minio:latest
+    command: [ "server", "/data", "--console-address", ":9001" ]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+    volumes:
+      - perfcho-minio:/data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live" ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  minio-init:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+      S3_BUCKET: ${S3_BUCKET:-perfcho}
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - >-
+        mc alias set perfcho http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" && mc mb --ignore-existing "perfcho/$${S3_BUCKET}"
+    restart: "no"
+
+  calculator-dotnet:
+    image: hkccr.ccs.tencentyun.com/truerou/perfcho.pp:master
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  api:
+    <<: *app
+    image: hkccr.ccs.tencentyun.com/truerou/perfcho.py:master
+    command: [ "uvicorn", "perfcho.main:asgi_app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header" ]
+    ports:
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PUBLISHED_PORT:-10727}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; raise SystemExit(urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3).status != 200)
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  taskiq:
+    <<: *app
+    command:
+      - taskiq
+      - worker
+      - perfcho.worker:broker
+      - --ack-type
+      - when_executed
+      - --workers
+      - ${TASKIQ_WORKERS:-2}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      calculator-dotnet:
+        condition: service_started
+
+volumes:
+  perfcho-postgres:
+  perfcho-redis:
+  perfcho-minio:

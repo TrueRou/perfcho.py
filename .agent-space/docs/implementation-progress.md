@@ -29,7 +29,7 @@
 - Stable Stats：从 `UserPlayStat` 与默认 Policy 的 `UserRankedStat` 读取 Play Count、Total/Ranked Score、Accuracy、Global Rank 和 Performance；未配置 Formula 时 Performance 保持 Pending。
 - Stable 成绩提交后的 Stats：成绩上传只提交 Score 与 Outbox；后续 Stable 状态刷新读取最新 PC、总分和可用的加权总 PP，避免上传请求同步写 Redis。
 - bancho.py v5.2.2 离线迁移：Preflight/Apply/Verify、严格身份归并、批次 Checkpoint、`.osu`/`.osr` S3 迁移、Legacy Formula Provenance 和 bcrypt(MD5) 首次登录升级；运维步骤见[迁移文档](bancho-migration.md)。
-- 统一 Compose 环境：根目录 `compose.yaml` 同时承载本地开发基础设施与可部署生产拓扑，包含 PostgreSQL、带认证的 Redis、内部 MinIO、API 与 Taskiq Worker；MinIO bucket 由一次性初始化容器幂等创建，依赖只发布到宿主机回环地址。
+- 统一应用环境：开发使用 `.env.example` + `compose.yaml` 启动 PostgreSQL/Redis/MinIO 并由宿主机运行 API/Worker；生产使用 `.env.production.example` + `compose.prod.yaml` 运行 PostgreSQL/认证 Redis/MinIO/perfcho-pp/API/Worker。
 
 ## 已实现但未完成生产接线
 

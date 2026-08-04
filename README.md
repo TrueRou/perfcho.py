@@ -14,27 +14,29 @@ outbox runtime. Stable/Lazer protocol services will be implemented against this 
 
 ## Runtime Environment
 
-The repository has one Compose stack. `compose.yaml` is the deployable topology: PostgreSQL, authenticated Redis,
-internal MinIO with an idempotent bucket initializer, the API, and the Taskiq Worker. Dependencies are exposed only on
-loopback addresses so host-run development processes can reach them; API and Worker run inside Compose for deployment
-and share one Python image. All state lives in named volumes.
+The repository has separate development and production Compose topologies. `compose.yaml` starts only local
+PostgreSQL, Redis, and MinIO infrastructure; the API and Taskiq Worker run as host processes and read `.env`.
+`compose.prod.yaml` runs PostgreSQL, authenticated Redis, internal MinIO, the perfcho-pp Calculator, the API, and the
+Taskiq Worker in containers. The two application roles share one Python image in production.
 
 ### Environment files
 
 - `.env.example` — complete local contract with working development values. Copy it to `.env` for local development.
+- `.env.production.example` — production contract for `compose.prod.yaml`; copy it to `.env.production` and replace every
+  placeholder before deployment.
 
 ```bash
-openssl rand -hex 32
-docker compose --env-file .env up -d --build
-docker compose --env-file .env ps
+cp .env.example .env
+docker compose --env-file .env up -d --wait postgres redis minio
+docker compose --env-file .env run --rm --no-deps minio-init
 ```
 
-The stack waits for PostgreSQL/Redis/MinIO to become healthy and for the MinIO bucket to be created before starting the
-application roles. The first application role to connect creates missing PostgreSQL schemas and mapped tables through
-SQLAlchemy `MetaData.create_all()`; a PostgreSQL advisory lock serializes concurrent initialization. Only the API is
-published to the host, on `127.0.0.1:10727` by default for a same-host reverse proxy; change `APP_BIND_ADDRESS` to
-listen elsewhere. `create_all()` does not alter existing columns, constraints, or indexes, so model changes that affect
-an existing database still require an explicit operational rollout.
+The development infrastructure exposes PostgreSQL on `127.0.0.1:55432`, Redis on `127.0.0.1:56379`, and MinIO on
+`127.0.0.1:59000`; the host-run application roles read the same local endpoints and credentials from `.env`.
+The first application role to connect creates missing PostgreSQL schemas and mapped tables through SQLAlchemy
+`MetaData.create_all()`; a PostgreSQL advisory lock serializes concurrent initialization. `create_all()` does not alter
+existing columns, constraints, or indexes, so model changes that affect an existing database still require an explicit
+operational rollout.
 
 ## Local development
 
@@ -67,6 +69,20 @@ Run the process roles separately:
 uv run uvicorn perfcho.main:asgi_app --host 127.0.0.1 --port 8000
 uv run taskiq worker perfcho.worker:broker --ack-type when_executed
 ```
+
+## Production Compose
+
+`compose.prod.yaml` is a standalone production topology and includes internal MinIO:
+
+```bash
+cp .env.production.example .env.production
+# Replace all replace-with-* values, then:
+docker compose --env-file .env.production -f compose.prod.yaml up -d --build
+docker compose --env-file .env.production -f compose.prod.yaml ps
+```
+
+Only the API is published, on `127.0.0.1:10727` by default for a same-host reverse proxy. PostgreSQL, Redis, and MinIO
+use named volumes and are not published to the host.
 
 ## Verification
 

@@ -13,9 +13,9 @@ perfcho 是一个可信中心应用，不拆分微服务，也不接受外部状
 
 ## 部署映射
 
-本地开发由 VS Code Compound 同时启动 API 和 Taskiq Worker。启动前任务负责同步锁定依赖、启动并等待开发 Compose 中的 PostgreSQL/Redis/MinIO，以及幂等初始化对象存储桶；两个应用角色连接 PostgreSQL 时通过共享 Advisory Lock 串行执行 SQLAlchemy 自动建表。`perfcho.worker` 是唯一 Worker 组合根，启动后创建 Outbox 与 Performance 两个相互隔离的 Relay Loop，以及由 `system.maintenance_states` 去重的每日 Rank Snapshot 循环；调试结束不自动销毁基础设施和开发数据卷。
+本地开发由 VS Code Compound 同时启动 API 和 Taskiq Worker。启动前任务负责同步锁定依赖、启动并等待开发 `compose.yaml` 中的 PostgreSQL/Redis/MinIO，以及幂等初始化对象存储桶；两个应用角色连接 PostgreSQL 时通过共享 Advisory Lock 串行执行 SQLAlchemy 自动建表。`perfcho.worker` 是唯一 Worker 组合根，启动后创建 Outbox 与 Performance 两个相互隔离的 Relay Loop，以及由 `system.maintenance_states` 去重的每日 Rank Snapshot 循环；调试结束不自动销毁基础设施和开发数据卷。
 
-根目录 `compose.yaml` 是唯一的运行环境与生产拓扑。PostgreSQL、带认证的 Redis 与本地 MinIO 只发布到宿主机回环地址；MinIO 使用独立持久卷并由一次性初始化容器幂等创建 bucket。应用角色等待 PostgreSQL、Redis 与 MinIO bucket 初始化完成后启动，并通过 SQLAlchemy `create_all()` 创建缺失的 Schema 和表。Calculator 服务必须加入同一 Compose 网络，才能通过 `http://minio:9000` 访问 Worker 生成的短期签名 URL。API 默认仅向宿主机回环地址发布端口，由同机反向代理提供 TLS；部署凭据由 `.env.production.example` 模板提供，本地开发用 `.env` 覆盖同一套变量。
+根目录 `compose.prod.yaml` 是生产拓扑。PostgreSQL、带认证的 Redis、内部 MinIO 与 perfcho-pp Calculator 在 Compose 网络内运行，`minio-init` 幂等创建 bucket，Taskiq Worker 在 Calculator 容器启动后运行；Calculator 通过内部 `http://minio:9000` 访问 Worker 生成的短期签名 URL。API 默认仅向宿主机回环地址发布端口，由同机反向代理提供 TLS；部署凭据由 `.env.production.example` 模板提供。开发 `compose.yaml` 只启动宿主机进程所需的 PostgreSQL、Redis 与 MinIO，`.env.example` 提供对应的本地连接 URL 和凭据。
 
 ## Redis 约定
 

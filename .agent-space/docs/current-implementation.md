@@ -208,7 +208,7 @@ Session 登录 deadline 由 Redis Lua 在 Redis `TIME` 基准下限制为配置�
 - Multiplayer Projection TTL：12 小时；最多 4096 个 Stable Room
 - Presence All 单次最多 2048 个账户；Lobby 单次最多 100 个 Match
 
-部署与本地开发共用根目录 `compose.yaml` 单一拓扑，通过不同环境文件区分：`.env.example` 提供可工作的本地默认值，`.env.production.example` 是部署模板并强制替换全部 Secret。
+部署与本地开发使用同一应用配置模型，但采用独立 Compose 拓扑：`.env.example` 配合 `compose.yaml` 提供可工作的本地默认值，`.env.production.example` 配合 `compose.prod.yaml` 提供生产部署模板并强制替换全部 Secret。
 
 ## 8. 验证基线
 
