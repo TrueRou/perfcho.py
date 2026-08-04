@@ -1,6 +1,6 @@
 # Stable 适配器支持矩阵
 
-最后更新：2026-08-03。
+最后更新：2026-08-04。
 
 本文只描述当前生产 Router 和 Dispatcher 的真实支持范围。Stable 是协议适配层，所有权威校验仍应在共享应用服务中完成。
 
@@ -37,18 +37,19 @@
 3. 顺序处理本次请求中的客户端 Packet。
 4. 刷新 Session/Presence 有效期，但不超过持久会话到期时间。
 5. 领取 Mailbox 批次，与本次请求产生的响应一起返回并确认。
+6. 若请求严格只含一个空载荷 `Osu_Pong`（ID `4`）且 Mailbox 为空，保持本次 fenced Lease 并等待最多 `stable_mailbox_wait_seconds`；其他请求不等待。
 
 若本次请求处理 `LOGOUT`，登出会先关闭持久会话并 Fence Redis Session；Poll 随即结束，不再对已移除的 Mailbox Lease 执行确认或释放。
 
 Poll 在处理客户端 Packet 前获取 fenced Mailbox Lease，避免并发 Poll 在业务副作用完成后才发生冲突。最终响应把本地输出和 Mailbox 一起计入 `stable_max_response_bytes`，只确认实际返回的完整 Mailbox 项，超出预算的后缀保留到后续 Poll。
 
-客户端源码把 ID `4` 定义为 `Osu_Pong`，成功的空 HTTP Poll 同样会刷新连接计时器。ID `8` 是服务端主动发起的 `Bancho_Ping`；把两者错误地做成请求/响应对会令客户端立即再次发送 ID `4`，并可能触发客户端权限变化退出检查。
+Mailbox 入队同时写入按完整 Session Fence 隔离的 Redis Signal；等待中的纯 ID `4` Poll 会被跨进程唤醒，释放空 Lease 后重新领取最新批次。若实际返回了 Mailbox Packet 且响应预算仍容纳一个完整 Packet，响应末尾追加服务端 `Bancho_Ping`（ID `8`），令客户端立即建立下一次短等待窗口。等待超时返回空响应且不追加 ID `8`，因此快速链自动终止，不形成永久长连接。客户端源码把 ID `4` 定义为 `Osu_Pong`；非纯 ID `4` 请求绝不进入等待，避免业务 Packet 在客户端单网络线程中被长时间阻塞。
 
 ## 3. 客户端 Packet 支持
 
 | Client Packet | 状态 | 当前行为 |
 | --- | --- | --- |
-| `PING` | 已接线 | 消费客户端 keepalive 并返回空 Poll；服务端不会对客户端 ID `4` 回发 ID `8` |
+| `PING` | 已接线 | 消费客户端 keepalive；严格单个空 ID `4` 可进入 200–500 ms 短等待，超时返回空；只有实际 Mailbox 数据返回时才按预算附加 ID `8` 延续活跃窗口 |
 | `REQUEST_STATUS_UPDATE` | 已接线 | 从权威 Score/Ranking Query 返回基础 Stats；PP 保持 Deferred |
 | `CHANGE_ACTION` | 已接线 | 查询当前基础 Stats，更新 Redis Presence 并按订阅 Filter 扇出 |
 | `USER_STATS_REQUEST` | 已接线 | 从 Redis Presence Snapshot 提取指定账户 Stats |

@@ -1,6 +1,6 @@
 # 当前实现总览
 
-最后更新：2026-08-03。本文描述当前代码事实，不把后续计划写成已完成能力。
+最后更新：2026-08-04。本文描述当前代码事实，不把后续计划写成已完成能力。
 
 ## 1. 项目目标与边界
 
@@ -123,7 +123,7 @@ Performance Relay 独立领取 `PerformanceCalculationJob`，不会因 Outbox Re
 | `community` | 部分接线 | 频道、公开消息、私信、离线消息、Silence、私信策略、频道摘要与通知 Consumer | Stable 消息已接线；Notification Query 和外部邮件/Push Dispatcher 未实现 |
 | `scoring` | 部分接线 | Canonical Score、Mod 规范化、校验、Attempt/Score/Hit/Replay/Attestation、中性后续任务调度端口、规范统计投影、Replay View、Ranking Query、Stable 统计 Query | 全量重建、Eligibility 反转和统计对账仍未完成 |
 | `performance` | 已接线 | Formula/Release、持久计算 Job、Lease/Fencing、版本化 HTTP Calculator、Input/Output Digest、Multi-PP Query 与完成事件 | 尚未发布真实 C#/Rust Formula Release、Backfill 和管理 Command |
-| `realtime` | 已接线 | Redis Session、Presence Index/Filter、Away、Mailbox、Spectator Relation、Frame History、Fence | 没有跨进程 Pub/Sub；即时扇出使用有界 Mailbox |
+| `realtime` | 已接线 | Redis Session、Presence Index/Filter、Away、Mailbox、Mailbox Signal、Spectator Relation、Frame History、Fence | 没有跨进程 Pub/Sub；即时扇出使用有界 Mailbox，短 Poll 唤醒使用 Fence 隔离的 Redis List Signal |
 | `multiplayer` | 已接线 | Canonical Command/Query、SQL Repository、数据库 Public ID Epoch、Redis CAS Projection、Room/Slot/Host/Password、Round/Attempt、Stable Lobby/Match Dispatcher，以及支持迟到成绩的结果 Projector | 未做 Tourney/Matchmaking；START 与最后一次 Slot Mod CAS 的严格跨存储线性化仍需专门 Reservation/Fence |
 | `moderation` | 已实现未接线 | 建案、Case Entry、处罚施加/延期/撤销、Sanction Event、Command Receipt、Audit 与 Outbox | 独立 Management 组合根已完成，但尚无认证后的管理协议入口 |
 | `audit` | 已实现未接线 | 事务绑定 Audit Writer；Authorization/Moderation 敏感命令原子写 `audit_events` | 尚无审计查询 API 和保留策略任务 |
@@ -178,7 +178,7 @@ Formula 是对外可选 PP 系统，唯一绑定一个 Calculator Code，但可�
 - Stable Realtime Session：账户、会话、Revision、过期时间。
 - Presence Snapshot：Bancho Presence 和 Stats 的预编码 Packet。
 - Presence Index 与 Client Preference：有界在线列表、订阅 Filter 和 Away Message；均受 Session Fence 与 TTL 保护。
-- Mailbox：跨 Poll 的有界 Packet 队列，支持 Lease 与批量确认。
+- Mailbox：跨 Poll 的有界 Packet 队列，支持 Lease、批量确认和按完整 Session Fence 隔离的短等待 Signal。普通入队与观战帧原子扇出都会写 Signal；严格单个空 ID `4` Poll 最多等待 200–500 ms，超时后停止快速链。
 - Spectator Relation：玩家与 Host 的关系和 Fence。
 - Spectator Frame History：按 Sequence 保存有界帧历史，并限制总帧数和总字节数。
 - Multiplayer Projection：Room、16 个 Stable Slot、Ready/Loaded/Skip/Fail、Lobby Index 和账户唯一房间索引，使用 Lua CAS 与 TTL。
@@ -204,6 +204,7 @@ Session 登录 deadline 由 Redis Lua 在 Redis `TIME` 基准下限制为配置�
 - Redis Session/Presence TTL：360 秒
 - Mailbox TTL：600 秒
 - Mailbox 最大 4096 个 Packet、16 MiB
+- Stable Mailbox 短等待：默认 300 ms，可配置范围 200–500 ms
 - Spectator Frame 最大 4096 帧、16 MiB
 - Multiplayer Projection TTL：12 小时；最多 4096 个 Stable Room
 - Presence All 单次最多 2048 个账户；Lobby 单次最多 100 个 Match

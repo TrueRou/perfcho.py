@@ -63,6 +63,8 @@ def test_relay_task_logging_middleware_scopes_task_name() -> None:
 
 
 def test_settings_reject_performance_timing_shorter_than_http_window() -> None:
+    with pytest.raises(ValidationError, match="Redis socket timeout must exceed"):
+        Settings(redis_socket_timeout=0.2, stable_mailbox_wait_seconds=0.3)
     with pytest.raises(ValidationError, match="lease must exceed"):
         Settings(
             performance_http_timeout_seconds=60,

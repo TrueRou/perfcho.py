@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from perfcho.modules.realtime import MAX_SEQUENCE, PresenceSnapshot, SpectatorFrame
+from perfcho.modules.realtime import MAX_SEQUENCE, PresenceSnapshot, SessionFence, SpectatorFrame
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _PRESENCE_HEADER = struct.Struct(">QQQ16s")
@@ -206,6 +206,10 @@ class RealtimeKeys:
     def mailbox_lease(self, account_id: int) -> str:
         """Return an account's exclusive mailbox lease key."""
         return f"{self.base}:mailbox:{account_id}:lease"
+
+    def mailbox_signal(self, account_id: int, fence: SessionFence) -> str:
+        """Return the short-wait signal key for one exact mailbox epoch."""
+        return f"{self.base}:mailbox:{account_id}:signal:{fence.session_id}:{fence.revision}"
 
     def spectator_relation_revision(self, spectator_account_id: int) -> str:
         """Return a session-lifetime monotonic relation revision counter."""

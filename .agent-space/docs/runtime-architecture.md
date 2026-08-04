@@ -31,7 +31,7 @@ perfcho:state:ratelimit:{scope}:{subject}
 
 在线 Presence 采用续期 TTL；房间瞬时状态不超过 Session 最大重连窗口；帧数据使用短 TTL 和有界长度；限流键 TTL 等于限流窗口。禁止创建无 TTL 的状态键。Key 格式或值结构变化时增加版本段，避免新旧进程误读。
 
-Stable Poll 先用一次持久 Session touch 完成 Token 身份解析，再解析 Redis epoch 并执行 fenced heartbeat；不会在同一 Poll 重复解析身份。Presence 列表通过一次 Hash pipeline 解码所有已索引账户，缺失索引成员使用一次批量 ZREM 清理，不对每个账户追加 Redis 请求。
+Stable Poll 先用一次持久 Session touch 完成 Token 身份解析，再解析 Redis epoch 并执行 fenced heartbeat；不会在同一 Poll 重复解析身份。严格单个空载荷 ID `4` 在 Mailbox 为空时可持有 fenced Lease 做 200–500 ms 短等待，普通入队与观战帧扇出通过按 Session Fence 隔离的 Redis List Signal 跨进程唤醒；超时空响应不发送 ID `8`，不会形成永久请求链。Presence 列表通过一次 Hash pipeline 解码所有已索引账户，缺失索引成员使用一次批量 ZREM 清理，不对每个账户追加 Redis 请求。
 
 ## 可靠任务流程
 

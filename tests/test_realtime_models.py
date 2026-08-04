@@ -166,6 +166,7 @@ def test_repository_protocol_covers_the_realtime_state_lifecycle() -> None:
         "list_channel_members",
         "enqueue_mailbox",
         "lease_mailbox",
+        "wait_mailbox",
         "ack_mailbox",
         "release_mailbox",
         "attach_spectator",

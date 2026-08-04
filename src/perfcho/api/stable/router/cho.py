@@ -31,6 +31,7 @@ from perfcho.modules.realtime import (
 )
 from perfcho.modules.realtime.stable import (
     Channel,
+    ClientPacket,
     LoginFailureReason,
     Message,
     PacketReader,
@@ -44,6 +45,7 @@ from perfcho.modules.realtime.stable import (
     friends_list,
     login_reply,
     notification,
+    pong,
     privileges,
     protocol_version,
     restart,
@@ -380,6 +382,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
 async def _poll(request: Request, body: bytes, raw_token: str, services: StableServices) -> Response:
     started_ns = monotonic_ns()
     now = services.clock.now()
+    idle_ping = _is_idle_ping(body)
     try:
         identity = await services.identity.touch_stable_session(raw_token)
     except InvalidStableSession as error:
@@ -537,12 +540,67 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
         # There is nothing left for this Poll to acknowledge or release.
         return _binary_response(local_output)
 
+    mailbox_waited = False
+    mailbox_signaled = False
+    lease_active = True
+    if idle_ping and not local_output and not batch.packets:
+        mailbox_waited = True
+        try:
+            mailbox_signaled = await services.realtime.wait_mailbox(
+                identity.account_id,
+                recipient_fence=realtime.fence,
+                timeout=services.settings.stable_mailbox_wait_seconds,
+            )
+        except BaseException:
+            await _release_mailbox(identity.account_id, realtime, lease_id, services)
+            raise
+
+        lease_active = not await _release_mailbox(identity.account_id, realtime, lease_id, services)
+        if mailbox_signaled and not lease_active:
+            lease_id = services.id_generator.new()
+            lease_now = services.clock.now()
+            try:
+                batch = await services.realtime.lease_mailbox(
+                    identity.account_id,
+                    recipient_fence=realtime.fence,
+                    lease_id=lease_id,
+                    limit=services.settings.stable_mailbox_batch_size,
+                    expires_at=lease_now + timedelta(seconds=services.settings.stable_mailbox_lease_seconds),
+                )
+                lease_active = True
+            except PollLeaseConflict as error:
+                if rate_limit("stable.poll.mailbox_lease_conflict", interval_seconds=5.0):
+                    log_event(
+                        "INFO",
+                        "stable.poll.mailbox_lease_conflict",
+                        exception=error,
+                        stage="reacquire_after_wait",
+                        outcome="conflict",
+                        account_id=identity.account_id,
+                        error_code=error.code,
+                        error_type=type(error).__name__,
+                    )
+                return _binary_response(b"")
+            except (RealtimeSessionNotFound, RealtimeSessionFenced) as error:
+                return await _realtime_lost(
+                    raw_token,
+                    services,
+                    account_id=identity.account_id,
+                    stage="mailbox_reacquire_after_wait",
+                    error=error,
+                )
+
     mailbox_packets = _mailbox_packets_within_budget(
         batch.packets,
         services.settings.stable_max_response_bytes - len(local_output),
     )
     mailbox_output = b"".join(packet.payload for packet in mailbox_packets)
+    continuation = pong() if mailbox_packets else b""
+    if len(local_output) + len(mailbox_output) + len(continuation) > services.settings.stable_max_response_bytes:
+        continuation = b""
     mailbox_stage = "acked" if mailbox_packets else "released"
+    if mailbox_waited and not mailbox_signaled:
+        mailbox_stage = "wait_timeout"
     try:
         if mailbox_packets:
             await services.realtime.ack_mailbox(
@@ -551,7 +609,7 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
                 lease_id=lease_id,
                 through_sequence=mailbox_packets[-1].sequence,
             )
-        else:
+        elif lease_active:
             await services.realtime.release_mailbox(
                 identity.account_id,
                 recipient_fence=realtime.fence,
@@ -580,7 +638,7 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
     except BaseException:
         await _release_mailbox(identity.account_id, realtime, lease_id, services)
         raise
-    output = local_output + mailbox_output
+    output = local_output + mailbox_output + continuation
     if sampled((started_ns, "poll_summary"), services.settings.log_hot_path_sample_rate):
         log_event(
             "INFO",
@@ -593,6 +651,9 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
             leased_packet_count=len(batch.packets),
             returned_mailbox_packet_count=len(mailbox_packets),
             deferred_mailbox_packet_count=len(batch.packets) - len(mailbox_packets),
+            mailbox_waited=mailbox_waited,
+            mailbox_signaled=mailbox_signaled,
+            continuation_sent=bool(continuation),
             response_bytes=len(output),
             duration_ms=duration_ms(started_ns),
         )
@@ -681,6 +742,22 @@ def _mailbox_packets_within_budget(
     return tuple(selected)
 
 
+def _is_idle_ping(body: bytes) -> bool:
+    """Return whether the body is exactly one empty Stable Osu_Pong packet."""
+    try:
+        reader = PacketReader(body)
+        packet = next(reader)
+        if packet.packet_type is not ClientPacket.PING or packet.payload.remaining:
+            return False
+        try:
+            next(reader)
+        except StopIteration:
+            return True
+    except ProtocolError, ValueError, StopIteration:
+        return False
+    return False
+
+
 async def _compensate_failed_login(
     raw_token: str,
     realtime: RealtimeSession | None,
@@ -751,13 +828,14 @@ async def _release_mailbox(
     realtime: RealtimeSession,
     lease_id: uuid.UUID,
     services: StableServices,
-) -> None:
+) -> bool:
     try:
         await services.realtime.release_mailbox(
             account_id,
             recipient_fence=realtime.fence,
             lease_id=lease_id,
         )
+        return True
     except Exception as error:
         log_event(
             "WARNING",
@@ -768,6 +846,7 @@ async def _release_mailbox(
             error_code=getattr(error, "code", "cleanup_failed"),
             error_type=type(error).__name__,
         )
+        return False
 
 
 def _log_invalid_poll_session(stage: str, error: InvalidStableSession) -> None:

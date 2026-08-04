@@ -117,6 +117,8 @@ class FakeRealtime:
         self.active_lease = False
         self.release_calls = 0
         self.lease_conflict = False
+        self.wait_calls = 0
+        self.wait_payload: bytes | None = None
         self.fail_set_presence = False
         self.fail_presence_capacity = False
         self.open_calls = 0
@@ -221,6 +223,22 @@ class FakeRealtime:
         self.lease_fences.append(recipient_fence)
         self.active_lease = True
         return MailboxBatch(lease_id, tuple(self.mailbox), expires_at)
+
+    async def wait_mailbox(
+        self,
+        account_id: int,
+        *,
+        recipient_fence: SessionFence,
+        timeout: float,
+    ) -> bool:
+        del account_id, recipient_fence, timeout
+        self.wait_calls += 1
+        if self.wait_payload is None:
+            return False
+        sequence = self.mailbox[-1].sequence + 1 if self.mailbox else 1
+        self.mailbox.append(MailboxPacket(sequence, self.wait_payload))
+        self.wait_payload = None
+        return True
 
     async def ack_mailbox(
         self,
@@ -405,7 +423,7 @@ async def test_old_build_and_non_osu_user_agent_fail_in_protocol() -> None:
 
 
 @pytest.mark.asyncio
-async def test_authenticated_client_keepalive_drains_mailbox_without_server_ping() -> None:
+async def test_authenticated_client_keepalive_drains_mailbox_and_opens_short_poll_window() -> None:
     services, identity, realtime = stable_services()
     await realtime.open_session(
         session_id=identity.session_id,
@@ -427,10 +445,44 @@ async def test_authenticated_client_keepalive_drains_mailbox_without_server_ping
 
     assert [packet.packet_type for packet in PacketReader(response.content, packet_enum=ServerPacket)] == [
         ServerPacket.NOTIFICATION,
+        ServerPacket.PONG,
     ]
     assert realtime.mailbox == []
     assert identity.touch_calls == 1
     assert realtime.lease_fences == [SessionFence(identity.session_id, 1)]
+
+
+@pytest.mark.asyncio
+async def test_idle_ping_waits_for_mailbox_signal_and_releases_latest_packets() -> None:
+    services, identity, realtime = stable_services()
+    await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    realtime.wait_payload = build_packet(ServerPacket.NOTIFICATION, b"\x00")
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    assert [packet.packet_type for packet in PacketReader(response.content, packet_enum=ServerPacket)] == [
+        ServerPacket.NOTIFICATION,
+        ServerPacket.PONG,
+    ]
+    assert realtime.wait_calls == 1
+    assert realtime.lease_fences == [
+        SessionFence(identity.session_id, 1),
+        SessionFence(identity.session_id, 1),
+    ]
+    assert realtime.mailbox == []
 
 
 @pytest.mark.asyncio
@@ -457,6 +509,55 @@ async def test_authenticated_client_keepalive_returns_empty_success() -> None:
     assert response.headers["content-type"].startswith("application/octet-stream")
     assert response.content == b""
     assert identity.touch_calls == 1
+    assert realtime.wait_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_multiple_keepalives_do_not_enter_the_short_wait_window() -> None:
+    services, identity, realtime = stable_services()
+    await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING) * 2,
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    assert response.content == b""
+    assert realtime.wait_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_keepalive_with_payload_is_rejected_without_waiting() -> None:
+    services, identity, realtime = stable_services()
+    await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING, b"invalid"),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    assert list(PacketReader(response.content, packet_enum=ServerPacket))[-1].packet_type is ServerPacket.RESTART
+    assert realtime.wait_calls == 0
 
 
 @pytest.mark.asyncio
@@ -517,7 +618,7 @@ async def test_login_and_sampled_poll_logs_are_structured_and_secret_free(monkey
     event_fields = {event: fields for _, event, fields in events}
     assert event_fields["stable.login.completed"]["outcome"] == "success"
     assert event_fields["stable.packet.dispatch_summary"]["packet_histogram"] == {"PING": 1}
-    assert event_fields["stable.poll.completed"]["mailbox_stage"] == "released"
+    assert event_fields["stable.poll.completed"]["mailbox_stage"] == "wait_timeout"
     rendered = repr(events)
     for secret in ("player", "stable-token-value", "a" * 32, "path:adapters"):
         assert secret not in rendered
@@ -556,9 +657,11 @@ async def test_poll_response_budget_defers_mailbox_packets_without_acknowledging
         ServerPacket.USER_STATS
     ]
     assert [packet.packet_type for packet in PacketReader(drained.content, packet_enum=ServerPacket)] == [
-        ServerPacket.PONG
+        ServerPacket.PONG,
+        ServerPacket.PONG,
     ]
     assert realtime.mailbox == []
+    assert realtime.wait_calls == 0
 
 
 @pytest.mark.asyncio

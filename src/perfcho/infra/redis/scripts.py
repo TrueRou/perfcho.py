@@ -193,6 +193,7 @@ if old_epoch then
     local old_session_id = separator and string.sub(old_epoch, 1, separator - 1)
     local old_revision = separator and string.sub(old_epoch, separator + 1)
     if old_session_id and old_revision then
+        redis.call('DEL', ARGV[12] .. ARGV[1] .. ':signal:' .. old_session_id .. ':' .. old_revision)
         local old_channels = ARGV[8] .. old_session_id .. ':channels'
         for _, channel_id in ipairs(redis.call('SMEMBERS', old_channels)) do
             local members = ARGV[9] .. channel_id .. ':members'
@@ -360,6 +361,7 @@ local now = now_ms()
 local status = session_status(KEYS[1], KEYS[2], ARGV[1], ARGV[2], ARGV[3], now)
 if status ~= 'OK' then return {status} end
 local epoch = ARGV[2] .. '|' .. ARGV[3]
+redis.call('DEL', ARGV[7] .. ARGV[1] .. ':signal:' .. ARGV[2] .. ':' .. ARGV[3])
 for _, channel_id in ipairs(redis.call('SMEMBERS', KEYS[6])) do
     local members = ARGV[4] .. channel_id .. ':members'
     local epochs = ARGV[4] .. channel_id .. ':epochs'
@@ -561,6 +563,9 @@ bytes = bytes + #ARGV[4]
 deadline = math.max(deadline, expiry)
 expire_ordered(KEYS[3], KEYS[4], count, bytes, deadline)
 redis.call('PEXPIREAT', KEYS[5], math.max(deadline, previous_deadline))
+redis.call('LPUSH', KEYS[6], token)
+redis.call('LTRIM', KEYS[6], 0, 0)
+redis.call('PEXPIREAT', KEYS[6], deadline)
 return {'OK', tostring(sequence)}
 """
 )
@@ -585,6 +590,7 @@ local count, bytes, deadline = ordered_stats(KEYS[3], now, tonumber(ARGV[8]), tr
 if count < 0 then return {'CORRUPT'} end
 expire_ordered(KEYS[3], KEYS[4], count, bytes, deadline)
 local packets = redis.call('ZRANGE', KEYS[3], 0, tonumber(ARGV[5]) - 1)
+if #packets == 0 then redis.call('DEL', KEYS[6]) end
 local through = string.rep('0', 19)
 if #packets > 0 then through = string.sub(packets[#packets], 1, 19) end
 redis.call('SET', KEYS[5], ARGV[2] .. '|' .. ARGV[3] .. '|' .. ARGV[4] .. '|' .. through)
@@ -616,6 +622,7 @@ end
 local count, bytes, deadline = ordered_stats(KEYS[3], 0, tonumber(ARGV[6]), false)
 expire_ordered(KEYS[3], KEYS[4], count, bytes, deadline)
 redis.call('DEL', KEYS[5])
+if count == 0 then redis.call('DEL', KEYS[6]) end
 return {'OK'}
 """
 )
@@ -868,6 +875,7 @@ for _, spectator in ipairs(redis.call('ZRANGE', KEYS[6], 0, -1)) do
         local packets_key = mailbox_base .. ':packets'
         local bytes_key = mailbox_base .. ':bytes'
         local sequence_key = mailbox_base .. ':sequence'
+        local signal_key = mailbox_base .. ':signal:' .. spectator_session_id .. ':' .. spectator_revision
         local packet_expiry = math.min(expiry, tonumber(relation_expiry), tonumber(spectator_expiry),
             now + tonumber(ARGV[12]))
         local packet_count, packet_bytes, packet_deadline = ordered_stats(
@@ -884,6 +892,9 @@ for _, spectator in ipairs(redis.call('ZRANGE', KEYS[6], 0, -1)) do
             packet_deadline = math.max(packet_deadline, packet_expiry)
             expire_ordered(packets_key, bytes_key, packet_count, packet_bytes, packet_deadline)
             redis.call('PEXPIREAT', sequence_key, packet_deadline)
+            redis.call('LPUSH', signal_key, packet_token)
+            redis.call('LTRIM', signal_key, 0, 0)
+            redis.call('PEXPIREAT', signal_key, packet_deadline)
             result[#result + 1] = spectator
         end
     else

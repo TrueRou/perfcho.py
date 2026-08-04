@@ -225,6 +225,7 @@ class RedisRealtimeRepository(RealtimeRepository):
                 f"{self._keys.base}:channel:",
                 f"{self._keys.base}:spectator:viewer:",
                 f"{self._keys.base}:spectator:host:",
+                f"{self._keys.base}:mailbox:",
             ],
         )
         self._raise_session_status(_text(result[0]))
@@ -312,6 +313,7 @@ class RedisRealtimeRepository(RealtimeRepository):
                 f"{self._keys.base}:channel:",
                 f"{self._keys.base}:spectator:viewer:",
                 f"{self._keys.base}:spectator:host:",
+                f"{self._keys.base}:mailbox:",
             ],
         )
         self._raise_session_status(_text(result[0]))
@@ -592,6 +594,7 @@ class RedisRealtimeRepository(RealtimeRepository):
                 self._keys.mailbox_packets(account_id),
                 self._keys.mailbox_bytes(account_id),
                 self._keys.mailbox_sequence(account_id),
+                self._keys.mailbox_signal(account_id, fence),
             ],
             args=[
                 account_id,
@@ -637,6 +640,7 @@ class RedisRealtimeRepository(RealtimeRepository):
                 self._keys.mailbox_packets(account_id),
                 self._keys.mailbox_bytes(account_id),
                 self._keys.mailbox_lease(account_id),
+                self._keys.mailbox_signal(account_id, fence),
             ],
             args=[
                 account_id,
@@ -659,6 +663,23 @@ class RedisRealtimeRepository(RealtimeRepository):
         )
         return MailboxBatch(lease_id, packets, expires_at)
 
+    async def wait_mailbox(
+        self,
+        account_id: int,
+        *,
+        recipient_fence: SessionFence,
+        timeout: float,
+    ) -> bool:
+        """Block one Redis connection briefly until the fenced mailbox is signalled."""
+        _positive_integer("account_id", account_id)
+        fence = _fence("recipient_fence", recipient_fence)
+        timeout_seconds = duration_to_milliseconds(timeout, name="timeout") / 1_000
+        result = await self._redis.blpop(
+            self._keys.mailbox_signal(account_id, fence),
+            timeout=timeout_seconds,
+        )
+        return result is not None
+
     async def ack_mailbox(
         self,
         account_id: int,
@@ -680,6 +701,7 @@ class RedisRealtimeRepository(RealtimeRepository):
                 self._keys.mailbox_packets(account_id),
                 self._keys.mailbox_bytes(account_id),
                 self._keys.mailbox_lease(account_id),
+                self._keys.mailbox_signal(account_id, fence),
             ],
             args=[
                 account_id,

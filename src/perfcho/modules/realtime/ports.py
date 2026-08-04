@@ -149,6 +149,16 @@ class RealtimeRepository(Protocol):
         """Acquire an exclusive bounded poll lease and return ordered packets."""
         ...
 
+    async def wait_mailbox(
+        self,
+        account_id: int,
+        *,
+        recipient_fence: SessionFence,
+        timeout: float,
+    ) -> bool:
+        """Wait briefly for the fenced mailbox to receive a packet."""
+        ...
+
     async def ack_mailbox(
         self,
         account_id: int,

@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     stable_presence_fanout_concurrency: int = Field(default=32, ge=1, le=256)
     stable_mailbox_batch_size: int = Field(default=256, ge=1, le=4096)
     stable_mailbox_lease_seconds: int = Field(default=10, ge=1, le=60)
+    stable_mailbox_wait_seconds: float = Field(default=0.3, ge=0.2, le=0.5)
     stable_welcome_notification: str = Field(default="Welcome to perfcho.py.", max_length=1024)
     stable_beatmap_download_base_url: str = Field(
         default="https://osu.ppy.sh/beatmapsets",
@@ -150,8 +151,10 @@ class Settings(BaseSettings):
         return normalized
 
     @model_validator(mode="after")
-    def validate_performance_timing(self) -> Self:
-        """Keep execution leases and signed URLs beyond the HTTP timeout window."""
+    def validate_timing_windows(self) -> Self:
+        """Keep blocking operations within their transport and lease windows."""
+        if self.redis_socket_timeout <= self.stable_mailbox_wait_seconds:
+            raise ValueError("Redis socket timeout must exceed the Stable mailbox wait")
         if self.stable_session_touch_interval_seconds >= self.stable_session_stale_grace_seconds:
             raise ValueError("Stable session touch interval must be shorter than stale grace")
         minimum_window = ceil(self.performance_http_timeout_seconds) + 30

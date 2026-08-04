@@ -48,6 +48,7 @@ def repository_double() -> RepositoryDouble:
     redis = AsyncMock(spec=Redis)
     redis.hget = AsyncMock()
     redis.hgetall = AsyncMock()
+    redis.blpop = AsyncMock()
     scripts: dict[str, AsyncMock] = {}
 
     def register(source: str) -> AsyncMock:
@@ -102,6 +103,7 @@ def test_repository_registers_v2_atomic_consistency_scripts(repository_double: R
     assert "ZPOPMIN" in publish
     assert "% 65536" in publish
     assert "mailbox_base" in publish
+    assert "LPUSH', signal_key" in publish
     attach = sources["-- perfcho:attach-spectator:v2"]
     assert "latest_frame_window" in attach
     assert "relation_id" in attach
@@ -124,6 +126,8 @@ def test_state_codecs_include_owner_and_independent_frame_cursor() -> None:
     assert keys.account_session(42) == "deployment:v2:account:42:session"
     assert keys.session_channels(session_id).endswith(f"session:{session_id}:channels")
     assert keys.session_revision(session_id).endswith(f"session:{session_id}:revision")
+    fence = SessionFence(session_id, 7)
+    assert keys.mailbox_signal(42, fence).endswith(f"mailbox:42:signal:{session_id}:7")
 
 
 @pytest.mark.asyncio
@@ -269,6 +273,7 @@ async def test_mailbox_enqueue_and_lease_require_recipient_epoch(repository_doub
         f"{PREFIX}:v2:session:{fence.session_id}",
         f"{PREFIX}:v2:account:42:session",
     ]
+    assert enqueue_call.kwargs["keys"][-1] == f"{PREFIX}:v2:mailbox:42:signal:{fence.session_id}:3"
     assert enqueue_call.kwargs["args"][:4] == [42, str(fence.session_id), 3, b"packet"]
 
     enqueue.return_value = [b"FENCED"]
@@ -288,6 +293,13 @@ async def test_mailbox_enqueue_and_lease_require_recipient_epoch(repository_doub
         expires_at=SESSION_EXPIRY,
     )
     assert batch.packets == (packet,)
+
+    repository_double.redis.blpop.return_value = (b"signal", b"11")
+    assert await repository.wait_mailbox(42, recipient_fence=fence, timeout=0.3)
+    repository_double.redis.blpop.assert_awaited_once_with(
+        f"{PREFIX}:v2:mailbox:42:signal:{fence.session_id}:3",
+        timeout=0.3,
+    )
 
 
 @pytest.mark.asyncio
@@ -585,6 +597,7 @@ async def test_real_redis_epoch_heartbeat_spectator_history_and_mailbox_consiste
         )
         assert zero.recipient_account_ids == (43,)
         assert one.recipient_account_ids == (43,)
+        assert await repository.wait_mailbox(43, recipient_fence=spectator, timeout=0.2)
         latest = await repository.read_spectator_frames(
             42,
             host_fence=host,
@@ -659,6 +672,7 @@ async def test_real_redis_epoch_heartbeat_spectator_history_and_mailbox_consiste
             recipient_fence=new_spectator,
             expires_at=now + timedelta(seconds=10),
         )
+        assert await repository.wait_mailbox(43, recipient_fence=new_spectator, timeout=0.2)
         with pytest.raises(RealtimeSessionFenced, match="superseded"):
             await repository.ack_mailbox(
                 43,
