@@ -4,7 +4,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from py3rijndael import Pkcs7Padding, RijndaelCbc
 
 from perfcho.api.stable.canonize.scoring import (
     ParsedStableScore,
@@ -12,6 +11,7 @@ from perfcho.api.stable.canonize.scoring import (
     stable_online_checksum,
     verify_stable_online_checksum,
 )
+from perfcho.infra.security.rijndael import Rijndael256Cbc
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant, ScoreGrade, ScoreOutcome
 from perfcho.modules.scoring.mods import LEGACY_MOD_BITS
 
@@ -21,11 +21,9 @@ IV = b"i" * 32
 
 
 def encrypted_fields(fields: list[str], client_hash: str = "client-hash") -> tuple[str, str, str]:
-    cipher = RijndaelCbc(
+    cipher = Rijndael256Cbc(
         key=f"osu!-scoreburgr---------{OSU_VERSION}".encode(),
         iv=IV,
-        padding=Pkcs7Padding(32),
-        block_size=32,
     )
     score = b64encode(cipher.encrypt(":".join(fields).encode())).decode()
     encrypted_client_hash = b64encode(cipher.encrypt(client_hash.encode())).decode()

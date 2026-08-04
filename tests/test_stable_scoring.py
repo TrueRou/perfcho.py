@@ -12,7 +12,6 @@ from typing import cast
 import httpx
 import pytest
 from fastapi import FastAPI
-from py3rijndael import Pkcs7Padding, RijndaelCbc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.api.stable import router
@@ -20,6 +19,7 @@ from perfcho.api.stable.dependencies import get_stable_services
 from perfcho.infra.db.models.scoring import RankingPolicy, Score
 from perfcho.infra.db.projectors.ranking import _metric_value, _tie_break_value
 from perfcho.infra.glue.stable import StableServices
+from perfcho.infra.security.rijndael import Rijndael256Cbc
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage, StoredObject
@@ -345,11 +345,9 @@ def encrypted_score(*, checksum: str | None = None, play_time: str = "2607291230
     )
     fields[2] = checksum or hashlib.md5(checksum_payload.encode(), usedforsecurity=False).hexdigest()
     iv = b"i" * 32
-    cipher = RijndaelCbc(
+    cipher = Rijndael256Cbc(
         key=f"osu!-scoreburgr---------{OSU_VERSION}".encode(),
         iv=iv,
-        padding=Pkcs7Padding(32),
-        block_size=32,
     )
     score = b64encode(cipher.encrypt(":".join(fields).encode())).decode()
     client_hash = b64encode(cipher.encrypt(b"client-hash")).decode()

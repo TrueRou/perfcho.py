@@ -5,8 +5,7 @@ import re
 from base64 import b64encode
 from datetime import UTC, datetime
 
-from py3rijndael import Pkcs7Padding, RijndaelCbc
-
+from perfcho.infra.security.rijndael import Rijndael256Cbc
 from tools.fakeclient.client import FakeClient, FakeClientError
 
 _SCORE_ID = re.compile(r"(?:^|\|)onlineScoreId:(\d+)(?:\||$)")
@@ -54,11 +53,9 @@ def submit_score(
     )
     fields[2] = hashlib.md5(checksum_payload.encode(), usedforsecurity=False).hexdigest()
     iv = b"fakeclient-score-iv".ljust(32, b"-")
-    cipher = RijndaelCbc(
+    cipher = Rijndael256Cbc(
         key=f"osu!-scoreburgr---------{_OSU_VERSION}".encode(),
         iv=iv,
-        padding=Pkcs7Padding(32),
-        block_size=32,
     )
     encrypted_score = b64encode(cipher.encrypt(":".join(fields).encode())).decode()
     encrypted_client_hash = b64encode(cipher.encrypt(client_hash.encode())).decode()

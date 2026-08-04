@@ -14,10 +14,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import Request
-from py3rijndael import Pkcs7Padding, RijndaelCbc
 from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
+from perfcho.infra.security.rijndael import Rijndael256Cbc
 from perfcho.modules.scoring import (
     CanonicalMod,
     ClientFamily,
@@ -210,11 +210,9 @@ def decrypt_stable_score(
         iv = b64decode(iv_b64, validate=True)
         score_data = b64decode(score_data_b64, validate=True)
         encrypted_client_hash = b64decode(client_hash_b64, validate=True)
-        cipher = RijndaelCbc(
+        cipher = Rijndael256Cbc(
             key=f"osu!-scoreburgr---------{osu_version}".encode(),
             iv=iv,
-            padding=Pkcs7Padding(32),
-            block_size=32,
         )
         fields = cipher.decrypt(score_data).decode("utf-8").split(":")
         client_hash = cipher.decrypt(encrypted_client_hash).decode("utf-8")
