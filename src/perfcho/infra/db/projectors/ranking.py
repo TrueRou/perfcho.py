@@ -4,10 +4,11 @@ import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, literal, select, true
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from perfcho.infra.db.enums import ScoreGrade
 from perfcho.infra.db.models.content import Beatmap
 from perfcho.infra.db.models.core import Account
 from perfcho.infra.db.models.events import OutboxEvent
@@ -21,8 +22,12 @@ from perfcho.infra.db.models.scoring import (
     ScorePerformance,
     UserRankedStat,
 )
-from perfcho.infra.db.projectors.common import advance_checkpoint, payload_integer, require_event_context
-from perfcho.modules.scoring.models import weighted_total_performance
+from perfcho.infra.db.projectors.common import (
+    advance_checkpoint,
+    payload_integer,
+    payload_uuid,
+    require_event_context,
+)
 
 CONSUMER_NAME = "ranking-projector.v1"
 EVENT_TYPES = frozenset({"score.accepted.v1", "score.performance-calculated.v1"})
@@ -73,6 +78,9 @@ async def project_accepted_score(session: AsyncSession, event: OutboxEvent, part
     }
     if len(mod_acronyms) != len(canonical_mods):
         raise RuntimeError("score mod set contains invalid canonical entries")
+    performance_release_id = (
+        payload_uuid(event.payload, "release_id") if event.event_type == "score.performance-calculated.v1" else None
+    )
     for policy, mod_rules in policy_rows:
         overall_changed = await _project_policy(
             session,
@@ -83,7 +91,7 @@ async def project_accepted_score(session: AsyncSession, event: OutboxEvent, part
             mod_acronyms,
             mod_rules,
         )
-        if overall_changed:
+        if overall_changed or performance_release_id == policy.calculation_release_id:
             await _project_user_ranked_stat(session, score.account_id, policy, event.id)
     await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
 
@@ -95,43 +103,111 @@ async def _project_user_ranked_stat(
     source_event_id: uuid.UUID,
 ) -> None:
     """Rebuild one account's policy-owned ranked statistics."""
-    rows = list(
-        await session.execute(
-            select(
-                LeaderboardEntry.metric_value,
-                Score.total_score,
-                Score.classic_score,
-                Score.accuracy,
-                Score.grade,
-            )
-            .join(Score, Score.id == LeaderboardEntry.score_id)
-            .where(
-                LeaderboardEntry.policy_id == policy.id,
-                LeaderboardEntry.scope == "overall",
-                LeaderboardEntry.filter_mod_set_id.is_(None),
-                LeaderboardEntry.account_id == account_id,
-            )
-            .order_by(LeaderboardEntry.metric_value.desc(), LeaderboardEntry.score_id.asc())
+    ranked_entries = (
+        select(Score.total_score, Score.classic_score, Score.accuracy, Score.grade)
+        .select_from(LeaderboardEntry)
+        .join(Score, Score.id == LeaderboardEntry.score_id)
+        .where(
+            LeaderboardEntry.policy_id == policy.id,
+            LeaderboardEntry.scope == "overall",
+            LeaderboardEntry.filter_mod_set_id.is_(None),
+            LeaderboardEntry.account_id == account_id,
         )
+        .cte("ranked_entries")
     )
-    ranked_score = sum(row.classic_score if policy.metric == "classic_score" else row.total_score for row in rows)
-    performance = (
-        Decimal(weighted_total_performance([row.metric_value for row in rows])) if policy.metric == "pp" else Decimal(0)
+    ranked_score_value = (
+        ranked_entries.c.classic_score if policy.metric == "classic_score" else ranked_entries.c.total_score
     )
-    accuracy = sum((Decimal(row.accuracy) for row in rows), Decimal(0)) / len(rows) if rows else Decimal(0)
-    grade_counts = {grade: 0 for grade in ("XH", "X", "SH", "S", "A")}
-    for row in rows:
-        if row.grade.value in grade_counts:
-            grade_counts[row.grade.value] += 1
+    grade_counts = func.jsonb_build_object(
+        "XH",
+        func.count().filter(ranked_entries.c.grade == ScoreGrade.XH),
+        "X",
+        func.count().filter(ranked_entries.c.grade == ScoreGrade.X),
+        "SH",
+        func.count().filter(ranked_entries.c.grade == ScoreGrade.SH),
+        "S",
+        func.count().filter(ranked_entries.c.grade == ScoreGrade.S),
+        "A",
+        func.count().filter(ranked_entries.c.grade == ScoreGrade.A),
+    )
+    overall_stats = select(
+        func.coalesce(func.sum(ranked_score_value), 0).label("ranked_score"),
+        func.coalesce(func.avg(ranked_entries.c.accuracy), 0).label("accuracy"),
+        grade_counts.label("grade_counts"),
+    ).cte("overall_stats")
 
-    statement = insert(UserRankedStat).values(
-        account_id=account_id,
-        policy_id=policy.id,
-        ranked_score=ranked_score,
-        performance=performance,
-        accuracy=accuracy,
-        grade_counts=grade_counts,
-        source_event_id=source_event_id,
+    per_beatmap = (
+        select(
+            Score.beatmap_id,
+            ScorePerformance.pp,
+            func.row_number()
+            .over(
+                partition_by=Score.beatmap_id,
+                order_by=(ScorePerformance.pp.desc(), Score.id.asc()),
+            )
+            .label("beatmap_position"),
+        )
+        .join(ScorePerformance, ScorePerformance.score_id == Score.id)
+        .join(
+            ScoreEligibility,
+            (ScoreEligibility.score_id == Score.id) & (ScoreEligibility.policy_id == policy.id),
+        )
+        .where(
+            Score.account_id == account_id,
+            Score.scoreboard_id == policy.scoreboard_id,
+            ScoreEligibility.state == "eligible",
+            ScorePerformance.release_id == policy.calculation_release_id,
+        )
+        .cte("per_beatmap_performance")
+    )
+    best_per_beatmap = (
+        select(per_beatmap.c.beatmap_id, per_beatmap.c.pp)
+        .where(per_beatmap.c.beatmap_position == 1)
+        .cte("best_per_beatmap_performance")
+    )
+    ordered_performance = select(
+        best_per_beatmap.c.pp,
+        (
+            func.row_number().over(order_by=(best_per_beatmap.c.pp.desc(), best_per_beatmap.c.beatmap_id.asc())) - 1
+        ).label("performance_index"),
+    ).cte("ordered_performance")
+    performance_count = func.count()
+    weighted_performance = func.coalesce(
+        func.sum(
+            ordered_performance.c.pp * func.power(literal(Decimal("0.95")), ordered_performance.c.performance_index)
+        ),
+        Decimal(0),
+    )
+    bonus_performance = (Decimal(1) - func.power(literal(Decimal("0.9994")), performance_count)) * literal(
+        Decimal("416.6667")
+    )
+    performance_stats = (
+        select(func.round(weighted_performance + bonus_performance).label("performance"))
+        .select_from(ordered_performance)
+        .cte("performance_stats")
+    )
+
+    statement = insert(UserRankedStat).from_select(
+        (
+            "account_id",
+            "policy_id",
+            "ranked_score",
+            "performance",
+            "accuracy",
+            "grade_counts",
+            "source_event_id",
+        ),
+        select(
+            literal(account_id),
+            literal(policy.id),
+            overall_stats.c.ranked_score,
+            performance_stats.c.performance,
+            overall_stats.c.accuracy,
+            overall_stats.c.grade_counts,
+            literal(source_event_id),
+        )
+        .select_from(overall_stats)
+        .join(performance_stats, true()),
     )
     excluded = statement.excluded
     await session.execute(

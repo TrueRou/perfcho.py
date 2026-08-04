@@ -192,6 +192,10 @@ async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_databa
             performance_releases = [release for release in releases if release.formula_id == formulas["official"].id]
             assert len(performance_releases) == 4
             assert all(release.difficulty_release_id is not None for release in performance_releases)
+            assert {policy.calculation_release_id for policy in vanilla_policies} == {
+                release.id for release in performance_releases
+            }
+            assert all(policy.calculation_release_id is None for policy in assistance_policies)
             assert not await session.scalar(
                 select(func.count())
                 .select_from(AccountRoleGrant)

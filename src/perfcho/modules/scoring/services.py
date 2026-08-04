@@ -395,7 +395,7 @@ class RankingQueryService:
         ruleset: Ruleset,
         variant: ScoreboardVariant = ScoreboardVariant.VANILLA,
     ) -> AccountStatsView:
-        """Return current score totals while leaving Performance explicitly deferred."""
+        """Return current projected score totals, Performance, and rank."""
         _positive_identifier("account_id", account_id)
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).get_account_stats(account_id, ruleset, variant)

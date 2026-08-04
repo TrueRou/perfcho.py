@@ -1,6 +1,6 @@
 # 实现进度
 
-最后更新：2026-08-03。
+最后更新：2026-08-04。
 
 状态定义见[文档索引](README.md)：已接线、已实现未接线、仅设计必须严格区分。完整事实见[当前实现总览](current-implementation.md)，Stable 路由与 Packet 见[支持矩阵](stable-adapter.md)，后续约束见[剩余设计](remaining-design.md)。
 
@@ -26,8 +26,8 @@
 - Multiplayer：Canonical Room/Session/Slot/Round/Attempt、PostgreSQL 权威事实、Redis CAS Projection、Stable Lobby/Create/Join/Part/Settings/Ready/Start/Frame/Complete/Invite 全流程；完成事件和迟到成绩幂等生成 Round Result、Standing 与房间/谱单汇总。
 - Management：Moderation 建案/条目/处罚施加/延期/撤销、Authorization Grant/Revoke、Audit、Receipt 与 Outbox 已由 `infra/wiring/management.py` 独立组合根装配；共享基础设施 wiring 位于 `infra/wiring/common.py`。
 - Stable 房间进入时同步发送 `CHANNEL_KICK #lobby` 与 `CHANNEL_JOIN_SUCCESS #multiplayer`；未加入频道发送公开消息返回稳定通知，不会穿透为 HTTP 500。
-- Stable Stats：从 `UserPlayStat` 与默认 Policy 的 `UserRankedStat` 读取 Play Count、Total/Ranked Score、Accuracy、Global Rank 和 Performance；未配置 Formula 时 Performance 保持 Pending。
-- Stable 成绩提交后的 Stats：成绩上传只提交 Score 与 Outbox；后续 Stable 状态刷新读取最新 PC、总分和可用的加权总 PP，避免上传请求同步写 Redis。
+- Stable Stats：按客户端当前 Ruleset/Variant 从 `UserPlayStat` 与默认 Policy 的 `UserRankedStat` 读取 Play Count、Total/Ranked Score、Accuracy、Global Rank 和 Performance；Level 由客户端根据 Total Score 推导，不跨模式聚合。
+- Stable 成绩提交后的 Stats：成绩上传只提交 Score 与 Outbox；Vanilla 谱面榜保持 Total Score 指标，个人统计按 Policy 固定的 Performance Release 从每张谱面最高合资格 PP 计算加权总 PP 和 PP Global Rank。Performance 完成即使未替换总分 PB 也会刷新投影，后续 Stable 状态请求再更新 Redis Presence。
 - bancho.py v5.2.2 离线迁移：Preflight/Apply/Verify、严格身份归并、批次 Checkpoint、`.osu`/`.osr` S3 迁移、Legacy Formula Provenance 和 bcrypt(MD5) 首次登录升级；运维步骤见[迁移文档](bancho-migration.md)。
 - 统一应用环境：开发使用 `.env.example` + `compose.yaml` 启动 PostgreSQL/Redis/MinIO 并由宿主机运行 API/Worker；生产使用 `.env.production.example` + `compose.prod.yaml` 运行 PostgreSQL/认证 Redis/MinIO/perfcho-pp/API/Worker。
 

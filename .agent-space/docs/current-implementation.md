@@ -165,7 +165,7 @@ Stable 成绩提交路径：
 7. Ranking Consumer 对全部活动 Policy 更新符合资格的 Overall/Exact-Mods 最佳成绩投影；Stable Query 只读取每个 Scoreboard 的默认 Policy。
 8. 已同步谱面的 Multiplayer Round 会预先签发 Attempt，Stable 提交按 Account 与 Beatmap Revision 解析并在同一成绩事务中消费。
 
-当前排行榜支持 Top、Exact Mods、Friends 和 Country 过滤；Exact Mods 会合并所有可表示为同一 Stable Bitmask 的 Canonical ModSet。Vanilla 的 Ranked/Approved/Qualified/Loved 使用 Total Score；RX/AP 只接受指定 Release 的 PP，缺失时保持 `performance_pending` 而不回退。Bancho Stats 由 `scoring-stats-projector.v1` 和 `ranking-projector.v1` 分别写入 `UserPlayStat` 与 `UserRankedStat`，查询动态计算当前 Default Policy 的 Global Rank。成绩上传只提交 Score 事实和 Outbox，不同步写 Redis Presence/Mailbox；后续 `REQUEST_STATUS_UPDATE` 读取最新 Stats，没有结果时不能把零值解释为最终计算结果。
+当前排行榜支持 Top、Exact Mods、Friends 和 Country 过滤；Exact Mods 会合并所有可表示为同一 Stable Bitmask 的 Canonical ModSet。Vanilla 的 Ranked/Approved/Qualified/Loved 谱面榜使用 Total Score；RX/AP 只接受指定 Release 的 PP，缺失时保持 `performance_pending` 而不回退。Bancho Stats 由 `scoring-stats-projector.v1` 和 `ranking-projector.v1` 分别写入 `UserPlayStat` 与 `UserRankedStat`。Vanilla 默认 Policy 额外固定官方 Performance Release，按每张谱面最高合资格 PP 计算加权总 PP；Performance 完成会刷新总 PP，即使该成绩没有替换 Total Score 谱面榜记录。Stable Global Rank 按该总 PP 动态计算。成绩上传只提交 Score 事实和 Outbox，不同步写 Redis Presence/Mailbox；后续 `REQUEST_STATUS_UPDATE` 按客户端当前 Ruleset/Variant 读取最新 Stats，没有结果时不能把零值解释为其他模式的统计。
 
 Formula 是对外可选 PP 系统，唯一绑定一个 Calculator Code，但可通过关联表覆盖多个 Scoreboard；Calculator 可以承载多个 Formula。Release 按 `(formula_id, ruleset)` 单活且版本不可变，Performance Release 固定依赖一个 Difficulty Release。同一 Score 可在 `score_performances` 保存任意多个 Formula/历史 Release 结果，`PerformanceQueryService` 返回全部结果，Ranking Policy 始终引用精确 Release。
 
@@ -234,7 +234,7 @@ Session 登录 deadline 由 Redis Lua 在 Redis `TIME` 基准下限制为配置�
 - Multiplayer 完成事件与多人 Score Accepted 事件会幂等重建结果；Round 完成后宽限期内迟到的已验证成绩可修正 Result/Standing/Summary。Abort 不生成 Round Result。
 - Authorization/Moderation 管理命令和 Audit 已实现并有独立组合根，但没有对外管理 API；在认证、授权和错误映射完成前不能视为生产可调用入口。
 - `ContentSyncService` 已有 Stable 排行榜按需补全与响应后到期刷新，但仍没有主动 Scheduler、Worker 或管理命令入口。
-- 在线性能路径已完成首轮收敛：Stable 服务/Bot 在 API lifespan 组合一次；Poll 合并身份解析并按间隔持久化 touch，Stable Web 使用数据库事实校验后的短期 HMAC 验证缓存，Presence 列表消除 Redis N+1，登录与 Presence 扇出使用有界并发；Relay 有界并发入队并按批次事务写回 enqueue outcome；成绩统计主投影合并查询并补齐 Ranked Score 排名索引，Ranking 只在 Overall 最佳成绩变化后重算，Multiplayer 汇总使用批量 Upsert；Content Sync 外部文件 I/O 使用有界并发。
+- 在线性能路径已完成首轮收敛：Stable 服务/Bot 在 API lifespan 组合一次；Poll 合并身份解析并按间隔持久化 touch，Stable Web 使用数据库事实校验后的短期 HMAC 验证缓存，Presence 列表消除 Redis N+1，登录与 Presence 扇出使用有界并发；Relay 有界并发入队并按批次事务写回 enqueue outcome；成绩统计主投影合并查询并补齐 Ranked Score 排名索引，Ranking 只在 Overall 最佳成绩变化后重算，`UserRankedStat` 通过 PostgreSQL CTE 和窗口聚合直接 Upsert，不把用户全部最佳成绩或 PP 序列加载到 Worker；Multiplayer 汇总使用批量 Upsert；Content Sync 外部文件 I/O 使用有界并发。
 - Activity、Notification、Beatmapset Sync 和 Channel Read 投影已由 Outbox Consumer 生成，但尚无 Lazer Query API、分页读取服务或全量 Rebuild。
 - `NotificationDispatch` 当前只生成邮件/Push 待投递意图，尚无外部 Provider Sender；Stable Redis Mailbox 继续由同步适配器负责。
 - 中心应用不内嵌 Python PP 引擎；发布并配置外部 C#/Rust Calculator 制品前，当前不能输出真实 PP。

@@ -597,9 +597,9 @@ class SqlAlchemyScoringRepository:
         if row is None:
             return AccountStatsView(0, Decimal(0), 0, 0, 0)
         global_rank = 0
-        if row.policy_id is not None and row.ranked_score is not None:
-            rank_column = UserRankedStat.performance if row.metric == "pp" else UserRankedStat.ranked_score
-            rank_value = row.performance if row.metric == "pp" else row.ranked_score
+        if row.policy_id is not None and row.performance is not None:
+            rank_column = UserRankedStat.performance
+            rank_value = row.performance
             if rank_value > 0:
                 higher = await self._session.scalar(
                     select(func.count())

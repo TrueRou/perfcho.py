@@ -1,5 +1,7 @@
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import cast
 
@@ -44,6 +46,7 @@ from perfcho.modules.realtime.stable import (
     user_stats,
 )
 from perfcho.modules.realtime.stable.countries import stable_country_id
+from perfcho.modules.scoring import AccountStatsView, RankingQueryService
 from perfcho.modules.scoring.mods import LEGACY_MOD_BITS
 from perfcho.modules.social import AccountIdentityView, SocialInteractionBlocked, SocialService
 
@@ -220,6 +223,13 @@ class FakeBot:
         return CommandResult(self.response, False, 1.0)
 
 
+class FakeRankingQuery:
+    async def get_account_stats(self, account_id: int, ruleset: object, variant: object) -> AccountStatsView:
+        assert account_id == 10
+        del ruleset, variant
+        return AccountStatsView(123_456, Decimal("0.987654"), 12, 2_000_000, 4, 321)
+
+
 class FakeRealtime:
     def __init__(self, presences: tuple[PresenceSnapshot, ...]) -> None:
         self.presences = {snapshot.account_id: snapshot for snapshot in presences}
@@ -363,6 +373,7 @@ def services(
     settings: Settings | None = None,
     multiplayer: FakeMultiplayer | None = None,
     bot: FakeBot | None = None,
+    ranking_query: FakeRankingQuery | None = None,
 ) -> StableServices:
     return StableServices(
         identity=cast(IdentityService, identity or FakeIdentity()),
@@ -375,6 +386,7 @@ def services(
         community=cast(CommunityService, community or FakeCommunity()),
         multiplayer=cast(MultiplayerService, multiplayer),
         bot=cast(BotCommandService, bot) if bot is not None else None,
+        ranking_query=cast(RankingQueryService, ranking_query),
     )
 
 
@@ -643,6 +655,29 @@ async def test_status_request_refreshes_fenced_authoritative_snapshot() -> None:
 
     assert realtime.stored_presence is not None
     assert realtime.stored_presence.fence == realtime.presences[10].fence
+
+
+@pytest.mark.asyncio
+async def test_status_request_refreshes_mode_specific_authoritative_stats() -> None:
+    realtime = FakeRealtime((snapshot(10, "sender"),))
+    current = replace(
+        context(realtime),
+        presence=UserPresence(10, "sender", 0, 0, 1, 3, 0.0, 0.0, 0),
+        stats=UserStats(10, 0, "", "", 0, 3, 0, 0, 0.0, 0, 0, 0, 0),
+    )
+
+    response = await dispatch_packets(
+        build_packet(ClientPacket.REQUEST_STATUS_UPDATE),
+        current,
+        services(realtime, ranking_query=FakeRankingQuery()),
+    )
+
+    stats = next(PacketReader(response, packet_enum=ServerPacket)).payload.read_user_stats()
+    assert (stats.mode, stats.play_count, stats.total_score, stats.performance) == (3, 12, 2_000_000, 321)
+    assert realtime.stored_presence is not None
+    stored_packets = list(PacketReader(realtime.stored_presence.payload, packet_enum=ServerPacket))
+    stored_stats = stored_packets[1].payload.read_user_stats()
+    assert (stored_stats.mode, stored_stats.play_count, stored_stats.performance) == (3, 12, 321)
 
 
 @pytest.mark.asyncio

@@ -589,7 +589,7 @@ def replace_stats_mode(stats: UserStats, *, mode: int, mods: int) -> UserStats:
 
 
 async def account_stats(stats: UserStats, services: StableServices) -> UserStats:
-    """Overlay canonical score totals while leaving deferred Performance at zero."""
+    """Overlay canonical score totals, Performance, and rank for the current mode."""
     if services.ranking_query is None or not 0 <= stats.mode <= 3:
         return stats
     try:

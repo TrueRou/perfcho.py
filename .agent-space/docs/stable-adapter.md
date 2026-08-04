@@ -50,7 +50,7 @@ Mailbox 入队同时写入按完整 Session Fence 隔离的 Redis Signal；等�
 | Client Packet | 状态 | 当前行为 |
 | --- | --- | --- |
 | `PING` | 已接线 | 消费客户端 keepalive；严格单个空 ID `4` 可进入 200–500 ms 短等待，超时返回空；只有实际 Mailbox 数据返回时才按预算附加 ID `8` 延续活跃窗口 |
-| `REQUEST_STATUS_UPDATE` | 已接线 | 从权威 Score/Ranking Query 返回基础 Stats；PP 保持 Deferred |
+| `REQUEST_STATUS_UPDATE` | 已接线 | 按当前 Ruleset/Variant 从权威 Score/Ranking Query 返回 Stats，刷新 Redis Presence；PP 未完成时保持 Deferred |
 | `CHANGE_ACTION` | 已接线 | 查询当前基础 Stats，更新 Redis Presence 并按订阅 Filter 扇出 |
 | `USER_STATS_REQUEST` | 已接线 | 从 Redis Presence Snapshot 提取指定账户 Stats |
 | `USER_PRESENCE_REQUEST` | 已接线 | 从 Redis Presence Snapshot 提取指定账户 Presence |
@@ -157,7 +157,7 @@ Stable `leaderboard_type` 当前支持：
 
 编辑器请求返回空排行但保留谱面头信息。谱面不存在、客户端 MD5 过期、Set ID 不匹配和非法 Mod 组合均映射为 Stable 约定响应；服务端首次补全本身不代表客户端需要更新。
 
-Vanilla Policy 以 Total Score 排名，并明确允许 Ranked、Approved、Qualified 与 Loved。Relax/Autopilot Policy 只允许 Ranked/Approved 且以指定 Calculation Release 的 PP 排名；PP 缺失时 Eligibility 为 `performance_pending`，不会静默回退为 Total Score。真实 PP Release 尚未配置时 RX/AP 排行为空，这不能解释为最终 Performance 结果。
+Vanilla Policy 的谱面榜以 Total Score 排名，并明确允许 Ranked、Approved、Qualified 与 Loved；个人总 PP 使用 Policy 固定的官方 Performance Release，按每张谱面最高合资格 PP 加权计算，Global Rank 按总 PP 计算。Relax/Autopilot Policy 只允许 Ranked/Approved 且以指定 Calculation Release 的 PP 排名；PP 缺失时 Eligibility 为 `performance_pending`，不会静默回退为 Total Score。Stable Stats 始终按当前模式隔离，Level 不是 Bancho 字段，由客户端根据该模式 Total Score 推导。
 
 ## 7. Social、Community 与 Spectator
 

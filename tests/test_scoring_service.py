@@ -18,6 +18,7 @@ from perfcho.infra.db.models.content import Beatmap, BeatmapRevision, Beatmapset
 from perfcho.infra.db.models.events import OutboxEvent
 from perfcho.infra.db.models.scoring import (
     BeatmapActivity,
+    BeatmapDifficultyAttribute,
     BeatmapFailHistogram,
     CalculationFormula,
     CalculationRelease,
@@ -29,6 +30,7 @@ from perfcho.infra.db.models.scoring import (
     ReplayViewEvent,
     Score,
     ScoreHitStatistic,
+    ScorePerformance,
     UserBeatmapActivity,
     UserMonthlyActivity,
     UserPlayStat,
@@ -586,7 +588,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             mods=(CanonicalMod("HD", {"test_setting": 1}),),
             score=replace(submitted.score, online_checksum=b"p" * 16),
         )
-        await service.accept(shared_replay)
+        shared = await service.accept(shared_replay)
 
         performance_relay = SqlAlchemyPerformanceJobRelayStore(
             session_factory,
@@ -621,8 +623,8 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 )
             ).all()
             for event in events:
-                await project_accepted_score(session, event, "scoreboard:1")
-                await project_scoring_stats(session, event, "scoreboard:1")
+                await project_accepted_score(session, event, "account:1:scoreboard:1")
+                await project_scoring_stats(session, event, "account:1:scoreboard:1")
             exact_mods = await SqlAlchemyScoringRepository(session).get_leaderboard(
                 beatmap_id=first.beatmap_id,
                 ruleset=Ruleset.OSU,
@@ -660,9 +662,9 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 await session.scalars(select(OutboxEvent).where(OutboxEvent.event_type == "score.replay-viewed.v1"))
             ).all()
             assert len(replay_events) == 1
-            await project_scoring_stats(session, replay_events[0], "scoreboard:1")
+            await project_scoring_stats(session, replay_events[0], "account:1:scoreboard:1")
 
-        assert replayed == first
+        assert replayed == replace(first, new_achievement_unlocks=())
         assert len(exact_mods.scores) == 1
         async with session_factory() as session:
             assert await session.scalar(select(func.count()).select_from(PlayAttempt)) == 2
@@ -676,7 +678,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 CalculationJobStatus.PENDING
             }
             assert set(await session.scalars(select(PerformanceCalculationJob.attempt_count))) == {0}
-            assert await session.scalar(select(func.count()).select_from(OutboxEvent)) == 3
+            assert await session.scalar(select(func.count()).select_from(OutboxEvent)) == 4
             assert await session.scalar(select(func.count()).select_from(LeaderboardEntry)) == 3
             play_stat = await session.get(UserPlayStat, {"account_id": 1, "scoreboard_id": 1})
             policy_id = await session.scalar(
@@ -689,6 +691,9 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             assert (play_stat.play_count, play_stat.total_score, play_stat.total_hits) == (2, 2_000_000, 20)
             assert play_stat.replay_views == 1
             assert ranked_stat.ranked_score == 1_000_000
+            assert ranked_stat.performance == Decimal(0)
+            assert ranked_stat.accuracy == Decimal(1)
+            assert ranked_stat.grade_counts == {"XH": 1, "X": 0, "SH": 0, "S": 0, "A": 0}
             monthly = (
                 await session.scalars(
                     select(UserMonthlyActivity)
@@ -710,6 +715,87 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 2,
             )
             assert await session.scalar(select(func.count()).select_from(ReplayViewEvent)) == 1
+
+            first_score = await session.get(Score, first.score_id)
+            shared_score = await session.get(Score, shared.score_id)
+            assert first_score is not None and shared_score is not None
+            first_difficulty = BeatmapDifficultyAttribute(
+                beatmap_revision_id=first_score.beatmap_revision_id,
+                scoreboard_id=first_score.scoreboard_id,
+                mod_set_id=first_score.mod_set_id,
+                release_id=performance_release.id,
+                star_rating=Decimal("1"),
+                max_combo=first_score.max_combo,
+            )
+            shared_difficulty = BeatmapDifficultyAttribute(
+                beatmap_revision_id=shared_score.beatmap_revision_id,
+                scoreboard_id=shared_score.scoreboard_id,
+                mod_set_id=shared_score.mod_set_id,
+                release_id=performance_release.id,
+                star_rating=Decimal("1"),
+                max_combo=shared_score.max_combo,
+            )
+            session.add_all((first_difficulty, shared_difficulty))
+            await session.flush()
+            session.add_all(
+                (
+                    ScorePerformance(
+                        score_id=first.score_id,
+                        release_id=performance_release.id,
+                        difficulty_attribute_id=first_difficulty.id,
+                        pp=Decimal("100"),
+                        input_digest=b"f" * 32,
+                        output_digest=b"p" * 32,
+                    ),
+                    ScorePerformance(
+                        score_id=shared.score_id,
+                        release_id=performance_release.id,
+                        difficulty_attribute_id=shared_difficulty.id,
+                        pp=Decimal("200"),
+                        input_digest=b"i" * 32,
+                        output_digest=b"o" * 32,
+                    ),
+                )
+            )
+            await SqlAlchemyOutboxWriter(session).append(
+                PendingEvent(
+                    aggregate_type="score",
+                    aggregate_id=str(shared.score_id),
+                    event_type="score.performance-calculated.v1",
+                    schema_version=1,
+                    payload={
+                        "score_id": shared.score_id,
+                        "account_id": 1,
+                        "scoreboard_id": 1,
+                        "formula_id": str(performance_release.formula_id),
+                        "formula_code": "official",
+                        "release_id": str(performance_release.id),
+                        "pp": "200",
+                        "output_digest": (b"o" * 32).hex(),
+                    },
+                    consumers=("ranking-projector.v1",),
+                    partition_key="account:1:scoreboard:1",
+                )
+            )
+            await session.flush()
+            performance_event = await session.scalar(
+                select(OutboxEvent).where(
+                    OutboxEvent.event_type == "score.performance-calculated.v1",
+                    OutboxEvent.aggregate_id == str(shared.score_id),
+                )
+            )
+            assert performance_event is not None
+            await project_accepted_score(session, performance_event, "account:1:scoreboard:1")
+            ranked_stat = await session.get(UserRankedStat, {"account_id": 1, "policy_id": policy_id})
+            assert ranked_stat is not None
+            await session.refresh(ranked_stat)
+            assert ranked_stat.performance == Decimal("200")
+            account_stats = await SqlAlchemyScoringRepository(session).get_account_stats(
+                1,
+                Ruleset.OSU,
+                ScoreboardVariant.VANILLA,
+            )
+            assert (account_stats.performance, account_stats.global_rank) == (200, 1)
 
         failed_base = command()
         failed_command = replace(
@@ -752,8 +838,8 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 )
             )
             assert failed_event is not None
-            await project_accepted_score(session, failed_event, "scoreboard:1")
-            await project_scoring_stats(session, failed_event, "scoreboard:1")
+            await project_accepted_score(session, failed_event, "account:1:scoreboard:1")
+            await project_scoring_stats(session, failed_event, "account:1:scoreboard:1")
         async with session_factory() as session:
             histogram = await session.get(
                 BeatmapFailHistogram,

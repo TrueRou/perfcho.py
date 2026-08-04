@@ -455,7 +455,7 @@ async def _seed_scoring_catalog(session: AsyncSession) -> None:
 
     mod_policy_rows: list[dict[str, object]] = []
     ranking_policy_rows: list[dict[str, object]] = []
-    for scoreboard_id, scoreboard_code, _, variant in SCOREBOARDS:
+    for scoreboard_id, scoreboard_code, ruleset, variant in SCOREBOARDS:
         rules = _mod_policy_rules(scoreboard_code, variant)
         mod_policy_id = _bootstrap_uuid(f"mod-policy:{scoreboard_code}:v{_BOOTSTRAP_VERSION}")
         mod_policy_rows.append(
@@ -476,6 +476,11 @@ async def _seed_scoring_catalog(session: AsyncSession) -> None:
                 "metric": "total_score" if variant is ScoreboardVariant.VANILLA else "pp",
                 "tie_breaker": "ended_at",
                 "mod_policy_id": mod_policy_id,
+                "calculation_release_id": (
+                    _bootstrap_uuid(f"calculation-release:performance:{ruleset.value}")
+                    if variant is ScoreboardVariant.VANILLA
+                    else None
+                ),
                 "configuration": {
                     "best_per_account": True,
                     "eligible_beatmap_statuses": (
@@ -497,6 +502,7 @@ async def _seed_scoring_catalog(session: AsyncSession) -> None:
         conflict_columns=("id",),
         update_columns=("name", "schema_version", "rules", "digest"),
     )
+    await _seed_default_calculations(session)
     await _upsert_catalog(
         session,
         RankingPolicy.__table__,
@@ -509,12 +515,12 @@ async def _seed_scoring_catalog(session: AsyncSession) -> None:
             "metric",
             "tie_breaker",
             "mod_policy_id",
+            "calculation_release_id",
             "configuration",
             "is_default",
             "active",
         ),
     )
-    await _seed_default_calculations(session)
 
 
 async def _seed_default_calculations(session: AsyncSession) -> None:
