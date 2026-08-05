@@ -63,6 +63,7 @@ from perfcho.modules.scoring import (
     HitStatistic,
     MultiplayerSubmissionContext,
     PlayAttemptSubmission,
+    ReplayNotFound,
     ReplayQueryService,
     ReplayService,
     Ruleset,
@@ -857,8 +858,11 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 ),
                 online_checksum=b"f" * 16,
             ),
+            replay=None,
         )
         failed_result = await service.accept(failed_command)
+        with pytest.raises(ReplayNotFound):
+            await replay_query.get(failed_result.score_id)
         async with session_factory.begin() as session:
             failed_event = await session.scalar(
                 select(OutboxEvent).where(

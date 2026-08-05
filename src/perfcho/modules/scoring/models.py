@@ -270,7 +270,7 @@ class AcceptScore:
     mods: tuple[CanonicalMod, ...]
     attempt: PlayAttemptSubmission
     score: ScoreSubmission
-    replay: StagedReplayManifest
+    replay: StagedReplayManifest | None
     attestation: ScoreAttestation
     multiplayer: MultiplayerSubmissionContext | None = None
 
@@ -387,7 +387,7 @@ class ScoreAcceptanceRecord:
     mod_set: ModSetInfo
     attempt: PlayAttemptSubmission
     score: ScoreSubmission
-    replay: StagedReplayManifest
+    replay: StagedReplayManifest | None
     attestation: ScoreAttestation
     validated: ValidatedScore
     processed_at: datetime

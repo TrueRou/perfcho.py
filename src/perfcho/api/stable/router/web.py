@@ -77,6 +77,7 @@ from perfcho.modules.scoring import (
     ReplayService,
     Ruleset,
     ScoreGrade,
+    ScoreOutcome,
     ScoringService,
     StagedReplayManifest,
 )
@@ -948,26 +949,39 @@ async def submit_score(
         return Response(b"error: no")
 
     try:
-        replay_content = await read_stable_replay(form.replay, services.settings.stable_replay_max_bytes)
+        replay_content = await read_stable_replay(
+            form.replay,
+            services.settings.stable_replay_max_bytes,
+            require_structure=parsed.score.outcome is ScoreOutcome.PASSED,
+        )
     except ValueError as error:
         _log_score_rejection(started_ns, "artifact_validation", account_id=principal.account_id, error=error)
         return Response(b"error: no")
     finally:
         await form.replay.close()
     replay_digest = hashlib.sha256(replay_content).digest()
-    storage_key = f"replays/stable/{principal.account_id}/{replay_digest.hex()}.osr"
-    try:
-        # Content-addressed upload precedes the database transaction; reconciliation removes orphaned objects.
-        stored = await object_storage.put(
-            storage_key,
-            replay_content,
-            media_type="application/octet-stream",
-            expected_sha256=replay_digest,
+    replay_manifest: StagedReplayManifest | None = None
+    if parsed.score.outcome is ScoreOutcome.PASSED:
+        storage_key = f"replays/stable/{principal.account_id}/{replay_digest.hex()}.osr"
+        try:
+            # Content-addressed upload precedes the database transaction; reconciliation removes orphaned objects.
+            stored = await object_storage.put(
+                storage_key,
+                replay_content,
+                media_type="application/octet-stream",
+                expected_sha256=replay_digest,
+            )
+        except ObjectUnavailable as error:
+            _log_score_rejection(started_ns, "object_staging", account_id=principal.account_id, error=error)
+            return Response(b"")
+        _log_score_stage(started_ns, "object_staged", account_id=principal.account_id)
+        replay_manifest = StagedReplayManifest(
+            format="stable",
+            sha256=replay_digest,
+            size_bytes=stored.size_bytes,
+            storage_key=stored.storage_key,
+            client_version=services.settings.stable_build,
         )
-    except ObjectUnavailable as error:
-        _log_score_rejection(started_ns, "object_staging", account_id=principal.account_id, error=error)
-        return Response(b"")
-    _log_score_stage(started_ns, "object_staged", account_id=principal.account_id)
 
     request_id = services.id_generator.new()
     online_checksum = parsed.score.online_checksum
@@ -995,13 +1009,7 @@ async def submit_score(
         mods=parsed.mods,
         attempt=parsed.attempt,
         score=parsed.score,
-        replay=StagedReplayManifest(
-            format="stable",
-            sha256=replay_digest,
-            size_bytes=stored.size_bytes,
-            storage_key=stored.storage_key,
-            client_version=services.settings.stable_build,
-        ),
+        replay=replay_manifest,
         attestation=normalize_stable_attestation(form, parsed),
         multiplayer=None,
     )

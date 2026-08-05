@@ -98,12 +98,12 @@ async def parse_stable_submission_form(request: Request, maximum: int) -> Stable
     return _parse_submission_form(form)
 
 
-async def read_stable_replay(upload: UploadFile, maximum: int) -> bytes:
-    """Read one bounded replay with the minimum Stable replay structure."""
+async def read_stable_replay(upload: UploadFile, maximum: int, *, require_structure: bool = True) -> bytes:
+    """Read one bounded replay, validating structure only when a replay is required."""
     content = await upload.read(maximum + 1)
     if len(content) > maximum:
         raise ValueError("Stable replay exceeds the configured limit")
-    if len(content) < _MIN_REPLAY_BYTES:
+    if require_structure and len(content) < _MIN_REPLAY_BYTES:
         raise ValueError("Stable replay does not contain its minimum structure")
     return content
 

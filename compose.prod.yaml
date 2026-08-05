@@ -132,6 +132,11 @@ services:
 
   calculator-dotnet:
     image: hkccr.ccs.tencentyun.com/truerou/perfcho.pp:master
+    environment:
+      CACHE_DISK_ENABLED: ${CACHE_DISK_ENABLED:-false}
+      CACHE_MAXIMUM_MEMORY_CACHE_BYTES: ${CACHE_MAXIMUM_MEMORY_CACHE_BYTES:-134217728}
+    volumes:
+      - perfcho-calculator-cache:/data/cache
     restart: unless-stopped
     stop_grace_period: 30s
 
@@ -183,3 +188,4 @@ volumes:
   perfcho-postgres:
   perfcho-redis:
   perfcho-minio:
+  perfcho-calculator-cache:

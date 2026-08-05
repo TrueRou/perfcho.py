@@ -45,6 +45,7 @@ from perfcho.modules.scoring import (
     ReplayService,
     Ruleset,
     ScoreboardVariant,
+    ScoreOutcome,
     ScoreRejected,
     ScoringService,
 )
@@ -322,7 +323,12 @@ def stable_app(services: StableServices) -> FastAPI:
     return app
 
 
-def encrypted_score(*, checksum: str | None = None, play_time: str = "260729123000") -> tuple[str, str, str]:
+def encrypted_score(
+    *,
+    checksum: str | None = None,
+    play_time: str = "260729123000",
+    passed: bool = True,
+) -> tuple[str, str, str]:
     fields = [
         BEATMAP_MD5,
         "player ",
@@ -335,10 +341,10 @@ def encrypted_score(*, checksum: str | None = None, play_time: str = "2607291230
         "0",
         "1000000",
         "10",
-        "True",
-        "X",
+        "True" if passed else "False",
+        "X" if passed else "F",
         "0",
-        "True",
+        "True" if passed else "False",
         "0",
         play_time,
         OSU_VERSION,
@@ -367,13 +373,15 @@ def submission_files(
     replay: bytes = REPLAY_CONTENT,
     unique_ids: str = "uninstall-id|disk-id",
     play_time: str = "260729123000",
+    passed: bool = True,
+    fail_time_ms: int = 0,
 ) -> list[tuple[str, tuple]]:
-    score, client_hash, iv = encrypted_score(checksum=checksum, play_time=play_time)
+    score, client_hash, iv = encrypted_score(checksum=checksum, play_time=play_time, passed=passed)
     return [
         ("score", (None, score)),
         ("score", ("replay.osr", replay, "application/octet-stream")),
         ("x", (None, "0")),
-        ("ft", (None, "0")),
+        ("ft", (None, str(fail_time_ms))),
         ("st", (None, "60000")),
         ("pass", (None, password)),
         ("osuver", (None, OSU_VERSION)),
@@ -402,6 +410,7 @@ async def test_stable_score_submission_stages_replay_and_calls_canonical_service
     assert storage.puts[0][1] == REPLAY_CONTENT
     command = scoring.commands[0]
     assert command.meta.actor is not None and command.meta.actor.account_id == 3
+    assert command.replay is not None
     assert command.replay.storage_key.startswith("replays/stable/3/")
     assert command.attestation.client_integrity_digest is not None
     assert command.attestation.checksum == command.score.online_checksum
@@ -541,6 +550,24 @@ async def test_stable_score_submission_rejects_checksum_timing_and_short_replay_
     } == {"error: no"}
     assert storage.puts == []
     assert scoring.commands == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replay", [b"", b"failed replay"])
+async def test_stable_failed_score_allows_an_incomplete_replay_payload(replay: bytes) -> None:
+    services, scoring, storage, _, _ = stable_services()
+    app = stable_app(services)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/web/osu-submit-modular-selector.php",
+            files=submission_files(passed=False, fail_time_ms=30_000, replay=replay),
+        )
+
+    assert response.status_code == 200
+    assert response.text == "error: no"
+    assert storage.puts == []
+    assert scoring.commands[0].replay is None
+    assert scoring.commands[0].score.outcome is ScoreOutcome.FAILED
 
 
 @pytest.mark.asyncio

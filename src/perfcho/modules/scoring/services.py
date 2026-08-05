@@ -78,7 +78,7 @@ class ScoringService:
         self._receipt_ttl = receipt_ttl
 
     async def accept(self, command: AcceptScore) -> AcceptedScoreResult:
-        """Accept score facts, replay evidence, follow-up work, and one durable event."""
+        """Accept score facts, optional replay evidence, follow-up work, and one durable event."""
         started_ns = time.monotonic_ns()
         actor = command.meta.actor
         if actor is None:

@@ -68,7 +68,7 @@ class ScoringRepository(Protocol):
         ...
 
     async def insert_score(self, record: ScoreAcceptanceRecord) -> AcceptedScoreResult:
-        """Insert score, hits, replay, and attestation facts."""
+        """Insert score, hits, optional replay, and attestation facts."""
         ...
 
     async def complete_acceptance(self, idempotency_key: str, result: AcceptedScoreResult) -> None:

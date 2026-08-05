@@ -268,7 +268,7 @@ class SqlAlchemyScoringRepository:
         return AttemptClaim(attempt.id, prior)
 
     async def insert_score(self, record: ScoreAcceptanceRecord) -> AcceptedScoreResult:
-        """Insert score, hit, replay, and attestation facts."""
+        """Insert score, hit, optional replay, and attestation facts."""
         score = Score(
             attempt_id=record.attempt_id,
             account_id=record.account_id,
@@ -303,18 +303,19 @@ class SqlAlchemyScoringRepository:
             )
             for statistic in record.score.hits
         )
-        self._session.add(
-            Replay(
-                score_id=score_id,
-                format=record.replay.format,
-                sha256=record.replay.sha256,
-                size_bytes=record.replay.size_bytes,
-                storage_key=record.replay.storage_key,
-                state="ready",
-                client_version=record.replay.client_version,
-                verified_at=record.processed_at,
+        if record.replay is not None:
+            self._session.add(
+                Replay(
+                    score_id=score_id,
+                    format=record.replay.format,
+                    sha256=record.replay.sha256,
+                    size_bytes=record.replay.size_bytes,
+                    storage_key=record.replay.storage_key,
+                    state="ready",
+                    client_version=record.replay.client_version,
+                    verified_at=record.processed_at,
+                )
             )
-        )
         self._session.add(
             ScoreAttestation(
                 score_id=score_id,

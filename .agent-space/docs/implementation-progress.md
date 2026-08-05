@@ -1,6 +1,6 @@
 # 实现进度
 
-最后更新：2026-08-04。
+最后更新：2026-08-05。
 
 状态定义见[文档索引](README.md)：已接线、已实现未接线、仅设计必须严格区分。完整事实见[当前实现总览](current-implementation.md)，Stable 路由与 Packet 见[支持矩阵](stable-adapter.md)，后续约束见[剩余设计](remaining-design.md)。
 
@@ -17,7 +17,7 @@
 - Scoring：Canonical Score、Legacy Mod 规范化、命中/Accuracy/Grade 校验、命令与 Attempt 幂等、Score/Hit/Replay/Attestation 原子写入、账户/多人提交校验和中性后续任务调度端口。
 - Performance：独立业务模块与适配器，包含 Formula/Scoreboard、Bootstrap 默认 `official`/`official-difficulty` 目录、不可变 Difficulty/Performance Release、每 Score/Release 持久 Job、独立 Job Relay、单 Token Attempt、Lease/Fencing、版本化 HTTP Calculator、Input/Output Digest、多结果 Query 与完成事件。
 - 数据库 Bootstrap：仅初始化启动时为空的目录表，保留已有表中的应用数据，并保持并发启动锁与幂等行为；运行时配置只使用环境 `Settings`，不保留未被读取的数据库配置副本。
-- Stable Scoring：Rijndael modular submission、Replay staging/download、仅包含本次新解锁且重放为空的提交 Chart 和 `osu-osz2-getscores.php`。
+- Stable Scoring：Rijndael modular submission、Replay staging/download、失败/放弃成绩不创建 replay Manifest、仅包含本次新解锁且重放为空的提交 Chart 和 `osu-osz2-getscores.php`。
 - Ranking：成绩接受与 Performance 完成 Consumer、活动 Policy/Mod Policy Eligibility、Overall/Exact-Mods 最佳成绩投影及 Top/Mods/Friends/Country 查询。
 - Statistics：`scoring-stats-projector.v1` 维护用户游玩、月度、用户/谱面活动和失败进度；Ranking Projector 维护 `UserRankedStat`，Worker 每日生成 `RankSnapshot`。
 - Spectator：关系 Fence、Join/Leave/Fellow 通知、有界 Frame 历史和 Mailbox 扇出。

@@ -133,13 +133,14 @@ Mailbox 入队同时写入按完整 Session Fence 隔离的 Redis Signal；等�
 - Play Attempt
 - Score
 - Hit Statistics
-- Replay Manifest
+- Replay Manifest for passed scores
 - Score Attestation 与 Evidence
 - Command Receipt
 - `score.accepted.v1` Outbox Event 与 Ranking/Scoring Stats Delivery
 - 可确定且本次首次满足的 `social.achievement_unlocks` 与 `social.achievement-unlocked.v1` Delivery
 
 Replay 二进制先在事务外按 SHA-256 写入对象存储。数据库失败时可能留下无引用对象，后续应由对象存储对账/GC 清理；不能在数据库事务里执行 S3 I/O。
+Passed 成绩要求 Stable replay 至少包含最小结构并写入 Manifest；Failed/Abandoned 成绩仍读取并摘要请求中的 replay 字节，但不上传对象、不创建 ready Manifest。
 
 成绩事务提交后，Stable Web 适配器只返回提交结果和可选的只读 Overall Chart；`achievements-new` 仅序列化该事务首次创建的解锁，命令重放保持为空。适配器不同步写在线 Redis Presence/Mailbox。`score.accepted.v1`、`score.performance-calculated.v1`、Achievement 和 Replay View 事件由 Outbox/Worker 处理，分别更新 `UserPlayStat`、`UserRankedStat`、Activity/Notification 和排行榜；后续 `REQUEST_STATUS_UPDATE` 再读取规范统计投影。PC 与总分、Ranked Score、Global Rank 和 PP 都以这些投影为准，投影尚未完成时保持延迟语义。
 

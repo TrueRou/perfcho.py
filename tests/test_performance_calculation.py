@@ -163,7 +163,7 @@ async def test_http_calculator_routes_by_formula_calculator_and_verifies_release
                 "schema_version": 1,
                 "calculator": "perfcho-pp",
                 "release_version": "2026.07.1",
-                "difficulty_release_version": "2026.07.1-difficulty",
+                "difficulty_release_version": "2026.07.1",
                 "input_digest": (b"i" * 32).hex(),
                 "difficulty": {
                     "star_rating": "6.543219",
@@ -356,7 +356,7 @@ def _calculation() -> PerformanceCalculationInput:
         difficulty_formula_id=uuid.uuid7(),
         difficulty_formula_code="official-difficulty",
         difficulty_release_id=uuid.uuid7(),
-        difficulty_release_version="2026.07.1-difficulty",
+        difficulty_release_version="2026.07.1",
         difficulty_release_configuration={},
         input_digest=b"i" * 32,
         beatmap_revision_id=1,

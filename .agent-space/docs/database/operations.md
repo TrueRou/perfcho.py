@@ -10,7 +10,7 @@ docker compose up -d --wait postgres redis minio
 docker compose run --rm --no-deps minio-init
 ```
 
-PostgreSQL 监听 `127.0.0.1:55432`。开发 Redis 监听 `127.0.0.1:56379`，DB 0 保存在线状态，DB 1 承载 Taskiq Stream；生产 Redis 单独启用 `requirepass`。MinIO API 监听 `127.0.0.1:59000`，控制台监听 `127.0.0.1:59001`。开发库为 `perfcho`，集成测试库为 `perfcho_test`，均由 Compose 初始化脚本创建；宿主机进程通过 `.env` 读取与开发 Compose 一致的连接 URL 和 MinIO 凭据。
+PostgreSQL 监听 `127.0.0.1:55432`。开发 Redis 监听 `127.0.0.1:56379`，DB 0 保存在线状态，DB 1 承载 Taskiq Stream；生产 Redis 单独启用 `requirepass`。MinIO API 监听 `127.0.0.1:59000`，控制台监听 `127.0.0.1:59001`。开发库为 `perfcho`，由 Compose 的 `POSTGRES_DB` 创建；集成测试库由 PostgreSQL 测试夹具在运行前按需创建。测试连接用户需要 `CREATEDB` 权限，宿主机进程通过 `.env` 读取与开发 Compose 一致的连接 URL 和 MinIO 凭据。
 
 VS Code 中选择 `perfcho: all processes` 后按 F5，会并行执行依赖同步与 Compose 基础设施启动，待 PostgreSQL、Redis、MinIO 健康后幂等初始化对象存储桶，最后同时调试 API 和 Taskiq Worker。Worker 内部运行 Outbox 与 Performance 持久任务 Relay。结束调试只停止两个应用进程，基础设施保持运行；不再需要时执行 `docker compose down`。
 

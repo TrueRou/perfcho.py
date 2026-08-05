@@ -116,6 +116,10 @@ uv run pytest
 TEST_DATABASE_URL=postgresql+asyncpg://perfcho:perfcho@127.0.0.1:55432/perfcho_test uv run pytest -m postgres
 ```
 
+When `TEST_DATABASE_URL` is configured, the PostgreSQL test fixture creates the target database if it does not exist
+and resets its application schemas around each test. The configured PostgreSQL role therefore needs `CREATEDB`
+permission.
+
 ## Bancho Migration
 
 The offline bancho.py v5.2.2 MySQL and asset migration is available through
@@ -124,25 +128,6 @@ format, recovery rules, and verification procedure are documented in
 [the migration runbook](.agent-space/docs/bancho-migration.md).
 
 ## Structure
-
-```text
-src/perfcho/infra/db/
-  base.py                 SQLAlchemy metadata and schema registry
-  enums.py                Stable cross-domain values
-  mixins.py               ID and timestamp policies
-  models/                 Domain-separated models with English purpose docstrings
-  projectors/             Idempotent outbox consumers and projection checkpoints
-src/perfcho/modules/performance/   Performance models, ports, and application services
-src/perfcho/infra/db/repositories/performance/  Performance scheduling, job, and query adapters
-src/perfcho/infra/db/relays/       Outbox Delivery and Performance Job state machines
-src/perfcho/infra/db/projectors/catalog.py      Explicit outbox consumer catalog
-src/perfcho/infra/upstream/performance_calculator.py  External Calculator HTTP client
-src/perfcho/infra/taskiq.py        Redis Stream broker transport
-src/perfcho/tasks/                 Thin Taskiq task adapters
-src/perfcho/worker.py              Worker composition root and process lifecycle
-.agent-space/docs/        Chinese architecture, operations, and business contracts
-tests/                    Infrastructure and domain contract tests
-```
 
 See [the database architecture](.agent-space/docs/database/architecture.md) before changing a model or adding a
 business workflow.

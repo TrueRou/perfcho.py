@@ -28,7 +28,7 @@
 
 | 概念 | 责任 | 示例 |
 | --- | --- | --- |
-| Calculator | 一组可部署、可路由的计算实现，使用稳定 Code 标识 | `osu-lazer-dotnet`、`perfcho-rust` |
+| Calculator | 一组可部署、可路由的计算实现，使用稳定 Code 标识 | `perfcho-pp`、`perfcho-rust` |
 | Formula | 用户、Ranking 和产品语义可选择的计算系统 | `official`、`custom-relax`、`custom-aim` |
 | Calculation Release | Formula 在某个 Ruleset 下的不可变算法制品与配置 | `official/osu/2026.07.1` |
 
@@ -144,7 +144,7 @@ Content-Type: multipart/form-data
 perfcho 通过 Calculator Code 查找基础 URL：
 
 ```env
-PERFORMANCE_CALCULATOR_URLS={"osu-lazer-dotnet":"http://calculator-dotnet:6001","perfcho-rust":"http://calculator-rust:6002"}
+PERFORMANCE_CALCULATOR_URLS={"perfcho-pp":"http://calculator-dotnet:6001"}
 PERFORMANCE_HTTP_TIMEOUT_SECONDS=30
 PERFORMANCE_BEATMAP_URL_EXPIRY_SECONDS=600
 S3_PRESIGN_ENDPOINT_URL=http://minio:9000
@@ -187,7 +187,7 @@ curl --fail-with-body \
   "score_id": 100,
   "formula_id": "019f0000-0000-7000-8000-000000000002",
   "formula_code": "official",
-  "calculator": "osu-lazer-dotnet",
+  "calculator": "perfcho-pp",
   "release_id": "019f0000-0000-7000-8000-000000000003",
   "release_version": "2026.07.1",
   "release_configuration": {
@@ -196,7 +196,7 @@ curl --fail-with-body \
   "difficulty_formula_id": "019f0000-0000-7000-8000-000000000004",
   "difficulty_formula_code": "official-difficulty",
   "difficulty_release_id": "019f0000-0000-7000-8000-000000000005",
-  "difficulty_release_version": "2026.07.1-difficulty",
+  "difficulty_release_version": "2026.07.1",
   "difficulty_release_configuration": {},
   "input_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "beatmap_revision_id": 501,
@@ -277,9 +277,9 @@ perfcho 使用 UTF-8、JSON Key 排序、无额外空白和 ASCII Escape 生成�
 ```json
 {
   "schema_version": 1,
-  "calculator": "osu-lazer-dotnet",
+  "calculator": "perfcho-pp",
   "release_version": "2026.07.1",
-  "difficulty_release_version": "2026.07.1-difficulty",
+  "difficulty_release_version": "2026.07.1",
   "input_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "difficulty": {
     "star_rating": "6.543219",
