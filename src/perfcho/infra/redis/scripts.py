@@ -822,9 +822,10 @@ if not expiry or expiry <= now or expiry > math.min(host_expiry, tonumber(presen
     or expiry - now > tonumber(ARGV[7]) then
     return {'INVALID_EXPIRY'}
 end
+local reset_sequence = ARGV[20] == '1'
 local stored_session = redis.call('HGET', KEYS[7], 'session_id')
-if stored_session and (stored_session ~= ARGV[2]
-    or redis.call('HGET', KEYS[7], 'revision') ~= ARGV[3]) then
+if reset_sequence or (stored_session and (stored_session ~= ARGV[2]
+    or redis.call('HGET', KEYS[7], 'revision') ~= ARGV[3])) then
     redis.call('DEL', KEYS[4], KEYS[5], KEYS[7])
 end
 local previous_sequence = redis.call('HGET', KEYS[7], 'wire_sequence')

@@ -102,6 +102,8 @@ def test_repository_registers_v2_atomic_consistency_scripts(repository_double: R
     publish = sources["-- perfcho:publish-frame:v2"]
     assert "ZPOPMIN" in publish
     assert "% 65536" in publish
+    assert "local reset_sequence = ARGV[20] == '1'" in publish
+    assert "if reset_sequence or (stored_session" in publish
     assert "mailbox_base" in publish
     assert "LPUSH', signal_key" in publish
     attach = sources["-- perfcho:attach-spectator:v2"]
@@ -342,11 +344,25 @@ async def test_spectator_contract_returns_atomic_handoff_and_live_recipients(
         42,
         host_fence=host,
         sequence=1,
+        reset_sequence=False,
         payload=b"live",
         expires_at=PRESENCE_EXPIRY,
     )
     assert published.frame.cursor == 6
     assert published.recipient_account_ids == (43, 44)
+    assert publish.call_args.kwargs["args"][-1] == 0
+
+    publish.return_value = [b"OK", b"1", b"43", b"44"]
+    reset = await repository.publish_spectator_frame(
+        42,
+        host_fence=host,
+        sequence=0,
+        reset_sequence=True,
+        payload=b"new song",
+        expires_at=PRESENCE_EXPIRY,
+    )
+    assert reset.frame.cursor == 1
+    assert publish.call_args.kwargs["args"][-1] == 1
 
     publish.return_value = [b"FRAME_TOO_LARGE"]
     with pytest.raises(InvalidFrame, match="frame_too_large"):
@@ -354,6 +370,7 @@ async def test_spectator_contract_returns_atomic_handoff_and_live_recipients(
             42,
             host_fence=host,
             sequence=2,
+            reset_sequence=False,
             payload=b"too large",
             expires_at=PRESENCE_EXPIRY,
         )
@@ -513,6 +530,7 @@ async def test_real_redis_epoch_heartbeat_spectator_history_and_mailbox_consiste
             42,
             host_fence=host,
             sequence=65535,
+            reset_sequence=False,
             payload=b"old!",
             expires_at=now + timedelta(seconds=18),
         )
@@ -585,6 +603,7 @@ async def test_real_redis_epoch_heartbeat_spectator_history_and_mailbox_consiste
             42,
             host_fence=host,
             sequence=0,
+            reset_sequence=False,
             payload=b"zero",
             expires_at=now + timedelta(seconds=18),
         )
@@ -592,6 +611,7 @@ async def test_real_redis_epoch_heartbeat_spectator_history_and_mailbox_consiste
             42,
             host_fence=host,
             sequence=1,
+            reset_sequence=False,
             payload=b"one!",
             expires_at=now + timedelta(seconds=18),
         )
@@ -615,11 +635,38 @@ async def test_real_redis_epoch_heartbeat_spectator_history_and_mailbox_consiste
             at=now,
         )
         assert after_evicted.truncated
+        with pytest.raises(InvalidFrame, match="non_monotonic"):
+            await repository.publish_spectator_frame(
+                42,
+                host_fence=host,
+                sequence=0,
+                reset_sequence=False,
+                payload=b"stale",
+                expires_at=now + timedelta(seconds=18),
+            )
+        reset = await repository.publish_spectator_frame(
+            42,
+            host_fence=host,
+            sequence=0,
+            reset_sequence=True,
+            payload=b"new song",
+            expires_at=now + timedelta(seconds=18),
+        )
+        reset_window = await repository.read_spectator_frames(
+            42,
+            host_fence=host,
+            after_cursor=None,
+            limit=2,
+            at=now,
+        )
+        assert reset.frame.cursor == 1
+        assert tuple(frame.sequence for frame in reset_window.frames) == (0,)
         with pytest.raises(InvalidFrame, match="frame_too_large"):
             await repository.publish_spectator_frame(
                 42,
                 host_fence=host,
                 sequence=2,
+                reset_sequence=False,
                 payload=b"x" * 13,
                 expires_at=now + timedelta(seconds=18),
             )
@@ -654,7 +701,7 @@ async def test_real_redis_epoch_heartbeat_spectator_history_and_mailbox_consiste
             limit=8,
             expires_at=now + timedelta(seconds=10),
         )
-        assert [packet.payload for packet in live.packets] == [b"zero", b"one!"]
+        assert [packet.payload for packet in live.packets] == [b"zero", b"one!", b"new song"]
 
         new_spectator_id, new_spectator = await _open(repository, 43, now)
         assert new_spectator_id != spectator_id
@@ -736,6 +783,7 @@ async def test_real_redis_epoch_heartbeat_spectator_history_and_mailbox_consiste
                 42,
                 host_fence=host,
                 sequence=2,
+                reset_sequence=False,
                 payload=b"old!",
                 expires_at=now + timedelta(seconds=10),
             )

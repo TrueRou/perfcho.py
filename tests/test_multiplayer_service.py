@@ -388,6 +388,42 @@ async def test_same_idempotency_key_replays_create_without_new_room() -> None:
 
 
 @pytest.mark.asyncio
+async def test_same_join_command_after_leave_creates_new_presence() -> None:
+    repository = FakeRepository()
+    state = FakeState()
+    multiplayer = service(repository, state)
+    await multiplayer.create_room(CreateRoom(meta(10, "create"), settings(), "secret"))
+    command = JoinRoom(meta(11, "same-join"), 7, "secret")
+
+    first = await multiplayer.join_room(command)
+    assert first.slot_for(11) is not None
+    with pytest.raises(MatchPasswordRejected):
+        await multiplayer.join_room(JoinRoom(meta(11, "new-wrong-join"), 7, "wrong"))
+    replayed = await multiplayer.join_room(command)
+    assert replayed.room.version == first.room.version
+    assert len(repository.command_rooms) == 2
+    assert repository.room is not None
+    repository.accounts = (10,)
+    repository.room = replace(repository.room, version=repository.room.version + 1)
+    assert state.state is not None
+    state.state = replace(
+        state.state,
+        room=repository.room,
+        state_revision=state.state.state_revision + 1,
+        slots=tuple(
+            RoomSlot(slot.position, SlotStatus.OPEN) if slot.account_id == 11 else slot for slot in state.state.slots
+        ),
+    )
+
+    rejoined = await multiplayer.join_room(command)
+
+    assert rejoined.slot_for(11) is not None
+    assert repository.accounts == (10, 11)
+    assert rejoined.room.version == first.room.version + 2
+    assert len(repository.command_rooms) == 3
+
+
+@pytest.mark.asyncio
 async def test_canonical_service_enforces_host_permission_before_create() -> None:
     class DenyMultiplayer:
         async def require(self, account_id: int, permissions: tuple[str, ...], *, at: datetime) -> None:

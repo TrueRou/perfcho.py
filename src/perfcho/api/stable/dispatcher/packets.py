@@ -74,6 +74,7 @@ from perfcho.modules.realtime.stable.models import (
     ClientPacket,
     ClientStatus,
     Message,
+    ReplayAction,
     ServerPacket,
     UserPresence,
     UserStats,
@@ -270,7 +271,13 @@ async def _dispatch_packets(
             bundle = packet.payload.read_replay_frame_bundle()
             packet.payload.require_exhausted()
             sequence = bundle.sequence if bundle.sequence is not None else bundle.score_frame.time & 0xFFFF
-            await _publish_spectator_frames(sequence, bundle.raw_data, context, services)
+            await _publish_spectator_frames(
+                sequence,
+                bundle.raw_data,
+                context,
+                services,
+                reset_sequence=bundle.action is ReplayAction.NEW_SONG,
+            )
         elif packet_type is ClientPacket.CANT_SPECTATE:
             packet.payload.require_exhausted()
             await _cant_spectate(context, services)
@@ -1579,6 +1586,8 @@ async def _publish_spectator_frames(
     raw_data: memoryview,
     context: StableRuntimeContext,
     services: StableServices,
+    *,
+    reset_sequence: bool,
 ) -> None:
     started_ns = monotonic_ns()
     wire = spectate_frames(raw_data)
@@ -1587,6 +1596,7 @@ async def _publish_spectator_frames(
             context.identity.account_id,
             host_fence=context.realtime.fence,
             sequence=sequence,
+            reset_sequence=reset_sequence,
             payload=wire,
             expires_at=context.realtime.expires_at,
         )

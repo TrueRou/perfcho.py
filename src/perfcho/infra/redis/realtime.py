@@ -950,13 +950,16 @@ class RedisRealtimeRepository(RealtimeRepository):
         *,
         host_fence: SessionFence,
         sequence: int,
+        reset_sequence: bool,
         payload: bytes,
         expires_at: datetime,
     ) -> SpectatorFramePublish:
-        """Roll history and queue live delivery in one host-epoch-fenced transition."""
+        """Roll per-play history and queue live delivery in one host-epoch-fenced transition."""
         _positive_integer("host_account_id", host_account_id)
         host = _fence("host_fence", host_fence)
         _bounded_integer("sequence", sequence, MAX_FRAME_SEQUENCE)
+        if not isinstance(reset_sequence, bool):
+            raise TypeError("reset_sequence must be a boolean")
         frozen_payload = _bytes(payload)
         result = await self._run(
             self._scripts.publish_frame,
@@ -989,6 +992,7 @@ class RedisRealtimeRepository(RealtimeRepository):
                 self._keys.session_prefix,
                 f"{self._keys.base}:spectator:viewer:",
                 f"{self._keys.base}:mailbox:",
+                int(reset_sequence),
             ],
         )
         status = _text(result[0])

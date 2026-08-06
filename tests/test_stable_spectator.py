@@ -177,11 +177,14 @@ class SpectatorRealtime:
         *,
         host_fence: SessionFence,
         sequence: int,
+        reset_sequence: bool,
         payload: bytes,
         expires_at: datetime,
     ) -> SpectatorFramePublish:
         assert expires_at > NOW
         assert host_fence == self.fences[host_account_id]
+        if reset_sequence:
+            self.frames.pop(host_account_id, None)
         frame = SpectatorFrame(len(self.frames.get(host_account_id, ())) + 1, sequence, payload)
         self.frames.setdefault(host_account_id, []).append(frame)
         recipients: list[int] = []
@@ -253,11 +256,11 @@ def services(realtime: SpectatorRealtime) -> StableServices:
     )
 
 
-def spectator_frame_packet(sequence: int) -> bytes:
+def spectator_frame_packet(sequence: int, *, action: ReplayAction = ReplayAction.STANDARD) -> bytes:
     bundle = ReplayFrameBundle(
         frames=(ReplayFrame(0, 0, 1.0, 2.0, 10),),
         score_frame=ScoreFrame(10, 1, 1, 0, 0, 0, 0, 0, 300, 1, 1, True, 255, 0, False),
-        action=ReplayAction.STANDARD,
+        action=action,
         extra=0,
         sequence=sequence,
         raw_data=memoryview(b""),
@@ -326,6 +329,19 @@ async def test_spectator_join_frames_and_stop_notify_host_and_fellows(monkeypatc
     assert frame_event["recipient_count"] == 2
     assert "spectator" not in frame_event.values()
     assert "host" not in frame_event.values()
+
+
+@pytest.mark.asyncio
+async def test_new_song_resets_spectator_frame_history_before_sequence_restarts() -> None:
+    realtime = SpectatorRealtime()
+    stable_services = services(realtime)
+    host = context(2, "host", realtime)
+
+    await dispatch_packets(spectator_frame_packet(28), host, stable_services)
+    await dispatch_packets(spectator_frame_packet(0, action=ReplayAction.NEW_SONG), host, stable_services)
+    await dispatch_packets(spectator_frame_packet(1), host, stable_services)
+
+    assert [frame.sequence for frame in realtime.frames[2]] == [0, 1]
 
 
 @pytest.mark.asyncio

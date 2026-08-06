@@ -233,10 +233,11 @@ class RealtimeRepository(Protocol):
         *,
         host_fence: SessionFence,
         sequence: int,
+        reset_sequence: bool,
         payload: bytes,
         expires_at: datetime,
     ) -> SpectatorFramePublish:
-        """Roll history and atomically queue one live frame to fenced viewers."""
+        """Roll per-play history and atomically queue one live frame to fenced viewers."""
         ...
 
     async def read_spectator_frames(

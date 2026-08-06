@@ -154,12 +154,27 @@ class MultiplayerService:
         async with self._uow_factory() as uow:
             await self._access_policy_factory(uow.session).require(actor, ("multiplayer.play",), at=now)
             repository = self._repository_factory(uow.session)
-            room = await repository.find_command_room(command_id)
+            room = await repository.get_room(command.public_id, for_update=True)
             if room is None:
-                room = await repository.get_room(command.public_id, for_update=True)
-                if room is None:
-                    raise MatchNotFound("room is not active")
+                raise MatchNotFound("room is not active")
+            command_room = await repository.find_command_room(command_id)
+            active_room = await repository.find_room_for_account(actor)
+            if active_room is not None:
+                if active_room.public_id != command.public_id:
+                    raise MatchAlreadyJoined("account already has an active multiplayer presence")
+                if command_room is None:
+                    self._verify_admission(room, actor, command.password, now=now)
+                else:
+                    replayed = True
+                room = active_room
+                snapshot = await repository.load_snapshot(room)
+            else:
                 self._verify_admission(room, actor, command.password, now=now)
+                if command_room is not None:
+                    command_id = uuid.uuid5(
+                        command_id,
+                        f"membership:{room.session_id}:{room.version}",
+                    )
                 room = await repository.join_room(
                     room,
                     command_id=command_id,
@@ -169,9 +184,6 @@ class MultiplayerService:
                 )
                 snapshot = await repository.load_snapshot(room)
                 await uow.commit()
-            else:
-                replayed = True
-                snapshot = await repository.load_snapshot(room)
         _log_room_event(
             "DEBUG" if replayed else "INFO",
             "multiplayer.room.joined",
