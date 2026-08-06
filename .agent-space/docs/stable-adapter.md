@@ -1,6 +1,6 @@
 # Stable 适配器支持矩阵
 
-最后更新：2026-08-04。
+最后更新：2026-08-06。
 
 本文只描述当前生产 Router 和 Dispatcher 的真实支持范围。Stable 是协议适配层，所有权威校验仍应在共享应用服务中完成。
 
@@ -24,7 +24,7 @@
 2. 使用 Canonical `StableLogin` Command 验证账户、凭据、设备和单会话约束。
 3. 查询 Stable Privilege、公开频道、好友和未读离线私信。
 4. 在 Redis 创建带 Revision 和 TTL 的 Realtime Session 与 Presence。
-5. 返回 Protocol Version、Login Reply、Privileges、Welcome、Channel List、Friend List、Silence、Presence、Stats 和离线消息。
+5. 返回 Protocol Version、Login Reply、Privileges、Welcome、Channel List、Friend List、Silence、Presence、Stats 和离线消息。Privileges 与当前玩家自身 Presence 使用同一份真实 Stable 权限投影，不无条件伪造 Supporter；自身 Presence/Stats 先于其他在线玩家发送。
 
 错误语义包括无效请求、旧客户端、凭据错误和重复在线会话。Bancho Token 对应持久 Auth Session，Redis 只承担在线 Lease，不替代持久会话事实。
 

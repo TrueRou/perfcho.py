@@ -15,7 +15,6 @@ from perfcho.api.stable.dependencies import StableServicesDependency
 from perfcho.api.stable.dispatcher import StableRuntimeContext, account_stats, dispatch_packets, realtime_expiry
 from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.logging import duration_ms, log_event, rate_limit, sampled
-from perfcho.modules.authorization import StablePrivilege
 from perfcho.modules.common import ClientContext, CommandMeta
 from perfcho.modules.community import StableChannel
 from perfcho.modules.identity import InvalidCredentials, InvalidStableSession, StableLogin, StableSessionAlreadyActive
@@ -321,15 +320,15 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             (
                 protocol_version(services.settings.stable_protocol_version),
                 login_reply(result.account_id),
-                privileges(int(stable_privileges | StablePrivilege.SUPPORTER)),
+                privileges(int(stable_privileges)),
                 notification(services.settings.stable_welcome_notification),
                 *channel_packets,
                 channel_info_end(),
                 friends_list(friend_ids),
                 silence_end(silence_seconds),
-                *online_packets,
                 presence_packet,
                 stats_packet,
+                *online_packets,
                 *offline_packets,
             )
         )

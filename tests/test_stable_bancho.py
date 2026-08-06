@@ -400,8 +400,8 @@ async def test_successful_login_has_ordered_binary_bootstrap() -> None:
     assert realtime.presence.session_id == identity.session_id
     assert realtime.durable_expires_at == NOW + timedelta(hours=1)
     privilege_packet = next(packet for packet in packets if packet.packet_type is ServerPacket.PRIVILEGES)
-    assert privilege_packet.payload.read_i32() == StablePrivilege.PLAYER | StablePrivilege.SUPPORTER
     own_presence = next(packet for packet in packets if packet.packet_type is ServerPacket.USER_PRESENCE)
+    assert privilege_packet.payload.read_i32() == StablePrivilege.PLAYER
     assert own_presence.payload.read_user_presence().privileges == StablePrivilege.PLAYER
 
 
@@ -869,19 +869,26 @@ async def test_login_bootstraps_online_users_channels_silence_and_timestamped_ma
     presences = [
         packet.payload.read_user_presence() for packet in packets if packet.packet_type is ServerPacket.USER_PRESENCE
     ]
+    privilege_packet = next(packet for packet in packets if packet.packet_type is ServerPacket.PRIVILEGES)
     silence = next(packet for packet in packets if packet.packet_type is ServerPacket.SILENCE_END)
     offline = next(packet for packet in packets if packet.packet_type is ServerPacket.SEND_MESSAGE)
 
     assert len(channels) == 1
     assert (channels[0].name, channels[0].topic, channels[0].player_count) == ("#general", "General", 4)
-    assert [presence.user_id for presence in presences] == [8, 3]
-    assert presences[0].privileges == StablePrivilege.PLAYER
+    assert [presence.user_id for presence in presences] == [3, 8]
+    assert privilege_packet.payload.read_i32() == presences[0].privileges == StablePrivilege.PLAYER
     assert silence.payload.read_i32() == 91
     assert offline.payload.read_message().text == "[Wed Jul 29 @ 00:00AM] older message"
     assert community.policy == "friends"
     assert realtime.channel_members == {7: {3}}
     assert realtime.presence is not None
     assert realtime.enqueued == [(8, realtime.presence.payload, SessionFence(other_session_id, 4))]
+    broadcast_packets = list(PacketReader(realtime.enqueued[0][1], packet_enum=ServerPacket))
+    assert [packet.packet_type for packet in broadcast_packets] == [
+        ServerPacket.USER_PRESENCE,
+        ServerPacket.USER_STATS,
+    ]
+    assert broadcast_packets[0].payload.read_user_presence().privileges == StablePrivilege.PLAYER
 
 
 @pytest.mark.asyncio
