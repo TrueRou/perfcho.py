@@ -8,7 +8,7 @@ from perfcho.infra.logging import duration_ms, log_event
 from perfcho.infra.settings import settings
 
 
-async def create_redis() -> Redis:
+async def create_state_redis() -> Redis:
     """Create a binary Redis client and fail fast when unavailable."""
     started_ns = monotonic_ns()
     log_event(
@@ -36,4 +36,20 @@ async def create_redis() -> Redis:
         )
         raise RuntimeError("Failed to connect to Redis state storage") from e
     log_event("INFO", "redis.state.connected", endpoint_label="state", duration_ms=duration_ms(started_ns))
+    return redis_engine
+
+
+async def create_cache_redis() -> Redis:
+    """Create the isolated Redis client used by best-effort query caches."""
+    redis_engine = Redis.from_url(
+        settings.redis_cache_url,
+        decode_responses=False,
+        socket_timeout=settings.redis_cache_socket_timeout,
+        socket_connect_timeout=settings.redis_cache_socket_timeout,
+    )
+    try:
+        await redis_engine.ping()
+    except Exception:
+        await redis_engine.aclose()
+        raise RuntimeError("Failed to connect to Redis query cache") from None
     return redis_engine

@@ -700,10 +700,17 @@ async def _send_public_message(message: Message, context: StableRuntimeContext, 
             _stable_message_id("public", message.recipient, content, context, services),
             content,
         )
-        channel = await services.community.get_public_channel_by_stable_name(
-            context.identity.account_id,
-            message.recipient,
-        )
+        channel = result.resolved_channel
+        if channel is None:
+            community_query = services.community_query
+            if community_query is not None:
+                channel = await community_query.get_public_channel_by_stable_name(
+                    context.identity.account_id, message.recipient
+                )
+            else:
+                channel = await services.community.get_public_channel_by_stable_name(
+                    context.identity.account_id, message.recipient
+                )
         channel_member_ids = tuple(sorted(await services.realtime.list_channel_members(channel.channel_id)))
         member_ids = tuple(account_id for account_id in channel_member_ids if account_id != context.identity.account_id)
         if services.social is not None:

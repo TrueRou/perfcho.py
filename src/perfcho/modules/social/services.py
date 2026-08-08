@@ -5,6 +5,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from datetime import datetime
 
+from perfcho.infra.cache import MemoryCache
 from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.normalization import normalize_name
@@ -34,6 +35,7 @@ from perfcho.modules.social.ports import (
     SocialRepositoryFactory,
     SocialUnitOfWork,
 )
+from perfcho.modules.social.queries import SocialQueryService
 
 _SOCIAL_CONSUMERS = ("social-projector.v1",)
 _ACHIEVEMENT_CONSUMERS = ("achievement-projector.v1",)
@@ -48,12 +50,14 @@ class SocialService:
         repository_factory: SocialRepositoryFactory,
         outbox_writer_factory: OutboxWriterFactory,
         clock: Clock,
+        queries: SocialQueryService | None = None,
     ) -> None:
         """Bind transaction, persistence, event, and time dependencies."""
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
         self._outbox_writer_factory = outbox_writer_factory
         self._clock = clock
+        self._queries = queries or SocialQueryService(uow_factory, repository_factory, MemoryCache())
 
     async def follow(
         self,
@@ -127,6 +131,7 @@ class SocialService:
                 )
             )
             await uow.commit()
+            await self._queries.invalidate_friends(actor_account_id, target_account_id)
             if removed_block:
                 _log_relationship_change(
                     "unblock",
@@ -164,6 +169,7 @@ class SocialService:
                     )
                 )
             await uow.commit()
+            await self._queries.invalidate_friends(actor_account_id, target_account_id)
             if removed:
                 _log_relationship_change(
                     "unfollow",
@@ -222,6 +228,7 @@ class SocialService:
                     )
                 )
             await uow.commit()
+            await self._queries.invalidate_friends(actor_account_id, target_account_id)
             if changed:
                 _log_relationship_change(
                     "block",
@@ -254,6 +261,7 @@ class SocialService:
                     )
                 )
             await uow.commit()
+            await self._queries.invalidate_friends(actor_account_id, target_account_id)
             if removed:
                 _log_relationship_change(
                     "unblock",

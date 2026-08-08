@@ -32,6 +32,7 @@ from perfcho.modules.content import (
     UpstreamContentUnavailable,
 )
 from perfcho.modules.content.ports import ContentRepository
+from tests.cache_support import MemoryCache
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 BEATMAP_FILE = b"osu file format v14\n[General]\n"
@@ -577,6 +578,7 @@ def sync_service(
         object_storage=cast(ObjectStorage, storage),
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, FakeIds()),
+        cache=MemoryCache(),
     )
     return service, repository, storage, outbox, units
 

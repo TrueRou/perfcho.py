@@ -8,6 +8,7 @@ from typing import cast
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
+from perfcho.infra.cache import RedisCache
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.base import DbSessionFactory
 from perfcho.infra.db.repositories.account import SqlAlchemyAccountRepository
@@ -50,7 +51,7 @@ from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.authorization.management import AuthorizationManagementService
 from perfcho.modules.bot import BotCommandService, register_core_commands
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage
-from perfcho.modules.community import CommunityService
+from perfcho.modules.community import CommunityQueryService, CommunityService
 from perfcho.modules.content import BeatmapRevisionView, ContentQueryService, ContentService, ContentSyncService
 from perfcho.modules.identity import IdentityService
 from perfcho.modules.moderation.services import ModerationService
@@ -68,7 +69,7 @@ from perfcho.modules.scoring import (
     ReplayService,
     ScoringService,
 )
-from perfcho.modules.social import SocialService, TransactionAchievementAwarder, build_clan_commands
+from perfcho.modules.social import SocialQueryService, SocialService, TransactionAchievementAwarder, build_clan_commands
 from perfcho.modules.social.achievements import default_achievement_evaluator_registry
 
 core_services: CoreServices | None = None
@@ -165,26 +166,39 @@ class _Uuid7Generator:
 
 @dataclass(frozen=True, slots=True)
 class CoreServices:
-    """Collect process-owned services used by all request scopes."""
+    """Collect process-owned services used by all request scopes.
+
+    ``state_redis`` is the raw DB0 client for online state adapters.
+    ``cache_redis`` is the raw DB2 client owned by the process lifecycle.
+    ``cache`` is the only cache API exposed to application services.
+    """
 
     config: Settings
     clock: Clock
     id_generator: IdGenerator
-    redis: Redis
+    state_redis: Redis
+    cache_redis: Redis
+    cache: RedisCache
     postgres: AsyncEngine
     session_factory: DbSessionFactory
 
 
 async def compose_core_services() -> CoreServices:
     """Build process-owned services used by all request scopes."""
+    config = Settings()
     postgres = await infra_db.create_engine()
 
+    state_redis = await infra_redis.create_state_redis()
+    cache_redis = await infra_redis.create_cache_redis()
+    cache = RedisCache(cache_redis, prefix=config.redis_cache_prefix)
     return CoreServices(
-        config=Settings(),
+        config=config,
         clock=_SystemClock(),
         id_generator=_Uuid7Generator(),
-        redis=await infra_redis.create_redis(),
-        postgres=await infra_db.create_engine(),
+        state_redis=state_redis,
+        cache_redis=cache_redis,
+        cache=cache,
+        postgres=postgres,
         session_factory=infra_db.create_session_factory(postgres),
     )
 
@@ -203,7 +217,9 @@ class StableServices:
     content: ContentService | None = None
     content_sync: ContentSyncService | None = None
     social: SocialService | None = None
+    social_query: SocialQueryService | None = None
     community: CommunityService | None = None
+    community_query: CommunityQueryService | None = None
     object_storage: ObjectStorage | None = None
     scoring: ScoringService | None = None
     performance_query: PerformanceQueryService | None = None
@@ -239,13 +255,13 @@ async def compose_stable_services(
         stable_session_stale_grace=timedelta(seconds=core.config.stable_session_stale_grace_seconds),
         stable_session_touch_interval=timedelta(seconds=core.config.stable_session_touch_interval_seconds),
         stable_web_verification_cache=RedisStableWebVerificationCache(
-            core.redis,
+            core.state_redis,
             prefix=core.config.redis_state_prefix,
             ttl_seconds=core.config.stable_web_auth_cache_ttl_seconds,
         ),
     )
     realtime = RedisRealtimeRepository(
-        core.redis,
+        core.state_redis,
         prefix=core.config.redis_state_prefix,
         session_ttl=timedelta(seconds=core.config.redis_session_ttl_seconds),
         presence_ttl=timedelta(seconds=core.config.redis_presence_ttl_seconds),
@@ -258,6 +274,11 @@ async def compose_stable_services(
         max_spectators_per_host=core.config.redis_spectator_max_viewers,
     )
     uow_factory = SqlAlchemyUnitOfWorkFactory(core.session_factory)
+    authorization = AuthorizationQueryService(
+        SqlAlchemyAuthorizationQueryRepository(core.session_factory),
+        core.clock,
+        core.cache,
+    )
     account = AccountService(
         uow_factory,
         _account_repository,
@@ -273,13 +294,14 @@ async def compose_stable_services(
         ),
         core.clock,
     )
-    content_query = ContentQueryService(uow_factory, _content_repository)
+    content_query = ContentQueryService(uow_factory, _content_repository, core.cache)
     content = ContentService(uow_factory, _content_repository)
-    social = SocialService(uow_factory, _social_repository, _outbox_writer, core.clock)
+    social_query = SocialQueryService(uow_factory, _social_repository, core.cache)
+    social = SocialService(uow_factory, _social_repository, _outbox_writer, core.clock, social_query)
     community = CommunityService(
         uow_factory,
         _community_repository,
-        _authorization_repository,
+        authorization,
         _silence_policy,
         _outbox_writer,
         core.clock,
@@ -300,7 +322,7 @@ async def compose_stable_services(
         _multiplayer_repository,
         _outbox_writer,
         RedisMultiplayerStateRepository(
-            core.redis,
+            core.state_redis,
             prefix=core.config.redis_state_prefix,
             state_ttl=timedelta(seconds=core.config.redis_multiplayer_ttl_seconds),
             max_rooms=core.config.redis_multiplayer_max_rooms,
@@ -328,18 +350,13 @@ async def compose_stable_services(
         build_multiplayer_commands(
             MultiplayerCommandDependencies(
                 service=multiplayer,
-                resolve_account=social.resolve_account_by_name,
+                resolve_account=social_query.resolve_account_by_name,
                 resolve_beatmap=resolve_beatmap,
             )
         )
     )
     bot.register_group(build_pool_commands())
     bot.register_group(build_clan_commands())
-
-    authorization = AuthorizationQueryService(
-        SqlAlchemyAuthorizationQueryRepository(core.session_factory),
-        core.clock,
-    )
 
     object_storage = S3ObjectStorage.from_settings(core.config)
 
@@ -351,6 +368,7 @@ async def compose_stable_services(
         object_storage,
         core.clock,
         core.id_generator,
+        core.cache,
         max_concurrency=core.config.content_sync_max_concurrency,
     )
 
@@ -365,6 +383,7 @@ async def compose_stable_services(
         content=content,
         content_sync=content_sync,
         social=social,
+        social_query=social_query,
         community=community,
         object_storage=object_storage,
         scoring=scoring,
@@ -388,6 +407,7 @@ class AdminServices:
 
 def compose_admin_services(
     session_factory: DbSessionFactory,
+    cache: RedisCache,
     *,
     clock: Clock | None = None,
 ) -> AdminServices:
@@ -401,7 +421,8 @@ def compose_admin_services(
             _audit_writer,
             _outbox_writer,
             application_clock,
-            _receipt_store,
+            cache=cache,
+            receipt_store_factory=_receipt_store,
         ),
         moderation=ModerationService(
             uow_factory,

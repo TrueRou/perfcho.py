@@ -6,6 +6,8 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
+from perfcho.infra.cache.backend import CacheBackend
+from perfcho.infra.cache.values import decode_json, encode_json
 from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import Clock, IdGenerator, ObjectStorage, OutboxWriterFactory
@@ -39,6 +41,29 @@ _REFRESH_RETRY = timedelta(minutes=5)
 _LEADERBOARD_STATUSES = frozenset({"ranked", "approved", "loved"})
 
 
+def _beatmap_view(value: object) -> BeatmapRevisionView:
+    if not isinstance(value, dict):
+        raise ValueError("invalid cached beatmap")
+    return BeatmapRevisionView(**value)
+
+
+def _beatmapset_view(value: object) -> BeatmapsetView:
+    if not isinstance(value, dict):
+        raise ValueError("invalid cached beatmapset")
+    return BeatmapsetView(
+        beatmapset_id=value["beatmapset_id"],
+        external_beatmapset_id=value["external_beatmapset_id"],
+        artist=value["artist"],
+        title=value["title"],
+        creator=value["creator"],
+        status=value["status"],
+        last_updated_at=value["last_updated_at"],
+        available=value["available"],
+        has_video=value["has_video"],
+        beatmaps=tuple(_beatmap_view(item) for item in value["beatmaps"]),
+    )
+
+
 class ContentQueryService:
     """Read canonical immutable content through short-lived sessions."""
 
@@ -46,36 +71,53 @@ class ContentQueryService:
         self,
         uow_factory: Callable[[], ContentUnitOfWork],
         repository_factory: ContentRepositoryFactory,
+        cache: CacheBackend,
     ) -> None:
         """Bind transaction and persistence factories."""
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
+        self._cache = cache
 
     async def lookup_md5(self, md5: str | bytes) -> BeatmapRevisionView:
         """Resolve an immutable revision by Stable MD5."""
         digest = _md5_bytes(md5)
+        key = self._cache.key("content", "md5", digest.hex())
+        cached = await self._cache.get(key)
+        if cached is not None:
+            return _beatmap_view(decode_json(cached))
         async with self._uow_factory() as uow:
             result = await self._repository_factory(uow.session).lookup_md5(digest)
         if result is None:
             raise BeatmapNotFound("beatmap md5 is unknown")
+        await self._cache.set(key, encode_json(result), ttl_seconds=900)
         return result
 
     async def lookup_beatmap(self, beatmap_id: int, *, external: bool = True) -> BeatmapRevisionView:
         """Resolve the current revision by public or canonical beatmap ID."""
         _positive("beatmap_id", beatmap_id)
+        key = self._cache.key("content", "beatmap", f"{int(external)}:{beatmap_id}")
+        cached = await self._cache.get(key)
+        if cached is not None:
+            return _beatmap_view(decode_json(cached))
         async with self._uow_factory() as uow:
             result = await self._repository_factory(uow.session).lookup_beatmap(beatmap_id, external=external)
         if result is None:
             raise BeatmapNotFound("beatmap is unknown")
+        await self._cache.set(key, encode_json(result), ttl_seconds=300)
         return result
 
     async def lookup_filename(self, file_name: str) -> BeatmapRevisionView:
         """Resolve the current revision by normalized Stable filename."""
-        key = _filename_key(file_name)
+        normalized = _filename_key(file_name)
+        key = self._cache.key("content", "filename", hashlib.sha256(normalized.encode()).hexdigest())
+        cached = await self._cache.get(key)
+        if cached is not None:
+            return _beatmap_view(decode_json(cached))
         async with self._uow_factory() as uow:
-            result = await self._repository_factory(uow.session).lookup_filename(key)
+            result = await self._repository_factory(uow.session).lookup_filename(normalized)
         if result is None:
             raise BeatmapNotFound("beatmap filename is unknown")
+        await self._cache.set(key, encode_json(result), ttl_seconds=300)
         return result
 
     async def batch_lookup(
@@ -95,10 +137,15 @@ class ContentQueryService:
     async def get_beatmapset(self, beatmapset_id: int, *, external: bool = True) -> BeatmapsetView:
         """Return a beatmapset with all current revisions."""
         _positive("beatmapset_id", beatmapset_id)
+        key = self._cache.key("content", "beatmapset", f"{int(external)}:{beatmapset_id}")
+        cached = await self._cache.get(key)
+        if cached is not None:
+            return _beatmapset_view(decode_json(cached))
         async with self._uow_factory() as uow:
             result = await self._repository_factory(uow.session).get_beatmapset(beatmapset_id, external=external)
         if result is None:
             raise BeatmapsetNotFound("beatmapset is unknown")
+        await self._cache.set(key, encode_json(result), ttl_seconds=300)
         return result
 
     async def search(self, query: ContentSearch) -> ContentSearchPage:
@@ -218,6 +265,7 @@ class ContentSyncService:
         object_storage: ObjectStorage,
         clock: Clock,
         id_generator: IdGenerator,
+        cache: CacheBackend,
         *,
         max_concurrency: int = 8,
     ) -> None:
@@ -230,6 +278,7 @@ class ContentSyncService:
         self._object_storage = object_storage
         self._clock = clock
         self._id_generator = id_generator
+        self._cache = cache
         self._io_semaphore = asyncio.Semaphore(max_concurrency)
         self._inflight_lock = asyncio.Lock()
         self._inflight: dict[int, asyncio.Task[ContentSyncResult]] = {}
@@ -388,6 +437,7 @@ class ContentSyncService:
                 )
             )
             await uow.commit()
+            await self._invalidate_snapshot(snapshot)
             log_event(
                 "INFO",
                 "content.sync.committed",
@@ -399,6 +449,15 @@ class ContentSyncService:
                 duration_ms=duration_ms(started_ns),
             )
             return result
+
+    async def _invalidate_snapshot(self, snapshot: UpstreamBeatmapsetSnapshot) -> None:
+        """Remove cache entries affected by a committed upstream snapshot."""
+        await self._cache.delete(self._cache.key("content", "beatmapset", f"1:{snapshot.external_beatmapset_id}"))
+        for beatmap in snapshot.beatmaps:
+            await self._cache.delete(self._cache.key("content", "beatmap", f"1:{beatmap.external_beatmap_id}"))
+            await self._cache.delete(self._cache.key("content", "md5", beatmap.md5.hex()))
+            filename = hashlib.sha256(_filename_key(beatmap.file_name).encode()).hexdigest()
+            await self._cache.delete(self._cache.key("content", "filename", filename))
 
     async def _fetch_and_store_file(
         self,

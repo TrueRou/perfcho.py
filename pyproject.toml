@@ -56,6 +56,13 @@ convention = "pep257"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D"]
+"src/perfcho/infra/cache/backend.py" = ["D102", "D107"]
+"src/perfcho/infra/cache/decorator.py" = ["UP047"]
+"src/perfcho/infra/cache/memory.py" = ["D102", "D107"]
+"src/perfcho/infra/cache/redis.py" = ["D102", "D107"]
+"src/perfcho/infra/cache/values.py" = ["ANN401", "D103"]
+"src/perfcho/modules/community/queries.py" = ["D102", "D107"]
+"src/perfcho/modules/social/queries.py" = ["D102", "D107"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

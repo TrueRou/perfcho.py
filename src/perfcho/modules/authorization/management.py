@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Protocol
 
+from perfcho.infra.cache.backend import CacheBackend
 from perfcho.modules.audit import AuditEventValue, AuditWriterFactory
 from perfcho.modules.authorization.commands import (
     AuthorizationGrant,
@@ -50,6 +51,7 @@ class AuthorizationManagementService:
         audit_writer_factory: AuditWriterFactory,
         outbox_writer_factory: OutboxWriterFactory,
         clock: Clock,
+        cache: CacheBackend,
         receipt_store_factory: CommandReceiptStoreFactory | None = None,
     ) -> None:
         """Bind transaction, persistence, audit, event, and clock ports."""
@@ -59,6 +61,7 @@ class AuthorizationManagementService:
         self._outbox_writer_factory = outbox_writer_factory
         self._clock = clock
         self._receipt_store_factory = receipt_store_factory
+        self._cache = cache
 
     async def grant_role(self, command: GrantRole) -> AuthorizationGrant:
         """Grant a role after validating actor, subject, and period."""
@@ -141,6 +144,7 @@ class AuthorizationManagementService:
             await self._record(session, command, result, actor_id, kind, action=f"authorization.{kind}.granted")
             await self._complete(session, command.meta, f"authorization.{kind}.grant", result)
             await uow.commit()
+            await self._cache.delete(self._cache.key("authorization", "effective", str(result.account_id)))
             return result
 
     async def _revoke(self, command: _RevokeCommand, kind: str) -> AuthorizationGrant:
@@ -171,6 +175,7 @@ class AuthorizationManagementService:
             await self._record(session, command, result, actor_id, kind, action=f"authorization.{kind}.revoked")
             await self._complete(session, command.meta, f"authorization.{kind}.revoke", result)
             await uow.commit()
+            await self._cache.delete(self._cache.key("authorization", "effective", str(result.account_id)))
             return result
 
     async def _require_manager(

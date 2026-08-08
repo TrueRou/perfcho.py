@@ -150,6 +150,7 @@ class MessageResult:
     created_at: datetime
     direct_recipient_account_id: int | None = None
     created: bool = True
+    resolved_channel: StableChannel | None = None
 
     def __post_init__(self) -> None:
         """Validate identifiers and creation time."""

@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 
+from perfcho.infra.cache import MemoryCache
 from perfcho.modules.audit import AuditEventValue
 from perfcho.modules.authorization import (
     AuthorizationGrant,
@@ -188,6 +189,7 @@ def authorization_service(
         lambda session: audit,
         lambda session: outbox,
         FakeClock(),
+        MemoryCache(),
         (lambda session: cast(CommandReceiptStore, receipts)) if receipts is not None else None,
     )
     return service, uow, audit, outbox

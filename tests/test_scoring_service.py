@@ -392,6 +392,7 @@ async def test_multiplayer_score_routes_results_projector_in_acceptance_transact
     assert outbox.events[0].consumers == (
         "ranking-projector.v1",
         "scoring-stats-projector.v1",
+        "performance-projector.v1",
         "multiplayer-results-projector.v1",
     )
 

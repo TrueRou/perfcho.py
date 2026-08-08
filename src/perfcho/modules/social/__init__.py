@@ -22,6 +22,7 @@ from perfcho.modules.social.models import (
     ScoreAchievementContext,
 )
 from perfcho.modules.social.ports import AchievementAwarder, SocialRepository
+from perfcho.modules.social.queries import SocialQueryService
 from perfcho.modules.social.services import SocialService, TransactionAchievementAwarder
 
 __all__ = (
@@ -44,6 +45,7 @@ __all__ = (
     "SocialRelationRejected",
     "SocialRepository",
     "SocialService",
+    "SocialQueryService",
     "ScoreAchievementContext",
     "TransactionAchievementAwarder",
 )

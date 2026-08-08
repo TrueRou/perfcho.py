@@ -25,9 +25,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
     started_ns = monotonic_ns()
     logging.log_event("INFO", "runtime.api.starting")
 
+    core_services = await compose_core_services()
+    stable_services = await compose_stable_services(core_services)
+
     try:
-        core_services = await compose_core_services()
-        stable_services = await compose_stable_services(core_services)
         yield {
             "core_services": core_services,
             "stable_services": stable_services,
@@ -43,6 +44,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
         )
         raise error
     finally:
+        await core_services.cache_redis.aclose()
+        await core_services.state_redis.aclose()
+        await core_services.postgres.dispose()
         logging.log_event("INFO", "runtime.api.stopped", duration_ms=logging.duration_ms(started_ns))
 
 

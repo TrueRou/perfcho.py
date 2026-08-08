@@ -12,6 +12,7 @@ from perfcho.infra.db.enums import SanctionKind
 from perfcho.infra.db.models.community import Message
 from perfcho.infra.db.repositories.community import SqlAlchemyActiveSilencePolicy, SqlAlchemyCommunityRepository
 from perfcho.modules.authorization import EffectiveAuthorization
+from perfcho.modules.authorization.services import AuthorizationQueryService
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.community import (
     ActiveSilence,
@@ -30,6 +31,7 @@ from perfcho.modules.community.models import (
     OfflineDirectMessage,
 )
 from perfcho.modules.community.ports import CommunityRepository
+from tests.cache_support import MemoryCache
 
 INSTANT = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 
@@ -318,7 +320,7 @@ def _service(
         CommunityService(
             create_uow,
             lambda session: cast(CommunityRepository, repository),
-            lambda session: authorization,
+            AuthorizationQueryService(authorization, FixedClock(), MemoryCache()),
             lambda session: silence_policy,
             lambda session: outbox,
             FixedClock(),

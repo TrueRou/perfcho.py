@@ -13,6 +13,8 @@ from perfcho.modules.common.ports import OutboxWriter
 from perfcho.modules.social import SocialAccountNotFound, SocialInteractionBlocked, SocialService
 from perfcho.modules.social.models import FollowRecord, PairRelationship
 from perfcho.modules.social.ports import SocialRepository
+from perfcho.modules.social.queries import SocialQueryService
+from tests.cache_support import MemoryCache
 
 INSTANT = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 
@@ -125,6 +127,7 @@ def _service(
             lambda session: cast(SocialRepository, repository),
             lambda session: cast(OutboxWriter, outbox),
             FixedClock(),
+            SocialQueryService(create_uow, lambda session: cast(SocialRepository, repository), MemoryCache()),
         ),
         outbox,
         units,

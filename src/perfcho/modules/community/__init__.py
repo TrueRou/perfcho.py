@@ -27,6 +27,7 @@ from perfcho.modules.community.models import (
     StableChannel,
 )
 from perfcho.modules.community.ports import ActiveChannelMembershipQuery, ActiveSilencePolicy, CommunityRepository
+from perfcho.modules.community.queries import CommunityQueryService
 from perfcho.modules.community.services import CommunityService
 
 __all__ = (
@@ -43,6 +44,7 @@ __all__ = (
     "CommunityInputRejected",
     "CommunityRepository",
     "CommunityService",
+    "CommunityQueryService",
     "ConversationReadCursor",
     "DirectConversationResult",
     "DirectMessageBlocked",

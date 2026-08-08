@@ -1,19 +1,22 @@
 from datetime import timedelta
+from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import SecretStr
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
+from perfcho.infra.cache import RedisCache
+from perfcho.infra.compose import CoreServices, compose_stable_services
 from perfcho.infra.redis.realtime import RedisRealtimeRepository
 from perfcho.infra.settings import Settings
+from perfcho.modules.common.ports import Clock, IdGenerator
 
 
 @pytest.mark.asyncio
 async def test_stable_composition_wires_independent_security_keys() -> None:
     pytest.importorskip("perfcho.infra.redis.realtime", reason="realtime adapter is being changed in parallel")
-    from perfcho.infra.compose import compose_stable_services
-
     token_key = "composition-token-hmac-key"
     match_password_key = "composition-match-password-hmac-key"
     admission_key = "composition-admission-hmac-key"
@@ -28,7 +31,17 @@ async def test_stable_composition_wires_independent_security_keys() -> None:
     session_factory = async_sessionmaker(expire_on_commit=False)
     redis = Redis()
     try:
-        services = compose_stable_services(session_factory, redis, config=config)
+        core = CoreServices(
+            config=config,
+            clock=cast(Clock, MagicMock()),
+            id_generator=cast(IdGenerator, MagicMock()),
+            state_redis=redis,
+            cache_redis=redis,
+            cache=RedisCache(redis, prefix=config.redis_cache_prefix),
+            postgres=cast(AsyncEngine, MagicMock()),
+            session_factory=session_factory,
+        )
+        services = await compose_stable_services(core)
         assert services.account is not None
         assert services.bot is not None
         assert services.bot.bot_name == "BanchoBot"

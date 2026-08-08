@@ -3,11 +3,13 @@
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 from math import ceil
 
 from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.authorization.models import EffectiveAuthorization
+from perfcho.modules.authorization.services import AuthorizationQueryService
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import Clock, OutboxWriterFactory
 from perfcho.modules.community.errors import (
@@ -40,7 +42,6 @@ from perfcho.modules.community.models import (
 from perfcho.modules.community.ports import (
     ActiveChannelMembershipQuery,
     ActiveSilencePolicyFactory,
-    AuthorizationRepositoryFactory,
     CommunityRepository,
     CommunityRepositoryFactory,
     CommunityUnitOfWork,
@@ -58,7 +59,7 @@ class CommunityService:
         self,
         uow_factory: Callable[[], CommunityUnitOfWork],
         repository_factory: CommunityRepositoryFactory,
-        authorization_repository_factory: AuthorizationRepositoryFactory,
+        authorization: AuthorizationQueryService,
         silence_policy_factory: ActiveSilencePolicyFactory,
         outbox_writer_factory: OutboxWriterFactory,
         clock: Clock,
@@ -67,7 +68,7 @@ class CommunityService:
         """Bind transaction, persistence, policy, event, and time dependencies."""
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
-        self._authorization_repository_factory = authorization_repository_factory
+        self._authorization = authorization
         self._silence_policy_factory = silence_policy_factory
         self._outbox_writer_factory = outbox_writer_factory
         self._clock = clock
@@ -76,13 +77,9 @@ class CommunityService:
     async def list_public_channels(self, account_id: int) -> tuple[StableChannel, ...]:
         """Return active public channels readable by current canonical authorization."""
         _validate_account_id(account_id)
-        now = self._clock.now()
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
-            authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                account_id,
-                at=now,
-            )
+            authorization = await self._authorization.get_effective(account_id)
             channels = await repository.list_public_channels(account_id)
             visible: list[StableChannel] = []
             for channel in channels:
@@ -95,16 +92,12 @@ class CommunityService:
         """Resolve one readable public channel by a normalized Stable name."""
         _validate_account_id(account_id)
         normalized_name = _normalize_stable_channel_name(stable_name)
-        now = self._clock.now()
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
             channel = await repository.get_public_channel_by_stable_name(normalized_name, account_id)
             if channel is None:
                 raise ChannelNotFound("public channel does not exist")
-            authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                account_id,
-                at=now,
-            )
+            authorization = await self._authorization.get_effective(account_id)
             permissions = _evaluate_permissions(channel, account_id, authorization)
             if not permissions.can_read:
                 raise ChannelNotFound("public channel does not exist")
@@ -114,16 +107,12 @@ class CommunityService:
         """Evaluate account-specific channel permissions through canonical authorization."""
         _validate_account_id(account_id)
         _validate_account_id(channel_id)
-        now = self._clock.now()
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
             channel = await repository.get_channel(channel_id, account_id)
             if channel is None or channel.archived:
                 raise ChannelNotFound("channel does not exist")
-            authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                account_id,
-                at=now,
-            )
+            authorization = await self._authorization.get_effective(account_id)
             return _evaluate_permissions(channel, account_id, authorization)
 
     async def create_direct_conversation(
@@ -176,18 +165,18 @@ class CommunityService:
             channel = await repository.get_public_channel_by_stable_name(normalized_name, sender_account_id)
             if channel is None:
                 raise ChannelNotFound("public channel does not exist")
+            authorization = await self._authorization.get_effective(sender_account_id)
+            permissions = _evaluate_permissions(channel, sender_account_id, authorization)
             previous = await repository.get_message_by_client_id(sender_account_id, client_message_id)
             if previous is not None:
                 _require_exact_message(previous, channel.channel_id, content, is_action, reply_to_id, None)
+                authorization = await self._authorization.get_effective(sender_account_id)
                 await uow.commit()
                 replay = _as_replay(previous)
                 _log_message(replay, started_ns=started_ns)
-                return replay
+                return replace(replay, resolved_channel=_stable_channel(channel, permissions))
             _validate_message_content(content, channel.message_length_limit)
-            authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                sender_account_id,
-                at=now,
-            )
+            authorization = await self._authorization.get_effective(sender_account_id)
             permissions = _evaluate_permissions(channel, sender_account_id, authorization)
             if not permissions.can_write:
                 raise ChannelAccessDenied("channel is not writable")
@@ -214,7 +203,7 @@ class CommunityService:
                 await self._append_message_event(uow.session, message)
             await uow.commit()
             _log_message(message, started_ns=started_ns)
-            return message
+            return replace(message, resolved_channel=_stable_channel(channel, permissions))
 
     async def send_direct_message(
         self,
@@ -254,10 +243,7 @@ class CommunityService:
                 return replay
             _enforce_direct_message_context(context, sender_account_id, recipient_account_id)
             await self._require_target_not_silenced(uow.session, recipient_account_id, now)
-            authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                sender_account_id,
-                at=now,
-            )
+            authorization = await self._authorization.get_effective(sender_account_id)
             if not authorization.allows("chat.write"):
                 raise ChannelAccessDenied("direct messages are not writable")
             conversation = await repository.get_or_create_direct_conversation(
@@ -311,10 +297,7 @@ class CommunityService:
             channel = await repository.get_channel(channel_id, account_id)
             if channel is None or channel.archived:
                 raise ChannelNotFound("channel does not exist")
-            authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                account_id,
-                at=now,
-            )
+            authorization = await self._authorization.get_effective(account_id)
             if not _evaluate_permissions(channel, account_id, authorization).can_read:
                 raise ChannelAccessDenied("channel is not readable")
             if not await repository.message_belongs_to_channel(channel_id, message_id):
@@ -387,10 +370,7 @@ class CommunityService:
         now = self._clock.now()
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
-            authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                account_id,
-                at=now,
-            )
+            authorization = await self._authorization.get_effective(account_id)
             if not (authorization.allows("chat.read") or authorization.allows("chat.manage")):
                 raise ChannelAccessDenied("direct messages are not readable")
             valid_cursors = await repository.list_valid_direct_read_cursors(account_id, normalized)
@@ -410,10 +390,7 @@ class CommunityService:
         now = self._clock.now()
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
-            authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                account_id,
-                at=now,
-            )
+            authorization = await self._authorization.get_effective(account_id)
             if not (authorization.allows("chat.read") or authorization.allows("chat.manage")):
                 raise ChannelAccessDenied("direct messages are not readable")
             cursor = await repository.get_direct_conversation_read_cursor(account_id, other_account_id)
@@ -461,10 +438,7 @@ class CommunityService:
                 channel = await repository.get_channel(channel_id, account_id)
                 if channel is None or channel.archived:
                     raise ChannelNotFound("channel does not exist")
-                authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                    account_id,
-                    at=now,
-                )
+                authorization = await self._authorization.get_effective(account_id)
                 if not _evaluate_permissions(channel, account_id, authorization).can_read:
                     raise ChannelAccessDenied("channel is not readable")
         count = await active_memberships.count_active_members(channel_id, at=now)
@@ -520,10 +494,7 @@ class CommunityService:
                 raise ChannelNotFound("channel does not exist")
             if channel.direct:
                 raise MembershipRejected("direct-conversation membership is fixed by its account pair")
-            authorization = await self._authorization_repository_factory(uow.session).get_effective(
-                account_id,
-                at=now,
-            )
+            authorization = await self._authorization.get_effective(account_id)
             permissions = _evaluate_permissions(channel, account_id, authorization)
             if joining and not permissions.can_read:
                 raise ChannelAccessDenied("channel is not readable")

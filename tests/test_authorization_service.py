@@ -15,6 +15,7 @@ from perfcho.modules.authorization import (
     project_stable_privileges,
 )
 from perfcho.modules.authorization.ports import AuthorizationRepository
+from tests.cache_support import MemoryCache
 
 
 class FixedClock:
@@ -92,7 +93,7 @@ async def test_query_service_uses_one_clock_instant_for_the_repository() -> None
     instant = datetime(2026, 7, 28, 12, 30, tzinfo=UTC)
     authorization = _authorization(instant, permissions=frozenset({"account.login"}))
     repository = StubAuthorizationRepository(authorization)
-    service = AuthorizationQueryService(repository, FixedClock(instant))
+    service = AuthorizationQueryService(repository, FixedClock(instant), MemoryCache())
 
     assert await service.get_effective(42) is authorization
     assert repository.requested == (42, instant)
