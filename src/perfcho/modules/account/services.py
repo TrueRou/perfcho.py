@@ -17,7 +17,7 @@ from perfcho.modules.account.errors import EmailUnavailable, NameUnavailable, Re
 from perfcho.modules.account.models import RegisterAccount, RegistrationRecord, RegistrationResult
 from perfcho.modules.account.ports import AccountRepositoryFactory, AccountUnitOfWork
 from perfcho.modules.common.models import PendingEvent
-from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
+from perfcho.modules.common.normalization import normalize_email, normalize_name
 from perfcho.modules.common.ports import Clock, OutboxWriterFactory
 
 _RECEIPT_SCOPE = "account.register"
@@ -53,7 +53,7 @@ class AccountService:
     async def check_availability(self, display_name: str, email_address: str) -> None:
         """Validate account identifiers and report their current availability."""
         try:
-            name_key = normalize_stable_name(unicodedata.normalize("NFKC", display_name))
+            name_key = normalize_name(unicodedata.normalize("NFKC", display_name))
             email_key = normalize_email(email_address)
         except ValueError as error:
             raise RegistrationRejected(str(error)) from error
@@ -70,7 +70,7 @@ class AccountService:
         started_ns = time.monotonic_ns()
         try:
             display_name = unicodedata.normalize("NFKC", command.display_name)
-            name_key = normalize_stable_name(display_name)
+            name_key = normalize_name(display_name)
             email = normalize_email(command.email)
             password_preverification = validate_stable_password_token(command.password_preverification)
         except ValueError as error:

@@ -47,7 +47,7 @@ from perfcho.modules.common import (
     ObjectStorage,
     ObjectUnavailable,
 )
-from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
+from perfcho.modules.common.normalization import normalize_email, normalize_name
 from perfcho.modules.community import CommunityService
 from perfcho.modules.content import (
     BeatmapNotFound,
@@ -458,7 +458,7 @@ async def register_account(
     """Validate or atomically create one Stable-compatible account."""
     try:
         display_name = username.strip()
-        normalize_stable_name(display_name)
+        normalize_name(display_name)
     except ValueError as error:
         return _registration_error("username", [str(error)])
     try:

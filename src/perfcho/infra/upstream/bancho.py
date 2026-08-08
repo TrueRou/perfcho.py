@@ -21,7 +21,7 @@ from perfcho.modules.content import (
 )
 
 
-class OsuUpstreamContentSource:
+class BanchoUpstreamContentSource:
     """Normalize official osu! metadata and bounded beatmap file responses."""
 
     def __init__(
@@ -56,7 +56,7 @@ class OsuUpstreamContentSource:
         settings: Settings,
         *,
         client: httpx.AsyncClient | None = None,
-    ) -> OsuUpstreamContentSource:
+    ) -> BanchoUpstreamContentSource:
         """Construct the official source adapter from validated settings."""
         return cls(
             api_base_url=settings.osu_api_base_url,

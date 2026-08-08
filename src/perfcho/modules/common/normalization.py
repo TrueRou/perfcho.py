@@ -2,31 +2,29 @@
 
 import unicodedata
 
-_STABLE_NAME_MIN_LENGTH = 2
-_STABLE_NAME_MAX_LENGTH = 15
-_STABLE_NAME_KEY_MAX_LENGTH = 32
+_NAME_MIN_LENGTH = 2
+_NAME_MAX_LENGTH = 15
+_NAME_KEY_MAX_LENGTH = 32
 _EMAIL_MAX_LENGTH = 254
 _EMAIL_LOCAL_PART_MAX_LENGTH = 64
-_STABLE_NAME_PUNCTUATION = frozenset("_[]-")
+_NAME_PUNCTUATION = frozenset("_[]-")
 
 
-def normalize_stable_name(name: str) -> str:
+def normalize_name(name: str) -> str:
     """Validate a Stable-compatible display name and return its canonical key."""
     normalized = unicodedata.normalize("NFKC", name)
-    if not _STABLE_NAME_MIN_LENGTH <= len(normalized) <= _STABLE_NAME_MAX_LENGTH:
-        raise ValueError("Stable names must contain between 2 and 15 characters after NFKC normalization")
+    if not _NAME_MIN_LENGTH <= len(normalized) <= _NAME_MAX_LENGTH:
+        raise ValueError("Names must contain between 2 and 15 characters after NFKC normalization")
     if not all(
-        character.isalnum() or character.isspace() or character in _STABLE_NAME_PUNCTUATION for character in normalized
+        character.isalnum() or character.isspace() or character in _NAME_PUNCTUATION for character in normalized
     ):
-        raise ValueError(
-            "Stable names may only contain letters, numbers, whitespace, underscores, brackets, and hyphens"
-        )
+        raise ValueError("Names may only contain letters, numbers, whitespace, underscores, brackets, and hyphens")
     if not any(character.isalnum() for character in normalized):
-        raise ValueError("Stable names must contain at least one letter or number")
+        raise ValueError("Names must contain at least one letter or number")
     if "_" in normalized and any(character.isspace() for character in normalized):
-        raise ValueError("Stable names may contain underscores or whitespace, but not both")
+        raise ValueError("Names may contain underscores or whitespace, but not both")
     key = "".join("_" if character.isspace() else character for character in normalized.casefold())
-    if len(key) > _STABLE_NAME_KEY_MAX_LENGTH:
+    if len(key) > _NAME_KEY_MAX_LENGTH:
         raise ValueError("normalized Stable names must not exceed 32 characters")
     return key
 

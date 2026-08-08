@@ -7,7 +7,7 @@ from datetime import datetime
 
 from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
-from perfcho.modules.common.normalization import normalize_stable_name
+from perfcho.modules.common.normalization import normalize_name
 from perfcho.modules.common.ports import Clock, OutboxWriter, OutboxWriterFactory
 from perfcho.modules.social.achievements import AchievementEvaluatorRegistry
 from perfcho.modules.social.errors import (
@@ -274,7 +274,7 @@ class SocialService:
     async def resolve_account_by_name(self, display_name: str) -> AccountIdentityView:
         """Resolve one current active account through the Stable name normalization rule."""
         try:
-            name_key = normalize_stable_name(display_name)
+            name_key = normalize_name(display_name)
         except ValueError as error:
             raise SocialAccountNotFound("account does not exist") from error
         async with self._uow_factory() as uow:

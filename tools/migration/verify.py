@@ -14,7 +14,7 @@ from perfcho.infra.db.models.core import Account, AccountEmail, AccountName, Med
 from perfcho.infra.db.models.scoring import PlayAttempt, Replay, Score, ScoreAttestation, ScoreHitStatistic
 from perfcho.infra.logging import log_event
 from perfcho.modules.common import ObjectStorage, ObjectUnavailable
-from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
+from perfcho.modules.common.normalization import normalize_email, normalize_name
 from tools.migration.config import MigrationConfig
 from tools.migration.models import DiagnosticSeverity, MigrationRuntime, SourceSchema
 from tools.migration.observability import VerificationObserver, event_fields
@@ -242,7 +242,7 @@ async def _account_preflight(
             try:
                 raw_name = override.display_name if override is not None and override.display_name else row["name"]
                 raw_email = override.email if override is not None and override.email else row["email"]
-                name_key = normalize_stable_name(str(raw_name).strip())
+                name_key = normalize_name(str(raw_name).strip())
                 email_key = normalize_email(str(raw_email))
             except ValueError as error:
                 report.add(

@@ -27,7 +27,7 @@ from perfcho.infra.security.tokens import (
     hmac_sha256_digest,
 )
 from perfcho.modules.common.models import PendingEvent
-from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
+from perfcho.modules.common.normalization import normalize_email, normalize_name
 from perfcho.modules.common.ports import Clock, IdGenerator, OutboxWriterFactory
 from perfcho.modules.identity.errors import InvalidCredentials, InvalidStableSession, StableSessionAlreadyActive
 from perfcho.modules.identity.models import (
@@ -535,7 +535,7 @@ def _normalize_identifier(identifier: str) -> tuple[str, str] | None:
             return "id", str(account_id)
         if "@" in normalized:
             return "email", normalize_email(normalized)
-        return "name", normalize_stable_name(normalized)
+        return "name", normalize_name(normalized)
     except ValueError:
         return None
 

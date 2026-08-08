@@ -20,7 +20,7 @@ from perfcho.infra.security import (
     hash_password,
     hmac_sha256_digest,
     normalize_email,
-    normalize_stable_name,
+    normalize_name,
     preverify_lazer_password,
     validate_stable_password_token,
     verify_dummy_password,
@@ -33,8 +33,8 @@ TEST_POLICY = Argon2Policy(time_cost=1, memory_cost_kib=32, parallelism=1)
 
 
 def test_stable_name_normalization_uses_nfkc_casefold_and_unicode_whitespace() -> None:
-    assert normalize_stable_name("ＴｅＳＴ\u2003Straße") == "test_strasse"
-    assert normalize_stable_name("Player Name") == normalize_stable_name("player\tname")
+    assert normalize_name("ＴｅＳＴ\u2003Straße") == "test_strasse"
+    assert normalize_name("Player Name") == normalize_name("player\tname")
 
 
 @pytest.mark.parametrize(
@@ -49,7 +49,7 @@ def test_stable_name_normalization_uses_nfkc_casefold_and_unicode_whitespace() -
 )
 def test_stable_name_normalization_rejects_invalid_names(name: str) -> None:
     with pytest.raises(ValueError):
-        normalize_stable_name(name)
+        normalize_name(name)
 
 
 def test_email_normalization_is_conservative() -> None:

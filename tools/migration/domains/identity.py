@@ -32,7 +32,7 @@ from perfcho.infra.db.models.iam import (
 from perfcho.infra.db.models.moderation import ModerationCase, Sanction
 from perfcho.infra.security.tokens import digest_device_component, hmac_sha256_digest
 from perfcho.infra.settings import settings
-from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
+from perfcho.modules.common.normalization import normalize_email, normalize_name
 from tools.migration.domains.common import run_batched_phase, run_single_phase
 from tools.migration.models import DiagnosticSeverity, MigrationRuntime, SourceRow
 from tools.migration.transforms import aware_datetime, play_styles, source_ruleset, unix_datetime
@@ -196,7 +196,7 @@ def _prepare_user(runtime: MigrationRuntime, row: SourceRow, *, identity_only: b
         if not isinstance(raw_name, str):
             raise ValueError("name must be text")
         display_name = unicodedata.normalize("NFKC", raw_name).strip()
-        name_key = normalize_stable_name(display_name)
+        name_key = normalize_name(display_name)
     except ValueError as error:
         runtime.report.add(
             DiagnosticSeverity.WARNING,

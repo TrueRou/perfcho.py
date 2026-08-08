@@ -20,7 +20,7 @@ from perfcho.infra.security.tokens import (
     hmac_sha256_digest,
     verify_hmac_sha256_digest,
 )
-from perfcho.modules.common.normalization import normalize_email, normalize_stable_name
+from perfcho.modules.common.normalization import normalize_email, normalize_name
 
 __all__ = (
     "Argon2Policy",
@@ -34,7 +34,7 @@ __all__ = (
     "hash_password",
     "hmac_sha256_digest",
     "normalize_email",
-    "normalize_stable_name",
+    "normalize_name",
     "preverify_lazer_password",
     "validate_stable_password_token",
     "verify_dummy_password",

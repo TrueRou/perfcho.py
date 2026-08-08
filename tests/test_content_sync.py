@@ -19,7 +19,7 @@ from perfcho.infra.db.repositories.content import (
     _snapshot_beatmapset_metadata,
     _snapshot_extends_current_revision_set,
 )
-from perfcho.infra.upstream.osu import OsuUpstreamContentSource
+from perfcho.infra.upstream.bancho import BanchoUpstreamContentSource
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage, PendingEvent, StoredObject
 from perfcho.modules.content import (
     BeatmapRevisionView,
@@ -789,7 +789,7 @@ async def test_osu_upstream_source_normalizes_metadata_and_bounds_file_body() ->
         return httpx.Response(404)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    source = OsuUpstreamContentSource(
+    source = BanchoUpstreamContentSource(
         api_base_url="https://osu.test/api/v2",
         token_url="https://osu.test/oauth/token",
         client_id=1,
@@ -827,7 +827,7 @@ async def test_osu_upstream_lookup_falls_back_from_checksum_to_filename() -> Non
         return httpx.Response(404)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    source = OsuUpstreamContentSource(
+    source = BanchoUpstreamContentSource(
         api_base_url="https://osu.test/api/v2",
         token_url="https://osu.test/oauth/token",
         client_id=1,

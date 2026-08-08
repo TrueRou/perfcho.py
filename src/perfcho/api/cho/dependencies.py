@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 
-from perfcho.infra.glue.stable import StableServices
+from perfcho.infra.compose import StableServices
 
 
 async def get_stable_services(request: Request) -> StableServices:
