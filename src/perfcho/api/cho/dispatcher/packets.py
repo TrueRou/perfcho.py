@@ -7,8 +7,8 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta
 from time import monotonic_ns
 
-from perfcho.api.stable.dispatcher.models import StableRuntimeContext
-from perfcho.api.stable.dispatcher.multiplayer import (
+from perfcho.api.cho.dispatcher.models import StableRuntimeContext
+from perfcho.api.cho.dispatcher.multiplayer import (
     MULTIPLAYER_PACKETS,
     _broadcast_lobby,
     _broadcast_state,
@@ -16,7 +16,7 @@ from perfcho.api.stable.dispatcher.multiplayer import (
     dispatch_multiplayer_mutation,
     dispatch_multiplayer_packet,
 )
-from perfcho.infra.glue.stable import StableServices
+from perfcho.infra.compose import StableServices
 from perfcho.infra.logging import duration_ms, log_event, rate_limit, sampled
 from perfcho.infra.settings import settings
 from perfcho.modules.bot import BotDirective, BotInvocation

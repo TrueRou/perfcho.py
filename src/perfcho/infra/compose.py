@@ -30,7 +30,6 @@ from perfcho.infra.db.repositories.multiplayer import (
 )
 from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
 from perfcho.infra.db.repositories.performance.query import SqlAlchemyPerformanceQueryRepository
-from perfcho.infra.db.repositories.performance.scheduling import SqlAlchemyPerformanceJobScheduler
 from perfcho.infra.db.repositories.scoring import (
     SqlAlchemyAccountSubmissionValidator,
     SqlAlchemyMultiplayerSubmissionValidator,
@@ -120,10 +119,6 @@ def _silence_policy(session: object) -> SqlAlchemyActiveSilencePolicy:
 
 def _scoring_repository(session: object) -> SqlAlchemyScoringRepository:
     return SqlAlchemyScoringRepository(cast(AsyncSession, session))
-
-
-def _performance_job_scheduler(session: object) -> SqlAlchemyPerformanceJobScheduler:
-    return SqlAlchemyPerformanceJobScheduler(cast(AsyncSession, session))
 
 
 def _performance_query_repository(session: object) -> SqlAlchemyPerformanceQueryRepository:
@@ -296,7 +291,6 @@ async def compose_stable_services(
         _outbox_writer,
         _account_submission_validator,
         _multiplayer_submission_validator,
-        _performance_job_scheduler,
         _achievement_awarder,
         core.clock,
         core.id_generator,

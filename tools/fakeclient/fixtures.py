@@ -6,11 +6,12 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from perfcho.infra.compose import _SystemClock as SystemClock
+from perfcho.infra.compose import _Uuid7Generator as Uuid7Generator
 from perfcho.infra.db.engine import create_engine, create_session_factory
 from perfcho.infra.db.repositories.content import SqlAlchemyContentRepository
 from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
-from perfcho.infra.glue.common import SystemClock, Uuid7Generator
 from perfcho.infra.settings import settings
 from perfcho.infra.storage import S3ObjectStorage
 from perfcho.modules.content import ContentSyncService, UpstreamBeatmapsetSnapshot, UpstreamBeatmapSnapshot

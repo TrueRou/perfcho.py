@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.schema import CreateSchema
 
 import perfcho.infra.db.models  # noqa: F401
+from perfcho.infra.compose import compose_admin_services as compose_management_services
 from perfcho.infra.db.base import MODEL_SCHEMAS, DbBase
 from perfcho.infra.db.bootstrap import bootstrap_database
 from perfcho.infra.db.engine import create_session_factory
@@ -24,7 +25,6 @@ from perfcho.infra.db.repositories.audit import SqlAlchemyAuditWriter
 from perfcho.infra.db.repositories.authorization import SqlAlchemyAuthorizationRepository
 from perfcho.infra.db.repositories.moderation import SqlAlchemyModerationRepository
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
-from perfcho.infra.glue.management import compose_management_services
 from perfcho.modules.authorization import GrantRole
 from perfcho.modules.authorization.ports import AuthorizationRepository
 from perfcho.modules.common import Actor, ClientContext, CommandMeta

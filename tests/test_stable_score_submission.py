@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from perfcho.api.stable.canonize.scoring import (
+from perfcho.api.cho.canonize.scoring import (
     ParsedStableScore,
     decrypt_stable_score,
     stable_online_checksum,

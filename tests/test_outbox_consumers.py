@@ -59,6 +59,7 @@ EXPECTED_CONSUMERS = {
         "community.channel-member-left.v1",
     },
     "community-message-projector.v1": {"community.message-sent.v1"},
+    "performance-projector.v1": {"score.accepted.v1"},
     "ranking-projector.v1": {"score.accepted.v1", "score.performance-calculated.v1"},
     "scoring-stats-projector.v1": {"score.accepted.v1", "score.replay-viewed.v1"},
     "multiplayer-results-projector.v1": {"multiplayer.round-completed.v1", "score.accepted.v1"},

@@ -10,35 +10,27 @@ from time import monotonic_ns
 from typing import Any, NotRequired, Protocol, TypedDict, cast
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine
 from taskiq import TaskiqEvents, TaskiqState
 
 from perfcho.infra import logging
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.maintenance import RankSnapshotMaintenance
-from perfcho.infra.db.projectors.catalog import DEFAULT_CONSUMER_CATALOG
+from perfcho.infra.db.projectors.catalog import build_consumer_catalog
+from perfcho.infra.db.projectors.performance import PerformanceProjector
 from perfcho.infra.db.relays.outbox_delivery import (
     OutboxDeliveryProcessor,
     OutboxDeliveryReference,
     SqlAlchemyOutboxDeliveryRelayStore,
 )
-from perfcho.infra.db.relays.performance_job import (
-    PerformanceJobReference,
-    SqlAlchemyPerformanceJobRelayStore,
-)
-from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
-from perfcho.infra.db.repositories.performance.job import SqlAlchemyPerformanceJobRepository
-from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
 from perfcho.infra.settings import settings
 from perfcho.infra.storage import S3ObjectStorage
 from perfcho.infra.upstream.calculator import HttpPerformanceCalculator
-from perfcho.modules.performance.services import PerformanceCalculationService
 
 logging.init_logger("worker")
 
 from perfcho.infra.taskiq import broker  # noqa: E402
 from perfcho.tasks.outbox_delivery import dispatch_outbox_delivery  # noqa: E402
-from perfcho.tasks.performance_calculation import calculate_performance  # noqa: E402
 
 
 class _RelayStore[Reference](Protocol):
@@ -82,7 +74,6 @@ class _ReferenceLogFields(TypedDict):
 
     event_id: NotRequired[str]
     consumer: NotRequired[str]
-    job_id: NotRequired[str]
 
 
 @broker.on_event(TaskiqEvents.WORKER_STARTUP)
@@ -106,39 +97,25 @@ async def worker_startup(state: TaskiqState) -> None:
             max_attempts=settings.outbox_delivery_max_attempts,
             max_retry_seconds=settings.outbox_delivery_max_retry_seconds,
         )
-        unknown_consumers = await outbox_store.unknown_consumers(DEFAULT_CONSUMER_CATALOG)
+        consumer_catalog = build_consumer_catalog(
+            PerformanceProjector(
+                HttpPerformanceCalculator(http_client, settings.performance_calculator_urls),
+                S3ObjectStorage.from_settings(settings),
+                beatmap_url_expiry_seconds=settings.performance_beatmap_url_expiry_seconds,
+            )
+        )
+        unknown_consumers = await outbox_store.unknown_consumers(consumer_catalog)
         if unknown_consumers:
             names = ", ".join(sorted(unknown_consumers))
             raise RuntimeError(f"Unregistered outbox consumers have unfinished deliveries: {names}")
 
-        performance_store = SqlAlchemyPerformanceJobRelayStore(
-            session_factory,
-            batch_size=settings.performance_calculation_batch_size,
-            lease_seconds=settings.performance_calculation_lease_seconds,
-            max_attempts=settings.performance_calculation_max_attempts,
-            max_retry_seconds=settings.performance_calculation_max_retry_seconds,
-        )
-        performance_service = PerformanceCalculationService(
-            SqlAlchemyUnitOfWorkFactory(session_factory),
-            lambda session: SqlAlchemyPerformanceJobRepository(
-                cast(AsyncSession, session),
-                execution_lease_seconds=settings.performance_calculation_lease_seconds,
-            ),
-            lambda session: SqlAlchemyOutboxWriter(cast(AsyncSession, session)),
-            HttpPerformanceCalculator(http_client, settings.performance_calculator_urls),
-            S3ObjectStorage.from_settings(settings),
-            max_attempts=settings.performance_calculation_max_attempts,
-            beatmap_url_expiry_seconds=settings.performance_beatmap_url_expiry_seconds,
-            max_retry_seconds=settings.performance_calculation_max_retry_seconds,
-        )
         owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
         state.outbox_delivery_processor = OutboxDeliveryProcessor(
             session_factory,
-            DEFAULT_CONSUMER_CATALOG,
+            consumer_catalog,
             max_attempts=settings.outbox_delivery_max_attempts,
             max_retry_seconds=settings.outbox_delivery_max_retry_seconds,
         )
-        state.performance_calculation_service = performance_service
         outbox_relay_task = asyncio.create_task(
             _run_relay_loop(
                 "outbox-delivery",
@@ -151,18 +128,6 @@ async def worker_startup(state: TaskiqState) -> None:
             name="perfcho-outbox-relay",
         )
         relay_tasks = (outbox_relay_task,)
-        performance_relay_task = asyncio.create_task(
-            _run_relay_loop(
-                "performance-job",
-                performance_store,
-                owner,
-                _enqueue_performance,
-                poll_interval=settings.durable_relay_poll_interval_seconds,
-                enqueue_concurrency=settings.durable_relay_enqueue_concurrency,
-            ),
-            name="perfcho-performance-relay",
-        )
-        relay_tasks = (outbox_relay_task, performance_relay_task)
         rank_snapshot_task = asyncio.create_task(
             _run_rank_snapshot_loop(
                 RankSnapshotMaintenance(session_factory),
@@ -170,7 +135,7 @@ async def worker_startup(state: TaskiqState) -> None:
             ),
             name="perfcho-rank-snapshot-maintenance",
         )
-        relay_tasks = (outbox_relay_task, performance_relay_task, rank_snapshot_task)
+        relay_tasks = (outbox_relay_task, rank_snapshot_task)
         state.worker_resources = _WorkerResources(
             db_engine=db_engine,
             http_client=http_client,
@@ -465,8 +430,6 @@ def _reference_fields(reference: object) -> _ReferenceLogFields:
     """Return only non-fencing identifiers approved for relay logs."""
     if isinstance(reference, OutboxDeliveryReference):
         return {"event_id": str(reference.event_id), "consumer": reference.consumer}
-    if isinstance(reference, PerformanceJobReference):
-        return {"job_id": str(reference.job_id)}
     return {}
 
 
@@ -475,13 +438,5 @@ async def _enqueue_outbox(reference: OutboxDeliveryReference) -> str:
         str(reference.event_id),
         reference.consumer,
         str(reference.delivery_token),
-    )
-    return str(task.task_id)
-
-
-async def _enqueue_performance(reference: PerformanceJobReference) -> str:
-    task = await cast(Any, calculate_performance).kiq(
-        str(reference.job_id),
-        str(reference.lease_token),
     )
     return str(task.task_id)

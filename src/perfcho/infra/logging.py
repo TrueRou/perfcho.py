@@ -119,7 +119,6 @@ _SAFE_EVENT_FIELDS = frozenset(
         "input_bytes",
         "invocation_id",
         "item_count",
-        "job_id",
         "joined",
         "leased_packet_count",
         "library",

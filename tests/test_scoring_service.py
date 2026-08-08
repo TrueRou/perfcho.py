@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.enums import BeatmapStatus as DbBeatmapStatus
-from perfcho.infra.db.enums import CalculationJobStatus
 from perfcho.infra.db.enums import Ruleset as DbRuleset
 from perfcho.infra.db.models.content import Beatmap, BeatmapRevision, Beatmapset
 from perfcho.infra.db.models.events import OutboxEvent
@@ -24,7 +23,6 @@ from perfcho.infra.db.models.scoring import (
     CalculationFormula,
     CalculationRelease,
     LeaderboardEntry,
-    PerformanceCalculationJob,
     PlayAttempt,
     RankingPolicy,
     Replay,
@@ -43,9 +41,7 @@ from perfcho.infra.db.models.scoring import (
 from perfcho.infra.db.models.social import AchievementDefinition, AchievementTranslation, AchievementUnlock
 from perfcho.infra.db.projectors.ranking import project_accepted_score
 from perfcho.infra.db.projectors.scoring_stats import project_scoring_stats
-from perfcho.infra.db.relays.performance_job import SqlAlchemyPerformanceJobRelayStore
 from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
-from perfcho.infra.db.repositories.performance.scheduling import SqlAlchemyPerformanceJobScheduler
 from perfcho.infra.db.repositories.scoring import (
     SqlAlchemyAccountSubmissionValidator,
     SqlAlchemyMultiplayerSubmissionValidator,
@@ -301,7 +297,6 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
         lambda session: outbox,
         lambda session: account,
         lambda session: FakeMultiplayerValidator(),
-        lambda session: FakeTaskScheduler(calls),
         lambda session: FakeAchievementAwarder(calls),
         cast(Clock, FixedClock()),
         cast(IdGenerator, FakeIds()),
@@ -325,7 +320,6 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
         "attempt",
         "score",
         "achievements",
-        "schedule-performance",
         "outbox",
         "complete",
         "commit",
@@ -335,7 +329,11 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
     assert repository.record is not None
     assert repository.record.validated.total_hits == 10
     assert outbox.events[0].event_type == "score.accepted.v1"
-    assert outbox.events[0].consumers == ("ranking-projector.v1", "scoring-stats-projector.v1")
+    assert outbox.events[0].consumers == (
+        "ranking-projector.v1",
+        "scoring-stats-projector.v1",
+        "performance-projector.v1",
+    )
     assert outbox.events[0].payload["country_code"] == "JP"
     assert "performance_release_ids" not in outbox.events[0].payload
     assert logged[0][:2] == ("INFO", "scoring.score.accepted")
@@ -359,7 +357,6 @@ async def test_scoring_service_does_not_commit_when_achievement_awarding_fails()
         lambda session: FakeOutbox(calls),
         lambda session: FakeAccountValidator(calls),
         lambda session: FakeMultiplayerValidator(),
-        lambda session: FakeTaskScheduler(calls),
         lambda session: FakeAchievementAwarder(calls, RuntimeError("achievement storage failed")),
         cast(Clock, FixedClock()),
         cast(IdGenerator, FakeIds()),
@@ -385,7 +382,6 @@ async def test_multiplayer_score_routes_results_projector_in_acceptance_transact
         lambda session: outbox,
         lambda session: FakeAccountValidator(calls),
         lambda session: FakeBoundMultiplayerValidator(),
-        lambda session: FakeTaskScheduler(calls),
         lambda session: FakeAchievementAwarder(calls),
         cast(Clock, FixedClock()),
         cast(IdGenerator, FakeIds()),
@@ -421,7 +417,6 @@ async def test_scoring_replay_logs_only_stable_ids_at_debug(monkeypatch: pytest.
         lambda session: FakeOutbox(calls),
         lambda session: FakeAccountValidator(calls),
         lambda session: FakeMultiplayerValidator(),
-        lambda session: FakeTaskScheduler(calls),
         lambda session: FakeAchievementAwarder(calls),
         cast(Clock, FixedClock()),
         cast(IdGenerator, FakeIds()),
@@ -570,7 +565,6 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             lambda session: SqlAlchemyOutboxWriter(cast(AsyncSession, session)),
             lambda session: SqlAlchemyAccountSubmissionValidator(cast(AsyncSession, session)),
             lambda session: SqlAlchemyMultiplayerSubmissionValidator(cast(AsyncSession, session)),
-            lambda session: SqlAlchemyPerformanceJobScheduler(cast(AsyncSession, session)),
             lambda session: TransactionAchievementAwarder(
                 SqlAlchemySocialRepository(cast(AsyncSession, session)),
                 SqlAlchemyOutboxWriter(cast(AsyncSession, session)),
@@ -601,21 +595,6 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             score=replace(submitted.score, online_checksum=b"p" * 16),
         )
         shared = await service.accept(shared_replay)
-
-        performance_relay = SqlAlchemyPerformanceJobRelayStore(
-            session_factory,
-            batch_size=10,
-            lease_seconds=300,
-            max_attempts=5,
-            max_retry_seconds=300,
-        )
-        performance_claims = await performance_relay.claim("tests:performance-owner")
-        assert len(performance_claims) == 2
-        await performance_relay.record_enqueue_outcomes(
-            [(performance_claims[0], RuntimeError("Redis unavailable"))],
-            "tests:performance-owner",
-        )
-        await performance_relay.release((performance_claims[1],), "tests:performance-owner")
 
         async with session_factory.begin() as session:
             assert (
@@ -702,12 +681,6 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             assert await session.scalar(select(func.count()).select_from(ScoreHitStatistic)) == 8
             assert await session.scalar(select(func.count()).select_from(Replay)) == 2
             assert await session.scalar(select(func.count()).select_from(DbScoreAttestation)) == 2
-            assert await session.scalar(select(func.count()).select_from(PerformanceCalculationJob)) == 2
-            assert set(await session.scalars(select(PerformanceCalculationJob.release_id))) == {performance_release.id}
-            assert set(await session.scalars(select(PerformanceCalculationJob.status))) == {
-                CalculationJobStatus.PENDING
-            }
-            assert set(await session.scalars(select(PerformanceCalculationJob.attempt_count))) == {0}
             assert await session.scalar(select(func.count()).select_from(OutboxEvent)) == 4
             assert await session.scalar(select(func.count()).select_from(LeaderboardEntry)) == 3
             play_stat = await session.get(UserPlayStat, {"account_id": 1, "scoreboard_id": 1})

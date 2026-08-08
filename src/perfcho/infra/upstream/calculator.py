@@ -39,7 +39,7 @@ class HttpPerformanceCalculator:
             log_event(
                 "ERROR",
                 "calculator.request.rejected",
-                job_id=str(calculation.job_id),
+                score_id=calculation.score_id,
                 calculator=calculation.calculator,
                 release_version=calculation.release_version,
                 reason="endpoint_not_configured",
@@ -51,7 +51,6 @@ class HttpPerformanceCalculator:
         metadata = calculation.digest_payload()
         metadata.update(
             {
-                "job_id": str(calculation.job_id),
                 "score_id": calculation.score_id,
                 "input_digest": calculation.input_digest.hex(),
                 "beatmap_url": beatmap_url,
@@ -73,7 +72,7 @@ class HttpPerformanceCalculator:
                 "WARNING",
                 "calculator.request.failed",
                 exception=error,
-                job_id=str(calculation.job_id),
+                score_id=calculation.score_id,
                 calculator=calculation.calculator,
                 release_version=calculation.release_version,
                 error_type=type(error).__name__,
@@ -86,7 +85,7 @@ class HttpPerformanceCalculator:
             log_event(
                 "WARNING" if retryable else "ERROR",
                 "calculator.request.failed",
-                job_id=str(calculation.job_id),
+                score_id=calculation.score_id,
                 calculator=calculation.calculator,
                 release_version=calculation.release_version,
                 status_code=response.status_code,
@@ -124,7 +123,7 @@ class HttpPerformanceCalculator:
                 "ERROR",
                 "calculator.response.invalid",
                 exception=error,
-                job_id=str(calculation.job_id),
+                score_id=calculation.score_id,
                 calculator=calculation.calculator,
                 release_version=calculation.release_version,
                 error_type=type(error).__name__,
@@ -134,7 +133,7 @@ class HttpPerformanceCalculator:
         log_event(
             "DEBUG",
             "calculator.request.completed",
-            job_id=str(calculation.job_id),
+            score_id=calculation.score_id,
             calculator=calculation.calculator,
             release_version=calculation.release_version,
             status_code=response.status_code,

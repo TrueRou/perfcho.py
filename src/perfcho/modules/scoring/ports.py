@@ -189,25 +189,3 @@ class MultiplayerSubmissionValidatorFactory(Protocol):
     def __call__(self, session: object) -> MultiplayerSubmissionValidator:
         """Return a transaction-bound multiplayer validator."""
         ...
-
-
-class ScoreAcceptedTaskScheduler(Protocol):
-    """Schedule durable follow-up work inside the score transaction."""
-
-    async def schedule(
-        self,
-        *,
-        score_id: int,
-        scoreboard: ScoreboardInfo,
-        now: datetime,
-    ) -> None:
-        """Schedule all required asynchronous work for an accepted score."""
-        ...
-
-
-class ScoreAcceptedTaskSchedulerFactory(Protocol):
-    """Bind accepted-score scheduling to one caller-owned transaction."""
-
-    def __call__(self, session: object) -> ScoreAcceptedTaskScheduler:
-        """Return a transaction-bound follow-up scheduler."""
-        ...

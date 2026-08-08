@@ -17,10 +17,8 @@ _CALCULATION_QUANTUM = Decimal("0.00001")
 class PerformanceCalculationInput:
     """Provide immutable score, release, and beatmap facts to one calculator."""
 
-    job_id: uuid.UUID
     score_id: int
     account_id: int
-    attempt_count: int
     formula_id: uuid.UUID
     formula_code: str
     calculator: str
@@ -44,7 +42,7 @@ class PerformanceCalculationInput:
 
     def __post_init__(self) -> None:
         """Validate identities, digests, and recursively immutable configuration."""
-        if self.score_id < 1 or self.attempt_count < 1 or self.beatmap_revision_id < 1 or self.mod_set_id < 1:
+        if self.score_id < 1 or self.beatmap_revision_id < 1 or self.mod_set_id < 1:
             raise ValueError("performance calculation identifiers and attempt count must be positive")
         if (
             not self.formula_code

@@ -7,8 +7,8 @@ from typing import cast
 
 import pytest
 
-from perfcho.api.stable.dispatcher import StableRuntimeContext, dispatch_packets
-from perfcho.infra.glue.stable import StableServices
+from perfcho.api.cho.dispatcher import StableRuntimeContext, dispatch_packets
+from perfcho.infra.compose import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.bot import BotCommandService, BotInvocation, CommandResult
@@ -421,7 +421,7 @@ def id_request_packet(packet_type: ClientPacket, account_ids: tuple[int, ...]) -
 async def test_private_message_is_persisted_enqueued_and_returns_away_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
+    dispatcher_module = importlib.import_module("perfcho.api.cho.dispatcher.packets")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -590,7 +590,7 @@ async def test_dispatcher_logs_expected_application_code_and_propagates_unexpect
 ) -> None:
     import importlib
 
-    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
+    dispatcher_module = importlib.import_module("perfcho.api.cho.dispatcher.packets")
     realtime = FakeRealtime((snapshot(10, "sender"),))
     current = context(realtime)
     stable_services = services(realtime)

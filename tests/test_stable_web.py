@@ -9,9 +9,9 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from perfcho.api.stable import router
-from perfcho.api.stable.dependencies import get_stable_services
-from perfcho.infra.glue.stable import StableServices
+from perfcho.api.cho import router
+from perfcho.api.cho.dependencies import get_stable_services
+from perfcho.infra.compose import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage, StoredObject
@@ -291,7 +291,7 @@ async def test_web_credentials_require_the_matching_realtime_epoch() -> None:
 async def test_web_auth_rejection_log_excludes_identifier_and_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    web_module = importlib.import_module("perfcho.api.stable.router.web")
+    web_module = importlib.import_module("perfcho.api.cho.router.web")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:

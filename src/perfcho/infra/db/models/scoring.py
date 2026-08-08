@@ -30,7 +30,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from perfcho.infra.db.base import DbBase
 from perfcho.infra.db.enums import (
     AttemptStatus,
-    CalculationJobStatus,
     CalculationKind,
     ClientFamily,
     Ruleset,
@@ -394,70 +393,6 @@ class ScorePerformance(CreatedAtMixin, DbBase):
     output_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
 
     score: Mapped[Score] = relationship(back_populates="performances", lazy="raise")
-
-
-class PerformanceCalculationJob(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
-    """Tracks durable at-least-once execution for one score and formula release."""
-
-    __tablename__ = "calculation_jobs"
-    __table_args__ = (
-        CheckConstraint("attempt_count >= 0 AND enqueue_count >= 0", name="nonnegative_attempt_counts"),
-        CheckConstraint("input_digest IS NULL OR octet_length(input_digest) = 32", name="input_digest_length"),
-        CheckConstraint("output_digest IS NULL OR octet_length(output_digest) = 32", name="output_digest_length"),
-        CheckConstraint(
-            "status != 'running' OR "
-            "(lease_owner IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)",
-            name="running_lease_required",
-        ),
-        CheckConstraint(
-            "status = 'running' OR (lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL)",
-            name="nonrunning_lease_forbidden",
-        ),
-        CheckConstraint(
-            "status != 'succeeded' OR (completed_at IS NOT NULL AND output_digest IS NOT NULL)",
-            name="succeeded_completion_required",
-        ),
-        CheckConstraint("status = 'succeeded' OR completed_at IS NULL", name="non_succeeded_completion_forbidden"),
-        CheckConstraint("status != 'dead' OR dead_lettered_at IS NOT NULL", name="dead_letter_required"),
-        CheckConstraint("status = 'dead' OR dead_lettered_at IS NULL", name="non_dead_letter_forbidden"),
-        CheckConstraint("status != 'pending' OR attempt_started_at IS NULL", name="pending_attempt_forbidden"),
-        UniqueConstraint("score_id", "release_id"),
-        Index(
-            "ix_calculation_jobs_due",
-            "available_at",
-            "lease_expires_at",
-            "created_at",
-            postgresql_where=text("status IN ('pending', 'running')"),
-        ),
-        Index("ix_calculation_jobs_release", "release_id", "status"),
-        Index("ix_calculation_jobs_broker_task", "broker_task_id"),
-        {"schema": "scoring"},
-    )
-
-    score_id: Mapped[int] = mapped_column(ForeignKey("scoring.scores.id", ondelete="CASCADE"), nullable=False)
-    release_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("scoring.calculation_releases.id", ondelete="RESTRICT"), nullable=False
-    )
-    status: Mapped[CalculationJobStatus] = mapped_column(
-        enum_type(CalculationJobStatus, "performance_calculation_job_status", 16),
-        nullable=False,
-        default=CalculationJobStatus.PENDING,
-        server_default=CalculationJobStatus.PENDING.value,
-    )
-    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    attempt_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
-    enqueue_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
-    lease_owner: Mapped[str | None] = mapped_column(String(128))
-    lease_token: Mapped[uuid.UUID | None] = mapped_column()
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    broker_task_id: Mapped[str | None] = mapped_column(String(128))
-    input_digest: Mapped[bytes | None] = mapped_column(LargeBinary(32))
-    output_digest: Mapped[bytes | None] = mapped_column(LargeBinary(32))
-    last_error: Mapped[str | None] = mapped_column(Text)
 
 
 class RankingPolicy(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):

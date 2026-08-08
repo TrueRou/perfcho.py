@@ -12,7 +12,7 @@ from perfcho.infra.settings import Settings
 @pytest.mark.asyncio
 async def test_stable_composition_wires_independent_security_keys() -> None:
     pytest.importorskip("perfcho.infra.redis.realtime", reason="realtime adapter is being changed in parallel")
-    from perfcho.infra.glue.stable import compose_stable_services
+    from perfcho.infra.compose import compose_stable_services
 
     token_key = "composition-token-hmac-key"
     match_password_key = "composition-match-password-hmac-key"

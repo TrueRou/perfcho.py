@@ -2,15 +2,11 @@ import json
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator
 from io import StringIO
 
-import httpx
 import pytest
 from loguru import logger
-from starlette.responses import StreamingResponse
 
-from perfcho.api.v1.middleware.error import ExceptionHandlerMiddleware
 from perfcho.infra.logging import init_logger, log_event, reset_relay_task, set_relay_task
 from perfcho.infra.settings import settings
 
@@ -174,33 +170,3 @@ def test_human_event_includes_full_exception(monkeypatch: pytest.MonkeyPatch) ->
     assert "Traceback (most recent call last)" in output
     assert 'raise ValueError("invalid calculation response")' in output
     assert "ValueError: invalid calculation response" in output
-
-
-@pytest.mark.asyncio
-async def test_http_completion_is_emitted_after_stream_finishes(monkeypatch: pytest.MonkeyPatch) -> None:
-    events: list[str] = []
-
-    def capture(level: str | int, event: str, **fields: object) -> None:
-        del level, fields
-        events.append(event)
-
-    import perfcho.api.v1.middleware.error as error_module
-
-    monkeypatch.setattr(error_module.logging, "log_event", capture)
-    monkeypatch.setattr(error_module.settings, "log_http_success_sample_rate", 1.0)
-
-    async def body() -> AsyncIterator[bytes]:
-        yield b"first"
-        yield b"second"
-
-    async def app(scope: dict[str, object], receive: object, send: object) -> None:
-        await StreamingResponse(body())(scope, receive, send)  # type: ignore[arg-type]
-
-    wrapped = ExceptionHandlerMiddleware(app)  # type: ignore[arg-type]
-    transport = httpx.ASGITransport(app=wrapped)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/safe")
-
-    assert response.status_code == 200
-    assert response.content == b"firstsecond"
-    assert events[-1] == "http.request.completed"

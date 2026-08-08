@@ -186,15 +186,6 @@ class OutboxDeliveryStatus(StrEnum):
     DEAD = "dead"
 
 
-class CalculationJobStatus(StrEnum):
-    """Describe one durable asynchronous calculation lifecycle."""
-
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    DEAD = "dead"
-
-
 def enum_type[T: StrEnum](enum: type[T], name: str, length: int = 32) -> SqlEnum:
     """Store a string enum with database checks and value validation."""
     return SqlEnum(

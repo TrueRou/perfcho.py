@@ -14,6 +14,7 @@ from perfcho.infra.db.projectors import (
     identity,
     management,
     multiplayer,
+    performance,
     ranking,
     scoring_stats,
     social,
@@ -60,47 +61,55 @@ class ConsumerCatalog(Mapping[str, ConsumerRegistration]):
         return len(self._registrations)
 
 
-DEFAULT_CONSUMER_CATALOG = ConsumerCatalog(
-    (
-        ConsumerRegistration(account.CONSUMER_NAME, account.EVENT_TYPES, account.project_account_event),
-        ConsumerRegistration(identity.CONSUMER_NAME, identity.EVENT_TYPES, identity.project_identity_event),
-        ConsumerRegistration(content.CONSUMER_NAME, content.EVENT_TYPES, content.project_content_event),
-        ConsumerRegistration(social.SOCIAL_CONSUMER_NAME, social.SOCIAL_EVENT_TYPES, social.project_social_event),
-        ConsumerRegistration(
-            social.ACHIEVEMENT_CONSUMER_NAME,
-            social.ACHIEVEMENT_EVENT_TYPES,
-            social.project_achievement_event,
-        ),
-        ConsumerRegistration(
-            community.COMMUNITY_CONSUMER_NAME,
-            community.COMMUNITY_EVENT_TYPES,
-            community.project_community_event,
-        ),
-        ConsumerRegistration(
-            community.MESSAGE_CONSUMER_NAME,
-            community.MESSAGE_EVENT_TYPES,
-            community.project_community_message,
-        ),
-        ConsumerRegistration(ranking.CONSUMER_NAME, ranking.EVENT_TYPES, ranking.project_accepted_score),
-        ConsumerRegistration(
-            scoring_stats.CONSUMER_NAME,
-            scoring_stats.EVENT_TYPES,
-            scoring_stats.project_scoring_stats,
-        ),
-        ConsumerRegistration(
-            multiplayer.CONSUMER_NAME,
-            multiplayer.EVENT_TYPES,
-            multiplayer.project_multiplayer_results,
-        ),
-        ConsumerRegistration(
-            management.AUTHORIZATION_CONSUMER_NAME,
-            management.AUTHORIZATION_EVENT_TYPES,
-            management.project_authorization_event,
-        ),
-        ConsumerRegistration(
-            management.MODERATION_CONSUMER_NAME,
-            management.MODERATION_EVENT_TYPES,
-            management.project_moderation_event,
-        ),
+def build_consumer_catalog(
+    performance_handler: ConsumerHandler = performance.unconfigured_projector,
+) -> ConsumerCatalog:
+    """Compose all consumers with the runtime-owned Performance handler."""
+    return ConsumerCatalog(
+        (
+            ConsumerRegistration(account.CONSUMER_NAME, account.EVENT_TYPES, account.project_account_event),
+            ConsumerRegistration(identity.CONSUMER_NAME, identity.EVENT_TYPES, identity.project_identity_event),
+            ConsumerRegistration(content.CONSUMER_NAME, content.EVENT_TYPES, content.project_content_event),
+            ConsumerRegistration(social.SOCIAL_CONSUMER_NAME, social.SOCIAL_EVENT_TYPES, social.project_social_event),
+            ConsumerRegistration(
+                social.ACHIEVEMENT_CONSUMER_NAME,
+                social.ACHIEVEMENT_EVENT_TYPES,
+                social.project_achievement_event,
+            ),
+            ConsumerRegistration(
+                community.COMMUNITY_CONSUMER_NAME,
+                community.COMMUNITY_EVENT_TYPES,
+                community.project_community_event,
+            ),
+            ConsumerRegistration(
+                community.MESSAGE_CONSUMER_NAME,
+                community.MESSAGE_EVENT_TYPES,
+                community.project_community_message,
+            ),
+            ConsumerRegistration(performance.CONSUMER_NAME, performance.EVENT_TYPES, performance_handler),
+            ConsumerRegistration(ranking.CONSUMER_NAME, ranking.EVENT_TYPES, ranking.project_accepted_score),
+            ConsumerRegistration(
+                scoring_stats.CONSUMER_NAME,
+                scoring_stats.EVENT_TYPES,
+                scoring_stats.project_scoring_stats,
+            ),
+            ConsumerRegistration(
+                multiplayer.CONSUMER_NAME,
+                multiplayer.EVENT_TYPES,
+                multiplayer.project_multiplayer_results,
+            ),
+            ConsumerRegistration(
+                management.AUTHORIZATION_CONSUMER_NAME,
+                management.AUTHORIZATION_EVENT_TYPES,
+                management.project_authorization_event,
+            ),
+            ConsumerRegistration(
+                management.MODERATION_CONSUMER_NAME,
+                management.MODERATION_EVENT_TYPES,
+                management.project_moderation_event,
+            ),
+        )
     )
-)
+
+
+DEFAULT_CONSUMER_CATALOG = build_consumer_catalog()

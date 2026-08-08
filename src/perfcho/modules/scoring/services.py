@@ -32,7 +32,6 @@ from perfcho.modules.scoring.mods import normalize_mods
 from perfcho.modules.scoring.ports import (
     AccountSubmissionValidatorFactory,
     MultiplayerSubmissionValidatorFactory,
-    ScoreAcceptedTaskSchedulerFactory,
     ScoringRepositoryFactory,
     ScoringUnitOfWork,
 )
@@ -44,6 +43,7 @@ _RECEIPT_TTL = timedelta(days=7)
 _RANKING_CONSUMER = "ranking-projector.v1"
 _STATS_CONSUMER = "scoring-stats-projector.v1"
 _MULTIPLAYER_RESULTS_CONSUMER = "multiplayer-results-projector.v1"
+_PERFORMANCE_CONSUMER = "performance-projector.v1"
 
 
 class ScoringService:
@@ -56,7 +56,6 @@ class ScoringService:
         outbox_writer_factory: OutboxWriterFactory,
         account_validator_factory: AccountSubmissionValidatorFactory,
         multiplayer_validator_factory: MultiplayerSubmissionValidatorFactory,
-        task_scheduler_factory: ScoreAcceptedTaskSchedulerFactory,
         achievement_awarder_factory: AchievementAwarderFactory,
         clock: Clock,
         id_generator: IdGenerator,
@@ -71,7 +70,6 @@ class ScoringService:
         self._outbox_writer_factory = outbox_writer_factory
         self._account_validator_factory = account_validator_factory
         self._multiplayer_validator_factory = multiplayer_validator_factory
-        self._task_scheduler_factory = task_scheduler_factory
         self._achievement_awarder_factory = achievement_awarder_factory
         self._clock = clock
         self._id_generator = id_generator
@@ -211,11 +209,6 @@ class ScoringService:
                 at=now,
             )
             result = replace(result, new_achievement_unlocks=new_unlocks)
-            await self._task_scheduler_factory(uow.session).schedule(
-                score_id=result.score_id,
-                scoreboard=scoreboard,
-                now=now,
-            )
             if command.multiplayer is not None:
                 await multiplayer_validator.bind_score(
                     command.multiplayer,
@@ -225,7 +218,7 @@ class ScoringService:
                 )
 
             outbox_writer = self._outbox_writer_factory(uow.session)
-            consumers = (_RANKING_CONSUMER, _STATS_CONSUMER)
+            consumers = (_RANKING_CONSUMER, _STATS_CONSUMER, _PERFORMANCE_CONSUMER)
             if command.multiplayer is not None:
                 consumers += (_MULTIPLAYER_RESULTS_CONSUMER,)
             await outbox_writer.append(

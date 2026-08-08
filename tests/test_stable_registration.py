@@ -8,9 +8,9 @@ import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
 
-from perfcho.api.stable import router
-from perfcho.api.stable.dependencies import get_stable_services
-from perfcho.infra.glue.stable import StableServices
+from perfcho.api.cho import router
+from perfcho.api.cho.dependencies import get_stable_services
+from perfcho.infra.compose import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.account import AccountService, EmailUnavailable, RegisterAccount, RegistrationResult
 from perfcho.modules.authorization import AuthorizationQueryService

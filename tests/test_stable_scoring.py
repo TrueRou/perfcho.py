@@ -14,11 +14,11 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.api.stable import router
-from perfcho.api.stable.dependencies import get_stable_services
+from perfcho.api.cho import router
+from perfcho.api.cho.dependencies import get_stable_services
+from perfcho.infra.compose import StableServices
 from perfcho.infra.db.models.scoring import RankingPolicy, Score
 from perfcho.infra.db.projectors.ranking import _metric_value, _tie_break_value
-from perfcho.infra.glue.stable import StableServices
 from perfcho.infra.security.rijndael import Rijndael256Cbc
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
@@ -450,7 +450,7 @@ async def test_score_submission_logs_stages_domain_code_and_no_submission_secret
 ) -> None:
     import importlib
 
-    web_module = importlib.import_module("perfcho.api.stable.router.web")
+    web_module = importlib.import_module("perfcho.api.cho.router.web")
     events: list[tuple[str, str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:

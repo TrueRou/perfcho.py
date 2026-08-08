@@ -60,7 +60,7 @@ def test_metadata_preserves_the_reviewed_table_inventory() -> None:
         "iam": 18,
         "moderation": 8,
         "multiplayer": 29,
-        "scoring": 26,
+        "scoring": 25,
         "social": 8,
         "system": 2,
     }

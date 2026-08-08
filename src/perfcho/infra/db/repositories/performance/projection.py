@@ -1,20 +1,18 @@
-"""Persist phased, fenced multi-formula Performance job execution."""
+"""Materialize and persist Performance projection results."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import uuid
 from dataclasses import replace
-from datetime import datetime, timedelta
 from typing import cast
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from perfcho.infra.db.enums import CalculationJobStatus, CalculationKind
+from perfcho.infra.db.enums import CalculationKind
 from perfcho.infra.db.models.content import BeatmapRevision
 from perfcho.infra.db.models.core import MediaAsset
 from perfcho.infra.db.models.scoring import (
@@ -23,7 +21,6 @@ from perfcho.infra.db.models.scoring import (
     CalculationFormulaScoreboard,
     CalculationRelease,
     ModSet,
-    PerformanceCalculationJob,
     PlayAttempt,
     Score,
     Scoreboard,
@@ -50,42 +47,18 @@ from perfcho.modules.scoring.models import (
 )
 
 
-class SqlAlchemyPerformanceJobRepository:
-    """Execute phased Performance jobs through caller-owned transactions."""
+class SqlAlchemyPerformanceProjectionRepository:
+    """Read immutable calculation inputs and persist idempotent outputs."""
 
-    def __init__(self, session: AsyncSession, *, execution_lease_seconds: int) -> None:
-        """Bind job operations to one caller-owned session."""
-        if execution_lease_seconds < 1:
-            raise ValueError("execution_lease_seconds must be positive")
+    def __init__(self, session: AsyncSession) -> None:
+        """Bind projection operations to one caller-owned session."""
         self._session = session
-        self._execution_lease_duration = timedelta(seconds=execution_lease_seconds)
 
-    async def start(
-        self,
-        job_id: uuid.UUID,
-        lease_token: uuid.UUID,
-    ) -> PerformanceCalculationInput | None:
-        """Start one execution attempt and materialize immutable engine input."""
-        job = await self._session.get(PerformanceCalculationJob, job_id, with_for_update=True)
-        now = await _database_now(self._session)
-        if (
-            job is None
-            or job.status is not CalculationJobStatus.RUNNING
-            or job.lease_token != lease_token
-            or job.lease_expires_at is None
-            or job.lease_expires_at <= now
-            or job.attempt_started_at is not None
-            or job.completed_at is not None
-            or job.dead_lettered_at is not None
-        ):
-            return None
-        job.attempt_count += 1
-        job.attempt_started_at = now
-        job.lease_expires_at = now + self._execution_lease_duration
-
+    async def materialize(self, score_id: int) -> tuple[PerformanceCalculationInput, ...]:
+        """Build one immutable input for every active release matching a score."""
         difficulty_release = aliased(CalculationRelease)
         difficulty_formula = aliased(CalculationFormula)
-        row = (
+        rows = (
             await self._session.execute(
                 select(
                     Score,
@@ -97,6 +70,7 @@ class SqlAlchemyPerformanceJobRepository:
                     Scoreboard.ruleset,
                     Scoreboard.variant,
                     ModSet.canonical,
+                    CalculationRelease.id.label("release_id"),
                     CalculationRelease.formula_id,
                     CalculationRelease.ruleset.label("release_ruleset"),
                     CalculationRelease.version,
@@ -105,7 +79,6 @@ class SqlAlchemyPerformanceJobRepository:
                     CalculationFormula.code.label("formula_code"),
                     CalculationFormula.calculator,
                     CalculationFormula.kind,
-                    CalculationFormulaScoreboard.scoreboard_id.label("formula_scoreboard_id"),
                     difficulty_release.formula_id.label("difficulty_formula_id"),
                     difficulty_release.ruleset.label("difficulty_ruleset"),
                     difficulty_release.version.label("difficulty_release_version"),
@@ -119,32 +92,27 @@ class SqlAlchemyPerformanceJobRepository:
                 .join(MediaAsset, MediaAsset.id == BeatmapRevision.file_asset_id)
                 .join(Scoreboard, Scoreboard.id == Score.scoreboard_id)
                 .join(ModSet, ModSet.id == Score.mod_set_id)
-                .join(CalculationRelease, CalculationRelease.id == job.release_id)
-                .join(CalculationFormula, CalculationFormula.id == CalculationRelease.formula_id)
+                .join(CalculationFormulaScoreboard, CalculationFormulaScoreboard.scoreboard_id == Score.scoreboard_id)
+                .join(CalculationFormula, CalculationFormula.id == CalculationFormulaScoreboard.formula_id)
+                .join(CalculationRelease, CalculationRelease.formula_id == CalculationFormula.id)
                 .join(difficulty_release, difficulty_release.id == CalculationRelease.difficulty_release_id)
                 .join(difficulty_formula, difficulty_formula.id == difficulty_release.formula_id)
-                .join(
-                    CalculationFormulaScoreboard,
-                    and_(
-                        CalculationFormulaScoreboard.formula_id == CalculationFormula.id,
-                        CalculationFormulaScoreboard.scoreboard_id == Score.scoreboard_id,
-                    ),
+                .where(
+                    Score.id == score_id,
+                    CalculationFormula.kind == CalculationKind.PERFORMANCE,
+                    CalculationFormula.enabled.is_(True),
+                    CalculationRelease.active.is_(True),
+                    CalculationRelease.difficulty_release_id.is_not(None),
+                    CalculationRelease.ruleset == Scoreboard.ruleset,
                 )
-                .where(Score.id == job.score_id)
+                .order_by(CalculationFormula.code, CalculationRelease.created_at)
             )
-        ).one_or_none()
-        if row is None:
-            raise RuntimeError("performance calculation references incomplete score or beatmap facts")
-        if (
-            row.kind is not CalculationKind.PERFORMANCE
-            or row.formula_scoreboard_id != row.scoreboard_id
-            or row.difficulty_release_id is None
-            or row.ruleset != row.release_ruleset
-            or row.difficulty_kind is not CalculationKind.DIFFICULTY
-            or row.difficulty_ruleset != row.ruleset
-            or row.difficulty_calculator != row.calculator
-        ):
-            raise RuntimeError("performance calculation release is incompatible with the score")
+        ).all()
+        if not rows:
+            score_exists = await self._session.scalar(select(Score.id).where(Score.id == score_id))
+            if score_exists is None:
+                raise RuntimeError("performance projection references a missing score")
+            return ()
 
         hits = tuple(
             HitStatistic(hit_result, actual, maximum)
@@ -155,91 +123,74 @@ class SqlAlchemyPerformanceJobRepository:
                         ScoreHitStatistic.actual,
                         ScoreHitStatistic.maximum,
                     )
-                    .where(ScoreHitStatistic.score_id == job.score_id)
+                    .where(ScoreHitStatistic.score_id == score_id)
                     .order_by(ScoreHitStatistic.hit_result)
                 )
             ).all()
         )
-        score = cast(Score, row[0])
-        calculation = PerformanceCalculationInput(
-            job_id=job.id,
-            score_id=score.id,
-            account_id=score.account_id,
-            attempt_count=job.attempt_count,
-            formula_id=row.formula_id,
-            formula_code=row.formula_code,
-            calculator=row.calculator,
-            release_id=job.release_id,
-            release_version=row.version,
-            release_configuration=row.configuration,
-            difficulty_formula_id=row.difficulty_formula_id,
-            difficulty_formula_code=row.difficulty_formula_code,
-            difficulty_release_id=row.difficulty_release_id,
-            difficulty_release_version=row.difficulty_release_version,
-            difficulty_release_configuration=row.difficulty_release_configuration,
-            input_digest=bytes(32),
-            beatmap_revision_id=score.beatmap_revision_id,
-            beatmap_sha256=row.sha256,
-            beatmap_storage_key=row.storage_key,
-            scoreboard=ScoreboardInfo(
-                row.scoreboard_id,
-                row.scoreboard_code,
-                Ruleset(row.ruleset.value),
-                ScoreboardVariant(row.variant.value),
-            ),
-            mod_set_id=score.mod_set_id,
-            mods=_canonical_mods(row.canonical),
-            client_family=ClientFamily(row.protocol.value),
-            score=ScoreSubmission(
-                total_score=score.total_score,
-                classic_score=score.classic_score,
-                accuracy=score.accuracy,
-                max_combo=score.max_combo,
-                grade=ScoreGrade(score.grade.value),
-                outcome=ScoreOutcome(score.outcome.value),
-                perfect=score.perfect,
-                hits=hits,
-                client_flags=score.client_flags,
-                online_checksum=score.online_checksum,
-            ),
-        )
-        input_digest = _canonical_digest(calculation.digest_payload())
-        if job.input_digest is not None and job.input_digest != input_digest:
-            raise PerformanceCalculationError(
-                "performance calculation input changed after the first attempt",
-                retryable=False,
+        calculations: list[PerformanceCalculationInput] = []
+        for row in rows:
+            if (
+                row.kind is not CalculationKind.PERFORMANCE
+                or row.difficulty_release_id is None
+                or row.ruleset != row.release_ruleset
+                or row.difficulty_kind is not CalculationKind.DIFFICULTY
+                or row.difficulty_ruleset != row.ruleset
+                or row.difficulty_calculator != row.calculator
+            ):
+                raise RuntimeError("performance calculation release is incompatible with the score")
+            score = cast(Score, row[0])
+            calculation = PerformanceCalculationInput(
+                score_id=score.id,
+                account_id=score.account_id,
+                formula_id=row.formula_id,
+                formula_code=row.formula_code,
+                calculator=row.calculator,
+                release_id=row.release_id,
+                release_version=row.version,
+                release_configuration=row.configuration,
+                difficulty_formula_id=row.difficulty_formula_id,
+                difficulty_formula_code=row.difficulty_formula_code,
+                difficulty_release_id=row.difficulty_release_id,
+                difficulty_release_version=row.difficulty_release_version,
+                difficulty_release_configuration=row.difficulty_release_configuration,
+                input_digest=bytes(32),
+                beatmap_revision_id=score.beatmap_revision_id,
+                beatmap_sha256=row.sha256,
+                beatmap_storage_key=row.storage_key,
+                scoreboard=ScoreboardInfo(
+                    row.scoreboard_id,
+                    row.scoreboard_code,
+                    Ruleset(row.ruleset.value),
+                    ScoreboardVariant(row.variant.value),
+                ),
+                mod_set_id=score.mod_set_id,
+                mods=_canonical_mods(row.canonical),
+                client_family=ClientFamily(row.protocol.value),
+                score=ScoreSubmission(
+                    total_score=score.total_score,
+                    classic_score=score.classic_score,
+                    accuracy=score.accuracy,
+                    max_combo=score.max_combo,
+                    grade=ScoreGrade(score.grade.value),
+                    outcome=ScoreOutcome(score.outcome.value),
+                    perfect=score.perfect,
+                    hits=hits,
+                    client_flags=score.client_flags,
+                    online_checksum=score.online_checksum,
+                ),
             )
-        job.input_digest = input_digest
-        job.last_error = None
-        return replace(calculation, input_digest=input_digest)
+            calculations.append(replace(calculation, input_digest=_canonical_digest(calculation.digest_payload())))
+        return tuple(calculations)
 
     async def complete(
         self,
         calculation: PerformanceCalculationInput,
-        lease_token: uuid.UUID,
         result: PerformanceResult,
         *,
         output_digest: bytes,
-    ) -> PerformanceCompletion | None:
-        """Persist reproducible difficulty and PP output under the current fence."""
-        job = await self._session.get(PerformanceCalculationJob, calculation.job_id, with_for_update=True)
-        now = await _database_now(self._session)
-        if (
-            job is None
-            or job.status is not CalculationJobStatus.RUNNING
-            or job.lease_token != lease_token
-            or job.lease_expires_at is None
-            or job.lease_expires_at <= now
-            or job.attempt_started_at is None
-            or job.input_digest != calculation.input_digest
-        ):
-            return None
-        if job.score_id != calculation.score_id or job.release_id != calculation.release_id:
-            raise PerformanceCalculationError(
-                "performance completion dimensions do not match the leased job",
-                retryable=False,
-            )
-
+    ) -> PerformanceCompletion:
+        """Persist one deterministic release result and reject inconsistent replays."""
         difficulty_id = await self._session.scalar(
             insert(BeatmapDifficultyAttribute)
             .values(
@@ -277,8 +228,7 @@ class SqlAlchemyPerformanceJobRepository:
                 result.difficulty.max_combo,
                 thaw_json_mapping(result.difficulty.attributes),
             )
-            actual = (difficulty.star_rating, difficulty.max_combo, difficulty.attributes)
-            if actual != expected:
+            if (difficulty.star_rating, difficulty.max_combo, difficulty.attributes) != expected:
                 raise PerformanceCalculationError(
                     "difficulty release produced inconsistent output",
                     retryable=False,
@@ -314,11 +264,6 @@ class SqlAlchemyPerformanceJobRepository:
                 retryable=False,
             )
 
-        job.status = CalculationJobStatus.SUCCEEDED
-        job.output_digest = output_digest
-        job.completed_at = now
-        _clear_job_lease(job)
-        job.last_error = None
         return PerformanceCompletion(
             score_id=calculation.score_id,
             account_id=calculation.account_id,
@@ -329,40 +274,6 @@ class SqlAlchemyPerformanceJobRepository:
             pp=result.pp,
             output_digest=output_digest,
         )
-
-    async def fail(
-        self,
-        job_id: uuid.UUID,
-        lease_token: uuid.UUID,
-        *,
-        error: str,
-        retry_delay: timedelta,
-        dead: bool,
-        consume_attempt: bool,
-    ) -> bool:
-        """Release or dead-letter a failed job only under its current fence."""
-        job = await self._session.get(PerformanceCalculationJob, job_id, with_for_update=True)
-        now = await _database_now(self._session)
-        if (
-            job is None
-            or job.status is not CalculationJobStatus.RUNNING
-            or job.lease_token != lease_token
-            or job.lease_expires_at is None
-            or job.lease_expires_at <= now
-        ):
-            return False
-        if consume_attempt:
-            job.attempt_count += 1
-        job.status = CalculationJobStatus.DEAD if dead else CalculationJobStatus.PENDING
-        job.available_at = now + retry_delay
-        job.dead_lettered_at = now if dead else None
-        job.enqueued_at = None
-        job.broker_task_id = None
-        if not dead:
-            job.attempt_started_at = None
-        _clear_job_lease(job)
-        job.last_error = error[:4000]
-        return True
 
 
 def _canonical_mods(value: object) -> tuple[CanonicalMod, ...]:
@@ -382,16 +293,3 @@ def _canonical_mods(value: object) -> tuple[CanonicalMod, ...]:
 def _canonical_digest(value: object) -> bytes:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return hashlib.sha256(encoded).digest()
-
-
-async def _database_now(session: AsyncSession) -> datetime:
-    now = await session.scalar(select(func.clock_timestamp()))
-    if now is None:
-        raise RuntimeError("PostgreSQL did not return a Performance job timestamp")
-    return now
-
-
-def _clear_job_lease(job: PerformanceCalculationJob) -> None:
-    job.lease_owner = None
-    job.lease_token = None
-    job.lease_expires_at = None

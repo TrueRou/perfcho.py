@@ -9,11 +9,11 @@ from time import monotonic_ns
 
 from fastapi import APIRouter, Header, Request, Response
 
-from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
-from perfcho.api.stable.canonize.login import StableLoginParseError, parse_stable_login
-from perfcho.api.stable.dependencies import StableServicesDependency
-from perfcho.api.stable.dispatcher import StableRuntimeContext, account_stats, dispatch_packets, realtime_expiry
-from perfcho.infra.glue.stable import StableServices
+from perfcho.api.cho.canonize.ipaddr import resolve_client_ip
+from perfcho.api.cho.canonize.login import StableLoginParseError, parse_stable_login
+from perfcho.api.cho.dependencies import StableServicesDependency
+from perfcho.api.cho.dispatcher import StableRuntimeContext, account_stats, dispatch_packets, realtime_expiry
+from perfcho.infra.compose import StableServices
 from perfcho.infra.logging import duration_ms, log_event, rate_limit, sampled
 from perfcho.modules.common import ClientContext, CommandMeta
 from perfcho.modules.community import StableChannel

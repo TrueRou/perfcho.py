@@ -130,10 +130,6 @@ class Settings(BaseSettings):
     performance_calculator_urls: dict[str, str] = Field(default_factory=dict)
     performance_http_timeout_seconds: float = Field(default=30.0, gt=0)
     performance_beatmap_url_expiry_seconds: int = Field(default=600, ge=30, le=3600)
-    performance_calculation_batch_size: int = Field(default=32, ge=1, le=1000)
-    performance_calculation_lease_seconds: int = Field(default=300, ge=30)
-    performance_calculation_max_attempts: int = Field(default=5, ge=1)
-    performance_calculation_max_retry_seconds: int = Field(default=300, ge=1)
     rank_snapshot_poll_interval_seconds: float = Field(default=60.0, ge=1)
 
     cors_origins: list[str] = Field(default=["http://localhost:3000", "http://localhost:5173"])
@@ -158,8 +154,6 @@ class Settings(BaseSettings):
         if self.stable_session_touch_interval_seconds >= self.stable_session_stale_grace_seconds:
             raise ValueError("Stable session touch interval must be shorter than stale grace")
         minimum_window = ceil(self.performance_http_timeout_seconds) + 30
-        if self.performance_calculation_lease_seconds < minimum_window:
-            raise ValueError("performance calculation lease must exceed the HTTP timeout by at least 30 seconds")
         if self.performance_beatmap_url_expiry_seconds < minimum_window:
             raise ValueError("performance Beatmap URL expiry must exceed the HTTP timeout by at least 30 seconds")
         return self

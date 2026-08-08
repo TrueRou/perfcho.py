@@ -17,8 +17,8 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Qu
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from starlette.formparsers import MultiPartException
 
-from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
-from perfcho.api.stable.canonize.scoring import (
+from perfcho.api.cho.canonize.ipaddr import resolve_client_ip
+from perfcho.api.cho.canonize.scoring import (
     ParsedStableScore,
     decrypt_stable_score,
     normalize_stable_attestation,
@@ -29,7 +29,7 @@ from perfcho.api.stable.canonize.scoring import (
     validate_stable_submission_time,
     verify_stable_online_checksum,
 )
-from perfcho.api.stable.dependencies import StableServicesDependency
+from perfcho.api.cho.dependencies import StableServicesDependency
 from perfcho.infra.logging import duration_ms, log_event, rate_limit
 from perfcho.infra.security.password import preverify_lazer_password
 from perfcho.modules.account import (

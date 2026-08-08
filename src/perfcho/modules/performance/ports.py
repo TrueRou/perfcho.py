@@ -1,13 +1,10 @@
 """Define transaction and calculator ports for performance workflows."""
 
-import uuid
-from datetime import timedelta
 from typing import Protocol
 
 from perfcho.modules.common.ports import UnitOfWork
 from perfcho.modules.performance.models import (
     PerformanceCalculationInput,
-    PerformanceCompletion,
     PerformanceResult,
     ScorePerformanceView,
 )
@@ -35,55 +32,11 @@ class PerformanceCalculator(Protocol):
         ...
 
 
-class PerformanceCalculationRepository(Protocol):
-    """Coordinate short transaction phases around external calculation I/O."""
-
-    async def start(
-        self,
-        job_id: uuid.UUID,
-        lease_token: uuid.UUID,
-    ) -> PerformanceCalculationInput | None:
-        """Fence and materialize one leased immutable calculation input."""
-        ...
-
-    async def complete(
-        self,
-        calculation: PerformanceCalculationInput,
-        lease_token: uuid.UUID,
-        result: PerformanceResult,
-        *,
-        output_digest: bytes,
-    ) -> PerformanceCompletion | None:
-        """Persist one idempotent result if the caller still owns the lease."""
-        ...
-
-    async def fail(
-        self,
-        job_id: uuid.UUID,
-        lease_token: uuid.UUID,
-        *,
-        error: str,
-        retry_delay: timedelta,
-        dead: bool,
-        consume_attempt: bool,
-    ) -> bool:
-        """Release or dead-letter a failed fenced job and report whether it persisted."""
-        ...
-
-
 class PerformanceQueryRepository(Protocol):
     """Read Formula-owned performance results."""
 
     async def list_for_score(self, score_id: int) -> tuple[ScorePerformanceView, ...]:
         """Return every persisted Formula release result for one score."""
-        ...
-
-
-class PerformanceCalculationRepositoryFactory(Protocol):
-    """Bind calculation persistence to one caller-owned transaction."""
-
-    def __call__(self, session: object) -> PerformanceCalculationRepository:
-        """Return a transaction-bound calculation repository."""
         ...
 
 

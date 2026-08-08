@@ -7,11 +7,11 @@ import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
 
-from perfcho.api.stable import router
-from perfcho.api.stable.canonize.login import StableLoginParseError, parse_stable_login
-from perfcho.api.stable.dependencies import get_stable_services
-from perfcho.api.stable.dispatcher import StableRuntimeContext
-from perfcho.infra.glue.stable import StableServices
+from perfcho.api.cho import router
+from perfcho.api.cho.canonize.login import StableLoginParseError, parse_stable_login
+from perfcho.api.cho.dependencies import get_stable_services
+from perfcho.api.cho.dispatcher import StableRuntimeContext
+from perfcho.infra.compose import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService, StablePrivilege
 from perfcho.modules.common import Clock, IdGenerator
@@ -592,8 +592,8 @@ async def test_logout_poll_does_not_cleanup_fenced_mailbox_again() -> None:
 async def test_login_and_sampled_poll_logs_are_structured_and_secret_free(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
-    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
+    cho_module = importlib.import_module("perfcho.api.cho.router.cho")
+    dispatcher_module = importlib.import_module("perfcho.api.cho.dispatcher.packets")
     events: list[tuple[str, str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -668,7 +668,7 @@ async def test_poll_response_budget_defers_mailbox_packets_without_acknowledging
 async def test_invalid_token_and_malformed_packet_request_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    cho_module = importlib.import_module("perfcho.api.cho.router.cho")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -724,7 +724,7 @@ async def test_login_bootstrap_failure_closes_durable_session_and_fences_realtim
 async def test_login_cleanup_failure_is_logged_with_exception_details(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    cho_module = importlib.import_module("perfcho.api.cho.router.cho")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -760,7 +760,7 @@ async def test_poll_with_lost_redis_epoch_closes_durable_session_and_restarts(
 ) -> None:
     import importlib
 
-    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    cho_module = importlib.import_module("perfcho.api.cho.router.cho")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -796,7 +796,7 @@ async def test_poll_acquires_fenced_mailbox_lease_before_dispatch_and_conflict_i
 ) -> None:
     import importlib
 
-    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    cho_module = importlib.import_module("perfcho.api.cho.router.cho")
     services, identity, realtime = stable_services()
     await realtime.open_session(
         session_id=identity.session_id,

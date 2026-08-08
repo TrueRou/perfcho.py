@@ -23,7 +23,6 @@ from perfcho.infra.settings import Settings, settings
 from perfcho.infra.taskiq import RelayTaskLoggingMiddleware
 from perfcho.modules.common.models import PendingEvent
 from perfcho.tasks.outbox_delivery import dispatch_outbox_delivery
-from perfcho.tasks.performance_calculation import calculate_performance
 from perfcho.worker import _cleanup_worker_resources, broker, worker_shutdown, worker_startup
 
 
@@ -40,7 +39,6 @@ def test_taskiq_uses_stream_broker_without_result_storage() -> None:
     assert broker.consumer_id == "0-0"
     assert broker.maxlen == settings.taskiq_stream_max_length
     assert dispatch_outbox_delivery.task_name in broker.get_all_tasks()
-    assert calculate_performance.task_name in broker.get_all_tasks()
     assert broker.event_handlers[TaskiqEvents.WORKER_STARTUP] == [worker_startup]
     assert broker.event_handlers[TaskiqEvents.WORKER_SHUTDOWN] == [worker_shutdown]
     assert any(isinstance(middleware, RelayTaskLoggingMiddleware) for middleware in broker.middlewares)
@@ -65,11 +63,6 @@ def test_relay_task_logging_middleware_scopes_task_name() -> None:
 def test_settings_reject_performance_timing_shorter_than_http_window() -> None:
     with pytest.raises(ValidationError, match="Redis socket timeout must exceed"):
         Settings(redis_socket_timeout=0.2, stable_mailbox_wait_seconds=0.3)
-    with pytest.raises(ValidationError, match="lease must exceed"):
-        Settings(
-            performance_http_timeout_seconds=60,
-            performance_calculation_lease_seconds=89,
-        )
     with pytest.raises(ValidationError, match="URL expiry must exceed"):
         Settings(
             performance_http_timeout_seconds=60,
@@ -103,19 +96,12 @@ async def test_worker_cleanup_continues_after_resource_close_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_task_payload_and_context_failures_include_exception_details() -> None:
-    job_id = uuid.uuid4()
     event_id = uuid.uuid4()
     records: list[dict[str, Any]] = []
     sink_id = logger.add(lambda message: records.append(cast(dict[str, Any], message.record)))
     empty_context = SimpleNamespace(state=SimpleNamespace())
 
     try:
-        with pytest.raises(ValueError):
-            await cast(Any, calculate_performance).original_func(
-                str(job_id),
-                "raw-lease-token",
-                empty_context,
-            )
         with pytest.raises(AttributeError):
             await cast(Any, dispatch_outbox_delivery).original_func(
                 str(event_id),
@@ -126,18 +112,12 @@ async def test_task_payload_and_context_failures_include_exception_details() -> 
     finally:
         logger.remove(sink_id)
 
-    malformed = next(
-        record for record in records if record["extra"]["event"] == "task.performance_calculation.malformed_payload"
-    )
     unexpected = next(record for record in records if record["extra"]["event"] == "task.outbox_delivery.failed")
-    assert malformed["extra"]["job_id"] == str(job_id)
     assert unexpected["extra"]["event_id"] == str(event_id)
     assert unexpected["extra"]["consumer"] == "tests-projector.v1"
     assert all(
-        {"lease_token", "delivery_token", "owner", "error"}.isdisjoint(record["extra"])
-        for record in (malformed, unexpected)
+        {"lease_token", "delivery_token", "owner", "error"}.isdisjoint(record["extra"]) for record in (unexpected,)
     )
-    assert malformed["exception"].value is not None
     assert unexpected["exception"].value is not None
 
 

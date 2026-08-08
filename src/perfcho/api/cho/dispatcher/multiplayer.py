@@ -3,8 +3,8 @@
 import hashlib
 from dataclasses import dataclass, replace
 
-from perfcho.api.stable.dispatcher.models import MultiplayerRuntimeContext
-from perfcho.infra.glue.stable import StableServices
+from perfcho.api.cho.dispatcher.models import MultiplayerRuntimeContext
+from perfcho.infra.compose import StableServices
 from perfcho.infra.logging import log_event, rate_limit, sampled
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
 from perfcho.modules.common.errors import ApplicationError

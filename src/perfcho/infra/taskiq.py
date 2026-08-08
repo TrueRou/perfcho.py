@@ -11,10 +11,7 @@ from perfcho.infra.settings import settings
 if TYPE_CHECKING:
     from taskiq import TaskiqResult
 
-_redelivery_timeout_seconds = max(
-    settings.outbox_delivery_lease_seconds,
-    settings.performance_calculation_lease_seconds,
-)
+_redelivery_timeout_seconds = settings.outbox_delivery_lease_seconds
 
 broker = RedisStreamBroker(
     url=settings.taskiq_broker_url,

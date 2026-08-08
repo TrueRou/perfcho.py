@@ -5,9 +5,9 @@ from typing import cast
 
 import pytest
 
-from perfcho.api.stable.dispatcher import StableRuntimeContext, dispatch_packets
-from perfcho.api.stable.dispatcher.multiplayer import _settings_from_wire
-from perfcho.infra.glue.stable import StableServices
+from perfcho.api.cho.dispatcher import StableRuntimeContext, dispatch_packets
+from perfcho.api.cho.dispatcher.multiplayer import _settings_from_wire
+from perfcho.infra.compose import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.bot import BotCommandService
@@ -325,7 +325,7 @@ def client_packet(packet_type: ClientPacket, write: object | None = None) -> byt
 async def test_create_match_maps_wire_settings_and_returns_join_success(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    multiplayer_module = importlib.import_module("perfcho.api.stable.dispatcher.multiplayer")
+    multiplayer_module = importlib.import_module("perfcho.api.cho.dispatcher.multiplayer")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -541,7 +541,7 @@ async def test_multiplayer_public_message_uses_room_members_instead_of_persisten
 ) -> None:
     import importlib
 
-    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
+    dispatcher_module = importlib.import_module("perfcho.api.cho.dispatcher.packets")
     multiplayer = FakeMultiplayer(room_state())
     multiplayer.state = replace(
         multiplayer.state,
