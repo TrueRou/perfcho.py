@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     redis_state_url: str = Field(default="redis://127.0.0.1:56379/0")
     redis_state_prefix: str = Field(default="perfcho:state")
     redis_socket_timeout: float = Field(default=5.0, gt=0)
-    redis_cache_url: str = Field(default="redis://127.0.0.1:56379/2")
+    redis_cache_url: str = Field(default="redis://127.0.0.1:56379/0")
     redis_cache_prefix: str = Field(default="perfcho:cache")
     redis_cache_socket_timeout: float = Field(default=1.0, gt=0)
     redis_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     upstream_beatmap_file_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
     content_sync_max_concurrency: int = Field(default=8, ge=1, le=64)
 
-    taskiq_broker_url: str = Field(default="redis://127.0.0.1:56379/1")
+    taskiq_broker_url: str = Field(default="redis://127.0.0.1:56379/0")
     taskiq_queue_name: str = Field(default="perfcho:tasks")
     taskiq_consumer_group: str = Field(default="perfcho:workers")
     taskiq_stream_max_length: int = Field(default=100_000, ge=1000)

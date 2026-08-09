@@ -561,11 +561,6 @@ class SqlAlchemyScoringRepository:
         account_id: int | None,
     ) -> tuple[LeaderboardScoreView, ...]:
         """Run the bounded leaderboard query for public or one-account rows."""
-        order = (
-            LeaderboardEntry.metric_value.desc(),
-            LeaderboardEntry.tie_break_value.desc(),
-            LeaderboardEntry.score_id.asc(),
-        )
         db_scope = "exact_mods" if scope.kind is LeaderboardScopeKind.EXACT_MODS else "overall"
         statement = (
             select(
@@ -605,12 +600,17 @@ class SqlAlchemyScoringRepository:
         if account_id is not None:
             statement = statement.where(LeaderboardEntry.account_id == account_id)
         candidates = statement.cte("leaderboard_rows")
+        ranked_order = (
+            candidates.c.metric_value.desc(),
+            candidates.c.tie_break_value.desc(),
+            candidates.c.score_id.asc(),
+        )
         ranked = (
             select(
                 candidates,
-                func.row_number().over(order_by=order).label("rank"),
+                func.row_number().over(order_by=ranked_order).label("rank"),
             )
-            .order_by(*order)
+            .order_by(*ranked_order)
             .limit(limit)
             .subquery()
         )
@@ -678,7 +678,7 @@ class SqlAlchemyScoringRepository:
             else:
                 rank_column = UserRankedStat.ranked_score
                 rank_value = row.ranked_score
-            if rank_value > 0:
+            if rank_value is not None and rank_value > 0:
                 higher = await self._session.scalar(
                     select(func.count())
                     .select_from(UserRankedStat)

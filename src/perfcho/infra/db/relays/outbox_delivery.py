@@ -247,6 +247,7 @@ class OutboxDeliveryProcessor:
         outcome: Literal["stale", "succeeded"] = "stale"
         attempt_count: int | None = None
         event_fields: _OutboxEventLogFields = {}
+        failure_event_fields: _OutboxEventLogFields = {}
         event: OutboxEvent | None = None
         try:
             async with self._session_factory.begin() as session:
@@ -256,6 +257,7 @@ class OutboxDeliveryProcessor:
                 event = await session.get(OutboxEvent, reference.event_id)
                 if event is not None:
                     event_fields = _outbox_event_fields(event)
+                    failure_event_fields = _outbox_event_fields(event, include_payload=True)
                 if delivery.status not in {OutboxDeliveryStatus.SUCCEEDED, OutboxDeliveryStatus.DEAD}:
                     now = await _database_now(session)
                     if (
@@ -288,7 +290,6 @@ class OutboxDeliveryProcessor:
                 raise
             _mark_outbox_failure_handled(error)
             failure_outcome, failure_attempt_count = failure
-            failure_fields = _outbox_event_fields(event, include_payload=True) if event is not None else event_fields
             log_event(
                 "ERROR" if failure_outcome == "dead" else "WARNING",
                 f"outbox.delivery.{failure_outcome}",
@@ -298,7 +299,7 @@ class OutboxDeliveryProcessor:
                 attempt_count=failure_attempt_count,
                 error_type=type(error).__name__,
                 duration_ms=duration_ms(started_ns),
-                **failure_fields,
+                **failure_event_fields,
             )
             raise
         if outcome == "succeeded":

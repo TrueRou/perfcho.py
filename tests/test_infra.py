@@ -26,10 +26,14 @@ from perfcho.tasks.outbox_delivery import dispatch_outbox_delivery
 from perfcho.worker import _cleanup_worker_resources, broker, worker_shutdown, worker_startup
 
 
-def test_redis_state_and_taskiq_use_separate_logical_databases() -> None:
+def test_redis_roles_use_db0_with_distinct_namespaces() -> None:
     assert urlparse(settings.redis_state_url).path == "/0"
-    assert urlparse(settings.taskiq_broker_url).path == "/1"
+    assert urlparse(settings.redis_cache_url).path == "/0"
+    assert urlparse(settings.taskiq_broker_url).path == "/0"
     assert settings.redis_state_prefix
+    assert settings.redis_cache_prefix
+    assert settings.redis_state_prefix != settings.redis_cache_prefix
+    assert settings.taskiq_queue_name not in {settings.redis_state_prefix, settings.redis_cache_prefix}
 
 
 def test_taskiq_uses_stream_broker_without_result_storage() -> None:

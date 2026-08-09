@@ -196,7 +196,7 @@ class CoreServices:
     """Collect process-owned services used by all request scopes.
 
     ``state_redis`` is the raw DB0 client for online state adapters.
-    ``cache_redis`` is the raw DB2 client owned by the process lifecycle.
+    ``cache_redis`` is a separate DB0 client owned by the process lifecycle.
     ``cache`` is the only cache API exposed to application services.
     """
 

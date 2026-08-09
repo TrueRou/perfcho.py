@@ -29,7 +29,7 @@ Pass `--redis-url` to include the Redis ZSET comparison workloads:
 
 ```bash
 uv run python -m tools.benchmark \
-  --redis-url redis://127.0.0.1:56379/2
+  --redis-url redis://127.0.0.1:56379/0
 ```
 
 The command writes:

@@ -1,15 +1,19 @@
 import hashlib
 import uuid
+import warnings
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select
+from sqlalchemy.exc import SAWarning
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import FROM_LINTING
 
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.enums import BeatmapStatus as DbBeatmapStatus
@@ -459,6 +463,60 @@ def test_score_validation_enforces_object_count_and_vanilla_combo_bounds() -> No
             replace(submitted.score, max_combo=11, perfect=False),
             revision,
         )
+
+
+@pytest.mark.asyncio
+async def test_account_stats_without_ranked_stat_returns_unranked_defaults() -> None:
+    session = AsyncMock(spec=AsyncSession)
+    result = MagicMock()
+    result.one_or_none.return_value = SimpleNamespace(
+        scoreboard_id=1,
+        policy_id=1,
+        metric="pp",
+        play_count=None,
+        total_score=None,
+        ranked_score=None,
+        accuracy=None,
+        performance=None,
+    )
+    session.execute.return_value = result
+
+    stats = await SqlAlchemyScoringRepository(cast(AsyncSession, session)).get_account_stats(
+        1,
+        Ruleset.OSU,
+        ScoreboardVariant.VANILLA,
+    )
+
+    assert (
+        stats.ranked_score,
+        stats.accuracy,
+        stats.play_count,
+        stats.total_score,
+        stats.global_rank,
+        stats.performance,
+    ) == (0, Decimal(0), 0, 0, 0, 0)
+    session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_leaderboard_query_has_no_cartesian_product() -> None:
+    session = AsyncMock(spec=AsyncSession)
+    result = MagicMock()
+    result.all.return_value = []
+    session.execute.return_value = result
+
+    await SqlAlchemyScoringRepository(cast(AsyncSession, session)).get_public_leaderboard(
+        beatmap_id=1,
+        ruleset=Ruleset.OSU,
+        variant=ScoreboardVariant.VANILLA,
+        scope=LeaderboardScope.overall(),
+        limit=50,
+    )
+
+    statement = session.execute.await_args.args[0]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", SAWarning)
+        statement.compile(linting=FROM_LINTING)
 
 
 @pytest.mark.postgres
