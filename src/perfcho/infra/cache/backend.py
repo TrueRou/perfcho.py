@@ -2,9 +2,10 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
+@runtime_checkable
 class CacheBackend(Protocol):
     """Common operations required by every application cache implementation."""
 

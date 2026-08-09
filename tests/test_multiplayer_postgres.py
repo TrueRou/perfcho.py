@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import Table, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db import engine as infra_db
@@ -170,13 +170,19 @@ async def _append_score_accepted(session: AsyncSession, score_id: int, scoreboar
 
 
 def test_multiplayer_partial_unique_indexes_cover_global_presence_and_active_round() -> None:
-    presence_indexes = {index.name: index for index in SessionPresence.__table__.indexes}
-    round_indexes = {index.name: index for index in Round.__table__.indexes}
+    presence_table = SessionPresence.__table__
+    round_table = Round.__table__
+    assert isinstance(presence_table, Table)
+    assert isinstance(round_table, Table)
+    presence_index = next(
+        index for index in presence_table.indexes if index.name == "uq_session_presences_account_current"
+    )
+    round_index = next(index for index in round_table.indexes if index.name == "uq_rounds_session_active")
 
-    assert presence_indexes["uq_session_presences_account_current"].unique
-    assert str(presence_indexes["uq_session_presences_account_current"].dialect_options["postgresql"]["where"])
-    assert round_indexes["uq_rounds_session_active"].unique
-    assert str(round_indexes["uq_rounds_session_active"].dialect_options["postgresql"]["where"])
+    assert presence_index.unique
+    assert str(presence_index.dialect_options["postgresql"]["where"])
+    assert round_index.unique
+    assert str(round_index.dialect_options["postgresql"]["where"])
     assert Room.__table__.c.public_id_epoch.identity is not None
 
 

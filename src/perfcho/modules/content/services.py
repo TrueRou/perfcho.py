@@ -5,6 +5,7 @@ import hashlib
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from typing import Protocol
 
 from perfcho.infra.cache import cached
 from perfcho.infra.cache.backend import CacheBackend
@@ -42,6 +43,10 @@ _REFRESH_RETRY = timedelta(minutes=5)
 _LEADERBOARD_STATUSES = frozenset({"ranked", "approved", "loved"})
 
 
+class _CacheOwner(Protocol):
+    _cache: CacheBackend
+
+
 def _beatmap_view(value: object) -> BeatmapRevisionView:
     if not isinstance(value, dict):
         raise ValueError("invalid cached beatmap")
@@ -65,21 +70,21 @@ def _beatmapset_view(value: object) -> BeatmapsetView:
     )
 
 
-def _content_md5_key(self: object, md5: str | bytes) -> str:
-    return self._cache.key("content", "md5", _md5_bytes(md5).hex())  # type: ignore[attr-defined]
+def _content_md5_key(self: _CacheOwner, md5: str | bytes) -> str:
+    return self._cache.key("content", "md5", _md5_bytes(md5).hex())
 
 
-def _content_beatmap_key(self: object, beatmap_id: int, *, external: bool = True) -> str:
-    return self._cache.key("content", "beatmap", f"{int(external)}:{beatmap_id}")  # type: ignore[attr-defined]
+def _content_beatmap_key(self: _CacheOwner, beatmap_id: int, *, external: bool = True) -> str:
+    return self._cache.key("content", "beatmap", f"{int(external)}:{beatmap_id}")
 
 
-def _content_filename_key(self: object, file_name: str) -> str:
+def _content_filename_key(self: _CacheOwner, file_name: str) -> str:
     normalized = _filename_key(file_name)
-    return self._cache.key("content", "filename", hashlib.sha256(normalized.encode()).hexdigest())  # type: ignore[attr-defined]
+    return self._cache.key("content", "filename", hashlib.sha256(normalized.encode()).hexdigest())
 
 
-def _content_beatmapset_key(self: object, beatmapset_id: int, *, external: bool = True) -> str:
-    return self._cache.key("content", "beatmapset", f"{int(external)}:{beatmapset_id}")  # type: ignore[attr-defined]
+def _content_beatmapset_key(self: _CacheOwner, beatmapset_id: int, *, external: bool = True) -> str:
+    return self._cache.key("content", "beatmapset", f"{int(external)}:{beatmapset_id}")
 
 
 class ContentQueryService:

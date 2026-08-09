@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta
 from time import monotonic_ns
+from typing import Protocol, runtime_checkable
 
 from perfcho.api.cho.dispatcher.models import StableRuntimeContext
 from perfcho.api.cho.dispatcher.multiplayer import (
@@ -79,11 +80,18 @@ from perfcho.modules.realtime.stable.models import (
     UserPresence,
     UserStats,
 )
-from perfcho.modules.scoring import Ruleset
+from perfcho.modules.scoring import AccountStatsView, Ruleset, ScoreboardVariant
 from perfcho.modules.scoring.mods import LEGACY_MOD_BITS, parse_legacy_mods
 from perfcho.modules.social import SocialAccountNotFound, SocialInteractionBlocked, SocialRelationRejected
 
 _MESSAGE_ID_WINDOW_SECONDS = 5
+
+
+@runtime_checkable
+class _LegacyAccountStatisticsQuery(Protocol):
+    async def get_account_stats(
+        self, account_id: int, ruleset: Ruleset, variant: ScoreboardVariant
+    ) -> AccountStatsView: ...
 
 
 async def dispatch_packets(body: bytes, context: StableRuntimeContext, services: StableServices) -> bytes:
@@ -611,7 +619,8 @@ async def account_stats(stats: UserStats, services: StableServices) -> UserStats
         view = await services.account_statistics.get_for_display(stats.user_id, tuple(Ruleset)[stats.mode], variant)
     else:
         ranking_query = services.ranking_query
-        assert ranking_query is not None
+        if not isinstance(ranking_query, _LegacyAccountStatisticsQuery):
+            return stats
         view = await ranking_query.get_account_stats(stats.user_id, tuple(Ruleset)[stats.mode], variant)
     return UserStats(
         stats.user_id,

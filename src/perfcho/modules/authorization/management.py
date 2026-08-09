@@ -19,6 +19,7 @@ from perfcho.modules.authorization.ports import AuthorizationManagementRepositor
 from perfcho.modules.common import (
     AuthorizationDenied,
     Clock,
+    CommandMeta,
     InputRejected,
     OutboxWriterFactory,
     PendingEvent,
@@ -188,13 +189,13 @@ class AuthorizationManagementService:
         if "admin.access" not in authorization.permission_codes:
             raise AuthorizationDenied("admin.access is required")
 
-    async def _claim(self, session: object, meta: object, scope: str, now: datetime) -> CommandClaim | None:
+    async def _claim(self, session: object, meta: CommandMeta, scope: str, now: datetime) -> CommandClaim | None:
         if self._receipt_store_factory is None:
             return None
         return await self._receipt_store_factory(session).claim(
             scope=scope,
-            idempotency_key=meta.idempotency_key,  # type: ignore[attr-defined]
-            request_digest=meta.request_digest,  # type: ignore[attr-defined]
+            idempotency_key=meta.idempotency_key,
+            request_digest=meta.request_digest,
             now=now,
             expires_at=now + timedelta(days=1),
         )
@@ -202,14 +203,14 @@ class AuthorizationManagementService:
     async def _complete(
         self,
         session: object,
-        meta: object,
+        meta: CommandMeta,
         scope: str,
         result: AuthorizationGrant,
     ) -> None:
         if self._receipt_store_factory is not None:
             await self._receipt_store_factory(session).complete(
                 scope=scope,
-                idempotency_key=meta.idempotency_key,  # type: ignore[attr-defined]
+                idempotency_key=meta.idempotency_key,
                 resource_type=f"authorization_{result.kind}_grant",
                 resource_id=str(result.grant_id),
                 result_snapshot=_grant_state(result),

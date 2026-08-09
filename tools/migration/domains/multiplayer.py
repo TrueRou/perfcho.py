@@ -47,7 +47,7 @@ async def _reconstruct_pool_mappings(runtime: MigrationRuntime) -> None:
                 )
             )
         ).all()
-    by_name = dict(target_rows)
+    by_name: dict[str, uuid.UUID] = dict(target_rows)
     for row in source_rows:
         source_id = _positive(row.get("id"), "pool id")
         target_id = by_name.get(_name_key(row.get("name")))

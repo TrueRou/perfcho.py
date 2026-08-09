@@ -29,6 +29,12 @@ from perfcho.infra.security import (
     verify_password,
 )
 
+
+def set_runtime_attribute(target: object, name: str, value: object) -> None:
+    """Exercise an immutable object's assignment boundary at runtime."""
+    setattr(target, name, value)
+
+
 TEST_POLICY = Argon2Policy(time_cost=1, memory_cost_kib=32, parallelism=1)
 
 
@@ -153,7 +159,7 @@ def test_password_verification_reports_policy_rehash_and_results_are_frozen() ->
     assert result.verified
     assert result.needs_rehash
     with pytest.raises(FrozenInstanceError):
-        result.needs_rehash = False  # type: ignore[misc]
+        set_runtime_attribute(result, "needs_rehash", False)
 
 
 def test_dummy_password_verification_spends_current_policy_without_authenticating() -> None:

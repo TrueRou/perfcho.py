@@ -8,9 +8,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Protocol
 from uuid import uuid4
 
+from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
@@ -21,18 +21,6 @@ class ScoringBenchmarkConfig:
 
     player_count: int = 50_000
     policy_id: int = 1
-
-
-class RedisRankingClient(Protocol):
-    """Minimal Redis contract needed by the ZSET adapter."""
-
-    async def zrevrank(self, key: str, member: str) -> int | None:
-        """Return a member's reverse rank."""
-        ...
-
-    async def zrevrange(self, key: str, start: int, end: int, *, withscores: bool) -> object:
-        """Return a reverse ordered range."""
-        ...
 
 
 class ScoringDatabaseScenario:
@@ -84,7 +72,7 @@ class ScoringDatabaseScenario:
 class ScoringRedisScenario:
     """Execute ZSET rank and top-N operations as a Redis comparison baseline."""
 
-    def __init__(self, redis: RedisRankingClient, name: str, key: str, player_count: int) -> None:
+    def __init__(self, redis: Redis, name: str, key: str, player_count: int) -> None:
         """Bind one ZSET workload to a benchmark-owned Redis key."""
         self.name = name
         self._redis = redis

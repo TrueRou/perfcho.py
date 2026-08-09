@@ -237,7 +237,7 @@ def _write_failed_report(config: MigrationConfig, report: MigrationReport) -> No
 
 
 def _attach_report(error: BaseException, report: MigrationReport) -> None:
-    error.migration_report = report  # type: ignore[attr-defined]
+    error.__dict__["migration_report"] = report
 
 
 async def _probe_object_storage(

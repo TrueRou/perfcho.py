@@ -60,7 +60,7 @@ class SqlAlchemyCommunityRepository:
                 .order_by(Channel.id)
             )
         ).all()
-        return tuple(_channel_record(row) for row in rows)
+        return tuple(_channel_record(row._tuple()) for row in rows)
 
     async def get_public_channel_by_stable_name(self, stable_name: str, account_id: int) -> ChannelRecord | None:
         """Resolve one active public channel case-insensitively by Stable name."""
@@ -73,14 +73,14 @@ class SqlAlchemyCommunityRepository:
                 )
             )
         ).one_or_none()
-        return _channel_record(row) if row is not None else None
+        return _channel_record(row._tuple()) if row is not None else None
 
     async def get_channel(self, channel_id: int, account_id: int) -> ChannelRecord | None:
         """Load one channel and all account-specific scope relationships in one query."""
         row = (
             await self._session.execute(_channel_statement(account_id).where(Channel.id == channel_id))
         ).one_or_none()
-        return _channel_record(row) if row is not None else None
+        return _channel_record(row._tuple()) if row is not None else None
 
     async def get_direct_message_context(
         self,
@@ -227,7 +227,7 @@ class SqlAlchemyCommunityRepository:
                 )
             )
         ).one_or_none()
-        return _message_result(row, created=False) if row is not None else None
+        return _message_result(row._tuple(), created=False) if row is not None else None
 
     async def insert_message(
         self,
@@ -616,24 +616,61 @@ def _channel_statement(account_id: int) -> Select:
     )
 
 
-def _channel_record(row: object) -> ChannelRecord:
+def _channel_record(
+    row: tuple[
+        int,
+        ChannelKind,
+        str | None,
+        str | None,
+        int | None,
+        int | None,
+        str | None,
+        str | None,
+        str | None,
+        bool,
+        int,
+        datetime | None,
+        int | None,
+        int | None,
+        bool,
+        bool,
+    ],
+) -> ChannelRecord:
+    (
+        channel_id,
+        kind,
+        stable_name,
+        description,
+        owner_account_id,
+        team_id,
+        read_permission_code,
+        write_permission_code,
+        manage_permission_code,
+        auto_join,
+        message_length_limit,
+        archived_at,
+        direct_low_account_id,
+        direct_high_account_id,
+        active_member,
+        active_team_member,
+    ) = row
     return ChannelRecord(
-        channel_id=row.id,  # type: ignore[attr-defined]
-        kind=row.kind.value,  # type: ignore[attr-defined]
-        stable_name=row.name,  # type: ignore[attr-defined]
-        description=row.description,  # type: ignore[attr-defined]
-        owner_account_id=row.owner_account_id,  # type: ignore[attr-defined]
-        team_id=row.team_id,  # type: ignore[attr-defined]
-        read_permission_code=row.read_permission_code,  # type: ignore[attr-defined]
-        write_permission_code=row.write_permission_code,  # type: ignore[attr-defined]
-        manage_permission_code=row.manage_permission_code,  # type: ignore[attr-defined]
-        auto_join=row.auto_join,  # type: ignore[attr-defined]
-        message_length_limit=row.message_length_limit,  # type: ignore[attr-defined]
-        archived=row.archived_at is not None,  # type: ignore[attr-defined]
-        direct_low_account_id=row.low_account_id,  # type: ignore[attr-defined]
-        direct_high_account_id=row.high_account_id,  # type: ignore[attr-defined]
-        active_member=row.active_member,  # type: ignore[attr-defined]
-        active_team_member=row.active_team_member,  # type: ignore[attr-defined]
+        channel_id=channel_id,
+        kind=kind.value,
+        stable_name=stable_name,
+        description=description,
+        owner_account_id=owner_account_id,
+        team_id=team_id,
+        read_permission_code=read_permission_code,
+        write_permission_code=write_permission_code,
+        manage_permission_code=manage_permission_code,
+        auto_join=auto_join,
+        message_length_limit=message_length_limit,
+        archived=archived_at is not None,
+        direct_low_account_id=direct_low_account_id,
+        direct_high_account_id=direct_high_account_id,
+        active_member=active_member,
+        active_team_member=active_team_member,
     )
 
 
@@ -656,16 +693,31 @@ def _message_statement() -> Select:
     ).outerjoin(DirectConversation, DirectConversation.channel_id == Message.channel_id)
 
 
-def _message_result(row: object, *, created: bool) -> MessageResult:
+def _message_result(
+    row: tuple[int, int, int, uuid.UUID, str, bool, int | None, datetime, int | None],
+    *,
+    created: bool,
+) -> MessageResult:
+    (
+        message_id,
+        channel_id,
+        sender_account_id,
+        client_message_id,
+        content,
+        is_action,
+        reply_to_id,
+        created_at,
+        direct_recipient_account_id,
+    ) = row
     return MessageResult(
-        message_id=row.id,  # type: ignore[attr-defined]
-        channel_id=row.channel_id,  # type: ignore[attr-defined]
-        sender_account_id=row.sender_account_id,  # type: ignore[attr-defined]
-        client_message_id=row.client_message_id,  # type: ignore[attr-defined]
-        content=row.content,  # type: ignore[attr-defined]
-        is_action=row.is_action,  # type: ignore[attr-defined]
-        reply_to_id=row.reply_to_id,  # type: ignore[attr-defined]
-        created_at=row.created_at,  # type: ignore[attr-defined]
-        direct_recipient_account_id=row.direct_recipient_account_id,  # type: ignore[attr-defined]
+        message_id=message_id,
+        channel_id=channel_id,
+        sender_account_id=sender_account_id,
+        client_message_id=client_message_id,
+        content=content,
+        is_action=is_action,
+        reply_to_id=reply_to_id,
+        created_at=created_at,
+        direct_recipient_account_id=direct_recipient_account_id,
         created=created,
     )

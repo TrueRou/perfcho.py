@@ -15,7 +15,10 @@ from .scoring import ScoringDatabaseScenario, ScoringRedisScenario, scoring_envi
 async def main() -> None:
     """Parse options and run the selected scoring benchmark."""
     parser = argparse.ArgumentParser(description="Run isolated perfcho benchmarks")
-    parser.add_argument("--database-url", default=os.getenv("DATABASE_URL", "postgresql+asyncpg://perfcho:perfcho@127.0.0.1:55432/perfcho"))
+    parser.add_argument(
+        "--database-url",
+        default=os.getenv("DATABASE_URL", "postgresql+asyncpg://perfcho:perfcho@127.0.0.1:55432/perfcho"),
+    )
     parser.add_argument("--redis-url", default=os.getenv("REDIS_CACHE_URL"))
     parser.add_argument("--players", type=int, default=50_000)
     parser.add_argument("--concurrency", type=int, default=50)
@@ -27,8 +30,8 @@ async def main() -> None:
     rows = []
     async with scoring_environment(args.database_url, args.players) as (_, session_factory, schema):
         for name in ("postgres-personal-rank", "postgres-top-n"):
-            scenario = ScoringDatabaseScenario(session_factory, name, args.players, schema)
-            rows.append(summarize(await run_benchmark(scenario, config)))
+            database_scenario = ScoringDatabaseScenario(session_factory, name, args.players, schema)
+            rows.append(summarize(await run_benchmark(database_scenario, config)))
         if args.redis_url:
             from redis.asyncio import Redis
 
@@ -41,8 +44,8 @@ async def main() -> None:
             )
             try:
                 for name in ("redis-personal-rank", "redis-top-n"):
-                    scenario = ScoringRedisScenario(redis, name, key, args.players)
-                    rows.append(summarize(await run_benchmark(scenario, config)))
+                    redis_scenario = ScoringRedisScenario(redis, name, key, args.players)
+                    rows.append(summarize(await run_benchmark(redis_scenario, config)))
             finally:
                 await redis.delete(key)
                 await redis.aclose()

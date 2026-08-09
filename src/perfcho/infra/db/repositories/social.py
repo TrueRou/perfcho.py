@@ -3,7 +3,6 @@
 import uuid
 from collections.abc import Mapping
 from datetime import datetime
-from typing import cast
 
 from sqlalchemy import delete, func, literal, select, union_all
 from sqlalchemy.dialects.postgresql import insert
@@ -117,7 +116,7 @@ class SqlAlchemySocialRepository:
                 )
             )
         ).one_or_none()
-        return _follow_record(row)
+        return _follow_record(row._tuple() if row is not None else None)
 
     async def upsert_follow(
         self,
@@ -143,7 +142,7 @@ class SqlAlchemySocialRepository:
             .returning(Follow.actor_account_id, Follow.target_account_id, Follow.remark, Follow.created_at)
         )
         row = (await self._session.execute(statement)).one()
-        record = _follow_record(row)
+        record = _follow_record(row._tuple())
         if record is None:
             raise RuntimeError("database did not return the follow")
         return record
@@ -215,7 +214,7 @@ class SqlAlchemySocialRepository:
                 )
             )
         ).one_or_none()
-        return _block_record(row)
+        return _block_record(row._tuple() if row is not None else None)
 
     async def upsert_block(
         self,
@@ -241,7 +240,7 @@ class SqlAlchemySocialRepository:
             .returning(Block.actor_account_id, Block.target_account_id, Block.reason, Block.created_at)
         )
         row = (await self._session.execute(statement)).one()
-        record = _block_record(row)
+        record = _block_record(row._tuple())
         if record is None:
             raise RuntimeError("database did not return the block")
         return record
@@ -473,7 +472,7 @@ class SqlAlchemySocialRepository:
         except IntegrityError as error:
             raise AchievementUnlockConflict("achievement unlock conflicts with existing evidence") from error
         if row is not None:
-            return AchievementUnlockResult(_achievement_unlock(row), created=True)
+            return AchievementUnlockResult(_achievement_unlock(row._tuple()), created=True)
 
         existing = (
             await self._session.execute(
@@ -493,28 +492,35 @@ class SqlAlchemySocialRepository:
         ).one_or_none()
         if existing is None:
             raise AchievementUnlockConflict("source event is already assigned to another achievement unlock")
-        return AchievementUnlockResult(_achievement_unlock(existing), created=False)
+        return AchievementUnlockResult(_achievement_unlock(existing._tuple()), created=False)
 
 
-def _follow_record(row: object | None) -> FollowRecord | None:
+def _follow_record(row: tuple[int, int, str | None, datetime] | None) -> FollowRecord | None:
     if row is None:
         return None
-    return FollowRecord(row.actor_account_id, row.target_account_id, row.remark, row.created_at)  # type: ignore[attr-defined]
+    actor_account_id, target_account_id, remark, created_at = row
+    return FollowRecord(actor_account_id, target_account_id, remark, created_at)
 
 
-def _block_record(row: object | None) -> BlockRecord | None:
+def _block_record(row: tuple[int, int, str | None, datetime] | None) -> BlockRecord | None:
     if row is None:
         return None
-    return BlockRecord(row.actor_account_id, row.target_account_id, row.reason, row.created_at)  # type: ignore[attr-defined]
+    actor_account_id, target_account_id, reason, created_at = row
+    return BlockRecord(actor_account_id, target_account_id, reason, created_at)
 
 
-def _achievement_unlock(row: object) -> AchievementUnlockValue:
+def _achievement_unlock(
+    row: tuple[int, int, int, int | None, uuid.UUID | None, object, datetime],
+) -> AchievementUnlockValue:
+    account_id, achievement_id, definition_version, score_id, source_event_id, snapshot, created_at = row
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("achievement unlock snapshot is not a JSON object")
     return AchievementUnlockValue(
-        account_id=row.account_id,  # type: ignore[attr-defined]
-        achievement_id=row.achievement_id,  # type: ignore[attr-defined]
-        definition_version=row.definition_version,  # type: ignore[attr-defined]
-        score_id=row.score_id,  # type: ignore[attr-defined]
-        source_event_id=row.source_event_id,  # type: ignore[attr-defined]
-        snapshot=cast(dict[str, object], row.snapshot),  # type: ignore[attr-defined]
-        created_at=row.created_at,  # type: ignore[attr-defined]
+        account_id=account_id,
+        achievement_id=achievement_id,
+        definition_version=definition_version,
+        score_id=score_id,
+        source_event_id=source_event_id,
+        snapshot=dict(snapshot),
+        created_at=created_at,
     )

@@ -23,7 +23,8 @@ class RedisCache:
     async def get(self, key: str) -> bytes | None:
         """Read a value, treating Redis failures as misses."""
         try:
-            return await self._redis.get(key)
+            value = await self._redis.get(key)
+            return value if isinstance(value, bytes) else None
         except Exception:
             return None
 

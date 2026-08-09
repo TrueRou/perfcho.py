@@ -259,9 +259,15 @@ def run_full_suite(base_url: str, *, timeout: float = 8.0) -> tuple[ScenarioResu
             )
             if page is None or page.beatmap_id != BEATMAP_ID:
                 raise FakeClientError(f"osu.py {ranking_type.name} leaderboard query failed")
+        rate_params: dict[str, str | int] = {
+            "u": first.game.username,
+            "p": first.game.password_hash,
+            "c": checksum,
+            "v": 9,
+        }
         rate = first.game.api.session.get(
             f"{first.game.api.url}/web/osu-rate.php",
-            params={"u": first.game.username, "p": first.game.password_hash, "c": checksum, "v": 9},
+            params=rate_params,
             timeout=timeout,
         )
         if not rate.ok or not rate.text.startswith("alreadyvoted"):
@@ -274,9 +280,14 @@ def run_full_suite(base_url: str, *, timeout: float = 8.0) -> tuple[ScenarioResu
         )
         if not info.ok or checksum not in info.text:
             raise FakeClientError("Stable beatmap info query failed")
+        direct_set_params: dict[str, str | int] = {
+            "u": first.game.username,
+            "h": first.game.password_hash,
+            "s": BEATMAPSET_ID,
+        }
         direct_set = first.game.api.session.get(
             f"{first.game.api.url}/web/osu-search-set.php",
-            params={"u": first.game.username, "h": first.game.password_hash, "s": BEATMAPSET_ID},
+            params=direct_set_params,
             timeout=timeout,
         )
         if not direct_set.ok or str(BEATMAPSET_ID) not in direct_set.text:

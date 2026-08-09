@@ -499,6 +499,7 @@ def _hit_statistics(
     nkatu: int,
     nmiss: int,
 ) -> tuple[HitStatistic, ...]:
+    values: tuple[tuple[str, int], ...]
     if ruleset is Ruleset.OSU:
         values = (("great", n300), ("ok", n100), ("meh", n50), ("miss", nmiss))
     elif ruleset is Ruleset.TAIKO:

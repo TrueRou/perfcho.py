@@ -258,8 +258,10 @@ def _placeholder_commands(
 ) -> tuple[CommandDefinition, ...]:
     commands: list[CommandDefinition] = []
     for name, aliases, description in definitions:
+
+        def placeholder(_context: CommandContext, _parsed: ParsedArguments, *, feature: str = description) -> str:
+            return f"{feature} not yet implemented."
+
         builder = command(name).description(description).alias(*aliases).hidden(hidden)
-        commands.append(
-            builder.action(lambda _context, _parsed, feature=description: f"{feature} not yet implemented.")
-        )
+        commands.append(builder.action(placeholder))
     return tuple(commands)

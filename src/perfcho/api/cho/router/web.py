@@ -67,6 +67,7 @@ from perfcho.modules.realtime import RealtimeSessionFenced, RealtimeSessionNotFo
 from perfcho.modules.scoring import (
     AcceptScore,
     AccountStatsView,
+    BeatmapGradeView,
     BeatmapReference,
     BeatmapRevisionNotFound,
     LeaderboardPage,
@@ -594,7 +595,7 @@ async def get_beatmap_info(
     beatmaps = await content_query.batch_lookup(filenames, beatmap_ids)
     grades: dict[int, dict[Ruleset, ScoreGrade]] = {}
     beatmap_scores = services.beatmap_scores
-    projected_grades = ()
+    projected_grades: tuple[BeatmapGradeView, ...] = ()
     if beatmap_scores is not None:
         projected_grades = await beatmap_scores.get_for_account(
             authentication.principal.account_id,

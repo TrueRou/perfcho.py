@@ -75,6 +75,7 @@ def validate_score(
 
 
 def _judged_total(ruleset: Ruleset, values: dict[str, int]) -> int:
+    names: tuple[str, ...]
     if ruleset is Ruleset.OSU:
         names = ("great", "ok", "meh", "miss")
     elif ruleset is Ruleset.TAIKO:
@@ -88,17 +89,18 @@ def _judged_total(ruleset: Ruleset, values: dict[str, int]) -> int:
 
 def _accuracy(ruleset: Ruleset, values: dict[str, int], mods: set[str]) -> Decimal:
     total = Decimal(_judged_total(ruleset, values))
+    numerator: Decimal
     if ruleset is Ruleset.OSU:
-        numerator = 300 * values["great"] + 100 * values["ok"] + 50 * values["meh"]
+        numerator = Decimal(300 * values["great"] + 100 * values["ok"] + 50 * values["meh"])
         denominator = 300 * total
     elif ruleset is Ruleset.TAIKO:
-        numerator = values["great"] + Decimal("0.5") * values["ok"]
+        numerator = Decimal(values["great"]) + Decimal("0.5") * values["ok"]
         denominator = total
     elif ruleset is Ruleset.FRUITS:
-        numerator = values["great"] + values["large_tick_hit"] + values["small_tick_hit"]
+        numerator = Decimal(values["great"] + values["large_tick_hit"] + values["small_tick_hit"])
         denominator = total
     elif "SV2" in mods:
-        numerator = (
+        numerator = Decimal(
             305 * values["perfect"]
             + 300 * values["great"]
             + 200 * values["good"]
@@ -107,7 +109,7 @@ def _accuracy(ruleset: Ruleset, values: dict[str, int], mods: set[str]) -> Decim
         )
         denominator = 305 * total
     else:
-        numerator = (
+        numerator = Decimal(
             300 * (values["perfect"] + values["great"]) + 200 * values["good"] + 100 * values["ok"] + 50 * values["meh"]
         )
         denominator = 300 * total

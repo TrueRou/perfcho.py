@@ -1,5 +1,4 @@
 import asyncio
-from typing import cast
 
 import pytest
 
@@ -11,7 +10,7 @@ async def test_cached_decorator_deduplicates_concurrent_misses() -> None:
     cache = MemoryCache()
     calls = 0
 
-    @cached(  # type: ignore[arg-type]
+    @cached(
         cache,
         key_builder=lambda value: cache.key("test", "value", str(value)),
         encode=lambda value: str(value).encode(),
@@ -70,7 +69,7 @@ async def test_cached_decorator_can_cache_none() -> None:
     async def load(value: int) -> int | None:
         nonlocal calls
         calls += 1
-        return cast(int, None) if value == 1 else value
+        return None if value == 1 else value
 
     assert await load(1) is None
     assert await load(1) is None

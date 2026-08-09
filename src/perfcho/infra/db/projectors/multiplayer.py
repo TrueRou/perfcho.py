@@ -5,7 +5,7 @@ import json
 import uuid
 from collections import defaultdict
 from decimal import Decimal
-from typing import NotRequired, Protocol, TypedDict
+from typing import NamedTuple, NotRequired, TypedDict
 
 from sqlalchemy import Numeric, String, and_, case, cast, delete, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import insert
@@ -38,14 +38,12 @@ EVENT_TYPES = frozenset({"multiplayer.round-completed.v1", "score.accepted.v1"})
 _TEAM_MODES = frozenset({"team_vs", "tag_team_vs"})
 
 
-class _MetricRow(Protocol):
-    """Expose score columns used by deterministic result calculations."""
+class _MetricRow(NamedTuple):
+    """Hold score values used by deterministic result calculations."""
 
     account_id: int
     team_number: int
     score_id: int
-    status: str
-    scoring_mode: str
     total_score: int
     accuracy: Decimal
     max_combo: int
@@ -98,9 +96,11 @@ async def project_multiplayer_results(session: AsyncSession, event: OutboxEvent,
                 .where(Score.id == score_id)
             )
         ).one_or_none()
-        if dimensions is None or dimensions.scoreboard_id != scoreboard_id or dimensions.account_id != account_id:
+        if dimensions is None:
             raise RuntimeError("accepted score event does not match the authoritative score")
-        round_id = dimensions.round_id
+        authoritative_account_id, authoritative_scoreboard_id, round_id = dimensions._tuple()
+        if authoritative_scoreboard_id != scoreboard_id or authoritative_account_id != account_id:
+            raise RuntimeError("accepted score event does not match the authoritative score")
     else:
         raise RuntimeError(f"unsupported multiplayer results event: {event.event_type}")
 
@@ -148,7 +148,12 @@ async def _project_round(session: AsyncSession, round_id: uuid.UUID) -> None:
             .order_by(RoundParticipant.account_id)
         )
     ).all()
-    scored = [row for row in rows if round_row.status == "completed" and row.score_id is not None]
+    scored: list[_MetricRow] = []
+    if round_row.status == "completed":
+        for row in rows:
+            account_id, team_number, score_id, total_score, accuracy, max_combo = row._tuple()
+            if score_id is not None and total_score is not None and accuracy is not None and max_combo is not None:
+                scored.append(_MetricRow(account_id, team_number, score_id, total_score, accuracy, max_combo))
     team_mode = multiplayer_session.team_mode in _TEAM_MODES
     await _replace_round_results(session, round_row, scored, team_mode=team_mode)
     await _rebuild_session_standings(session, multiplayer_session, team_mode=team_mode)
@@ -170,7 +175,7 @@ async def _replace_round_results(
         for row in scored:
             if row.team_number > 0:
                 grouped[row.team_number].append(row)
-        ranked = sorted(
+        team_ranked = sorted(
             ((team, _team_metric(values, scoring_mode)) for team, values in grouped.items()),
             key=lambda item: (-item[1], item[0]),
         )
@@ -185,15 +190,15 @@ async def _replace_round_results(
                     "score_id": None,
                     "rank": index,
                     "metric_value": metric,
-                    "points": Decimal(len(ranked) - index + 1),
+                    "points": Decimal(len(team_ranked) - index + 1),
                 }
-                for index, (team, metric) in enumerate(ranked, start=1)
+                for index, (team, metric) in enumerate(team_ranked, start=1)
             ],
             subject=RoundResult.team_number,
         )
         return
 
-    ranked = sorted(scored, key=lambda row: (-_score_metric(row, scoring_mode), row.account_id))
+    account_ranked = sorted(scored, key=lambda row: (-_score_metric(row, scoring_mode), row.account_id))
     await session.execute(delete(RoundResult).where(RoundResult.round_id == round_row.id))
     await _upsert_round_results(
         session,
@@ -205,9 +210,9 @@ async def _replace_round_results(
                 "score_id": row.score_id,
                 "rank": index,
                 "metric_value": _score_metric(row, scoring_mode),
-                "points": Decimal(len(ranked) - index + 1),
+                "points": Decimal(len(account_ranked) - index + 1),
             }
-            for index, row in enumerate(ranked, start=1)
+            for index, row in enumerate(account_ranked, start=1)
         ],
         subject=RoundResult.account_id,
     )

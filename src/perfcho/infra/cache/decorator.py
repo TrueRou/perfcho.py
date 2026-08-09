@@ -3,7 +3,7 @@
 import functools
 import inspect
 from collections.abc import Awaitable, Callable
-from typing import Any, ParamSpec, TypeVar, cast
+from typing import Any, ParamSpec, TypeVar
 
 from perfcho.infra.cache.backend import CacheBackend
 
@@ -77,12 +77,13 @@ def _resolve_cache(
     kwargs: dict[str, object],
 ) -> CacheBackend:
     if cache is None:
-        if not args or not hasattr(args[0], "_cache"):
+        backend = getattr(args[0], "_cache", None) if args else None
+        if not isinstance(backend, CacheBackend):
             raise TypeError("cached instance methods require self._cache")
-        return args[0]._cache  # type: ignore[attr-defined]
-    if callable(cache) and not hasattr(cache, "get"):
+        return backend
+    if callable(cache) and not isinstance(cache, CacheBackend):
         return cache(*args, **kwargs)
-    return cast(CacheBackend, cache)
+    return cache
 
 
 def json_codec(

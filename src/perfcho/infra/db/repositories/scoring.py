@@ -9,7 +9,7 @@ from decimal import Decimal
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import InstrumentedAttribute, aliased
 from sqlalchemy.sql.selectable import Select
 
 from perfcho.infra.db.enums import (
@@ -522,13 +522,12 @@ class SqlAlchemyScoringRepository:
             score_ids.add(personal_row.score_id)
         hits = await self._score_hits(score_ids)
         scores = tuple(
-            _leaderboard_view(row, rank=row.rank, ruleset=ruleset, hits=hits.get(row.score_id, {})) for row in top_rows
+            _leaderboard_view(row._tuple(), ruleset=ruleset, hits=hits.get(row.score_id, {})) for row in top_rows
         )
         personal_best = None
         if personal_row is not None:
             personal_best = _leaderboard_view(
-                personal_row,
-                rank=personal_row.rank,
+                personal_row._tuple(),
                 ruleset=ruleset,
                 hits=hits.get(personal_row.score_id, {}),
             )
@@ -624,9 +623,7 @@ class SqlAlchemyScoringRepository:
         ).all()
         score_ids = {row.score_id for row in rows}
         hits = await self._score_hits(score_ids)
-        return tuple(
-            _leaderboard_view(row, rank=row.rank, ruleset=ruleset, hits=hits.get(row.score_id, {})) for row in rows
-        )
+        return tuple(_leaderboard_view(row._tuple(), ruleset=ruleset, hits=hits.get(row.score_id, {})) for row in rows)
 
     async def get_account_stats(
         self,
@@ -674,6 +671,7 @@ class SqlAlchemyScoringRepository:
             return AccountStatsView(0, Decimal(0), 0, 0, 0)
         global_rank = 0
         if row.policy_id is not None:
+            rank_column: InstrumentedAttribute[Decimal] | InstrumentedAttribute[int]
             if row.metric == "pp":
                 rank_column = UserRankedStat.performance
                 rank_value = row.performance
@@ -915,7 +913,7 @@ class SqlAlchemyMultiplayerSubmissionValidator:
 
     async def _submission_dimensions(self, attempt: MultiplayerAttempt) -> tuple[int, int, int | None] | None:
         if attempt.playlist_revision_id is not None:
-            row = (
+            playlist_row = (
                 await self._session.execute(
                     select(
                         PlaylistRevision.beatmap_revision_id,
@@ -924,12 +922,12 @@ class SqlAlchemyMultiplayerSubmissionValidator:
                     ).where(PlaylistRevision.id == attempt.playlist_revision_id)
                 )
             ).one_or_none()
-            if row is None:
+            if playlist_row is None:
                 return None
-            return row.beatmap_revision_id, row.scoreboard_id, row.required_mod_set_id
+            return playlist_row._tuple()
         if attempt.round_id is None:
             return None
-        row = (
+        round_row = (
             await self._session.execute(
                 select(
                     PlaylistRevision.beatmap_revision_id,
@@ -953,17 +951,26 @@ class SqlAlchemyMultiplayerSubmissionValidator:
                 .where(Round.id == attempt.round_id)
             )
         ).one_or_none()
-        if row is None:
+        if round_row is None:
             return None
-        if row.beatmap_revision_id is not None:
+        (
+            beatmap_revision_id,
+            scoreboard_id,
+            required_mod_set_id,
+            participant_mod_set_id,
+            pool_revision_id,
+            pool_scoreboard_id,
+            pool_mod_set_id,
+        ) = round_row._tuple()
+        if beatmap_revision_id is not None:
             return (
-                row.beatmap_revision_id,
-                row.scoreboard_id,
-                row.participant_mod_set_id or row.required_mod_set_id,
+                beatmap_revision_id,
+                scoreboard_id,
+                participant_mod_set_id or required_mod_set_id,
             )
-        if row.pool_revision_id is None or row.pool_scoreboard_id is None:
+        if pool_revision_id is None or pool_scoreboard_id is None:
             return None
-        return row.pool_revision_id, row.pool_scoreboard_id, row.participant_mod_set_id or row.pool_mod_set_id
+        return pool_revision_id, pool_scoreboard_id, participant_mod_set_id or pool_mod_set_id
 
 
 class SqlAlchemyScoringAcceptanceRepository(SqlAlchemyScoringRepository):
@@ -1023,12 +1030,24 @@ def _leaderboard_row_statement() -> Select:
 
 
 def _leaderboard_view(
-    row: object,
+    row: tuple[int, int, Decimal, int, int, bool, datetime, str, int, int | None, int],
     *,
-    rank: int,
     ruleset: Ruleset,
     hits: dict[str, int],
 ) -> LeaderboardScoreView:
+    (
+        score_id,
+        account_id,
+        metric_value,
+        _tie_break_value,
+        max_combo,
+        perfect,
+        ended_at,
+        display_name,
+        legacy_mod_bits,
+        replay_score_id,
+        rank,
+    ) = row
     if ruleset is Ruleset.OSU:
         n300, n100, n50 = hits.get("great", 0), hits.get("ok", 0), hits.get("meh", 0)
         ngeki = nkatu = 0
@@ -1045,22 +1064,22 @@ def _leaderboard_view(
         n300, n100, n50 = hits.get("great", 0), hits.get("ok", 0), hits.get("meh", 0)
         ngeki, nkatu = hits.get("perfect", 0), hits.get("good", 0)
     return LeaderboardScoreView(
-        score_id=row.score_id,  # type: ignore[attr-defined]
-        account_id=row.account_id,  # type: ignore[attr-defined]
-        display_name=row.display_name,  # type: ignore[attr-defined]
-        metric_value=row.metric_value,  # type: ignore[attr-defined]
-        max_combo=row.max_combo,  # type: ignore[attr-defined]
+        score_id=score_id,
+        account_id=account_id,
+        display_name=display_name,
+        metric_value=metric_value,
+        max_combo=max_combo,
         n50=n50,
         n100=n100,
         n300=n300,
         nmiss=hits.get("miss", 0),
         nkatu=nkatu,
         ngeki=ngeki,
-        perfect=row.perfect,  # type: ignore[attr-defined]
-        legacy_mod_bits=row.legacy_bits,  # type: ignore[attr-defined]
+        perfect=perfect,
+        legacy_mod_bits=legacy_mod_bits,
         rank=rank,
-        ended_at=row.ended_at,  # type: ignore[attr-defined]
-        has_replay=row.replay_score_id is not None,  # type: ignore[attr-defined]
+        ended_at=ended_at,
+        has_replay=replay_score_id is not None,
     )
 
 

@@ -7,6 +7,7 @@ import pytest
 
 from perfcho.api.cho.dispatcher import StableRuntimeContext, dispatch_packets
 from perfcho.infra.compose import StableServices
+from perfcho.infra.redis.realtime import RedisRealtimeRepository
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator
@@ -49,7 +50,7 @@ class FakeIds:
         return uuid.uuid7()
 
 
-class SpectatorRealtime:
+class SpectatorRealtime(RedisRealtimeRepository):
     def __init__(self) -> None:
         self.fences = {account_id: SessionFence(uuid.uuid7(), 1) for account_id in (2, 3, 9)}
         self.presences = {

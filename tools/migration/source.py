@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 from collections.abc import Iterator, Sequence
-from typing import cast
 
 import pymysql
 from pymysql.cursors import DictCursor, SSDictCursor
@@ -30,20 +29,17 @@ class BanchoSource:
         """Open a UTF-8 read-only connection."""
         if self._url.database is None:
             raise ValueError("source URL must include a database name")
-        self._connection = cast(
-            pymysql.Connection[DictCursor],
-            pymysql.connect(
-                host=self._url.host or "127.0.0.1",
-                port=self._url.port or 3306,
-                user=self._url.username or "",
-                password=self._url.password or "",
-                database=self._url.database,
-                charset="utf8mb4",
-                autocommit=False,
-                cursorclass=DictCursor,
-                read_timeout=120,
-                write_timeout=30,
-            ),
+        self._connection = pymysql.connect(
+            host=self._url.host or "127.0.0.1",
+            port=self._url.port or 3306,
+            user=self._url.username or "",
+            password=self._url.password or "",
+            database=self._url.database,
+            charset="utf8mb4",
+            autocommit=False,
+            cursorclass=DictCursor,
+            read_timeout=120,
+            write_timeout=30,
         )
         with self._connection.cursor() as cursor:
             cursor.execute("SET SESSION TRANSACTION READ ONLY")

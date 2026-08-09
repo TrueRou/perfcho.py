@@ -54,7 +54,7 @@ class FakeIds:
 
 class FakeIdentity:
     def __init__(self) -> None:
-        self.login_command = None
+        self.login_command: StableLogin | None = None
         self.session_id = uuid.uuid7()
         self.device_id = uuid.uuid7()
         self.touch_calls = 0

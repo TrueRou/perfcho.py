@@ -1,7 +1,7 @@
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import cast
+from typing import Protocol, cast
 
 import pytest
 
@@ -61,6 +61,14 @@ class FixedClock:
 class FakeIds:
     def new(self) -> uuid.UUID:
         return uuid.uuid7()
+
+
+class SettingsCommand(Protocol):
+    settings: RoomSettings
+
+
+class CompletionCommand(Protocol):
+    aborted: bool
 
 
 class FakeMultiplayer:
@@ -126,15 +134,15 @@ class FakeMultiplayer:
             round_participant_account_ids=participants,
         )
 
-    async def update_settings(self, command: object) -> MultiplayerMutationResult:
-        settings = command.settings  # type: ignore[attr-defined]
+    async def update_settings(self, command: SettingsCommand) -> MultiplayerMutationResult:
+        settings = command.settings
         self.state = replace(
             self.state,
             room=replace(self.state.room, version=self.state.room.version + 1, settings=settings),
         )
         return MultiplayerMutationResult(MultiplayerMutationKind.SETTINGS_UPDATED, self.state)
 
-    async def complete_round(self, command: object) -> MultiplayerMutationResult:
+    async def complete_round(self, command: CompletionCommand) -> MultiplayerMutationResult:
         participants = self.state.round_participant_account_ids
         self.state = replace(
             self.state,
@@ -146,11 +154,7 @@ class FakeMultiplayer:
             round_id=None,
             round_participant_account_ids=(),
         )
-        kind = (
-            MultiplayerMutationKind.ROUND_ABORTED
-            if command.aborted  # type: ignore[attr-defined]
-            else MultiplayerMutationKind.ROUND_COMPLETED
-        )
+        kind = MultiplayerMutationKind.ROUND_ABORTED if command.aborted else MultiplayerMutationKind.ROUND_COMPLETED
         return MultiplayerMutationResult(kind, self.state, round_participant_account_ids=participants)
 
     async def issue_admission_token(

@@ -101,7 +101,7 @@ async def _reconstruct_channel_mappings(runtime: MigrationRuntime) -> None:
         if not valid:
             continue
         async with runtime.session_factory() as session:
-            existing = dict(
+            existing: dict[str | None, int] = dict(
                 (
                     await session.execute(
                         select(Channel.slug, Channel.id).where(Channel.slug.in_({channel.slug for channel in valid}))
@@ -119,7 +119,7 @@ async def _migrate_channel_batch(
     runtime: MigrationRuntime,
     rows: list[SourceRow],
 ) -> None:
-    permission_ids = dict(
+    permission_ids: dict[str, int] = dict(
         (
             await session.execute(
                 select(Permission.code, Permission.id).where(
@@ -386,8 +386,8 @@ async def _migrate_mail_batch(
     states: dict[tuple[int, int], int | None] = {}
     imported = 0
     for mail in prepared:
-        channel_id = conversations.get((mail.low_account_id, mail.high_account_id))
-        if channel_id is None:
+        conversation_channel_id = conversations.get((mail.low_account_id, mail.high_account_id))
+        if conversation_channel_id is None:
             runtime.report.increment("community.mail", "skipped")
             continue
         message_id = _mail_message_id(runtime, mail.source_id)
@@ -396,7 +396,7 @@ async def _migrate_mail_batch(
             message_statement,
             {
                 "id": message_id,
-                "channel_id": channel_id,
+                "channel_id": conversation_channel_id,
                 "sender_account_id": mail.sender_id,
                 "client_message_id": client_message_id,
                 "content": mail.content,
@@ -413,7 +413,7 @@ async def _migrate_mail_batch(
                     )
                 )
             ).one_or_none()
-        if persisted is None or persisted.channel_id != channel_id:
+        if persisted is None or persisted.channel_id != conversation_channel_id:
             runtime.report.add(
                 DiagnosticSeverity.ERROR,
                 "mail_message_conflict",
@@ -423,10 +423,10 @@ async def _migrate_mail_batch(
             )
             runtime.report.increment("community.mail", "skipped")
             continue
-        _advance_state(states, channel_id, mail.sender_id, persisted.id)
-        states.setdefault((channel_id, mail.recipient_id), None)
+        _advance_state(states, conversation_channel_id, mail.sender_id, persisted.id)
+        states.setdefault((conversation_channel_id, mail.recipient_id), None)
         if mail.read:
-            _advance_state(states, channel_id, mail.recipient_id, persisted.id)
+            _advance_state(states, conversation_channel_id, mail.recipient_id, persisted.id)
         imported += 1
 
     if states:

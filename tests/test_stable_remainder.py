@@ -743,9 +743,9 @@ async def test_public_message_without_active_membership_returns_actionable_notif
         ),
     )
 
-    packet = next(PacketReader(response, packet_enum=ServerPacket))
-    assert packet.packet_type is ServerPacket.NOTIFICATION
-    assert packet.payload.read_string() == "Join the channel before sending messages."
+    notification_packet = next(PacketReader(response, packet_enum=ServerPacket))
+    assert notification_packet.packet_type is ServerPacket.NOTIFICATION
+    assert notification_packet.payload.read_string() == "Join the channel before sending messages."
 
 
 @pytest.mark.asyncio

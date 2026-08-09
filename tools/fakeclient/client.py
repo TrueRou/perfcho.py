@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
@@ -43,10 +43,10 @@ class LocalEndpointAdapter(HTTPAdapter):
         self,
         request: requests.PreparedRequest,
         stream: bool = False,
-        timeout: float | tuple[float, float] | tuple[float, None] | None = None,
+        timeout: float | tuple[float | None, float | None] | None = None,
         verify: bool | str = True,
-        cert: bytes | str | tuple[bytes | str, bytes | str] | None = None,
-        proxies: Mapping[str, str] | None = None,
+        cert: str | tuple[str, str] | None = None,
+        proxies: dict[str, str] | None = None,
     ) -> requests.Response:
         """Rewrite only the origin while preserving the Stable route and query."""
         if not isinstance(request.url, str):

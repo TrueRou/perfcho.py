@@ -36,7 +36,39 @@ from perfcho.modules.content.models import (
     RatingSummary,
     SyncedBeatmapFile,
     UpstreamBeatmapsetSnapshot,
+    UpstreamBeatmapSnapshot,
 )
+
+_RevisionRow = tuple[
+    BeatmapRevision,
+    Beatmap,
+    Beatmapset,
+    Decimal,
+    str,
+    str,
+    int,
+]
+_CurrentBeatmapMetadata = tuple[
+    Ruleset,
+    str,
+    BeatmapStatus,
+    bytes | None,
+    str | None,
+    datetime | None,
+    int | None,
+    int | None,
+    Decimal | None,
+    Decimal | None,
+    Decimal | None,
+    Decimal | None,
+    Decimal | None,
+    int | None,
+    int | None,
+    int | None,
+    int | None,
+    bool | None,
+    bool | None,
+]
 
 
 class SqlAlchemyContentRepository:
@@ -49,7 +81,7 @@ class SqlAlchemyContentRepository:
     async def lookup_md5(self, md5: bytes) -> BeatmapRevisionView | None:
         """Resolve any immutable revision by its globally unique MD5."""
         row = (await self._session.execute(_revision_statement().where(BeatmapRevision.md5 == md5))).one_or_none()
-        return _revision_view(row)
+        return _revision_view(row._tuple() if row is not None else None)
 
     async def lookup_beatmap(self, beatmap_id: int, *, external: bool) -> BeatmapRevisionView | None:
         """Resolve the current revision by canonical or public beatmap ID."""
@@ -59,7 +91,7 @@ class SqlAlchemyContentRepository:
                 _revision_statement().where(selector, BeatmapRevision.is_current.is_(True)).limit(1)
             )
         ).one_or_none()
-        return _revision_view(row)
+        return _revision_view(row._tuple() if row is not None else None)
 
     async def lookup_filename(self, file_name_key: str) -> BeatmapRevisionView | None:
         """Resolve the current revision by normalized filename."""
@@ -70,7 +102,7 @@ class SqlAlchemyContentRepository:
                 .limit(1)
             )
         ).one_or_none()
-        return _revision_view(row)
+        return _revision_view(row._tuple() if row is not None else None)
 
     async def batch_lookup(
         self,
@@ -92,7 +124,7 @@ class SqlAlchemyContentRepository:
                 .order_by(Beatmap.external_id)
             )
         ).all()
-        return tuple(_required_revision_view(row) for row in rows)
+        return tuple(_required_revision_view(row._tuple()) for row in rows)
 
     async def get_beatmapset(self, beatmapset_id: int, *, external: bool) -> BeatmapsetView | None:
         """Load a set and all current revisions in one query."""
@@ -102,7 +134,7 @@ class SqlAlchemyContentRepository:
                 _revision_statement().where(selector, BeatmapRevision.is_current.is_(True)).order_by(Beatmap.id)
             )
         ).all()
-        return _beatmapset_view(rows)
+        return _beatmapset_view(tuple(row._tuple() for row in rows))
 
     async def search(self, query: ContentSearch) -> ContentSearchPage:
         """Search current local beatmapsets and fetch their revisions in two queries."""
@@ -140,9 +172,10 @@ class SqlAlchemyContentRepository:
                 .order_by(Beatmapset.id.desc(), Beatmap.id)
             )
         ).all()
-        grouped: dict[int, list[object]] = defaultdict(list)
+        grouped: dict[int, list[_RevisionRow]] = defaultdict(list)
         for row in rows:
-            grouped[row.beatmapset_id].append(row)
+            values = row._tuple()
+            grouped[values[2].id].append(values)
         items = tuple(_required_beatmapset_view(grouped[identifier]) for identifier in selected if grouped[identifier])
         return ContentSearchPage(items, len(identifiers) > query.page_size)
 
@@ -698,29 +731,7 @@ class SqlAlchemyContentRepository:
             return False
         rows = (
             await self._session.execute(
-                select(
-                    Beatmap.external_id,
-                    Beatmap.ruleset,
-                    Beatmap.difficulty_name,
-                    Beatmap.status,
-                    Beatmap.deleted_at,
-                    BeatmapRevision.md5,
-                    BeatmapRevision.file_name,
-                    BeatmapRevision.source_updated_at,
-                    BeatmapRevision.total_length_ms,
-                    BeatmapRevision.drain_length_ms,
-                    BeatmapRevision.bpm,
-                    BeatmapRevision.circle_size,
-                    BeatmapRevision.overall_difficulty,
-                    BeatmapRevision.approach_rate,
-                    BeatmapRevision.health_drain,
-                    BeatmapRevision.circle_count,
-                    BeatmapRevision.slider_count,
-                    BeatmapRevision.spinner_count,
-                    BeatmapRevision.max_combo,
-                    BeatmapRevision.has_storyboard,
-                    BeatmapRevision.has_video,
-                )
+                select(Beatmap, BeatmapRevision)
                 .outerjoin(
                     BeatmapRevision,
                     and_(
@@ -733,11 +744,36 @@ class SqlAlchemyContentRepository:
         ).all()
         current: dict[int, tuple[object, ...] | None] = {}
         for row in rows:
-            current[row.external_id] = None if row.deleted_at is not None else _current_beatmap_metadata(row)
+            beatmap, revision_row = row._tuple()
+            revision: BeatmapRevision | None = revision_row
+            metadata: _CurrentBeatmapMetadata = (
+                beatmap.ruleset,
+                beatmap.difficulty_name,
+                beatmap.status,
+                revision.md5 if revision is not None else None,
+                revision.file_name if revision is not None else None,
+                revision.source_updated_at if revision is not None else None,
+                revision.total_length_ms if revision is not None else None,
+                revision.drain_length_ms if revision is not None else None,
+                revision.bpm if revision is not None else None,
+                revision.circle_size if revision is not None else None,
+                revision.overall_difficulty if revision is not None else None,
+                revision.approach_rate if revision is not None else None,
+                revision.health_drain if revision is not None else None,
+                revision.circle_count if revision is not None else None,
+                revision.slider_count if revision is not None else None,
+                revision.spinner_count if revision is not None else None,
+                revision.max_combo if revision is not None else None,
+                revision.has_storyboard if revision is not None else None,
+                revision.has_video if revision is not None else None,
+            )
+            current[beatmap.external_id] = (
+                None if beatmap.deleted_at is not None else _current_beatmap_metadata(metadata)
+            )
         return _snapshot_extends_current_revision_set(current, snapshot)
 
 
-def _revision_statement() -> Select:
+def _revision_statement() -> Select[*_RevisionRow]:
     no_mod_stars = (
         select(func.max(BeatmapDifficultyAttribute.star_rating))
         .join(ModSet, ModSet.id == BeatmapDifficultyAttribute.mod_set_id)
@@ -752,38 +788,13 @@ def _revision_statement() -> Select:
     )
     return (
         select(
-            Beatmap.id.label("beatmap_id"),
-            Beatmap.external_id.label("external_beatmap_id"),
-            Beatmapset.id.label("beatmapset_id"),
-            Beatmapset.external_id.label("external_beatmapset_id"),
-            BeatmapRevision.id.label("revision_id"),
-            BeatmapRevision.md5,
-            BeatmapRevision.sha256,
-            BeatmapRevision.file_name,
-            Beatmapset.artist,
-            Beatmapset.title,
-            Beatmapset.creator_name,
-            Beatmap.difficulty_name,
-            Beatmap.ruleset,
-            Beatmap.status,
-            BeatmapRevision.source_updated_at,
-            BeatmapRevision.total_length_ms,
-            BeatmapRevision.drain_length_ms,
-            BeatmapRevision.bpm,
-            BeatmapRevision.circle_size,
-            BeatmapRevision.overall_difficulty,
-            BeatmapRevision.approach_rate,
-            BeatmapRevision.health_drain,
-            BeatmapRevision.object_count,
-            BeatmapRevision.max_combo,
+            BeatmapRevision,
+            Beatmap,
+            Beatmapset,
             no_mod_stars.label("star_rating"),
-            BeatmapRevision.has_video,
-            BeatmapRevision.is_current,
             MediaAsset.storage_key.label("file_storage_key"),
             MediaAsset.media_type.label("file_media_type"),
             MediaAsset.size_bytes.label("file_size_bytes"),
-            Beatmapset.last_source_update_at,
-            Beatmapset.available,
         )
         .select_from(BeatmapRevision)
         .join(Beatmap, Beatmap.id == BeatmapRevision.beatmap_id)
@@ -857,109 +868,139 @@ def _snapshot_beatmapset_metadata(snapshot: UpstreamBeatmapsetSnapshot) -> tuple
     )
 
 
-def _current_beatmap_metadata(row: object) -> tuple[object, ...]:
+def _current_beatmap_metadata(row: _CurrentBeatmapMetadata) -> tuple[object, ...]:
+    (
+        ruleset,
+        difficulty_name,
+        status,
+        md5,
+        file_name,
+        source_updated_at,
+        total_length_ms,
+        drain_length_ms,
+        bpm,
+        circle_size,
+        overall_difficulty,
+        approach_rate,
+        health_drain,
+        circle_count,
+        slider_count,
+        spinner_count,
+        max_combo,
+        has_storyboard,
+        has_video,
+    ) = row
     return (
-        row.ruleset.value,  # type: ignore[attr-defined]
-        row.difficulty_name,  # type: ignore[attr-defined]
-        row.status.value,  # type: ignore[attr-defined]
-        row.md5,  # type: ignore[attr-defined]
-        row.file_name,  # type: ignore[attr-defined]
-        row.source_updated_at,  # type: ignore[attr-defined]
-        row.total_length_ms,  # type: ignore[attr-defined]
-        row.drain_length_ms,  # type: ignore[attr-defined]
-        row.bpm,  # type: ignore[attr-defined]
-        row.circle_size,  # type: ignore[attr-defined]
-        row.overall_difficulty,  # type: ignore[attr-defined]
-        row.approach_rate,  # type: ignore[attr-defined]
-        row.health_drain,  # type: ignore[attr-defined]
-        row.circle_count,  # type: ignore[attr-defined]
-        row.slider_count,  # type: ignore[attr-defined]
-        row.spinner_count,  # type: ignore[attr-defined]
-        row.max_combo,  # type: ignore[attr-defined]
-        row.has_storyboard,  # type: ignore[attr-defined]
-        row.has_video,  # type: ignore[attr-defined]
+        ruleset.value,
+        difficulty_name,
+        status.value,
+        md5,
+        file_name,
+        source_updated_at,
+        total_length_ms,
+        drain_length_ms,
+        bpm,
+        circle_size,
+        overall_difficulty,
+        approach_rate,
+        health_drain,
+        circle_count,
+        slider_count,
+        spinner_count,
+        max_combo,
+        has_storyboard,
+        has_video,
     )
 
 
-def _snapshot_beatmap_metadata(beatmap: object) -> tuple[object, ...]:
+def _snapshot_beatmap_metadata(beatmap: UpstreamBeatmapSnapshot) -> tuple[object, ...]:
     return (
-        beatmap.ruleset,  # type: ignore[attr-defined]
-        beatmap.difficulty_name,  # type: ignore[attr-defined]
-        beatmap.status,  # type: ignore[attr-defined]
-        beatmap.md5,  # type: ignore[attr-defined]
-        beatmap.file_name,  # type: ignore[attr-defined]
-        beatmap.source_updated_at,  # type: ignore[attr-defined]
-        beatmap.total_length_ms,  # type: ignore[attr-defined]
-        beatmap.drain_length_ms,  # type: ignore[attr-defined]
-        beatmap.bpm,  # type: ignore[attr-defined]
-        beatmap.circle_size,  # type: ignore[attr-defined]
-        beatmap.overall_difficulty,  # type: ignore[attr-defined]
-        beatmap.approach_rate,  # type: ignore[attr-defined]
-        beatmap.health_drain,  # type: ignore[attr-defined]
-        beatmap.circle_count,  # type: ignore[attr-defined]
-        beatmap.slider_count,  # type: ignore[attr-defined]
-        beatmap.spinner_count,  # type: ignore[attr-defined]
-        beatmap.max_combo,  # type: ignore[attr-defined]
-        beatmap.has_storyboard,  # type: ignore[attr-defined]
-        beatmap.has_video,  # type: ignore[attr-defined]
+        beatmap.ruleset,
+        beatmap.difficulty_name,
+        beatmap.status,
+        beatmap.md5,
+        beatmap.file_name,
+        beatmap.source_updated_at,
+        beatmap.total_length_ms,
+        beatmap.drain_length_ms,
+        beatmap.bpm,
+        beatmap.circle_size,
+        beatmap.overall_difficulty,
+        beatmap.approach_rate,
+        beatmap.health_drain,
+        beatmap.circle_count,
+        beatmap.slider_count,
+        beatmap.spinner_count,
+        beatmap.max_combo,
+        beatmap.has_storyboard,
+        beatmap.has_video,
     )
 
 
-def _revision_view(row: object | None) -> BeatmapRevisionView | None:
+def _revision_view(row: _RevisionRow | None) -> BeatmapRevisionView | None:
     return None if row is None else _required_revision_view(row)
 
 
-def _required_revision_view(row: object) -> BeatmapRevisionView:
+def _required_revision_view(row: _RevisionRow) -> BeatmapRevisionView:
+    (
+        revision,
+        beatmap,
+        beatmapset,
+        star_rating,
+        file_storage_key,
+        file_media_type,
+        file_size_bytes,
+    ) = row
     return BeatmapRevisionView(
-        beatmap_id=row.beatmap_id,  # type: ignore[attr-defined]
-        external_beatmap_id=row.external_beatmap_id,  # type: ignore[attr-defined]
-        beatmapset_id=row.beatmapset_id,  # type: ignore[attr-defined]
-        external_beatmapset_id=row.external_beatmapset_id,  # type: ignore[attr-defined]
-        revision_id=row.revision_id,  # type: ignore[attr-defined]
-        md5=row.md5,  # type: ignore[attr-defined]
-        sha256=row.sha256,  # type: ignore[attr-defined]
-        file_name=row.file_name,  # type: ignore[attr-defined]
-        artist=row.artist,  # type: ignore[attr-defined]
-        title=row.title,  # type: ignore[attr-defined]
-        creator=row.creator_name,  # type: ignore[attr-defined]
-        difficulty_name=row.difficulty_name,  # type: ignore[attr-defined]
-        ruleset=row.ruleset.value,  # type: ignore[attr-defined]
-        status=row.status.value,  # type: ignore[attr-defined]
-        source_updated_at=row.source_updated_at,  # type: ignore[attr-defined]
-        total_length_ms=row.total_length_ms,  # type: ignore[attr-defined]
-        drain_length_ms=row.drain_length_ms,  # type: ignore[attr-defined]
-        bpm=row.bpm,  # type: ignore[attr-defined]
-        circle_size=row.circle_size,  # type: ignore[attr-defined]
-        overall_difficulty=row.overall_difficulty,  # type: ignore[attr-defined]
-        approach_rate=row.approach_rate,  # type: ignore[attr-defined]
-        health_drain=row.health_drain,  # type: ignore[attr-defined]
-        object_count=row.object_count,  # type: ignore[attr-defined]
-        max_combo=row.max_combo,  # type: ignore[attr-defined]
-        star_rating=row.star_rating,  # type: ignore[attr-defined]
-        has_video=row.has_video,  # type: ignore[attr-defined]
-        is_current=row.is_current,  # type: ignore[attr-defined]
-        file_storage_key=row.file_storage_key,  # type: ignore[attr-defined]
-        file_media_type=row.file_media_type,  # type: ignore[attr-defined]
-        file_size_bytes=row.file_size_bytes,  # type: ignore[attr-defined]
+        beatmap_id=beatmap.id,
+        external_beatmap_id=beatmap.external_id,
+        beatmapset_id=beatmapset.id,
+        external_beatmapset_id=beatmapset.external_id,
+        revision_id=revision.id,
+        md5=revision.md5,
+        sha256=revision.sha256,
+        file_name=revision.file_name,
+        artist=beatmapset.artist,
+        title=beatmapset.title,
+        creator=beatmapset.creator_name,
+        difficulty_name=beatmap.difficulty_name,
+        ruleset=beatmap.ruleset.value,
+        status=beatmap.status.value,
+        source_updated_at=revision.source_updated_at,
+        total_length_ms=revision.total_length_ms,
+        drain_length_ms=revision.drain_length_ms,
+        bpm=revision.bpm,
+        circle_size=revision.circle_size,
+        overall_difficulty=revision.overall_difficulty,
+        approach_rate=revision.approach_rate,
+        health_drain=revision.health_drain,
+        object_count=revision.object_count,
+        max_combo=revision.max_combo,
+        star_rating=star_rating,
+        has_video=revision.has_video,
+        is_current=revision.is_current,
+        file_storage_key=file_storage_key,
+        file_media_type=file_media_type,
+        file_size_bytes=file_size_bytes,
     )
 
 
-def _beatmapset_view(rows: Sequence[object]) -> BeatmapsetView | None:
+def _beatmapset_view(rows: Sequence[_RevisionRow]) -> BeatmapsetView | None:
     return None if not rows else _required_beatmapset_view(rows)
 
 
-def _required_beatmapset_view(rows: Sequence[object]) -> BeatmapsetView:
-    first = rows[0]
+def _required_beatmapset_view(rows: Sequence[_RevisionRow]) -> BeatmapsetView:
+    _, _, beatmapset, _, _, _, _ = rows[0]
     beatmaps = tuple(_required_revision_view(row) for row in rows)
     return BeatmapsetView(
-        beatmapset_id=first.beatmapset_id,  # type: ignore[attr-defined]
-        external_beatmapset_id=first.external_beatmapset_id,  # type: ignore[attr-defined]
-        artist=first.artist,  # type: ignore[attr-defined]
-        title=first.title,  # type: ignore[attr-defined]
-        creator=first.creator_name,  # type: ignore[attr-defined]
-        status=first.status.value,  # type: ignore[attr-defined]
-        last_updated_at=first.last_source_update_at,  # type: ignore[attr-defined]
-        available=first.available,  # type: ignore[attr-defined]
+        beatmapset_id=beatmapset.id,
+        external_beatmapset_id=beatmapset.external_id,
+        artist=beatmapset.artist,
+        title=beatmapset.title,
+        creator=beatmapset.creator_name,
+        status=beatmapset.status.value,
+        last_updated_at=beatmapset.last_source_update_at,
+        available=beatmapset.available,
         has_video=any(item.has_video for item in beatmaps),
         beatmaps=beatmaps,
     )

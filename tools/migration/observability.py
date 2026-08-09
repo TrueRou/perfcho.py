@@ -18,6 +18,16 @@ class MigrationEventFields(TypedDict):
     migration_id: str
 
 
+class BatchEventFields(MigrationEventFields):
+    """Describe one allow-listed batch progress event."""
+
+    phase: str
+    batch_rows: int
+    batches_committed: int
+    rows_committed: int
+    duration_ms: float
+
+
 def event_fields(report: MigrationReport) -> MigrationEventFields:
     """Return identifiers approved for every migration event."""
     return {
@@ -91,7 +101,7 @@ class PhaseObserver:
         """Emit every commit at DEBUG and bounded aggregate progress at INFO."""
         self._batches_committed += 1
         self._rows_committed += row_count
-        fields = {
+        fields: BatchEventFields = {
             "phase": self._phase,
             "batch_rows": row_count,
             "batches_committed": self._batches_committed,

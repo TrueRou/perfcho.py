@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+from perfcho.infra.cache.null import NullCache
 from perfcho.infra.compose import _SystemClock as SystemClock
 from perfcho.infra.compose import _Uuid7Generator as Uuid7Generator
 from perfcho.infra.db.engine import create_engine, create_session_factory
@@ -110,6 +111,7 @@ async def seed() -> None:
             S3ObjectStorage.from_settings(settings),
             SystemClock(),
             Uuid7Generator(),
+            NullCache(),
         )
         result = await service.synchronize(BEATMAPSET_ID)
         if result.external_beatmapset_id != BEATMAPSET_ID:

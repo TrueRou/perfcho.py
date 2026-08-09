@@ -10,6 +10,7 @@ from typing import cast
 import bcrypt
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.enums import BeatmapStatus, Ruleset, ScoreboardVariant
 from perfcho.infra.db.models.scoring import CalculationFormula, CalculationRelease
@@ -26,7 +27,7 @@ from tools.migration.domains.identity import migrate_identity
 from tools.migration.domains.multiplayer import migrate_multiplayer
 from tools.migration.domains.scoring import migrate_scoring
 from tools.migration.domains.social import migrate_social
-from tools.migration.models import DiagnosticSeverity, MigrationRuntime, MigrationStatus, SourceSchema
+from tools.migration.models import DiagnosticSeverity, MigrationRuntime, MigrationStatus, SourceRow, SourceSchema
 from tools.migration.observability import PhaseObserver
 from tools.migration.report import MigrationReport
 from tools.migration.schema import EXCLUDED_TABLES, REQUIRED_COLUMNS, validate_source_schema
@@ -410,7 +411,7 @@ async def test_rolled_back_batch_restores_report_accounting(
         ),
     )
 
-    async def handler(session: object, rows: list[dict[str, object]]) -> None:
+    async def handler(session: AsyncSession, rows: list[SourceRow]) -> None:
         del session, rows
         report.increment("identity.users", "inserted")
         report.add(DiagnosticSeverity.WARNING, "rolled_back", "must not survive rollback")
@@ -421,7 +422,7 @@ async def test_rolled_back_batch_restores_report_accounting(
             phase="identity.users",
             table="users",
             key="id",
-            handler=handler,  # type: ignore[arg-type]
+            handler=lambda session, rows: handler(session, rows),
         )
 
     assert report.counters == {}
@@ -620,7 +621,7 @@ async def test_runner_fatal_exception_writes_failed_report_and_safe_lifecycle(
     with pytest.raises(ValueError, match="confirm-offline") as raised:
         await migration_runner.run_migration(config, invocation_id="invocation-runner")
 
-    report = raised.value.migration_report
+    report = getattr(raised.value, "migration_report", None)
     assert isinstance(report, MigrationReport)
     assert report.status is MigrationStatus.FAILED
     assert report.has_errors
@@ -756,8 +757,8 @@ async def test_empty_scoring_migration_installs_current_calculation_provenance(
         await migrate_scoring(runtime)
 
         async with session_factory() as session:
-            formulas = list(await session.scalars(select(CalculationFormula)))
-            releases = list(await session.scalars(select(CalculationRelease)))
+            formulas: list[CalculationFormula] = list(await session.scalars(select(CalculationFormula)))
+            releases: list[CalculationRelease] = list(await session.scalars(select(CalculationRelease)))
         assert {formula.code for formula in formulas} == {
             "legacy-bancho-difficulty",
             "legacy-bancho-performance",

@@ -231,7 +231,7 @@ class ScoringService:
                 )
 
             outbox_writer = self._outbox_writer_factory(uow.session)
-            consumers = (_RANKING_CONSUMER, _STATS_CONSUMER, _PERFORMANCE_CONSUMER)
+            consumers: tuple[str, ...] = (_RANKING_CONSUMER, _STATS_CONSUMER, _PERFORMANCE_CONSUMER)
             if command.multiplayer is not None:
                 consumers += (_MULTIPLAYER_RESULTS_CONSUMER,)
             await outbox_writer.append(
@@ -369,8 +369,9 @@ class RankingQueryService:
         encode=encode_json,
         decode=lambda raw: _leaderboard_scores_from_cache(raw),
         ttl_seconds=120,
-        enabled=lambda _self, **kwargs: kwargs["scope"].kind
-        in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS},
+        enabled=lambda _self, **kwargs: (
+            kwargs["scope"].kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}
+        ),
     )
     async def get_public_leaderboard(
         self,
@@ -400,8 +401,9 @@ class RankingQueryService:
         encode=encode_json,
         decode=lambda raw: _personal_score_from_cache(raw),
         ttl_seconds=120,
-        enabled=lambda _self, **kwargs: kwargs["scope"].kind
-        in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS},
+        enabled=lambda _self, **kwargs: (
+            kwargs["scope"].kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}
+        ),
         cache_none=True,
     )
     async def get_personal_leaderboard(

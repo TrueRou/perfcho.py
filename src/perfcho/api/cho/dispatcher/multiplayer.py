@@ -198,10 +198,10 @@ async def dispatch_multiplayer_mutation(
         )
         return wire + state_wire + _delivery_warning(failed)
     if kind is MultiplayerMutationKind.HOST_CHANGED:
-        target = mutation.target_account_id or state.room.host_account_id
-        delivered = await _enqueue(target, match_transfer_host(), state, services)
+        host_target = mutation.target_account_id or state.room.host_account_id
+        delivered = await _enqueue(host_target, match_transfer_host(), state, services)
         response = await _state_response(state, caller_account_id, services)
-        return response + _delivery_warning(() if delivered else (target,))
+        return response + _delivery_warning(() if delivered else (host_target,))
     if kind is MultiplayerMutationKind.PARTICIPANT_KICKED:
         target = mutation.target_account_id
         if target is None:
@@ -401,6 +401,7 @@ async def _part_match(dispatch: _MultiplayerPacketContext, current: RoomState) -
     dispatch.packet.payload.require_exhausted()
     account_id = dispatch.context.identity.account_id
     public_id = current.room.public_id
+    failed: set[int]
     state = await dispatch.multiplayer.leave_room(
         LeaveRoom(
             _meta(
@@ -415,7 +416,7 @@ async def _part_match(dispatch: _MultiplayerPacketContext, current: RoomState) -
         )
     )
     if state is None:
-        failed = await _broadcast_lobby(dispose_match(public_id), account_id, dispatch.services)
+        failed = set(await _broadcast_lobby(dispose_match(public_id), account_id, dispatch.services))
         action = "closed"
         participant_count = 0
     else:

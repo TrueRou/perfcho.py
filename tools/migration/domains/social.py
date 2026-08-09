@@ -185,9 +185,13 @@ async def _resolve_teams(
     source_ids = {team.source_id for team in teams}
     name_keys = {team.name_key for team in teams}
     tag_keys = {team.tag_key for team in teams}
-    existing_ids = set((await session.scalars(select(Team.id).where(Team.id.in_(source_ids)))).all())
-    by_name = dict((await session.execute(select(Team.name_key, Team.id).where(Team.name_key.in_(name_keys)))).all())
-    by_tag = dict((await session.execute(select(Team.tag_key, Team.id).where(Team.tag_key.in_(tag_keys)))).all())
+    existing_ids: set[int] = set((await session.scalars(select(Team.id).where(Team.id.in_(source_ids)))).all())
+    by_name: dict[str, int] = dict(
+        (await session.execute(select(Team.name_key, Team.id).where(Team.name_key.in_(name_keys)))).all()
+    )
+    by_tag: dict[str, int] = dict(
+        (await session.execute(select(Team.tag_key, Team.id).where(Team.tag_key.in_(tag_keys)))).all()
+    )
     reverse = {target_id: source_id for source_id, target_id in runtime.mappings.teams.items()}
     pending: list[_PreparedTeam] = []
     for team in teams:
@@ -250,7 +254,7 @@ async def _resolve_teams(
             )
             .on_conflict_do_nothing()
         )
-        persisted_ids = set(
+        persisted_ids: set[int] = set(
             (await session.scalars(select(Team.id).where(Team.id.in_({team.source_id for team in pending})))).all()
         )
         for team in pending:

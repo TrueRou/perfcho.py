@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import unicodedata
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -376,7 +377,7 @@ async def _resolve_accounts(
             )
         ).all()
     }
-    existing_ids = set((await session.scalars(select(Account.id).where(Account.id.in_(candidate_ids)))).all())
+    existing_ids: set[int] = set((await session.scalars(select(Account.id).where(Account.id.in_(candidate_ids)))).all())
     reverse_mappings = {target_id: source_id for source_id, target_id in runtime.mappings.accounts.items()}
     resolved: dict[int, int] = {}
     imported: set[int] = set()
@@ -633,14 +634,14 @@ async def _insert_access_facts(
     resolved: dict[int, int],
     users: dict[int, _PreparedUser],
 ) -> None:
-    roles = dict(
+    roles: dict[str, int] = dict(
         (
             await session.execute(
                 select(Role.code, Role.id).where(Role.code.in_(("user", "moderator", "administrator")))
             )
         ).all()
     )
-    permissions = dict(
+    permissions: dict[str, int] = dict(
         (
             await session.execute(
                 select(Permission.code, Permission.id).where(
@@ -663,7 +664,7 @@ async def _insert_access_facts(
         raise RuntimeError("bootstrap authorization catalog is incomplete")
 
     account_ids = set(resolved.values())
-    account_types = dict(
+    account_types: dict[int, AccountType] = dict(
         (await session.execute(select(Account.id, Account.type).where(Account.id.in_(account_ids)))).all()
     )
     active_roles: set[tuple[int, int]] = {
@@ -949,7 +950,7 @@ async def _migrate_client_hashes(
         )
         .on_conflict_do_nothing()
     )
-    device_ids = dict(
+    device_ids: dict[bytes, uuid.UUID] = dict(
         (
             await session.execute(
                 select(Device.fingerprint_hmac, Device.id).where(

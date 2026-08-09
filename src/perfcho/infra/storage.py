@@ -7,7 +7,7 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from time import monotonic_ns
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast, runtime_checkable
 
 import aioboto3
 from botocore.config import Config
@@ -18,6 +18,7 @@ from perfcho.infra.settings import Settings
 from perfcho.modules.common import ObjectStream, ObjectUnavailable, StoredObject
 
 
+@runtime_checkable
 class _StreamingBody(Protocol):
     async def read(self, amount: int) -> bytes: ...
 
@@ -64,7 +65,7 @@ class S3ObjectStorage:
         endpoint_url: str,
         access_key: str,
         secret_key: str,
-        addressing_style: str,
+        addressing_style: Literal["path", "virtual"],
         chunk_size: int,
         presign_endpoint_url: str | None = None,
         session: _S3Session | None = None,
@@ -152,7 +153,9 @@ class S3ObjectStorage:
         try:
             async with self._client() as client:
                 response = await client.get_object(Bucket=self._bucket, Key=key)
-                body = cast(_StreamingBody, response["Body"])
+                body = response["Body"]
+                if not isinstance(body, _StreamingBody):
+                    raise TypeError("object storage returned an invalid response body")
                 size_value = response.get("ContentLength", 0)
                 if isinstance(size_value, bool) or not isinstance(size_value, int | str):
                     raise ValueError("object storage returned an invalid content length")

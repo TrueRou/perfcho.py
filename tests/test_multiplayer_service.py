@@ -331,7 +331,7 @@ async def test_committed_create_returns_durable_snapshot_when_redis_is_down(
         del value
         raise ConnectionError("redis unavailable")
 
-    state.create = unavailable  # type: ignore[method-assign]
+    monkeypatch.setattr(state, "create", unavailable)
     logged: list[tuple[str, str, dict[str, object]]] = []
     monkeypatch.setattr("perfcho.modules.multiplayer.services.rate_limit", lambda key: True)
     monkeypatch.setattr(

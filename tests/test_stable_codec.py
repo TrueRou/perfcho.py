@@ -1,5 +1,6 @@
 import math
 import struct
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
@@ -45,6 +46,12 @@ from perfcho.modules.realtime.stable import (
     user_presence,
     user_stats,
 )
+
+
+def call_runtime(method: Callable[..., object], *arguments: object) -> object:
+    """Call a codec boundary with deliberately invalid wire-level values."""
+    return method(*arguments)
+
 
 CLIENT_PACKET_INVENTORY = {
     "CHANGE_ACTION": 0,
@@ -286,7 +293,7 @@ def test_invalid_primitive_values_are_controlled_protocol_errors() -> None:
     assert writer.to_bytes() == b""
 
     with pytest.raises(InvalidStructureError, match="must be bool"):
-        writer.write_bool(1)  # type: ignore[arg-type]
+        call_runtime(writer.write_bool, 1)
 
 
 @pytest.mark.parametrize(
@@ -555,7 +562,7 @@ def test_replay_bundle_accepts_legacy_payload_without_sequence() -> None:
 def test_replay_bundle_rejects_actions_outside_stable_inventory() -> None:
     score = ScoreFrame(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, False, 0, 0, False)
     with pytest.raises(ValueError, match="between 0 and 8"):
-        ReplayFrameBundle((), score, 9, 0, 0, memoryview(b""))  # type: ignore[arg-type]
+        call_runtime(ReplayFrameBundle, (), score, 9, 0, 0, memoryview(b""))
 
     valid = ReplayFrameBundle((), score, ReplayAction.STANDARD, 0, 0, memoryview(b""))
     writer = payload_writer()

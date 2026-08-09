@@ -251,6 +251,7 @@ class InterceptHandler(logging.Handler):
             and message.startswith("Received message: ")
         ):
             return
+        level: str | int
         try:
             level = logger.level(record.levelname).name
         except ValueError:
@@ -270,7 +271,7 @@ class InterceptHandler(logging.Handler):
 
 def init_logger(process_role: ProcessRole, *, stream: TextIO | None = None) -> None:
     """Configure one process-wide sink and standard-library interception."""
-    _ = logger.remove()
+    logger.remove()
     _ = logger.configure(
         extra={
             "event_schema": 1,

@@ -59,7 +59,7 @@ def submit_score(
     )
     encrypted_score = b64encode(cipher.encrypt(":".join(fields).encode())).decode()
     encrypted_client_hash = b64encode(cipher.encrypt(client_hash.encode())).decode()
-    files = [
+    files: list[tuple[str, tuple[str | None, str | bytes] | tuple[str | None, str | bytes, str]]] = [
         ("score", (None, encrypted_score)),
         ("score", ("fakeclient.osr", replay, "application/octet-stream")),
         ("x", (None, "0")),

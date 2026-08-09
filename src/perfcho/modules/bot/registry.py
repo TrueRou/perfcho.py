@@ -5,12 +5,14 @@ import shlex
 import time
 
 from perfcho.modules.bot.models import (
+    BotDirective,
     BotInvocation,
     BotReply,
     CommandContext,
     CommandDefinition,
     CommandGroup,
     CommandResult,
+    GuardFunction,
 )
 
 
@@ -142,8 +144,8 @@ class CommandRegistry:
         return "\n".join(lines)
 
 
-async def _allowed(guard: object, context: CommandContext) -> bool:
-    result = guard(context)  # type: ignore[operator]
+async def _allowed(guard: GuardFunction, context: CommandContext) -> bool:
+    result = guard(context)
     return bool(await result) if inspect.isawaitable(result) else bool(result)
 
 
@@ -152,8 +154,8 @@ def _result(
     *,
     response: str | None = None,
     hidden: bool = False,
-    directive: object = None,
-    effect: object = None,
+    directive: BotDirective | None = None,
+    effect: object | None = None,
 ) -> CommandResult:
     elapsed = (time.perf_counter_ns() - started) / 1_000_000
-    return CommandResult(response, hidden, elapsed, directive, effect)  # type: ignore[arg-type]
+    return CommandResult(response, hidden, elapsed, directive, effect)

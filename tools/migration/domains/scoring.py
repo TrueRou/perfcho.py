@@ -142,7 +142,7 @@ async def _migrate_releases(runtime: MigrationRuntime) -> None:
                 )
             )
         ).all()
-        formulas = dict(formula_rows)
+        formulas: dict[CalculationKind, uuid.UUID] = dict(formula_rows)
         if set(formulas) != {CalculationKind.DIFFICULTY, CalculationKind.PERFORMANCE}:
             raise RuntimeError("legacy calculation formula merge is incomplete")
         await session.execute(
@@ -594,7 +594,7 @@ async def _rebuild_rankings(runtime: MigrationRuntime) -> None:
 
 async def _migrate_stats(runtime: MigrationRuntime) -> None:
     async def handler(session: AsyncSession, rows: list[SourceRow]) -> None:
-        policies = dict(
+        policies: dict[int, uuid.UUID] = dict(
             (
                 await session.execute(
                     select(RankingPolicy.scoreboard_id, RankingPolicy.id).where(
@@ -933,6 +933,7 @@ def _hit_statistics(row: SourceRow, ruleset: Ruleset) -> tuple[tuple[str, int], 
         "ngeki": _nonnegative(row.get("ngeki"), "ngeki"),
         "nkatu": _nonnegative(row.get("nkatu"), "nkatu"),
     }
+    names: tuple[tuple[str, str], ...]
     if ruleset is Ruleset.OSU:
         names = (("great", "n300"), ("ok", "n100"), ("meh", "n50"), ("miss", "nmiss"))
     elif ruleset is Ruleset.TAIKO:

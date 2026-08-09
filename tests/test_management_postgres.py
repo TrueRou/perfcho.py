@@ -31,6 +31,7 @@ from perfcho.modules.common import Actor, ClientContext, CommandMeta
 from perfcho.modules.common.errors import ResourceConflict
 from perfcho.modules.moderation import AddCaseEntry, ImposeSanction, ModerationService, OpenCase, RevokeSanction
 from perfcho.modules.moderation.ports import ModerationRepository
+from tests.cache_support import RedisCacheFake
 
 NOW = datetime(2026, 8, 3, 12, tzinfo=UTC)
 
@@ -88,7 +89,7 @@ async def test_management_writes_are_atomic_audited_and_revoke_once(postgres_dat
                 )
             )
 
-        services = compose_management_services(session_factory, clock=FixedClock())
+        services = compose_management_services(session_factory, RedisCacheFake(), clock=FixedClock())
         grant_command = GrantRole(meta("grant"), 2, "moderator", NOW, NOW + timedelta(days=30), "staff assignment")
         grant = await services.authorization.grant_role(grant_command)
         assert await services.authorization.grant_role(grant_command) == grant

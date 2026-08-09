@@ -57,6 +57,7 @@ from perfcho.modules.scoring import (
     CanonicalMod,
     ClientFamily,
     HitStatistic,
+    LeaderboardScope,
     MultiplayerSubmissionContext,
     PlayAttemptSubmission,
     ReplayNotFound,
@@ -623,8 +624,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 beatmap_id=first.beatmap_id,
                 ruleset=Ruleset.OSU,
                 variant=ScoreboardVariant.VANILLA,
-                leaderboard_type=2,
-                legacy_mod_bits=1 << 3,
+                scope=LeaderboardScope.exact_mods(1 << 3),
                 requester_account_id=1,
                 limit=50,
             )
@@ -636,8 +636,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 beatmap_id=first.beatmap_id,
                 ruleset=Ruleset.OSU,
                 variant=ScoreboardVariant.VANILLA,
-                leaderboard_type=3,
-                legacy_mod_bits=0,
+                scope=LeaderboardScope.friends(frozenset()),
                 requester_account_id=1,
                 limit=50,
             )
