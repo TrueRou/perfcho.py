@@ -33,6 +33,63 @@ class ScoreboardVariant(StrEnum):
     AUTOPILOT = "autopilot"
 
 
+class LeaderboardScopeKind(StrEnum):
+    """Identify a protocol-neutral leaderboard population."""
+
+    OVERALL = "overall"
+    EXACT_MODS = "exact_mods"
+    FRIENDS = "friends"
+    COUNTRY = "country"
+
+
+@dataclass(frozen=True, slots=True)
+class LeaderboardScope:
+    """Describe the population and optional dimension used by a leaderboard."""
+
+    kind: LeaderboardScopeKind
+    legacy_mod_bits: int | None = None
+    account_ids: frozenset[int] | None = None
+    country_code: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject dimensions that do not belong to the selected scope."""
+        if self.kind is LeaderboardScopeKind.EXACT_MODS:
+            if self.legacy_mod_bits is None or self.legacy_mod_bits < 0:
+                raise ValueError("exact-mods scope requires nonnegative legacy_mod_bits")
+        elif self.legacy_mod_bits is not None:
+            raise ValueError("legacy_mod_bits is only valid for exact-mods scope")
+        if self.kind is LeaderboardScopeKind.FRIENDS:
+            if self.account_ids is None or any(account_id < 1 for account_id in self.account_ids):
+                raise ValueError("friends scope requires positive account IDs")
+        elif self.account_ids is not None:
+            raise ValueError("account_ids is only valid for friends scope")
+        if self.kind is LeaderboardScopeKind.COUNTRY:
+            if not self.country_code or self.country_code != self.country_code.strip().upper():
+                raise ValueError("country scope requires an uppercase country code")
+        elif self.country_code is not None:
+            raise ValueError("country_code is only valid for country scope")
+
+    @classmethod
+    def overall(cls) -> LeaderboardScope:
+        """Build an unrestricted overall leaderboard scope."""
+        return cls(LeaderboardScopeKind.OVERALL)
+
+    @classmethod
+    def exact_mods(cls, legacy_mod_bits: int) -> LeaderboardScope:
+        """Build an exact legacy-mods leaderboard scope."""
+        return cls(LeaderboardScopeKind.EXACT_MODS, legacy_mod_bits=legacy_mod_bits)
+
+    @classmethod
+    def friends(cls, account_ids: frozenset[int]) -> LeaderboardScope:
+        """Build a friends leaderboard scope from canonical account IDs."""
+        return cls(LeaderboardScopeKind.FRIENDS, account_ids=account_ids)
+
+    @classmethod
+    def country(cls, country_code: str) -> LeaderboardScope:
+        """Build a country leaderboard scope from a canonical country code."""
+        return cls(LeaderboardScopeKind.COUNTRY, country_code=country_code.strip().upper())
+
+
 class ClientFamily(StrEnum):
     """Identify the protocol family which supplied score evidence."""
 

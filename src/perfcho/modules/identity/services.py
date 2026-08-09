@@ -383,6 +383,7 @@ class IdentityService:
                         snapshot.current_name,
                         observed_session.session_id,
                         observed_session.expires_at,
+                        snapshot.country_code,
                     )
             except Exception as error:
                 log_event(
@@ -438,7 +439,9 @@ class IdentityService:
                     account_id=snapshot.account_id,
                     error_type=type(error).__name__,
                 )
-        return StableWebPrincipal(snapshot.account_id, current.current_name, session.session_id, session.expires_at)
+        return StableWebPrincipal(
+            snapshot.account_id, current.current_name, session.session_id, session.expires_at, current.country_code
+        )
 
     async def close_stable_session(self, raw_token: str, *, reason: str = "client_closed") -> None:
         """Close the active session represented by a bearer token."""

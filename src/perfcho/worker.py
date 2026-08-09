@@ -10,12 +10,15 @@ from time import monotonic_ns
 from typing import Any, NotRequired, Protocol, TypedDict, cast
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from taskiq import TaskiqEvents, TaskiqState
 
 from perfcho.infra import logging
+from perfcho.infra.cache import RedisCache
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.maintenance import RankSnapshotMaintenance
+from perfcho.infra.db.models.events import OutboxEvent
+from perfcho.infra.db.projectors import ranking
 from perfcho.infra.db.projectors.catalog import build_consumer_catalog
 from perfcho.infra.db.projectors.performance import PerformanceProjector
 from perfcho.infra.db.relays.outbox_delivery import (
@@ -23,6 +26,7 @@ from perfcho.infra.db.relays.outbox_delivery import (
     OutboxDeliveryReference,
     SqlAlchemyOutboxDeliveryRelayStore,
 )
+from perfcho.infra.redis import engine as infra_redis
 from perfcho.infra.settings import settings
 from perfcho.infra.storage import S3ObjectStorage
 from perfcho.infra.upstream.calculator import HttpPerformanceCalculator
@@ -56,6 +60,7 @@ class _WorkerResources:
 
     db_engine: AsyncEngine
     http_client: httpx.AsyncClient
+    cache: RedisCache
     relay_tasks: tuple[asyncio.Task[None], ...]
     started_ns: int
 
@@ -85,11 +90,14 @@ async def worker_startup(state: TaskiqState) -> None:
     logging.log_event("INFO", "runtime.worker.starting")
     db_engine: AsyncEngine | None = None
     http_client: httpx.AsyncClient | None = None
+    cache: RedisCache | None = None
     relay_tasks: tuple[asyncio.Task[None], ...] = ()
     try:
         db_engine = await infra_db.create_engine()
         session_factory = infra_db.create_session_factory(db_engine)
         http_client = httpx.AsyncClient(timeout=settings.performance_http_timeout_seconds)
+        cache_redis = await infra_redis.create_cache_redis()
+        cache = RedisCache(cache_redis, prefix=settings.redis_cache_prefix)
         outbox_store = SqlAlchemyOutboxDeliveryRelayStore(
             session_factory,
             batch_size=settings.outbox_delivery_batch_size,
@@ -97,12 +105,20 @@ async def worker_startup(state: TaskiqState) -> None:
             max_attempts=settings.outbox_delivery_max_attempts,
             max_retry_seconds=settings.outbox_delivery_max_retry_seconds,
         )
+
+        async def invalidate_leaderboard(beatmap_id: int) -> None:
+            await cache.increment(cache.key("scoring", "leaderboard-generation", str(beatmap_id)))
+
+        async def ranking_handler(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+            await ranking.project_accepted_score(session, event, partition_key, invalidate_leaderboard)
+
         consumer_catalog = build_consumer_catalog(
             PerformanceProjector(
                 HttpPerformanceCalculator(http_client, settings.performance_calculator_urls),
                 S3ObjectStorage.from_settings(settings),
                 beatmap_url_expiry_seconds=settings.performance_beatmap_url_expiry_seconds,
-            )
+            ),
+            ranking_handler=ranking_handler,
         )
         unknown_consumers = await outbox_store.unknown_consumers(consumer_catalog)
         if unknown_consumers:
@@ -139,6 +155,7 @@ async def worker_startup(state: TaskiqState) -> None:
         state.worker_resources = _WorkerResources(
             db_engine=db_engine,
             http_client=http_client,
+            cache=cache,
             relay_tasks=relay_tasks,
             started_ns=started_ns,
         )
@@ -152,7 +169,7 @@ async def worker_startup(state: TaskiqState) -> None:
             duration_ms=logging.duration_ms(started_ns),
         )
         logging.log_event("INFO", "runtime.worker.stopping")
-        await _cleanup_worker_resources(relay_tasks, http_client, db_engine)
+        await _cleanup_worker_resources(relay_tasks, http_client, db_engine, cache)
         state.worker_lifecycle_stopped = True
         logging.log_event("INFO", "runtime.worker.stopped", duration_ms=logging.duration_ms(started_ns))
         raise
@@ -171,6 +188,7 @@ async def worker_shutdown(state: TaskiqState) -> None:
             resources.relay_tasks,
             resources.http_client,
             resources.db_engine,
+            resources.cache,
         )
     state.worker_lifecycle_stopped = True
     logging.log_event("INFO", "runtime.worker.stopped", duration_ms=logging.duration_ms(started_ns))
@@ -180,6 +198,7 @@ async def _cleanup_worker_resources(
     relay_tasks: tuple[asyncio.Task[None], ...],
     http_client: httpx.AsyncClient | None,
     db_engine: AsyncEngine | None,
+    cache: RedisCache | None = None,
 ) -> None:
     """Close every initialized worker resource even when an earlier close fails."""
     for task in relay_tasks:
@@ -226,6 +245,17 @@ async def _cleanup_worker_resources(
                 "runtime.worker.resource_close_failed",
                 exception=error,
                 resource="postgres",
+                error_type=type(error).__name__,
+            )
+    if cache is not None:
+        try:
+            await cache.aclose()
+        except Exception as error:
+            logging.log_event(
+                "ERROR",
+                "runtime.worker.resource_close_failed",
+                exception=error,
+                resource="cache",
                 error_type=type(error).__name__,
             )
 

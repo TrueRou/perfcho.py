@@ -176,6 +176,7 @@ class StableWebPrincipal:
     current_name: str
     session_id: uuid.UUID
     expires_at: datetime
+    country_code: str | None = None
 
     def __post_init__(self) -> None:
         """Validate the online principal and expiry."""

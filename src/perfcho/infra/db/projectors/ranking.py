@@ -1,6 +1,7 @@
 """Project accepted score events into ranking and account statistics read models."""
 
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -33,7 +34,12 @@ CONSUMER_NAME = "ranking-projector.v1"
 EVENT_TYPES = frozenset({"score.accepted.v1", "score.performance-calculated.v1"})
 
 
-async def project_accepted_score(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def project_accepted_score(
+    session: AsyncSession,
+    event: OutboxEvent,
+    partition_key: str,
+    invalidate: Callable[[int], Awaitable[None]] | None = None,
+) -> None:
     """Project one accepted score under the active versioned ranking policy."""
     score_id = payload_integer(event.payload, "score_id")
     account_id = payload_integer(event.payload, "account_id")
@@ -94,6 +100,8 @@ async def project_accepted_score(session: AsyncSession, event: OutboxEvent, part
         if overall_changed or performance_release_id == policy.calculation_release_id:
             await _project_user_ranked_stat(session, score.account_id, policy, event.id)
     await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+    if invalidate is not None:
+        await invalidate(score.beatmap_id)
 
 
 async def _project_user_ranked_stat(

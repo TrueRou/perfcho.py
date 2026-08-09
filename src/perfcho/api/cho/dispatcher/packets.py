@@ -601,13 +601,18 @@ def replace_stats_mode(stats: UserStats, *, mode: int, mods: int) -> UserStats:
 
 async def account_stats(stats: UserStats, services: StableServices) -> UserStats:
     """Overlay canonical score totals, Performance, and rank for the current mode."""
-    if services.ranking_query is None or not 0 <= stats.mode <= 3:
+    if (services.account_statistics is None and services.ranking_query is None) or not 0 <= stats.mode <= 3:
         return stats
     try:
         _, variant = parse_legacy_mods(stats.mods)
     except ValueError:
         return stats
-    view = await services.ranking_query.get_account_stats(stats.user_id, tuple(Ruleset)[stats.mode], variant)
+    if services.account_statistics is not None:
+        view = await services.account_statistics.get_for_display(stats.user_id, tuple(Ruleset)[stats.mode], variant)
+    else:
+        ranking_query = services.ranking_query
+        assert ranking_query is not None
+        view = await ranking_query.get_account_stats(stats.user_id, tuple(Ruleset)[stats.mode], variant)
     return UserStats(
         stats.user_id,
         stats.action,

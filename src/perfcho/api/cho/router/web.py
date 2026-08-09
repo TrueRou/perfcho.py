@@ -70,6 +70,7 @@ from perfcho.modules.scoring import (
     BeatmapReference,
     BeatmapRevisionNotFound,
     LeaderboardPage,
+    LeaderboardScope,
     LeaderboardScoreView,
     RankingQueryService,
     ReplayNotFound,
@@ -177,6 +178,28 @@ def _ranking_query(services: StableServicesDependency) -> RankingQueryService:
     if services.ranking_query is None:
         raise RuntimeError("Stable ranking queries are not configured")
     return services.ranking_query
+
+
+async def _build_leaderboard_scope(
+    leaderboard_type: int,
+    legacy_mod_bits: int,
+    requester_account_id: int,
+    country_code: str | None,
+    social: SocialService,
+) -> LeaderboardScope:
+    """Translate Stable leaderboard dimensions into the canonical scope model."""
+    if leaderboard_type in {0, 1}:
+        return LeaderboardScope.overall()
+    if leaderboard_type == 2:
+        return LeaderboardScope.exact_mods(legacy_mod_bits)
+    if leaderboard_type == 3:
+        friends = await social.list_friends(requester_account_id)
+        return LeaderboardScope.friends(frozenset(friend.account_id for friend in friends))
+    if leaderboard_type == 4:
+        if not country_code:
+            raise ValueError("country leaderboard requires a country code")
+        return LeaderboardScope.country(country_code)
+    raise ValueError("leaderboard type is invalid")
 
 
 async def _authenticate(
@@ -570,14 +593,15 @@ async def get_beatmap_info(
         return Response(b"", status_code=status.HTTP_400_BAD_REQUEST)
     beatmaps = await content_query.batch_lookup(filenames, beatmap_ids)
     grades: dict[int, dict[Ruleset, ScoreGrade]] = {}
-    ranking_query: RankingQueryService | None = services.ranking_query
-    if ranking_query is not None:
-        projected_grades = await ranking_query.get_beatmap_grades(
+    beatmap_scores = services.beatmap_scores
+    projected_grades = ()
+    if beatmap_scores is not None:
+        projected_grades = await beatmap_scores.get_for_account(
             authentication.principal.account_id,
             tuple(dict.fromkeys(beatmap.beatmap_id for beatmap in beatmaps)),
         )
-        for projected in projected_grades:
-            grades.setdefault(projected.beatmap_id, {})[projected.ruleset] = projected.grade
+    for projected in projected_grades:
+        grades.setdefault(projected.beatmap_id, {})[projected.ruleset] = projected.grade
     by_filename = {beatmap.file_name.strip().casefold(): beatmap for beatmap in beatmaps}
     by_id = {beatmap.external_beatmap_id: beatmap for beatmap in beatmaps}
     lines = [
@@ -1163,15 +1187,21 @@ async def get_scores(
     except ValueError:
         return Response(b"-1|false")
     ruleset = _GRADE_RULESETS[mode]
+    scope = await _build_leaderboard_scope(
+        leaderboard_type,
+        legacy_mod_bits,
+        principal.account_id,
+        principal.country_code,
+        social,
+    )
     page = (
         LeaderboardPage((), None)
         if requesting_from_editor
-        else await ranking_query.get_stable_leaderboard(
+        else await ranking_query.get_combined_leaderboard(
             beatmap_id=beatmap.beatmap_id,
             ruleset=ruleset,
             variant=variant,
-            leaderboard_type=leaderboard_type,
-            legacy_mod_bits=legacy_mod_bits,
+            scope=scope,
             requester_account_id=principal.account_id,
         )
     )
@@ -1197,11 +1227,17 @@ async def _account_stats(
     parsed: ParsedStableScore,
 ) -> AccountStatsView | None:
     """Read Stable account totals without making score acceptance depend on them."""
-    ranking_query = services.ranking_query
-    if ranking_query is None:
+    if services.ranking_query is None and services.account_statistics is None:
         return None
     try:
-        return await ranking_query.get_account_stats(account_id, parsed.ruleset, parsed.variant)
+        if services.account_statistics is not None:
+            return await services.account_statistics.get_for_submission(account_id, parsed.ruleset, parsed.variant)
+        ranking_query = services.ranking_query
+        if ranking_query is None:
+            return None
+        legacy_stats_name = "get_account_stats"
+        legacy_stats = getattr(ranking_query, legacy_stats_name)
+        return await legacy_stats(account_id, parsed.ruleset, parsed.variant)
     except Exception as error:
         log_event(
             "WARNING",

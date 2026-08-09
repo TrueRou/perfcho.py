@@ -24,6 +24,10 @@ class CacheBackend(Protocol):
         """Delete a cache value."""
         ...
 
+    async def increment(self, key: str) -> int:
+        """Increment a small invalidation generation and return its value."""
+        ...
+
     async def load_once(self, key: str, loader: Callable[[], Awaitable[bytes]], *, ttl_seconds: int) -> bytes:
         """Load one key once per process when several requests miss together."""
         ...

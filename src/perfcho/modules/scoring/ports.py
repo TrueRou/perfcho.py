@@ -14,7 +14,8 @@ from perfcho.modules.scoring.models import (
     BeatmapGradeView,
     BeatmapReference,
     BeatmapRevisionInfo,
-    LeaderboardPage,
+    LeaderboardScope,
+    LeaderboardScoreView,
     ModSetInfo,
     MultiplayerSubmissionContext,
     NormalizedModSet,
@@ -37,7 +38,7 @@ class ScoringUnitOfWork(UnitOfWork, Protocol):
         ...
 
 
-class ScoringRepository(Protocol):
+class ScoringAcceptanceRepository(Protocol):
     """Persist score facts without returning ORM entities."""
 
     async def claim_acceptance(
@@ -75,6 +76,14 @@ class ScoringRepository(Protocol):
         """Attach the non-secret accepted result to its command receipt."""
         ...
 
+
+# Kept as a source-compatible alias for tests and non-query acceptance adapters.
+ScoringRepository = ScoringAcceptanceRepository
+
+
+class ReplayRepository(Protocol):
+    """Read replays and append replay-view facts."""
+
     async def get_replay(self, score_id: int) -> ReplayReference | None:
         """Resolve one ready replay and its score ownership."""
         ...
@@ -90,19 +99,37 @@ class ScoringRepository(Protocol):
         """Idempotently append one replay view fact and report whether it was new."""
         ...
 
-    async def get_leaderboard(
+
+class RankingRepository(Protocol):
+    """Read protocol-neutral leaderboard projections."""
+
+    async def get_public_leaderboard(
         self,
         *,
         beatmap_id: int,
         ruleset: Ruleset,
         variant: ScoreboardVariant,
-        leaderboard_type: int,
-        legacy_mod_bits: int,
-        requester_account_id: int,
+        scope: LeaderboardScope,
         limit: int,
-    ) -> LeaderboardPage:
-        """Return one bounded Stable leaderboard projection."""
+    ) -> tuple[LeaderboardScoreView, ...]:
+        """Return the public rows for one leaderboard scope."""
         ...
+
+    async def get_personal_leaderboard(
+        self,
+        *,
+        beatmap_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant,
+        scope: LeaderboardScope,
+        account_id: int,
+    ) -> LeaderboardScoreView | None:
+        """Return one account's best row for one leaderboard scope."""
+        ...
+
+
+class AccountStatisticsRepository(Protocol):
+    """Read projected account statistics."""
 
     async def get_account_stats(
         self,
@@ -112,6 +139,10 @@ class ScoringRepository(Protocol):
     ) -> AccountStatsView:
         """Aggregate Stable-facing account statistics without calculating PP."""
         ...
+
+
+class BeatmapScoresRepository(Protocol):
+    """Read projected scores for bounded beatmap batches."""
 
     async def get_beatmap_grades(
         self,
@@ -167,11 +198,43 @@ class AnticheatAnalyzer(Protocol):
         ...
 
 
-class ScoringRepositoryFactory(Protocol):
+class ScoringAcceptanceRepositoryFactory(Protocol):
     """Bind a scoring repository to one caller-owned transaction."""
 
-    def __call__(self, session: object) -> ScoringRepository:
+    def __call__(self, session: object) -> ScoringAcceptanceRepository:
         """Return a transaction-bound repository."""
+        ...
+
+
+class ReplayRepositoryFactory(Protocol):
+    """Bind replay persistence to a caller-owned transaction."""
+
+    def __call__(self, session: object) -> ReplayRepository:
+        """Return a replay repository bound to the session."""
+        ...
+
+
+class RankingRepositoryFactory(Protocol):
+    """Bind ranking queries to a caller-owned transaction."""
+
+    def __call__(self, session: object) -> RankingRepository:
+        """Return a ranking repository bound to the session."""
+        ...
+
+
+class AccountStatisticsRepositoryFactory(Protocol):
+    """Bind account statistics queries to a caller-owned transaction."""
+
+    def __call__(self, session: object) -> AccountStatisticsRepository:
+        """Return an account statistics repository bound to the session."""
+        ...
+
+
+class BeatmapScoresRepositoryFactory(Protocol):
+    """Bind beatmap score queries to a caller-owned transaction."""
+
+    def __call__(self, session: object) -> BeatmapScoresRepository:
+        """Return a beatmap scores repository bound to the session."""
         ...
 
 

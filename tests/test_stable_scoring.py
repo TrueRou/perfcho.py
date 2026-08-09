@@ -37,7 +37,9 @@ from perfcho.modules.scoring import (
     AcceptedScoreResult,
     AcceptScore,
     AccountStatsView,
+    BeatmapScoresQueryService,
     LeaderboardPage,
+    LeaderboardScope,
     LeaderboardScoreView,
     RankingQueryService,
     ReplayQueryService,
@@ -213,7 +215,7 @@ class FakeRankingQuery:
             AccountStatsView(200, Decimal("0.96"), 5, 2_000, 6, 130),
         ]
 
-    async def get_stable_leaderboard(self, **kwargs: object) -> LeaderboardPage:
+    async def get_combined_leaderboard(self, **kwargs: object) -> LeaderboardPage:
         self.calls.append(kwargs)
         score = LeaderboardScoreView(
             score_id=40,
@@ -311,9 +313,16 @@ def stable_services() -> tuple[StableServices, FakeScoring, FakeStorage, FakeRep
         replay_query=cast(ReplayQueryService, FakeReplayQuery()),
         replay=cast(ReplayService, replay),
         ranking_query=cast(RankingQueryService, ranking),
+        beatmap_scores=cast(BeatmapScoresQueryService, FakeBeatmapScores()),
         social=cast(SocialService, FakeSocial()),
     )
     return services, scoring, storage, replay, ranking
+
+
+class FakeBeatmapScores:
+    async def get_for_account(self, account_id: int, beatmap_ids: tuple[int, ...]) -> tuple[object, ...]:
+        del account_id, beatmap_ids
+        return ()
 
 
 def stable_app(services: StableServices) -> FastAPI:
@@ -674,7 +683,7 @@ async def test_stable_leaderboard_serializes_projection_and_friend_filter() -> N
     assert len(personal_fields) == len(score_fields) == 16
     assert personal_fields[:3] == ["40", "friend", "1000000"]
     assert score_fields[-3:] == ["1", str(int(NOW.timestamp())), "1"]
-    assert ranking.calls[0]["leaderboard_type"] == 3
+    assert cast(LeaderboardScope, ranking.calls[0]["scope"]).kind.value == "friends"
     assert "friend_account_ids" not in ranking.calls[0]
     assert cast(FakeContentSync, services.content_sync).refreshes == [200]
 

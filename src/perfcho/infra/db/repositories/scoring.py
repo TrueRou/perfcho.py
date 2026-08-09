@@ -59,7 +59,6 @@ from perfcho.infra.db.models.scoring import (
     UserPlayStat,
     UserRankedStat,
 )
-from perfcho.infra.db.models.social import Follow
 from perfcho.modules.common import AccountUnavailable
 from perfcho.modules.scoring.errors import AttemptIdempotencyConflict, MultiplayerContextRejected, ScoreRejected
 from perfcho.modules.scoring.models import (
@@ -72,6 +71,8 @@ from perfcho.modules.scoring.models import (
     BeatmapReference,
     BeatmapRevisionInfo,
     LeaderboardPage,
+    LeaderboardScope,
+    LeaderboardScopeKind,
     LeaderboardScoreView,
     ModSetInfo,
     MultiplayerSubmissionContext,
@@ -415,8 +416,7 @@ class SqlAlchemyScoringRepository:
         beatmap_id: int,
         ruleset: Ruleset,
         variant: ScoreboardVariant,
-        leaderboard_type: int,
-        legacy_mod_bits: int,
+        scope: LeaderboardScope,
         requester_account_id: int,
         limit: int,
     ) -> LeaderboardPage:
@@ -426,7 +426,7 @@ class SqlAlchemyScoringRepository:
             LeaderboardEntry.tie_break_value.desc(),
             LeaderboardEntry.score_id.asc(),
         )
-        scope = "exact_mods" if leaderboard_type == 2 else "overall"
+        db_scope = "exact_mods" if scope.kind is LeaderboardScopeKind.EXACT_MODS else "overall"
         candidate_statement = (
             select(
                 LeaderboardEntry.id.label("entry_id"),
@@ -444,35 +444,26 @@ class SqlAlchemyScoringRepository:
                 RankingPolicy.active.is_(True),
                 RankingPolicy.is_default.is_(True),
                 LeaderboardEntry.beatmap_id == beatmap_id,
-                LeaderboardEntry.scope == scope,
+                LeaderboardEntry.scope == db_scope,
             )
         )
-        if scope == "exact_mods":
+        if scope.kind is LeaderboardScopeKind.EXACT_MODS:
             filter_mod_set = aliased(ModSet)
             candidate_statement = candidate_statement.join(
                 filter_mod_set,
                 (filter_mod_set.id == LeaderboardEntry.filter_mod_set_id)
                 & (filter_mod_set.scoreboard_id == RankingPolicy.scoreboard_id),
-            ).where(filter_mod_set.legacy_bits == legacy_mod_bits)
+            ).where(filter_mod_set.legacy_bits == scope.legacy_mod_bits)
         else:
             candidate_statement = candidate_statement.where(LeaderboardEntry.filter_mod_set_id.is_(None))
-        if leaderboard_type == 3:
-            follows_requester = (
-                select(Follow.actor_account_id)
-                .where(
-                    Follow.actor_account_id == requester_account_id,
-                    Follow.target_account_id == LeaderboardEntry.account_id,
-                )
-                .exists()
-            )
+        if scope.kind is LeaderboardScopeKind.FRIENDS:
             candidate_statement = candidate_statement.where(
-                or_(LeaderboardEntry.account_id == requester_account_id, follows_requester)
+                LeaderboardEntry.account_id.in_(set(scope.account_ids or ()) | {requester_account_id})
             )
-        elif leaderboard_type == 4:
-            requester_country = select(Account.country_code).where(Account.id == requester_account_id).scalar_subquery()
-            candidate_statement = candidate_statement.where(LeaderboardEntry.country_code == requester_country)
+        elif scope.kind is LeaderboardScopeKind.COUNTRY:
+            candidate_statement = candidate_statement.where(LeaderboardEntry.country_code == scope.country_code)
 
-        if scope == "exact_mods":
+        if scope.kind is LeaderboardScopeKind.EXACT_MODS:
             mod_candidates = candidate_statement.add_columns(
                 func.row_number()
                 .over(
@@ -543,6 +534,100 @@ class SqlAlchemyScoringRepository:
             )
         return LeaderboardPage(scores, personal_best)
 
+    async def get_public_leaderboard(
+        self, *, beatmap_id: int, ruleset: Ruleset, variant: ScoreboardVariant, scope: LeaderboardScope, limit: int
+    ) -> tuple[LeaderboardScoreView, ...]:
+        """Return public rows using the common leaderboard query."""
+        return await self._query_leaderboard_rows(
+            beatmap_id=beatmap_id, ruleset=ruleset, variant=variant, scope=scope, limit=limit, account_id=None
+        )
+
+    async def get_personal_leaderboard(
+        self, *, beatmap_id: int, ruleset: Ruleset, variant: ScoreboardVariant, scope: LeaderboardScope, account_id: int
+    ) -> LeaderboardScoreView | None:
+        """Return the account row using the common leaderboard query."""
+        rows = await self._query_leaderboard_rows(
+            beatmap_id=beatmap_id, ruleset=ruleset, variant=variant, scope=scope, limit=1, account_id=account_id
+        )
+        return rows[0] if rows else None
+
+    async def _query_leaderboard_rows(
+        self,
+        *,
+        beatmap_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant,
+        scope: LeaderboardScope,
+        limit: int,
+        account_id: int | None,
+    ) -> tuple[LeaderboardScoreView, ...]:
+        """Run the bounded leaderboard query for public or one-account rows."""
+        order = (
+            LeaderboardEntry.metric_value.desc(),
+            LeaderboardEntry.tie_break_value.desc(),
+            LeaderboardEntry.score_id.asc(),
+        )
+        db_scope = "exact_mods" if scope.kind is LeaderboardScopeKind.EXACT_MODS else "overall"
+        statement = (
+            select(
+                LeaderboardEntry.account_id,
+                LeaderboardEntry.metric_value,
+                LeaderboardEntry.tie_break_value,
+                LeaderboardEntry.score_id,
+            )
+            .join(RankingPolicy, RankingPolicy.id == LeaderboardEntry.policy_id)
+            .join(Scoreboard, Scoreboard.id == RankingPolicy.scoreboard_id)
+            .where(
+                Scoreboard.ruleset == DbRuleset(ruleset.value),
+                Scoreboard.variant == DbScoreboardVariant(variant.value),
+                Scoreboard.active.is_(True),
+                RankingPolicy.active.is_(True),
+                RankingPolicy.is_default.is_(True),
+                LeaderboardEntry.beatmap_id == beatmap_id,
+                LeaderboardEntry.scope == db_scope,
+            )
+        )
+        if scope.kind is LeaderboardScopeKind.EXACT_MODS:
+            filter_mod_set = aliased(ModSet)
+            statement = statement.join(
+                filter_mod_set,
+                (filter_mod_set.id == LeaderboardEntry.filter_mod_set_id)
+                & (filter_mod_set.scoreboard_id == RankingPolicy.scoreboard_id),
+            ).where(filter_mod_set.legacy_bits == scope.legacy_mod_bits)
+        else:
+            statement = statement.where(LeaderboardEntry.filter_mod_set_id.is_(None))
+        if scope.kind is LeaderboardScopeKind.FRIENDS:
+            account_ids = set(scope.account_ids or ())
+            if account_id is not None:
+                account_ids.add(account_id)
+            statement = statement.where(LeaderboardEntry.account_id.in_(account_ids))
+        elif scope.kind is LeaderboardScopeKind.COUNTRY:
+            statement = statement.where(LeaderboardEntry.country_code == scope.country_code)
+        if account_id is not None:
+            statement = statement.where(LeaderboardEntry.account_id == account_id)
+        candidates = statement.cte("leaderboard_rows")
+        ranked = (
+            select(
+                candidates,
+                func.row_number().over(order_by=order).label("rank"),
+            )
+            .order_by(*order)
+            .limit(limit)
+            .subquery()
+        )
+        rows = (
+            await self._session.execute(
+                _leaderboard_row_statement()
+                .add_columns(ranked.c.rank)
+                .join(ranked, ranked.c.score_id == LeaderboardEntry.score_id)
+            )
+        ).all()
+        score_ids = {row.score_id for row in rows}
+        hits = await self._score_hits(score_ids)
+        return tuple(
+            _leaderboard_view(row, rank=row.rank, ruleset=ruleset, hits=hits.get(row.score_id, {})) for row in rows
+        )
+
     async def get_account_stats(
         self,
         account_id: int,
@@ -588,9 +673,13 @@ class SqlAlchemyScoringRepository:
         if row is None:
             return AccountStatsView(0, Decimal(0), 0, 0, 0)
         global_rank = 0
-        if row.policy_id is not None and row.performance is not None:
-            rank_column = UserRankedStat.performance
-            rank_value = row.performance
+        if row.policy_id is not None:
+            if row.metric == "pp":
+                rank_column = UserRankedStat.performance
+                rank_value = row.performance
+            else:
+                rank_column = UserRankedStat.ranked_score
+                rank_value = row.ranked_score
             if rank_value > 0:
                 higher = await self._session.scalar(
                     select(func.count())
@@ -875,6 +964,26 @@ class SqlAlchemyMultiplayerSubmissionValidator:
         if row.pool_revision_id is None or row.pool_scoreboard_id is None:
             return None
         return row.pool_revision_id, row.pool_scoreboard_id, row.participant_mod_set_id or row.pool_mod_set_id
+
+
+class SqlAlchemyScoringAcceptanceRepository(SqlAlchemyScoringRepository):
+    """Expose score acceptance persistence as a dedicated capability."""
+
+
+class SqlAlchemyReplayRepository(SqlAlchemyScoringRepository):
+    """Expose replay persistence as a dedicated capability."""
+
+
+class SqlAlchemyRankingRepository(SqlAlchemyScoringRepository):
+    """Expose ranking projections as a dedicated capability."""
+
+
+class SqlAlchemyAccountStatisticsRepository(SqlAlchemyScoringRepository):
+    """Expose account statistics projections as a dedicated capability."""
+
+
+class SqlAlchemyBeatmapScoresRepository(SqlAlchemyScoringRepository):
+    """Expose beatmap scores projections as a dedicated capability."""
 
 
 def _result_snapshot(result: AcceptedScoreResult) -> dict[str, object]:

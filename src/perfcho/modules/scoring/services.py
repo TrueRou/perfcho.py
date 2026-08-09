@@ -1,11 +1,15 @@
 """Accept canonical Stable and Lazer scores in one explicit transaction."""
 
+import hashlib
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
+from decimal import Decimal
 
+from perfcho.infra.cache.backend import CacheBackend
+from perfcho.infra.cache.values import decode_json, encode_json
 from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import Clock, IdGenerator, OutboxWriterFactory
@@ -22,6 +26,9 @@ from perfcho.modules.scoring.models import (
     BeatmapGradeView,
     ClientFamily,
     LeaderboardPage,
+    LeaderboardScope,
+    LeaderboardScopeKind,
+    LeaderboardScoreView,
     PlayAttemptRecord,
     ReplayReference,
     Ruleset,
@@ -30,9 +37,13 @@ from perfcho.modules.scoring.models import (
 )
 from perfcho.modules.scoring.mods import normalize_mods
 from perfcho.modules.scoring.ports import (
+    AccountStatisticsRepositoryFactory,
     AccountSubmissionValidatorFactory,
+    BeatmapScoresRepositoryFactory,
     MultiplayerSubmissionValidatorFactory,
-    ScoringRepositoryFactory,
+    RankingRepositoryFactory,
+    ReplayRepositoryFactory,
+    ScoringAcceptanceRepositoryFactory,
     ScoringUnitOfWork,
 )
 from perfcho.modules.scoring.validation import validate_score
@@ -52,7 +63,7 @@ class ScoringService:
     def __init__(
         self,
         uow_factory: Callable[[], ScoringUnitOfWork],
-        repository_factory: ScoringRepositoryFactory,
+        repository_factory: ScoringAcceptanceRepositoryFactory,
         outbox_writer_factory: OutboxWriterFactory,
         account_validator_factory: AccountSubmissionValidatorFactory,
         multiplayer_validator_factory: MultiplayerSubmissionValidatorFactory,
@@ -268,7 +279,7 @@ class ReplayQueryService:
     def __init__(
         self,
         uow_factory: Callable[[], ScoringUnitOfWork],
-        repository_factory: ScoringRepositoryFactory,
+        repository_factory: ReplayRepositoryFactory,
     ) -> None:
         """Bind transaction and scoring repository factories."""
         self._uow_factory = uow_factory
@@ -290,7 +301,7 @@ class ReplayService:
     def __init__(
         self,
         uow_factory: Callable[[], ScoringUnitOfWork],
-        repository_factory: ScoringRepositoryFactory,
+        repository_factory: ReplayRepositoryFactory,
         outbox_writer_factory: OutboxWriterFactory,
     ) -> None:
         """Bind transaction, scoring persistence, and durable events."""
@@ -343,65 +354,282 @@ class RankingQueryService:
     def __init__(
         self,
         uow_factory: Callable[[], ScoringUnitOfWork],
-        repository_factory: ScoringRepositoryFactory,
+        repository_factory: RankingRepositoryFactory,
+        cache: CacheBackend | None = None,
     ) -> None:
         """Bind transaction and scoring repository factories."""
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
+        self._cache = cache
 
-    async def get_stable_leaderboard(
+    async def get_public_leaderboard(
         self,
         *,
         beatmap_id: int,
         ruleset: Ruleset,
         variant: ScoreboardVariant,
-        leaderboard_type: int,
-        legacy_mod_bits: int,
-        requester_account_id: int,
+        scope: LeaderboardScope,
         limit: int = 50,
-    ) -> LeaderboardPage:
-        """Return a validated Stable local, top, mods, friends, or country page."""
+    ) -> tuple[LeaderboardScoreView, ...]:
+        """Return public leaderboard rows, caching only shared overall/mod rows."""
         _positive_identifier("beatmap_id", beatmap_id)
-        _positive_identifier("requester_account_id", requester_account_id)
-        if leaderboard_type not in range(5):
-            raise ValueError("leaderboard_type must be between zero and four")
-        if legacy_mod_bits < 0 or not 1 <= limit <= 100:
+        if not 1 <= limit <= 100:
             raise ValueError("leaderboard mods or limit is invalid")
+        generation = await self._leaderboard_generation(beatmap_id)
+        key = self._leaderboard_key("public", beatmap_id, ruleset, variant, scope, limit, generation)
+        if self._cache is not None and scope.kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}:
+            raw = await self._cache.get(key)
+            if raw is not None:
+                try:
+                    return _leaderboard_scores_from_cache(raw)
+                except TypeError, ValueError, KeyError:
+                    pass
         async with self._uow_factory() as uow:
-            return await self._repository_factory(uow.session).get_leaderboard(
+            result = await self._repository_factory(uow.session).get_public_leaderboard(
                 beatmap_id=beatmap_id,
                 ruleset=ruleset,
                 variant=variant,
-                leaderboard_type=leaderboard_type,
-                legacy_mod_bits=legacy_mod_bits,
-                requester_account_id=requester_account_id,
+                scope=scope,
                 limit=limit,
             )
+        if self._cache is not None and scope.kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}:
+            await self._cache.set(key, encode_json(result), ttl_seconds=120)
+        return result
 
-    async def get_account_stats(
+    async def get_personal_leaderboard(
+        self,
+        *,
+        beatmap_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant,
+        scope: LeaderboardScope,
+        account_id: int,
+    ) -> LeaderboardScoreView | None:
+        """Return one account's leaderboard row with a short-lived cache."""
+        _positive_identifier("beatmap_id", beatmap_id)
+        _positive_identifier("account_id", account_id)
+        generation = await self._leaderboard_generation(beatmap_id)
+        key = self._leaderboard_key("personal", beatmap_id, ruleset, variant, scope, account_id, generation)
+        if self._cache is not None and scope.kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}:
+            raw = await self._cache.get(key)
+            if raw is not None:
+                try:
+                    return _personal_score_from_cache(raw)
+                except TypeError, ValueError, KeyError:
+                    pass
+        async with self._uow_factory() as uow:
+            result = await self._repository_factory(uow.session).get_personal_leaderboard(
+                beatmap_id=beatmap_id,
+                ruleset=ruleset,
+                variant=variant,
+                scope=scope,
+                account_id=account_id,
+            )
+        if self._cache is not None and scope.kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}:
+            await self._cache.set(key, encode_json(result), ttl_seconds=120)
+        return result
+
+    async def get_combined_leaderboard(
+        self,
+        *,
+        beatmap_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant,
+        scope: LeaderboardScope,
+        requester_account_id: int,
+        limit: int = 50,
+    ) -> LeaderboardPage:
+        """Compose public rows and the requester's personal row."""
+        public = await self.get_public_leaderboard(
+            beatmap_id=beatmap_id, ruleset=ruleset, variant=variant, scope=scope, limit=limit
+        )
+        personal = await self.get_personal_leaderboard(
+            beatmap_id=beatmap_id,
+            ruleset=ruleset,
+            variant=variant,
+            scope=scope,
+            account_id=requester_account_id,
+        )
+        return LeaderboardPage(public, personal)
+
+    def _leaderboard_key(
+        self,
+        kind: str,
+        beatmap_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant,
+        scope: LeaderboardScope,
+        tail: int,
+        generation: str,
+    ) -> str:
+        dimension = scope.kind.value
+        if scope.legacy_mod_bits is not None:
+            dimension += f":{scope.legacy_mod_bits}"
+        if scope.account_ids is not None:
+            digest = hashlib.sha256(",".join(map(str, sorted(scope.account_ids))).encode()).hexdigest()[:16]
+            dimension += f":{digest}"
+        if scope.country_code is not None:
+            dimension += f":{scope.country_code}"
+        return (
+            self._cache.key(
+                "scoring",
+                f"leaderboard-{kind}",
+                f"{dimension}:{beatmap_id}:{ruleset.value}:{variant.value}:{tail}:{generation}",
+            )
+            if self._cache
+            else ""
+        )
+
+    async def _leaderboard_generation(self, beatmap_id: int) -> str:
+        if self._cache is None:
+            return "0"
+        key = self._cache.key("scoring", "leaderboard-generation", str(beatmap_id))
+        raw = await self._cache.get(key)
+        if raw is None:
+            return "0"
+        try:
+            return str(int(raw))
+        except TypeError, ValueError:
+            return "0"
+
+
+class AccountStatisticsQueryService:
+    """Read projected account statistics with explicit freshness semantics."""
+
+    def __init__(
+        self,
+        uow_factory: Callable[[], ScoringUnitOfWork],
+        repository_factory: AccountStatisticsRepositoryFactory,
+        cache: CacheBackend | None = None,
+    ) -> None:
+        """Bind statistics persistence and the optional display cache."""
+        self._uow_factory = uow_factory
+        self._repository_factory = repository_factory
+        self._cache = cache
+
+    async def get_for_submission(
         self,
         account_id: int,
         ruleset: Ruleset,
         variant: ScoreboardVariant = ScoreboardVariant.VANILLA,
     ) -> AccountStatsView:
-        """Return current projected score totals, Performance, and rank."""
+        """Read stats authoritatively for score submission before/after values."""
+        return await self._load(account_id, ruleset, variant)
+
+    async def get_for_display(
+        self,
+        account_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant = ScoreboardVariant.VANILLA,
+    ) -> AccountStatsView:
+        """Read short-lived stats suitable for online display."""
+        _positive_identifier("account_id", account_id)
+        key = (
+            self._cache.key("scoring", "account-stats", f"{account_id}:{ruleset.value}:{variant.value}")
+            if self._cache
+            else ""
+        )
+        if self._cache is not None:
+            raw = await self._cache.get(key)
+            if raw is not None:
+                return _account_stats_from_cache(raw)
+        result = await self._load(account_id, ruleset, variant)
+        if self._cache is not None:
+            await self._cache.set(key, encode_json(result), ttl_seconds=3)
+        return result
+
+    async def _load(self, account_id: int, ruleset: Ruleset, variant: ScoreboardVariant) -> AccountStatsView:
         _positive_identifier("account_id", account_id)
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).get_account_stats(account_id, ruleset, variant)
 
-    async def get_beatmap_grades(
+
+class BeatmapScoresQueryService:
+    """Read projected account scores for bounded beatmap batches."""
+
+    def __init__(
         self,
-        account_id: int,
-        beatmap_ids: tuple[int, ...],
-    ) -> tuple[BeatmapGradeView, ...]:
-        """Return real projected vanilla grades, leaving absent modes as absent."""
+        uow_factory: Callable[[], ScoringUnitOfWork],
+        repository_factory: BeatmapScoresRepositoryFactory,
+    ) -> None:
+        """Bind the scoring projection query dependencies."""
+        self._uow_factory = uow_factory
+        self._repository_factory = repository_factory
+
+    async def get_for_account(self, account_id: int, beatmap_ids: tuple[int, ...]) -> tuple[BeatmapGradeView, ...]:
+        """Return projected grades, preserving absent grades as absent."""
         _positive_identifier("account_id", account_id)
         if len(beatmap_ids) > 2048 or any(identifier < 1 for identifier in beatmap_ids):
-            raise ValueError("beatmap grade selectors are invalid")
+            raise ValueError("beatmap score selectors are invalid")
         if not beatmap_ids:
             return ()
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).get_beatmap_grades(account_id, beatmap_ids)
+
+
+def _leaderboard_scores_from_cache(raw: bytes) -> tuple[LeaderboardScoreView, ...]:
+    value = decode_json(raw)
+    if not isinstance(value, list):
+        raise ValueError("invalid cached leaderboard")
+    return tuple(_leaderboard_score_from_mapping(item) for item in value)
+
+
+def _personal_score_from_cache(raw: bytes) -> LeaderboardScoreView | None:
+    value = decode_json(raw)
+    if value is None:
+        return None
+    return _leaderboard_score_from_mapping(value)
+
+
+def _leaderboard_score_from_mapping(value: object) -> LeaderboardScoreView:
+    if not isinstance(value, dict):
+        raise ValueError("invalid cached leaderboard score")
+    return LeaderboardScoreView(
+        score_id=int(value["score_id"]),
+        account_id=int(value["account_id"]),
+        display_name=str(value["display_name"]),
+        metric_value=_decimal_cache_value(value["metric_value"]),
+        max_combo=int(value["max_combo"]),
+        n50=int(value["n50"]),
+        n100=int(value["n100"]),
+        n300=int(value["n300"]),
+        nmiss=int(value["nmiss"]),
+        nkatu=int(value["nkatu"]),
+        ngeki=int(value["ngeki"]),
+        perfect=bool(value["perfect"]),
+        legacy_mod_bits=int(value["legacy_mod_bits"]),
+        rank=int(value["rank"]),
+        ended_at=_datetime_cache_value(value["ended_at"]),
+        has_replay=bool(value["has_replay"]),
+    )
+
+
+def _account_stats_from_cache(raw: bytes) -> AccountStatsView:
+    value = decode_json(raw)
+    if not isinstance(value, dict):
+        raise ValueError("invalid cached account stats")
+    return AccountStatsView(
+        ranked_score=int(value["ranked_score"]),
+        accuracy=_decimal_cache_value(value["accuracy"]),
+        play_count=int(value["play_count"]),
+        total_score=int(value["total_score"]),
+        global_rank=int(value["global_rank"]),
+        performance=int(value["performance"]),
+    )
+
+
+def _decimal_cache_value(value: object) -> Decimal:
+    if isinstance(value, dict) and value.get("__type__") == "decimal":
+        return Decimal(str(value["value"]))
+    return Decimal(str(value))
+
+
+def _datetime_cache_value(value: object) -> datetime:
+    if isinstance(value, dict) and value.get("__type__") == "datetime":
+        return datetime.fromisoformat(str(value["value"]))
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
 
 
 def _positive_identifier(name: str, value: int) -> None:

@@ -41,6 +41,13 @@ class RedisCache:
         except Exception:
             return
 
+    async def increment(self, key: str) -> int:
+        """Increment a Redis generation without making it a business fact."""
+        try:
+            return int(await self._redis.incr(key))
+        except Exception:
+            return 0
+
     async def load_once(self, key: str, loader: Callable[[], Awaitable[bytes]], *, ttl_seconds: int) -> bytes:
         """Share one in-flight load for a key."""
         return await self._single_flight.run(key, loader)

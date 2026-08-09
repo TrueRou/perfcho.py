@@ -29,7 +29,7 @@ from perfcho.modules.content import (
 )
 from perfcho.modules.identity import IdentityService, InvalidCredentials, StableWebPrincipal
 from perfcho.modules.realtime import RealtimeRepository, RealtimeSession, RealtimeSessionNotFound
-from perfcho.modules.scoring import BeatmapGradeView, RankingQueryService, Ruleset, ScoreGrade
+from perfcho.modules.scoring import BeatmapGradeView, BeatmapScoresQueryService, Ruleset, ScoreGrade
 from perfcho.modules.social import AccountIdentityView, FollowView, SocialService
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
@@ -144,7 +144,11 @@ class FakeContent:
         return comment
 
 
-class FakeRankingQuery:
+class FakeBeatmapScores:
+    async def get_for_account(self, account_id: int, beatmap_ids: tuple[int, ...]) -> tuple[BeatmapGradeView, ...]:
+        assert account_id == 3 and beatmap_ids == (10,)
+        return (BeatmapGradeView(10, Ruleset.OSU, ScoreGrade.S),)
+
     async def get_beatmap_grades(
         self,
         account_id: int,
@@ -262,7 +266,7 @@ def stable_services() -> tuple[StableServices, FakeContentQuery, FakeContent, Fa
         social=cast(SocialService, FakeSocial()),
         community=cast(CommunityService, community),
         object_storage=cast(ObjectStorage, FakeObjectStorage()),
-        ranking_query=cast(RankingQueryService, FakeRankingQuery()),
+        beatmap_scores=cast(BeatmapScoresQueryService, FakeBeatmapScores()),
     )
     return services, content_query, content, community
 

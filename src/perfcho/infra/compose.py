@@ -32,8 +32,13 @@ from perfcho.infra.db.repositories.multiplayer import (
 from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
 from perfcho.infra.db.repositories.performance.query import SqlAlchemyPerformanceQueryRepository
 from perfcho.infra.db.repositories.scoring import (
+    SqlAlchemyAccountStatisticsRepository,
     SqlAlchemyAccountSubmissionValidator,
+    SqlAlchemyBeatmapScoresRepository,
     SqlAlchemyMultiplayerSubmissionValidator,
+    SqlAlchemyRankingRepository,
+    SqlAlchemyReplayRepository,
+    SqlAlchemyScoringAcceptanceRepository,
     SqlAlchemyScoringRepository,
 )
 from perfcho.infra.db.repositories.social import SqlAlchemySocialRepository
@@ -64,6 +69,8 @@ from perfcho.modules.multiplayer import (
 from perfcho.modules.performance.services import PerformanceQueryService
 from perfcho.modules.realtime import RealtimeRepository
 from perfcho.modules.scoring import (
+    AccountStatisticsQueryService,
+    BeatmapScoresQueryService,
     RankingQueryService,
     ReplayQueryService,
     ReplayService,
@@ -120,6 +127,26 @@ def _silence_policy(session: object) -> SqlAlchemyActiveSilencePolicy:
 
 def _scoring_repository(session: object) -> SqlAlchemyScoringRepository:
     return SqlAlchemyScoringRepository(cast(AsyncSession, session))
+
+
+def _scoring_acceptance_repository(session: object) -> SqlAlchemyScoringAcceptanceRepository:
+    return SqlAlchemyScoringAcceptanceRepository(cast(AsyncSession, session))
+
+
+def _replay_repository(session: object) -> SqlAlchemyReplayRepository:
+    return SqlAlchemyReplayRepository(cast(AsyncSession, session))
+
+
+def _ranking_repository(session: object) -> SqlAlchemyRankingRepository:
+    return SqlAlchemyRankingRepository(cast(AsyncSession, session))
+
+
+def _account_statistics_repository(session: object) -> SqlAlchemyAccountStatisticsRepository:
+    return SqlAlchemyAccountStatisticsRepository(cast(AsyncSession, session))
+
+
+def _beatmap_scores_repository(session: object) -> SqlAlchemyBeatmapScoresRepository:
+    return SqlAlchemyBeatmapScoresRepository(cast(AsyncSession, session))
 
 
 def _performance_query_repository(session: object) -> SqlAlchemyPerformanceQueryRepository:
@@ -226,6 +253,8 @@ class StableServices:
     replay_query: ReplayQueryService | None = None
     replay: ReplayService | None = None
     ranking_query: RankingQueryService | None = None
+    account_statistics: AccountStatisticsQueryService | None = None
+    beatmap_scores: BeatmapScoresQueryService | None = None
     multiplayer: MultiplayerService | None = None
     account: AccountService | None = None
     bot: BotCommandService | None = None
@@ -309,7 +338,7 @@ async def compose_stable_services(
     )
     scoring = ScoringService(
         uow_factory,
-        _scoring_repository,
+        _scoring_acceptance_repository,
         _outbox_writer,
         _account_submission_validator,
         _multiplayer_submission_validator,
@@ -388,9 +417,11 @@ async def compose_stable_services(
         object_storage=object_storage,
         scoring=scoring,
         performance_query=PerformanceQueryService(uow_factory, _performance_query_repository),
-        replay_query=ReplayQueryService(uow_factory, _scoring_repository),
-        replay=ReplayService(uow_factory, _scoring_repository, _outbox_writer),
-        ranking_query=RankingQueryService(uow_factory, _scoring_repository),
+        replay_query=ReplayQueryService(uow_factory, _replay_repository),
+        replay=ReplayService(uow_factory, _replay_repository, _outbox_writer),
+        ranking_query=RankingQueryService(uow_factory, _ranking_repository, core.cache),
+        account_statistics=AccountStatisticsQueryService(uow_factory, _account_statistics_repository, core.cache),
+        beatmap_scores=BeatmapScoresQueryService(uow_factory, _beatmap_scores_repository),
         multiplayer=multiplayer,
         account=account,
         bot=bot,

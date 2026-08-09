@@ -63,6 +63,7 @@ class ConsumerCatalog(Mapping[str, ConsumerRegistration]):
 
 def build_consumer_catalog(
     performance_handler: ConsumerHandler = performance.unconfigured_projector,
+    ranking_handler: ConsumerHandler = ranking.project_accepted_score,
 ) -> ConsumerCatalog:
     """Compose all consumers with the runtime-owned Performance handler."""
     return ConsumerCatalog(
@@ -87,7 +88,7 @@ def build_consumer_catalog(
                 community.project_community_message,
             ),
             ConsumerRegistration(performance.CONSUMER_NAME, performance.EVENT_TYPES, performance_handler),
-            ConsumerRegistration(ranking.CONSUMER_NAME, ranking.EVENT_TYPES, ranking.project_accepted_score),
+            ConsumerRegistration(ranking.CONSUMER_NAME, ranking.EVENT_TYPES, ranking_handler),
             ConsumerRegistration(
                 scoring_stats.CONSUMER_NAME,
                 scoring_stats.EVENT_TYPES,

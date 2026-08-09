@@ -31,6 +31,12 @@ class MemoryCache:
         """Delete a value from memory."""
         self._values.pop(key, None)
 
+    async def increment(self, key: str) -> int:
+        """Increment an in-memory generation value."""
+        value = int(self._values.get(key, b"0")) + 1
+        self._values[key] = str(value).encode()
+        return value
+
     async def load_once(self, key: str, loader: Callable[[], Awaitable[bytes]], *, ttl_seconds: int) -> bytes:
         """Share one in-flight load for a key."""
         del ttl_seconds
