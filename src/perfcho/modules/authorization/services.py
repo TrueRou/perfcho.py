@@ -1,5 +1,6 @@
 """Provide protocol-neutral authorization queries."""
 
+from perfcho.infra.cache import cached
 from perfcho.infra.cache.backend import CacheBackend
 from perfcho.infra.cache.values import decode_json, encode_json
 from perfcho.modules.authorization.models import EffectiveAuthorization
@@ -17,37 +18,28 @@ class AuthorizationQueryService:
         self._clock = clock
         self._cache = cache
 
+    @cached(
+        key_builder=lambda self, account_id: self._cache.key("authorization", "effective", str(account_id)),
+        encode=lambda value: encode_json(value),
+        decode=lambda raw: _authorization_from_cache(raw),
+        ttl_seconds=10,
+        return_loaded=True,
+    )
     async def get_effective(self, account_id: int) -> EffectiveAuthorization:
         """Return the account's authorization at one consistent current instant."""
-        key = self._cache.key("authorization", "effective", str(account_id))
-        raw = await self._cache.get(key)
-        if raw is not None:
-            try:
-                value = decode_json(raw)
-                return EffectiveAuthorization(
-                    account_id=int(value["account_id"]),
-                    evaluated_at=self._clock.now(),
-                    permission_codes=frozenset(value["permission_codes"]),
-                    role_codes=frozenset(value["role_codes"]),
-                    entitlement_codes=frozenset(value["entitlement_codes"]),
-                )
-            except KeyError, TypeError, ValueError:
-                await self._cache.delete(key)
-        result = await self._repository.get_effective(account_id, at=self._clock.now())
-        await self._cache.set(
-            key,
-            encode_json(
-                {
-                    "account_id": result.account_id,
-                    "permission_codes": tuple(result.permission_codes),
-                    "role_codes": tuple(result.role_codes),
-                    "entitlement_codes": tuple(result.entitlement_codes),
-                }
-            ),
-            ttl_seconds=10,
-        )
-        return result
+        return await self._repository.get_effective(account_id, at=self._clock.now())
 
     async def get_stable_privileges(self, account_id: int) -> StablePrivilege:
         """Return Stable client bits projected from current canonical authorization."""
         return project_stable_privileges(await self.get_effective(account_id))
+
+
+def _authorization_from_cache(raw: bytes) -> EffectiveAuthorization:
+    value = decode_json(raw)
+    return EffectiveAuthorization(
+        account_id=int(value["account_id"]),
+        evaluated_at=value["evaluated_at"],
+        permission_codes=frozenset(value["permission_codes"]),
+        role_codes=frozenset(value["role_codes"]),
+        entitlement_codes=frozenset(value["entitlement_codes"]),
+    )

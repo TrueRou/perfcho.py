@@ -7,7 +7,9 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import cast
 
+from perfcho.infra.cache import cached
 from perfcho.infra.cache.backend import CacheBackend
 from perfcho.infra.cache.values import decode_json, encode_json
 from perfcho.infra.logging import duration_ms, log_event
@@ -355,13 +357,21 @@ class RankingQueryService:
         self,
         uow_factory: Callable[[], ScoringUnitOfWork],
         repository_factory: RankingRepositoryFactory,
-        cache: CacheBackend | None = None,
+        cache: CacheBackend,
     ) -> None:
         """Bind transaction and scoring repository factories."""
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
         self._cache = cache
 
+    @cached(
+        key_builder=lambda self, **kwargs: self._public_leaderboard_cache_key(**kwargs),
+        encode=encode_json,
+        decode=lambda raw: _leaderboard_scores_from_cache(raw),
+        ttl_seconds=120,
+        enabled=lambda _self, **kwargs: kwargs["scope"].kind
+        in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS},
+    )
     async def get_public_leaderboard(
         self,
         *,
@@ -375,15 +385,6 @@ class RankingQueryService:
         _positive_identifier("beatmap_id", beatmap_id)
         if not 1 <= limit <= 100:
             raise ValueError("leaderboard mods or limit is invalid")
-        generation = await self._leaderboard_generation(beatmap_id)
-        key = self._leaderboard_key("public", beatmap_id, ruleset, variant, scope, limit, generation)
-        if self._cache is not None and scope.kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}:
-            raw = await self._cache.get(key)
-            if raw is not None:
-                try:
-                    return _leaderboard_scores_from_cache(raw)
-                except TypeError, ValueError, KeyError:
-                    pass
         async with self._uow_factory() as uow:
             result = await self._repository_factory(uow.session).get_public_leaderboard(
                 beatmap_id=beatmap_id,
@@ -392,10 +393,17 @@ class RankingQueryService:
                 scope=scope,
                 limit=limit,
             )
-        if self._cache is not None and scope.kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}:
-            await self._cache.set(key, encode_json(result), ttl_seconds=120)
         return result
 
+    @cached(
+        key_builder=lambda self, **kwargs: self._personal_leaderboard_cache_key(**kwargs),
+        encode=encode_json,
+        decode=lambda raw: _personal_score_from_cache(raw),
+        ttl_seconds=120,
+        enabled=lambda _self, **kwargs: kwargs["scope"].kind
+        in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS},
+        cache_none=True,
+    )
     async def get_personal_leaderboard(
         self,
         *,
@@ -408,15 +416,6 @@ class RankingQueryService:
         """Return one account's leaderboard row with a short-lived cache."""
         _positive_identifier("beatmap_id", beatmap_id)
         _positive_identifier("account_id", account_id)
-        generation = await self._leaderboard_generation(beatmap_id)
-        key = self._leaderboard_key("personal", beatmap_id, ruleset, variant, scope, account_id, generation)
-        if self._cache is not None and scope.kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}:
-            raw = await self._cache.get(key)
-            if raw is not None:
-                try:
-                    return _personal_score_from_cache(raw)
-                except TypeError, ValueError, KeyError:
-                    pass
         async with self._uow_factory() as uow:
             result = await self._repository_factory(uow.session).get_personal_leaderboard(
                 beatmap_id=beatmap_id,
@@ -425,8 +424,6 @@ class RankingQueryService:
                 scope=scope,
                 account_id=account_id,
             )
-        if self._cache is not None and scope.kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}:
-            await self._cache.set(key, encode_json(result), ttl_seconds=120)
         return result
 
     async def get_combined_leaderboard(
@@ -470,19 +467,39 @@ class RankingQueryService:
             dimension += f":{digest}"
         if scope.country_code is not None:
             dimension += f":{scope.country_code}"
-        return (
-            self._cache.key(
-                "scoring",
-                f"leaderboard-{kind}",
-                f"{dimension}:{beatmap_id}:{ruleset.value}:{variant.value}:{tail}:{generation}",
-            )
-            if self._cache
-            else ""
+        return self._cache.key(
+            "scoring",
+            f"leaderboard-{kind}",
+            f"{dimension}:{beatmap_id}:{ruleset.value}:{variant.value}:{tail}:{generation}",
+        )
+
+    async def _public_leaderboard_cache_key(self, **kwargs: object) -> str:
+        beatmap_id = cast(int, kwargs["beatmap_id"])
+        generation = await self._leaderboard_generation(beatmap_id)
+        return self._leaderboard_key(
+            "public",
+            beatmap_id,
+            cast(Ruleset, kwargs["ruleset"]),
+            cast(ScoreboardVariant, kwargs["variant"]),
+            cast(LeaderboardScope, kwargs["scope"]),
+            cast(int, kwargs["limit"]),
+            generation,
+        )
+
+    async def _personal_leaderboard_cache_key(self, **kwargs: object) -> str:
+        beatmap_id = cast(int, kwargs["beatmap_id"])
+        generation = await self._leaderboard_generation(beatmap_id)
+        return self._leaderboard_key(
+            "personal",
+            beatmap_id,
+            cast(Ruleset, kwargs["ruleset"]),
+            cast(ScoreboardVariant, kwargs["variant"]),
+            cast(LeaderboardScope, kwargs["scope"]),
+            cast(int, kwargs["account_id"]),
+            generation,
         )
 
     async def _leaderboard_generation(self, beatmap_id: int) -> str:
-        if self._cache is None:
-            return "0"
         key = self._cache.key("scoring", "leaderboard-generation", str(beatmap_id))
         raw = await self._cache.get(key)
         if raw is None:
@@ -500,7 +517,7 @@ class AccountStatisticsQueryService:
         self,
         uow_factory: Callable[[], ScoringUnitOfWork],
         repository_factory: AccountStatisticsRepositoryFactory,
-        cache: CacheBackend | None = None,
+        cache: CacheBackend,
     ) -> None:
         """Bind statistics persistence and the optional display cache."""
         self._uow_factory = uow_factory
@@ -516,6 +533,14 @@ class AccountStatisticsQueryService:
         """Read stats authoritatively for score submission before/after values."""
         return await self._load(account_id, ruleset, variant)
 
+    @cached(
+        key_builder=lambda self, account_id, ruleset, variant: self._cache.key(
+            "scoring", "account-stats", f"{account_id}:{ruleset.value}:{variant.value}"
+        ),
+        encode=encode_json,
+        decode=lambda raw: _account_stats_from_cache(raw),
+        ttl_seconds=3,
+    )
     async def get_for_display(
         self,
         account_id: int,
@@ -524,19 +549,7 @@ class AccountStatisticsQueryService:
     ) -> AccountStatsView:
         """Read short-lived stats suitable for online display."""
         _positive_identifier("account_id", account_id)
-        key = (
-            self._cache.key("scoring", "account-stats", f"{account_id}:{ruleset.value}:{variant.value}")
-            if self._cache
-            else ""
-        )
-        if self._cache is not None:
-            raw = await self._cache.get(key)
-            if raw is not None:
-                return _account_stats_from_cache(raw)
-        result = await self._load(account_id, ruleset, variant)
-        if self._cache is not None:
-            await self._cache.set(key, encode_json(result), ttl_seconds=3)
-        return result
+        return await self._load(account_id, ruleset, variant)
 
     async def _load(self, account_id: int, ruleset: Ruleset, variant: ScoreboardVariant) -> AccountStatsView:
         _positive_identifier("account_id", account_id)

@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from datetime import datetime
 
+from perfcho.infra.cache import cached
 from perfcho.infra.cache.backend import CacheBackend
 from perfcho.infra.cache.values import decode_json, encode_json
 from perfcho.modules.common.normalization import normalize_name
@@ -38,34 +39,38 @@ class SocialQueryService:
             name_key = normalize_name(display_name)
         except ValueError as error:
             raise SocialAccountNotFound("account does not exist") from error
-        key = self._cache.key("social", "account-name", name_key)
-        raw = await self._cache.get(key)
-        if raw is not None:
-            value = decode_json(raw)
-            if value is None:
-                raise SocialAccountNotFound("account does not exist")
-            return AccountIdentityView(int(value["account_id"]), str(value["display_name"]))
+        value = await self._resolve_account_by_name(name_key)
+        if value is None:
+            raise SocialAccountNotFound("account does not exist")
+        return value
+
+    @cached(
+        key_builder=lambda self, name_key: self._cache.key("social", "account-name", name_key),
+        encode=encode_json,
+        decode=lambda raw: None if decode_json(raw) is None else _account_view(decode_json(raw)),
+        ttl_seconds=lambda self, _name_key: 120,
+        cache_none=True,
+        ttl_for_value=lambda value: 5 if value is None else 120,
+    )
+    async def _resolve_account_by_name(self, name_key: str) -> AccountIdentityView | None:
         async with self._uow_factory() as uow:
             account = await self._repository_factory(uow.session).resolve_account_by_name(name_key)
-        if account is None:
-            await self._cache.set(key, encode_json(None), ttl_seconds=5)
-            raise SocialAccountNotFound("account does not exist")
-        await self._cache.set(key, encode_json(account), ttl_seconds=120)
         return account
 
     async def are_mutual_friends(self, first_account_id: int, second_account_id: int) -> bool:
         relationship = await self.get_pair_relationship(first_account_id, second_account_id)
         return relationship.mutual_friends and not relationship.blocked
 
+    @cached(
+        key_builder=lambda self, account_id: self.friends_key(account_id),
+        encode=encode_json,
+        decode=lambda raw: tuple(_follow_view(value) for value in decode_json(raw)),
+        ttl_seconds=30,
+    )
     async def list_friends(self, account_id: int) -> tuple[FollowView, ...]:
         _validate_account_id(account_id)
-        key = self.friends_key(account_id)
-        raw = await self._cache.get(key)
-        if raw is not None:
-            return tuple(_follow_view(value) for value in decode_json(raw))
         async with self._uow_factory() as uow:
             friends = await self._repository_factory(uow.session).list_friends(account_id)
-        await self._cache.set(key, encode_json(friends), ttl_seconds=30)
         return friends
 
     async def list_incoming_follower_account_ids(
@@ -118,6 +123,12 @@ def _follow_view(value: object) -> FollowView:
         datetime.fromisoformat(str(followed_at)),
         bool(value["mutual"]),
     )
+
+
+def _account_view(value: object) -> AccountIdentityView:
+    if not isinstance(value, dict):
+        raise SocialAccountNotFound("account does not exist")
+    return AccountIdentityView(int(value["account_id"]), str(value["display_name"]))
 
 
 def _validate_account_id(account_id: int) -> None:
