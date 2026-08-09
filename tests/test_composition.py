@@ -3,6 +3,7 @@ from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
+from apscheduler import AsyncScheduler
 from pydantic import SecretStr
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
@@ -40,6 +41,7 @@ async def test_stable_composition_wires_independent_security_keys() -> None:
             cache=RedisCache(redis, prefix=config.redis_cache_prefix),
             postgres=cast(AsyncEngine, MagicMock()),
             session_factory=session_factory,
+            scheduler=cast(AsyncScheduler, MagicMock()),
         )
         services = await compose_stable_services(core)
         assert services.account is not None

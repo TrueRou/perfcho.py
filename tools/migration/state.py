@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from perfcho.infra.db.models.system import MaintenanceState
+from perfcho.infra.db.models.system import MigrationState
 from perfcho.infra.logging import duration_ms, log_event
 
 
@@ -46,7 +46,7 @@ class MigrationStateStore:
     async def load(self) -> MigrationCheckpoint | None:
         """Return the persisted checkpoint, if this migration was started."""
         async with self._session_factory() as session:
-            state = await session.scalar(select(MaintenanceState.state).where(MaintenanceState.task == self.task))
+            state = await session.scalar(select(MigrationState.state).where(MigrationState.task == self.task))
         if state is None:
             log_event(
                 "DEBUG",
@@ -121,10 +121,10 @@ class MigrationStateStore:
     async def save(self, session: AsyncSession, checkpoint: MigrationCheckpoint) -> None:
         """Upsert a checkpoint in the caller-owned business batch transaction."""
         await session.execute(
-            insert(MaintenanceState)
+            insert(MigrationState)
             .values(task=self.task, state=_encode(checkpoint))
             .on_conflict_do_update(
-                index_elements=(MaintenanceState.task,),
+                index_elements=(MigrationState.task,),
                 set_={"state": _encode(checkpoint), "updated_at": datetime.now(UTC)},
             )
         )

@@ -1,12 +1,12 @@
 """Implement expiring multiplayer projections with Redis compare-and-set writes."""
 
-import json
 import uuid
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta
 
+import orjson
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
 
@@ -563,12 +563,12 @@ def _encode_state(state: RoomState) -> bytes:
         "round_participant_account_ids": list(state.round_participant_account_ids),
         "expires_at": state.expires_at.isoformat(),
     }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
 
 
 def _decode_state(payload: bytes) -> RoomState:
     try:
-        value = json.loads(payload)
+        value = orjson.loads(payload)
         settings_value = value["settings"]
         settings = RoomSettings(
             name=settings_value["name"],
@@ -618,7 +618,7 @@ def _decode_state(payload: bytes) -> RoomState:
             projection_status=ProjectionStatus.LIVE,
             expires_at=datetime.fromisoformat(value["expires_at"]),
         )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (KeyError, TypeError, ValueError, orjson.JSONDecodeError) as error:
         raise RuntimeError("stored multiplayer projection is invalid") from error
 
 

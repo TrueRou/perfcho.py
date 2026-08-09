@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import orjson
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +32,7 @@ class MigrationOverrides:
         """Load a bounded JSON override document, or return an empty document."""
         if path is None:
             return cls()
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = orjson.loads(path.read_bytes())
         if not isinstance(payload, dict) or not isinstance(payload.get("accounts", {}), dict):
             raise ValueError("migration overrides must contain an accounts object")
         accounts: dict[int, AccountOverride] = {}
@@ -94,7 +95,7 @@ class MigrationConfig:
             "data_directory": str(self.data_directory.resolve()),
             "overrides_sha256": _file_digest(self.overrides_path),
         }
-        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        encoded = orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
         return hashlib.sha256(encoded).hexdigest()
 
     @classmethod

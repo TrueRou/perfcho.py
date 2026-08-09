@@ -1,8 +1,8 @@
 """Project accepted scores into versioned Performance results."""
 
 import hashlib
-import json
 
+import orjson
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.models.events import OutboxEvent
@@ -100,5 +100,5 @@ def _performance_output_digest(result: PerformanceResult) -> bytes:
         },
         "breakdown": thaw_json_mapping(result.breakdown),
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
     return hashlib.sha256(encoded).digest()

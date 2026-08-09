@@ -5,7 +5,7 @@ from typing import Any, cast
 import pytest
 from loguru import logger
 
-from perfcho.worker import _relay_once, _run_relay_loop
+from perfcho.relay import _relay_once, _run_relay_loop
 
 
 class FakeRelayStore:
@@ -53,9 +53,7 @@ async def test_relay_records_each_enqueue_outcome_and_continues_batch() -> None:
     assert (result.claimed, result.enqueued, result.enqueue_failed) == (2, 1, 1)
     assert [(reference, owner) for reference, owner, _ in store.failed] == [(1, "tests:owner")]
     assert store.enqueued == [(2, "tests:owner", "task-2")]
-    enqueue_failure = next(
-        record for record in records if record["extra"]["event"] == "runtime.worker.relay.enqueue_failed"
-    )
+    enqueue_failure = next(record for record in records if record["extra"]["event"] == "runtime.relay.enqueue_failed")
     assert enqueue_failure["level"].name == "WARNING"
     assert enqueue_failure["extra"]["error_type"] == "RuntimeError"
     assert enqueue_failure["exception"].value.args == ("broker unavailable",)
@@ -116,15 +114,25 @@ async def test_relay_logs_lifecycle_and_only_nonempty_batch_aggregates() -> None
 
     try:
         with pytest.raises(asyncio.CancelledError):
-            await _run_relay_loop("tests", store, "tests:owner", enqueue, poll_interval=0.01)
+            wakeup = asyncio.Event()
+            wakeup.set()
+            await _run_relay_loop(
+                "tests",
+                store,
+                "tests:owner",
+                enqueue,
+                wakeup=wakeup,
+                poll_interval=0.01,
+                debounce_seconds=0.001,
+            )
     finally:
         logger.remove(sink_id)
 
     relay_events = [record["extra"]["event"] for record in records if record["extra"].get("relay") == "tests"]
     assert relay_events == [
-        "runtime.worker.relay.started",
-        "runtime.worker.relay.batch",
-        "runtime.worker.relay.stopped",
+        "runtime.relay.started",
+        "runtime.relay.batch",
+        "runtime.relay.stopped",
     ]
-    batch = next(record for record in records if record["extra"]["event"] == "runtime.worker.relay.batch")
+    batch = next(record for record in records if record["extra"]["event"] == "runtime.relay.batch")
     assert (batch["extra"]["claimed"], batch["extra"]["enqueued"], batch["extra"]["enqueue_failed"]) == (1, 1, 0)

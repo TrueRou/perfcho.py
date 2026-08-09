@@ -25,6 +25,7 @@ class ManagedRuntime:
     project_name: str = "perfcho-fakeclient-e2e"
     api_port: int = 18080
     api_process: subprocess.Popen[bytes] | None = None
+    relay_process: subprocess.Popen[bytes] | None = None
     worker_process: subprocess.Popen[bytes] | None = None
     upstream_process: subprocess.Popen[bytes] | None = None
 
@@ -93,6 +94,11 @@ class ManagedRuntime:
             check=True,
             timeout=60,
         )
+        self.relay_process = self._spawn(
+            ("uv", "run", "python", "-m", "perfcho.relay"),
+            env,
+            "relay.log",
+        )
         self.worker_process = self._spawn(
             ("uv", "run", "taskiq", "worker", "perfcho.worker:broker", "--ack-type", "when_executed"),
             env,
@@ -101,7 +107,7 @@ class ManagedRuntime:
 
     def stop(self) -> None:
         """Stop only owned child processes and the exact Compose project."""
-        for process in (self.worker_process, self.api_process, self.upstream_process):
+        for process in (self.relay_process, self.worker_process, self.api_process, self.upstream_process):
             if process is None or process.poll() is not None:
                 continue
             os.killpg(process.pid, signal.SIGTERM)

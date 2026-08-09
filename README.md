@@ -15,9 +15,9 @@ outbox runtime. Stable/Lazer protocol services will be implemented against this 
 ## Runtime Environment
 
 The repository has separate development and production Compose topologies. `compose.yaml` starts local PostgreSQL,
-Redis, MinIO, Loki, and Grafana infrastructure; the API and Taskiq Worker run as host processes and read `.env`.
-`compose.prod.yaml` runs the same infrastructure plus the perfcho-pp Calculator, API, and Taskiq Worker in containers.
-The two application roles share one Python image in production.
+Redis, MinIO, Loki, and Grafana infrastructure; the API, Outbox Relay, and Taskiq Worker run as host processes and read
+`.env`. `compose.prod.yaml` runs the same infrastructure plus the perfcho-pp Calculator, API, Outbox Relay, and Taskiq
+Worker in containers. The application roles share one Python image in production.
 
 ### Environment files
 
@@ -52,6 +52,13 @@ docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U perfcho -d perfcho \
   < tools/schema/20260809_add_outbox_trace_id.sql
 ```
 
+Databases that contain the former maintenance-state table also require the idempotent scheduler state rename:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U perfcho -d perfcho \
+  < tools/migration/20260810_rename_maintenance_states.sql
+```
+
 ## Local development
 
 Start the infrastructure and run the application roles as host processes:
@@ -74,7 +81,8 @@ Loki, and Grafana,
 initializes the object-storage bucket, and then debugs these roles in parallel:
 
 - API
-- Taskiq Worker, including the durable Outbox and Performance relay loop
+- Outbox Relay
+- Taskiq Worker
 
 Stopping one debug session stops both application roles. PostgreSQL, Redis, MinIO, Loki, and Grafana remain running so that
 subsequent debug sessions start quickly; stop them explicitly with `docker compose down` when they are no longer needed.
@@ -83,6 +91,7 @@ Run the process roles separately:
 
 ```bash
 uv run uvicorn perfcho.main:asgi_app --host 127.0.0.1 --port 8000
+uv run python -m perfcho.relay
 uv run taskiq worker perfcho.worker:broker --ack-type when_executed
 ```
 

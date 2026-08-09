@@ -1,8 +1,9 @@
 """Normalize structured mods into deterministic canonical identities."""
 
 import hashlib
-import json
 from collections.abc import Iterable
+
+import orjson
 
 from perfcho.modules.scoring.errors import ScoreRejected
 from perfcho.modules.scoring.models import CanonicalMod, NormalizedModSet, Ruleset, ScoreboardVariant
@@ -52,13 +53,10 @@ _INCOMPATIBLE_GROUPS = (
 
 def canonical_json_digest(value: object) -> bytes:
     """Hash compact sorted JSON exactly as the scoring bootstrap does."""
-    encoded = json.dumps(
+    encoded = orjson.dumps(
         value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode()
+        option=orjson.OPT_SORT_KEYS,
+    )
     return hashlib.sha256(encoded).digest()
 
 
@@ -153,4 +151,4 @@ def parse_legacy_mods(legacy_bits: int) -> tuple[tuple[CanonicalMod, ...], Score
 
 
 def _settings_sort_key(mod: CanonicalMod) -> str:
-    return json.dumps(mod.as_json().get("settings", {}), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return orjson.dumps(mod.as_json().get("settings", {}), option=orjson.OPT_SORT_KEYS).decode()

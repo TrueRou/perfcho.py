@@ -30,15 +30,12 @@ from perfcho.infra.db.projectors.catalog import (
     ConsumerCatalog,
     ConsumerRegistration,
 )
-from perfcho.infra.db.relays.outbox_delivery import (
-    OutboxDeliveryProcessor,
-    SqlAlchemyOutboxDeliveryRelayStore,
-    _outbox_event_fields,
-)
 from perfcho.infra.db.repositories.outbox import append_outbox_event
+from perfcho.infra.db.repositories.outbox_delivery import SqlAlchemyOutboxDeliveryRepository
 from perfcho.infra.settings import settings
 from perfcho.infra.tracing import trace_context
 from perfcho.modules.common.models import JsonValue, PendingEvent
+from perfcho.worker import OutboxDeliveryProcessor, _outbox_event_fields
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 ACTOR_ACCOUNT_ID = 2001
@@ -155,7 +152,7 @@ async def test_outbox_dead_delivery_blocks_later_partition_events(postgres_datab
     del postgres_database_url
     db_engine = await infra_db.create_engine()
     session_factory = infra_db.create_session_factory(db_engine)
-    store = SqlAlchemyOutboxDeliveryRelayStore(
+    store = SqlAlchemyOutboxDeliveryRepository(
         session_factory,
         batch_size=10,
         lease_seconds=30,
@@ -234,7 +231,7 @@ async def test_outbox_trace_id_persists_into_relay_reference(postgres_database_u
     del postgres_database_url
     db_engine = await infra_db.create_engine()
     session_factory = infra_db.create_session_factory(db_engine)
-    store = SqlAlchemyOutboxDeliveryRelayStore(
+    store = SqlAlchemyOutboxDeliveryRepository(
         session_factory,
         batch_size=1,
         lease_seconds=30,
@@ -267,7 +264,7 @@ async def test_outbox_stale_token_and_enqueue_failure_do_not_consume_attempt(
     del postgres_database_url
     db_engine = await infra_db.create_engine()
     session_factory = infra_db.create_session_factory(db_engine)
-    store = SqlAlchemyOutboxDeliveryRelayStore(
+    store = SqlAlchemyOutboxDeliveryRepository(
         session_factory,
         batch_size=1,
         lease_seconds=30,
@@ -342,7 +339,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
     del postgres_database_url
     db_engine = await infra_db.create_engine()
     session_factory = infra_db.create_session_factory(db_engine)
-    relay_store = SqlAlchemyOutboxDeliveryRelayStore(
+    relay_store = SqlAlchemyOutboxDeliveryRepository(
         session_factory,
         batch_size=settings.outbox_delivery_batch_size,
         lease_seconds=settings.outbox_delivery_lease_seconds,

@@ -8,6 +8,7 @@ authors = [
 ]
 dependencies = [
     "aioboto3>=15.5.0",
+    "apscheduler>=4.0.0a6,<5",
     "argon2-cffi>=25.1.0",
     "asyncpg>=0.31.0",
     "bcrypt>=4.3.0",
@@ -16,6 +17,7 @@ dependencies = [
     "httpx>=0.28.0",
     "loguru>=0.7.3",
     "loki-logger-handler>=1.1.2",
+    "orjson>=3.11.0,<4",
     "prompt-toolkit>=3.0.53",
     "pymysql>=1.1.2",
     "pydantic>=2.12.0",

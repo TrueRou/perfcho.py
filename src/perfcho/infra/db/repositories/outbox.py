@@ -10,6 +10,8 @@ from perfcho.infra.db.models.events import OutboxDelivery, OutboxEvent
 from perfcho.infra.tracing import current_trace_id
 from perfcho.modules.common.models import PendingEvent
 
+OUTBOX_NOTIFY_CHANNEL = "perfcho_outbox"
+
 
 class SqlAlchemyOutboxWriter:
     """Adapt outbox persistence to the transaction-bound writer port."""
@@ -56,6 +58,7 @@ async def append_outbox_event(session: AsyncSession, event: PendingEvent) -> Out
                 available_at=available_at,
             )
         )
+    await session.execute(text("SELECT pg_notify(:channel, '')"), {"channel": OUTBOX_NOTIFY_CHANNEL})
     return persisted
 
 

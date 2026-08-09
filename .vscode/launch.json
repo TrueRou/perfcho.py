@@ -18,6 +18,15 @@
             "justMyCode": true
         },
         {
+            "name": "Outbox Relay",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "perfcho.relay",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
             "name": "Taskiq Worker",
             "type": "debugpy",
             "request": "launch",
@@ -41,6 +50,7 @@
             "name": "All Services",
             "configurations": [
                 "FastAPI",
+                "Outbox Relay",
                 "Taskiq Worker"
             ],
             "preLaunchTask": "dev: prepare",

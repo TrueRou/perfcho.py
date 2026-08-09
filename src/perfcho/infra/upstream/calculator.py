@@ -1,12 +1,12 @@
 """Call versioned external Performance calculators through HTTP."""
 
-import json
 from collections.abc import Mapping
 from decimal import Decimal, DecimalException
 from time import monotonic_ns
 from typing import cast
 
 import httpx
+import orjson
 
 from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import JsonValue
@@ -62,7 +62,7 @@ class HttpPerformanceCalculator:
                 files={
                     "metadata": (
                         "metadata.json",
-                        json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                        orjson.dumps(metadata, option=orjson.OPT_SORT_KEYS),
                         "application/json",
                     )
                 },

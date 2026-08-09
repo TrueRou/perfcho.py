@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -13,6 +12,7 @@ from time import monotonic_ns
 from typing import Annotated, Literal
 from urllib.parse import parse_qs, quote
 
+import orjson
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from starlette.formparsers import MultiPartException
@@ -311,15 +311,14 @@ def _registration_digest(
     email: str,
     password_preverification: str,
 ) -> bytes:
-    payload = json.dumps(
+    payload = orjson.dumps(
         {
             "display_name": display_name,
             "email": email,
             "password_preverification": password_preverification,
         },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
+        option=orjson.OPT_SORT_KEYS,
+    )
     return hmac.digest(services.settings.device_hmac_key.get_secret_value().encode(), payload, hashlib.sha256)
 
 
@@ -342,7 +341,7 @@ async def _read_limited_body(request: Request, maximum: int) -> bytes:
 def _parse_beatmap_info_body(body: bytes, content_type: str) -> tuple[tuple[str, ...], tuple[int, ...]]:
     try:
         if content_type.partition(";")[0].strip().casefold() == "application/json":
-            payload = json.loads(body)
+            payload = orjson.loads(body)
             if not isinstance(payload, dict):
                 raise ValueError("beatmap info body must be an object")
             filenames_value = payload.get("Filenames", [])
@@ -351,7 +350,7 @@ def _parse_beatmap_info_body(body: bytes, content_type: str) -> tuple[tuple[str,
             payload = parse_qs(body.decode("utf-8"), keep_blank_values=True, max_num_fields=1024)
             filenames_value = payload.get("Filenames", payload.get("Filenames[]", []))
             ids_value = payload.get("Ids", payload.get("Ids[]", []))
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+    except (UnicodeDecodeError, orjson.JSONDecodeError, TypeError, ValueError) as error:
         raise ValueError("invalid beatmap info body") from error
     if not isinstance(filenames_value, list) or not isinstance(ids_value, list):
         raise ValueError("beatmap info selectors must be arrays")

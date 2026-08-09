@@ -17,15 +17,15 @@ from taskiq_redis import RedisStreamBroker
 from perfcho.infra.db import DbBase
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.models.events import OutboxDelivery
-from perfcho.infra.db.relays.outbox_delivery import OutboxDeliveryReference
 from perfcho.infra.db.repositories.outbox import append_outbox_event
+from perfcho.infra.db.repositories.outbox_delivery import OutboxDeliveryReference
 from perfcho.infra.logging import current_relay_task
 from perfcho.infra.settings import Settings, settings
 from perfcho.infra.taskiq import RelayTaskLoggingMiddleware
 from perfcho.infra.tracing import current_trace_id
 from perfcho.modules.common.models import PendingEvent
-from perfcho.tasks.outbox_delivery import dispatch_outbox_delivery
-from perfcho.worker import _cleanup_worker_resources, _enqueue_outbox, broker, worker_shutdown, worker_startup
+from perfcho.relay import _enqueue_outbox
+from perfcho.worker import _cleanup_worker_resources, broker, dispatch_outbox_delivery, worker_shutdown, worker_startup
 
 
 def test_redis_roles_use_db0_with_distinct_namespaces() -> None:
@@ -109,7 +109,6 @@ async def test_worker_cleanup_continues_after_resource_close_failure() -> None:
 
     try:
         await _cleanup_worker_resources(
-            (),
             cast(httpx.AsyncClient, http_client),
             cast(AsyncEngine, db_engine),
         )
@@ -218,7 +217,8 @@ async def test_outbox_writer_creates_explicit_consumer_delivery() -> None:
     assert added[1].partition_key == "test:1"
     assert added[1].available_at == available_at
     assert added[1].source_position == 1
-    session.execute.assert_awaited_once()
+    assert session.execute.await_count == 2
+    assert "pg_notify" in str(session.execute.await_args_list[-1].args[0])
     session.flush.assert_awaited_once()
 
 

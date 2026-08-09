@@ -1,12 +1,12 @@
 """Project completed multiplayer rounds from authoritative attempts and scores."""
 
 import hashlib
-import json
 import uuid
 from collections import defaultdict
 from decimal import Decimal
 from typing import NamedTuple, NotRequired, TypedDict
 
+import orjson
 from sqlalchemy import Numeric, String, and_, case, cast, delete, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -507,7 +507,7 @@ def _result_digest(
         "score_id": score_id,
         "team_number": team_number,
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).digest()
+    return hashlib.sha256(orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)).digest()
 
 
 async def _is_new_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> bool:

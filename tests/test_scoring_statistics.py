@@ -2,8 +2,8 @@ import pytest
 from sqlalchemy import func, select
 
 from perfcho.infra.db import engine as infra_db
-from perfcho.infra.db.maintenance import RankSnapshotMaintenance
 from perfcho.infra.db.models.scoring import RankingPolicy, RankSnapshot, UserRankedStat
+from perfcho.infra.scheduler.rank_snapshot import RankSnapshotTask
 
 
 @pytest.mark.postgres
@@ -32,9 +32,9 @@ async def test_daily_rank_snapshot_is_atomic_and_idempotent(postgres_database_ur
                 )
             )
 
-        maintenance = RankSnapshotMaintenance(session_factory)
-        assert await maintenance.run_due()
-        assert not await maintenance.run_due()
+        task = RankSnapshotTask(session_factory)
+        assert await task.run()
+        assert not await task.run()
 
         async with session_factory() as session:
             assert await session.scalar(select(func.count()).select_from(RankSnapshot)) == 1

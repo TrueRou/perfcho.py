@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import orjson
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateSchema
@@ -50,7 +50,7 @@ def create_target_engine(database_url: str) -> AsyncEngine:
         max_overflow=0,
         pool_pre_ping=True,
         hide_parameters=True,
-        json_serializer=lambda value: json.dumps(value, ensure_ascii=False, default=str),
+        json_serializer=lambda value: orjson.dumps(value, default=str).decode(),
     )
 
 

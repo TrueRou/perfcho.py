@@ -3,13 +3,14 @@
 import base64
 import hashlib
 import hmac
-import json
 import secrets
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
+
+import orjson
 
 from perfcho.infra.logging import duration_ms, log_event, rate_limit
 from perfcho.modules.common.models import CommandMeta, PendingEvent
@@ -1089,16 +1090,15 @@ class MultiplayerService:
         if state.slot_for(inviter_account_id) is None:
             raise MatchPermissionDenied("only a current participant can invite players")
         expires_at = self._clock.now() + self._admission_lifetime
-        payload = json.dumps(
+        payload = orjson.dumps(
             {
                 "exp": int(expires_at.timestamp()),
                 "recipient": recipient_account_id,
                 "room": str(state.room.room_id),
                 "session": str(state.room.session_id),
             },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+            option=orjson.OPT_SORT_KEYS,
+        )
         encoded = _base64url_encode(payload)
         signature = hmac.new(self._admission_key, encoded.encode("ascii"), hashlib.sha256).digest()
         return f"adm.{encoded}.{_base64url_encode(signature)}"
@@ -1113,7 +1113,7 @@ class MultiplayerService:
             expected = hmac.new(self._admission_key, encoded.encode("ascii"), hashlib.sha256).digest()
             if not hmac.compare_digest(signature, expected):
                 raise ValueError
-            payload = json.loads(_base64url_decode(encoded))
+            payload = orjson.loads(_base64url_decode(encoded))
             if (
                 not isinstance(payload, dict)
                 or payload.get("recipient") != account_id
@@ -1124,7 +1124,7 @@ class MultiplayerService:
                 or payload["exp"] > int((now + self._admission_lifetime).timestamp())
             ):
                 raise ValueError
-        except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as error:
+        except (UnicodeError, ValueError, TypeError, orjson.JSONDecodeError) as error:
             raise MatchPasswordRejected("room admission token is invalid or expired") from error
 
     @staticmethod

@@ -127,6 +127,7 @@ class Settings(BaseSettings):
     taskiq_stream_max_length: int = Field(default=100_000, ge=1000)
 
     durable_relay_poll_interval_seconds: float = Field(default=1.0, gt=0)
+    durable_relay_debounce_seconds: float = Field(default=0.02, gt=0, le=1)
     durable_relay_enqueue_concurrency: int = Field(default=16, ge=1, le=256)
     outbox_delivery_batch_size: int = Field(default=100, ge=1, le=1000)
     outbox_delivery_lease_seconds: int = Field(default=300, ge=30)
@@ -136,7 +137,7 @@ class Settings(BaseSettings):
     performance_calculator_urls: dict[str, str] = Field(default_factory=dict)
     performance_http_timeout_seconds: float = Field(default=30.0, gt=0)
     performance_beatmap_url_expiry_seconds: int = Field(default=600, ge=30, le=3600)
-    rank_snapshot_poll_interval_seconds: float = Field(default=60.0, ge=1)
+    rank_snapshot_cron: str = Field(default="0 4 * * *")
 
     cors_origins: list[str] = Field(default=["http://localhost:3000", "http://localhost:5173"])
 

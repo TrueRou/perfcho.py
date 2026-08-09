@@ -38,7 +38,7 @@ x-app-environment: &app-environment
   STABLE_PRESENCE_FANOUT_CONCURRENCY: ${STABLE_PRESENCE_FANOUT_CONCURRENCY:-32}
   STABLE_MAILBOX_WAIT_SECONDS: ${STABLE_MAILBOX_WAIT_SECONDS:-0.3}
   DURABLE_RELAY_ENQUEUE_CONCURRENCY: ${DURABLE_RELAY_ENQUEUE_CONCURRENCY:-16}
-  RANK_SNAPSHOT_POLL_INTERVAL_SECONDS: ${RANK_SNAPSHOT_POLL_INTERVAL_SECONDS:-60}
+  RANK_SNAPSHOT_INTERVAL_SECONDS: ${RANK_SNAPSHOT_INTERVAL_SECONDS:-60}
   BOT_ACCOUNT_ID: ${BOT_ACCOUNT_ID:-1}
   BOT_NAME: ${BOT_NAME:-BanchoBot}
   BOT_COMMAND_PREFIX: ${BOT_COMMAND_PREFIX:-!}
@@ -52,6 +52,8 @@ x-app-environment: &app-environment
   OSU_API_CLIENT_ID: ${OSU_API_CLIENT_ID:?OSU_API_CLIENT_ID must be set}
   OSU_API_CLIENT_SECRET: ${OSU_API_CLIENT_SECRET:?OSU_API_CLIENT_SECRET must be set}
   CONTENT_SYNC_MAX_CONCURRENCY: ${CONTENT_SYNC_MAX_CONCURRENCY:-8}
+  DURABLE_RELAY_POLL_INTERVAL_SECONDS: ${DURABLE_RELAY_POLL_INTERVAL_SECONDS:-1}
+  DURABLE_RELAY_DEBOUNCE_SECONDS: ${DURABLE_RELAY_DEBOUNCE_SECONDS:-0.02}
   STABLE_AVATAR_BASE_URL: ${STABLE_AVATAR_BASE_URL:-https://a.ppy.sh}
   STABLE_BEATMAP_ASSET_BASE_URL: ${STABLE_BEATMAP_ASSET_BASE_URL:-https://b.ppy.sh}
   STABLE_SEASONAL_URL: ${STABLE_SEASONAL_URL:-https://osu.ppy.sh/web/osu-getseasonal.php}
@@ -191,7 +193,7 @@ services:
   api:
     <<: *app
     image: hkccr.ccs.tencentyun.com/truerou/perfcho.py:master
-    command: [ "uvicorn", "perfcho.main:asgi_app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header" ]
+    command: [ "uvicorn", "perfcho.main:asgi_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "${API_WORKERS:-2}", "--no-server-header" ]
     ports:
       - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PUBLISHED_PORT:-10727}:8000"
     depends_on:
@@ -213,6 +215,20 @@ services:
       timeout: 5s
       retries: 6
       start_period: 15s
+
+  relay:
+    <<: *app
+    image: hkccr.ccs.tencentyun.com/truerou/perfcho.py:master
+    command: [ "python", "-m", "perfcho.relay" ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      loki:
+        condition: service_started
 
   taskiq:
     <<: *app

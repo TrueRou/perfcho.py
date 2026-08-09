@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+
+import orjson
 
 from tools.migration.models import Diagnostic, DiagnosticSeverity, MigrationStatus
 
@@ -102,7 +103,7 @@ class MigrationReport:
         payload["started_at"] = self.started_at.isoformat()
         payload["completed_at"] = self.completed_at.isoformat() if self.completed_at is not None else None
         payload["diagnostics"] = [{**asdict(item), "severity": item.severity.value} for item in self.diagnostics]
-        encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        encoded = orjson.dumps(payload, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode()
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(encoded)

@@ -1,10 +1,11 @@
 """Expose a small black-box smoke command for an already running perfcho API."""
 
 import argparse
-import json
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
+
+import orjson
 
 from tools.fakeclient.client import OSU_PY_COMMIT, OSU_PY_VERSION, FakeClient
 from tools.fakeclient.runtime import ManagedRuntime
@@ -32,7 +33,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run":
         with ManagedRuntime(args.artifacts) as runtime:
             results = run_full_suite(runtime.base_url, timeout=args.timeout)
-        print(json.dumps([asdict(result) for result in results], sort_keys=True))
+        print(orjson.dumps([asdict(result) for result in results], option=orjson.OPT_SORT_KEYS).decode())
         return 0
     with FakeClient(args.username, args.password, args.base_url, timeout=args.timeout) as client:
         client.game.bancho.request_status()
@@ -45,5 +46,5 @@ def main(argv: Sequence[str] | None = None) -> int:
             "protocol": client.game.bancho.protocol,
             "playcount": player.playcount,
         }
-        print(json.dumps(result, sort_keys=True))
+        print(orjson.dumps(result, option=orjson.OPT_SORT_KEYS).decode())
     return 0

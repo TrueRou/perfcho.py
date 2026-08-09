@@ -1,5 +1,4 @@
 import hashlib
-import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -8,6 +7,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import bcrypt
+import orjson
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -183,7 +183,7 @@ def test_config_digest_is_secret_free_stable_and_sensitive_to_overrides(tmp_path
     assert "secret" not in first.digest
 
     overrides = tmp_path / "overrides.json"
-    overrides.write_text(json.dumps({"accounts": {"3": {"target_account_id": 33}}}))
+    overrides.write_bytes(orjson.dumps({"accounts": {"3": {"target_account_id": 33}}}))
     changed = _config(tmp_path, overrides)
     assert changed.digest != first.digest
     assert changed.overrides == MigrationOverrides.load(overrides)
@@ -316,7 +316,7 @@ def test_report_bounds_diagnostics_and_writes_structured_json(tmp_path: Path) ->
     assert report.diagnostic_counts == {"info": 0, "warning": 1, "error": 1}
     path = tmp_path / "nested" / "report.json"
     report.write(path)
-    payload = json.loads(path.read_text())
+    payload = orjson.loads(path.read_bytes())
     assert payload["migration_id"] == "test"
     assert payload["status"] == "failed"
     assert payload["diagnostic_counts"] == {"info": 0, "warning": 1, "error": 1}
@@ -537,7 +537,7 @@ def test_cli_initializes_logging_preserves_summary_and_exception_details(
         ("ERROR", "migration.command.failed"),
     ]
     assert events[0][2]["invocation_id"] == events[1][2]["invocation_id"]
-    payload = json.loads(report_path.read_text())
+    payload = orjson.loads(report_path.read_bytes())
     assert payload["status"] == "failed"
     assert payload["diagnostic_counts"]["error"] == 1
     output = capsys.readouterr()
@@ -625,7 +625,7 @@ async def test_runner_fatal_exception_writes_failed_report_and_safe_lifecycle(
     assert isinstance(report, MigrationReport)
     assert report.status is MigrationStatus.FAILED
     assert report.has_errors
-    assert json.loads(config.report_path.read_text())["status"] == "failed"
+    assert orjson.loads(config.report_path.read_bytes())["status"] == "failed"
     assert [(level, event) for level, event, _ in events] == [
         ("INFO", "migration.apply.started"),
         ("ERROR", "migration.apply.failed"),
@@ -676,7 +676,7 @@ def test_cli_keyboard_interrupt_writes_report_and_returns_130(
         ("INFO", "migration.command.started"),
         ("WARNING", "migration.command.interrupted"),
     ]
-    assert json.loads(report_path.read_text())["status"] == "interrupted"
+    assert orjson.loads(report_path.read_bytes())["status"] == "interrupted"
 
 
 @pytest.mark.asyncio

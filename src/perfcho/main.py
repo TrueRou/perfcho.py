@@ -22,14 +22,16 @@ class AppState(TypedDict):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
-    """Create and dispose process-owned database and Redis clients."""
+    """Create process-owned resources and run application schedules."""
+    del app
     started_ns = monotonic_ns()
+    core_services: CoreServices | None = None
+    stable_services: StableServices | None = None
     logging.log_event("INFO", "runtime.api.starting")
 
-    core_services = await compose_core_services()
-    stable_services = await compose_stable_services(core_services)
-
     try:
+        core_services = await compose_core_services()
+        stable_services = await compose_stable_services(core_services)
         yield {
             "core_services": core_services,
             "stable_services": stable_services,
@@ -43,11 +45,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
             error_type=type(error).__name__,
             duration_ms=logging.duration_ms(started_ns),
         )
-        raise error
+        raise
     finally:
-        await core_services.cache_redis.aclose()
-        await core_services.state_redis.aclose()
-        await core_services.postgres.dispose()
+        if core_services:
+            await core_services.aclose()
         logging.log_event("INFO", "runtime.api.stopped", duration_ms=logging.duration_ms(started_ns))
 
 

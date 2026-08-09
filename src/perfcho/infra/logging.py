@@ -9,7 +9,6 @@ import sys
 import time
 from collections import OrderedDict
 from contextvars import ContextVar, Token
-from threading import Lock
 from typing import TYPE_CHECKING, Literal, TextIO, cast, override
 
 from loguru import logger
@@ -22,7 +21,7 @@ from perfcho.infra.tracing import current_trace_id
 if TYPE_CHECKING:
     from loguru import Record
 
-type ProcessRole = Literal["api", "worker", "migration", "test"]
+type ProcessRole = Literal["api", "relay", "worker", "migration", "test"]
 
 _HUMAN_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
@@ -49,7 +48,6 @@ _relay_task_name: ContextVar[str | None] = ContextVar("perfcho_relay_task_name",
 _relay_event_type: ContextVar[str | None] = ContextVar("perfcho_relay_event_type", default=None)
 _relay_delay_ms: ContextVar[float | None] = ContextVar("perfcho_relay_delay_ms", default=None)
 _RATE_LIMIT_CAPACITY = 256
-_rate_limit_lock = Lock()
 _rate_limit_deadlines: OrderedDict[str, float] = OrderedDict()
 
 
@@ -146,7 +144,7 @@ def init_logger(process_role: ProcessRole, *, stream: TextIO | None = None) -> N
             label_keys={"level"},
             timeout=settings.loki_flush_interval_seconds,
             compressed=True,
-            default_formatter=_StructuredLoguruFormatter(),
+            default_formatter=_StructuredLoguruFormatter(),  # type: ignore
             enable_structured_loki_metadata=True,
             loki_metadata_keys=_LOKI_METADATA_KEYS,
         )
@@ -263,14 +261,13 @@ def sampled(sample_key: object, rate: float) -> bool:
 def rate_limit(key: str, *, interval_seconds: float = 30.0) -> bool:
     """Allow one event per bounded process-local key and time interval."""
     now = time.monotonic()
-    with _rate_limit_lock:
-        deadline = _rate_limit_deadlines.get(key, 0.0)
-        if deadline > now:
-            return False
-        _rate_limit_deadlines[key] = now + interval_seconds
-        _rate_limit_deadlines.move_to_end(key)
-        while len(_rate_limit_deadlines) > _RATE_LIMIT_CAPACITY:
-            _ = _rate_limit_deadlines.popitem(last=False)
+    deadline = _rate_limit_deadlines.get(key, 0.0)
+    if deadline > now:
+        return False
+    _rate_limit_deadlines[key] = now + interval_seconds
+    _rate_limit_deadlines.move_to_end(key)
+    while len(_rate_limit_deadlines) > _RATE_LIMIT_CAPACITY:
+        _ = _rate_limit_deadlines.popitem(last=False)
     return True
 
 

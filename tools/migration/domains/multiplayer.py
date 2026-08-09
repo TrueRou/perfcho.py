@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import unicodedata
 import uuid
 
+import orjson
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -107,9 +107,7 @@ async def _migrate_pool(session: AsyncSession, runtime: MigrationRuntime, row: S
         configuration = [
             {"map_id": item.get("map_id"), "mods": item.get("mods"), "slot": item.get("slot")} for item in picks
         ]
-        configuration_digest = hashlib.sha256(
-            json.dumps(configuration, sort_keys=True, separators=(",", ":")).encode()
-        ).digest()
+        configuration_digest = hashlib.sha256(orjson.dumps(configuration, option=orjson.OPT_SORT_KEYS)).digest()
         actual_revision_id = await session.scalar(
             select(TournamentPoolRevision.id).where(
                 TournamentPoolRevision.pool_id == target_id,

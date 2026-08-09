@@ -1,12 +1,12 @@
 """Seed the deterministic minimum PostgreSQL runtime catalog."""
 
 import hashlib
-import json
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
+import orjson
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -170,13 +170,10 @@ _ACCOUNT_IDENTITY_SQL = text(
 
 def canonical_json_digest(value: object) -> bytes:
     """Hash canonical compact JSON for persisted policy and mod-set identity."""
-    encoded = json.dumps(
+    encoded = orjson.dumps(
         value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode()
+        option=orjson.OPT_SORT_KEYS,
+    )
     return hashlib.sha256(encoded).digest()
 
 

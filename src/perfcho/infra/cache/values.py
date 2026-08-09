@@ -1,18 +1,19 @@
 """Small explicit codecs for cacheable immutable domain values."""
 
-import json
 from dataclasses import fields, is_dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+import orjson
+
 
 def encode_json(value: Any) -> bytes:
-    return json.dumps({"v": 1, "value": _encode(value)}, separators=(",", ":")).encode()
+    return orjson.dumps({"v": 1, "value": _encode(value)})
 
 
 def decode_json(raw: bytes) -> Any:
-    payload = json.loads(raw)
+    payload = orjson.loads(raw)
     if payload.get("v") != 1:
         raise ValueError("unknown cache value version")
     return _decode(payload["value"])

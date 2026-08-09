@@ -1,9 +1,9 @@
 """Create and scope asynchronous PostgreSQL engines and sessions."""
 
-import json
 from collections.abc import AsyncIterator
 from time import monotonic_ns
 
+import orjson
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateSchema
@@ -34,7 +34,7 @@ async def create_engine() -> AsyncEngine:
         pool_pre_ping=True,
         pool_recycle=3600,
         hide_parameters=True,
-        json_serializer=lambda value: json.dumps(value, ensure_ascii=False, default=str),
+        json_serializer=lambda value: orjson.dumps(value, default=str).decode(),
     )
     try:
         phase = "schema"

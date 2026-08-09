@@ -1,90 +1,274 @@
-"""Compose the Taskiq worker process and durable relay loops."""
+"""Compose the Taskiq worker process and execute durable deliveries."""
 
-import asyncio
-import os
-import socket
-import uuid
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from contextlib import suppress
+from datetime import UTC, datetime
 from time import monotonic_ns
-from typing import Any, NotRequired, Protocol, TypedDict, cast
+from typing import Annotated, Literal, TypedDict, cast
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
-from taskiq import TaskiqEvents, TaskiqState
+from taskiq import Context, TaskiqDepends, TaskiqEvents, TaskiqState
 
 from perfcho.infra import logging
 from perfcho.infra.cache import RedisCache
 from perfcho.infra.db import engine as infra_db
-from perfcho.infra.db.maintenance import RankSnapshotMaintenance
-from perfcho.infra.db.models.events import OutboxEvent
+from perfcho.infra.db.base import DbSessionFactory
+from perfcho.infra.db.enums import OutboxDeliveryStatus
+from perfcho.infra.db.models.events import OutboxDelivery, OutboxEvent
 from perfcho.infra.db.projectors import ranking
-from perfcho.infra.db.projectors.catalog import build_consumer_catalog
+from perfcho.infra.db.projectors.catalog import ConsumerCatalog, build_consumer_catalog
 from perfcho.infra.db.projectors.performance import PerformanceProjector
-from perfcho.infra.db.relays.outbox_delivery import (
-    OutboxDeliveryProcessor,
+from perfcho.infra.db.repositories.outbox_delivery import (
     OutboxDeliveryReference,
-    SqlAlchemyOutboxDeliveryRelayStore,
+    SqlAlchemyOutboxDeliveryRepository,
+    _clear_delivery_lease,
+    _database_now,
+    _error_message,
+    _retry_delay,
 )
 from perfcho.infra.redis import engine as infra_redis
 from perfcho.infra.settings import settings
 from perfcho.infra.storage import S3ObjectStorage
+from perfcho.infra.tracing import trace_context
 from perfcho.infra.upstream.calculator import HttpPerformanceCalculator
 
 logging.init_logger("worker")
 
+from perfcho.infra.logging import set_relay_delay_ms, set_relay_event_type  # noqa: E402
 from perfcho.infra.taskiq import broker  # noqa: E402
-from perfcho.tasks.outbox_delivery import dispatch_outbox_delivery  # noqa: E402
+
+_HANDLED_FAILURE_ATTRIBUTE = "_perfcho_outbox_failure_handled"
+
+type DeliveryFailureOutcome = tuple[Literal["retry", "dead"], int]
 
 
-class _RelayStore[Reference](Protocol):
-    """Persist claims and enqueue outcomes for one work family."""
-
-    async def claim(self, owner: str) -> Sequence[Reference]: ...
-
-    async def record_enqueue_outcomes(
-        self,
-        outcomes: Sequence[tuple[Reference, str | Exception]],
-        owner: str,
-    ) -> None: ...
-
-    async def release(self, references: Sequence[Reference], owner: str) -> None: ...
-
-
-type _Enqueue[Reference] = Callable[[Reference], Awaitable[str]]
-
-
-@dataclass(frozen=True, slots=True)
 class _WorkerResources:
     """Own process resources that require ordered shutdown."""
 
-    db_engine: AsyncEngine
-    http_client: httpx.AsyncClient
-    cache: RedisCache
-    relay_tasks: tuple[asyncio.Task[None], ...]
-    started_ns: int
+    def __init__(
+        self,
+        db_engine: AsyncEngine,
+        http_client: httpx.AsyncClient,
+        cache: RedisCache,
+        started_ns: int,
+    ) -> None:
+        """Store worker-owned resources."""
+        self.db_engine = db_engine
+        self.http_client = http_client
+        self.cache = cache
+        self.started_ns = started_ns
 
 
-@dataclass(frozen=True, slots=True)
-class _RelayBatchResult:
-    """Summarize one committed relay batch for bounded aggregate logging."""
+class OutboxEventLogFields(TypedDict, total=False):
+    """Describe the outbox event context emitted by delivery logs."""
 
-    claimed: int
-    enqueued: int
-    enqueue_failed: int
+    event_type: str
+    aggregate_type: str
+    aggregate_id: str
+    schema_version: int
+    source_position: int
+    payload_fields: tuple[str, ...]
+    outbox_payload: dict[str, object]
 
 
-class _ReferenceLogFields(TypedDict):
-    """Constrain generic relay context to non-fencing durable identifiers."""
+class OutboxDeliveryProcessor:
+    """Execute one fenced projector transaction and persist bounded failures."""
 
-    event_id: NotRequired[str]
-    consumer: NotRequired[str]
-    trace_id: NotRequired[str]
+    def __init__(
+        self,
+        session_factory: DbSessionFactory,
+        consumer_catalog: ConsumerCatalog,
+        *,
+        max_attempts: int,
+        max_retry_seconds: int,
+    ) -> None:
+        """Bind delivery execution to PostgreSQL, consumers, and retry policy."""
+        if min(max_attempts, max_retry_seconds) < 1:
+            raise ValueError("Outbox processor limits must be positive")
+        self._session_factory = session_factory
+        self._consumer_catalog = consumer_catalog
+        self._max_attempts = max_attempts
+        self._max_retry_seconds = max_retry_seconds
+
+    async def execute(self, reference: OutboxDeliveryReference) -> None:
+        """Run one delivery if its lease is current and unexpired at task start."""
+        started_ns = monotonic_ns()
+        outcome: Literal["stale", "succeeded"] = "stale"
+        attempt_count: int | None = None
+        event_fields: OutboxEventLogFields = {}
+        failure_event_fields: OutboxEventLogFields = {}
+        event: OutboxEvent | None = None
+        try:
+            async with self._session_factory.begin() as session:
+                delivery = await _locked_delivery(session, reference)
+                if delivery is None:
+                    raise LookupError(f"Outbox delivery does not exist: {reference.event_id}/{reference.consumer}")
+                event = await session.get(OutboxEvent, reference.event_id)
+                if event is not None:
+                    event_fields = _outbox_event_fields(event)
+                    failure_event_fields = _outbox_event_fields(event, include_payload=True)
+                if delivery.status not in {OutboxDeliveryStatus.SUCCEEDED, OutboxDeliveryStatus.DEAD}:
+                    now = await _database_now(session)
+                    if (
+                        delivery.status is OutboxDeliveryStatus.RUNNING
+                        and delivery.delivery_token == reference.delivery_token
+                        and delivery.lease_expires_at is not None
+                        and delivery.lease_expires_at > now
+                    ):
+                        registration = self._consumer_catalog.get(reference.consumer)
+                        if registration is None:
+                            raise LookupError(f"Outbox consumer is not registered: {reference.consumer}")
+                        if event is None:
+                            raise LookupError(f"Outbox event does not exist: {reference.event_id}")
+                        if event.event_type not in registration.event_types:
+                            raise LookupError(
+                                f"Outbox consumer {reference.consumer} does not accept event type {event.event_type}"
+                            )
+
+                        await registration.handler(session, event, delivery.partition_key)
+                        delivery.attempt_count += 1
+                        delivery.status = OutboxDeliveryStatus.SUCCEEDED
+                        delivery.completed_at = now
+                        _clear_delivery_lease(delivery)
+                        delivery.last_error = None
+                        outcome = "succeeded"
+                        attempt_count = delivery.attempt_count
+        except Exception as error:
+            failure = await self._record_failure(reference, error)
+            if failure is None:
+                raise
+            _mark_outbox_failure_handled(error)
+            failure_outcome, failure_attempt_count = failure
+            logging.log_event(
+                "ERROR" if failure_outcome == "dead" else "WARNING",
+                f"outbox.delivery.{failure_outcome}",
+                exception=error,
+                event_id=str(reference.event_id),
+                consumer=reference.consumer,
+                attempt_count=failure_attempt_count,
+                error_type=type(error).__name__,
+                duration_ms=logging.duration_ms(started_ns),
+                **failure_event_fields,
+            )
+            raise
+        if outcome == "succeeded":
+            assert attempt_count is not None
+            logging.log_event(
+                "INFO",
+                "outbox.delivery.succeeded",
+                event_id=str(reference.event_id),
+                consumer=reference.consumer,
+                attempt_count=attempt_count,
+                duration_ms=logging.duration_ms(started_ns),
+                **event_fields,
+            )
+        else:
+            logging.log_event(
+                "DEBUG",
+                "outbox.delivery.stale",
+                event_id=str(reference.event_id),
+                consumer=reference.consumer,
+                duration_ms=logging.duration_ms(started_ns),
+                **event_fields,
+            )
+
+    async def _record_failure(
+        self,
+        reference: OutboxDeliveryReference,
+        error: Exception,
+    ) -> DeliveryFailureOutcome | None:
+        outcome: DeliveryFailureOutcome | None = None
+        async with self._session_factory.begin() as session:
+            delivery = await _locked_delivery(session, reference)
+            if (
+                delivery is not None
+                and delivery.status is OutboxDeliveryStatus.RUNNING
+                and delivery.delivery_token == reference.delivery_token
+            ):
+                now = await _database_now(session)
+                delivery.attempt_count += 1
+                delivery.enqueued_at = None
+                delivery.broker_task_id = None
+                delivery.last_error = _error_message(error)
+                if delivery.attempt_count >= self._max_attempts:
+                    delivery.status = OutboxDeliveryStatus.DEAD
+                    delivery.dead_lettered_at = now
+                    outcome = ("dead", delivery.attempt_count)
+                else:
+                    delivery.status = OutboxDeliveryStatus.PENDING
+                    delivery.available_at = now + _retry_delay(
+                        delivery.attempt_count,
+                        self._max_retry_seconds,
+                    )
+                    outcome = ("retry", delivery.attempt_count)
+                _clear_delivery_lease(delivery)
+        return outcome
+
+
+def is_handled_outbox_failure(error: Exception) -> bool:
+    """Return whether the processor already logged a durable failure outcome."""
+    return bool(getattr(error, _HANDLED_FAILURE_ATTRIBUTE, False))
+
+
+def _mark_outbox_failure_handled(error: Exception) -> None:
+    with suppress(AttributeError, TypeError):
+        setattr(error, _HANDLED_FAILURE_ATTRIBUTE, True)
+
+
+async def _locked_delivery(
+    session: AsyncSession,
+    reference: OutboxDeliveryReference,
+) -> OutboxDelivery | None:
+    return await session.get(
+        OutboxDelivery,
+        {"event_id": reference.event_id, "consumer": reference.consumer},
+        with_for_update=True,
+    )
+
+
+def _outbox_event_fields(
+    event: OutboxEvent,
+    *,
+    include_payload: bool = False,
+) -> OutboxEventLogFields:
+    """Return event identity, adding the complete payload only for failure diagnostics."""
+    fields: OutboxEventLogFields = {
+        "event_type": event.event_type,
+        "aggregate_type": event.aggregate_type,
+        "aggregate_id": event.aggregate_id,
+        "schema_version": event.schema_version,
+        "source_position": event.position,
+        "payload_fields": tuple(sorted(event.payload)),
+    }
+    if include_payload:
+        fields["outbox_payload"] = event.payload
+    return fields
+
+
+@broker.task(task_name="perfcho.outbox.dispatch")
+async def dispatch_outbox_delivery(
+    event_id: str,
+    consumer: str,
+    delivery_token: str,
+    trace_id: str | None,
+    event_type: str | None,
+    event_created_at: str | None,
+    context: Annotated[Context, TaskiqDepends()],
+) -> None:
+    """Pass one broker message to the worker-composed delivery processor."""
+    set_relay_event_type(event_type)
+    set_relay_delay_ms(_consumer_delay_ms(event_created_at))
+    try:
+        with trace_context(trace_id):
+            await _dispatch_outbox_delivery(event_id, consumer, delivery_token, context)
+    finally:
+        set_relay_event_type(None)
+        set_relay_delay_ms(None)
 
 
 @broker.on_event(TaskiqEvents.WORKER_STARTUP)
 async def worker_startup(state: TaskiqState) -> None:
-    """Create all worker-owned resources and independent relay loops."""
+    """Create resources used by Taskiq delivery consumers."""
     started_ns = monotonic_ns()
     state.worker_started_ns = started_ns
     state.worker_lifecycle_stopped = False
@@ -92,14 +276,13 @@ async def worker_startup(state: TaskiqState) -> None:
     db_engine: AsyncEngine | None = None
     http_client: httpx.AsyncClient | None = None
     cache: RedisCache | None = None
-    relay_tasks: tuple[asyncio.Task[None], ...] = ()
     try:
         db_engine = await infra_db.create_engine()
         session_factory = infra_db.create_session_factory(db_engine)
         http_client = httpx.AsyncClient(timeout=settings.performance_http_timeout_seconds)
         cache_redis = await infra_redis.create_cache_redis()
         cache = RedisCache(cache_redis, prefix=settings.redis_cache_prefix)
-        outbox_store = SqlAlchemyOutboxDeliveryRelayStore(
+        outbox_repository = SqlAlchemyOutboxDeliveryRepository(
             session_factory,
             batch_size=settings.outbox_delivery_batch_size,
             lease_seconds=settings.outbox_delivery_lease_seconds,
@@ -121,45 +304,18 @@ async def worker_startup(state: TaskiqState) -> None:
             ),
             ranking_handler=ranking_handler,
         )
-        unknown_consumers = await outbox_store.unknown_consumers(consumer_catalog)
+        unknown_consumers = await outbox_repository.unknown_consumers(consumer_catalog)
         if unknown_consumers:
             names = ", ".join(sorted(unknown_consumers))
             raise RuntimeError(f"Unregistered outbox consumers have unfinished deliveries: {names}")
 
-        owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
         state.outbox_delivery_processor = OutboxDeliveryProcessor(
             session_factory,
             consumer_catalog,
             max_attempts=settings.outbox_delivery_max_attempts,
             max_retry_seconds=settings.outbox_delivery_max_retry_seconds,
         )
-        outbox_relay_task = asyncio.create_task(
-            _run_relay_loop(
-                "outbox-delivery",
-                outbox_store,
-                owner,
-                _enqueue_outbox,
-                poll_interval=settings.durable_relay_poll_interval_seconds,
-                enqueue_concurrency=settings.durable_relay_enqueue_concurrency,
-            ),
-            name="perfcho-outbox-relay",
-        )
-        relay_tasks = (outbox_relay_task,)
-        rank_snapshot_task = asyncio.create_task(
-            _run_rank_snapshot_loop(
-                RankSnapshotMaintenance(session_factory),
-                poll_interval=settings.rank_snapshot_poll_interval_seconds,
-            ),
-            name="perfcho-rank-snapshot-maintenance",
-        )
-        relay_tasks = (outbox_relay_task, rank_snapshot_task)
-        state.worker_resources = _WorkerResources(
-            db_engine=db_engine,
-            http_client=http_client,
-            cache=cache,
-            relay_tasks=relay_tasks,
-            started_ns=started_ns,
-        )
+        state.worker_resources = _WorkerResources(db_engine, http_client, cache, started_ns)
         logging.log_event("INFO", "runtime.worker.ready", duration_ms=logging.duration_ms(started_ns))
     except BaseException as error:
         logging.log_event(
@@ -170,7 +326,7 @@ async def worker_startup(state: TaskiqState) -> None:
             duration_ms=logging.duration_ms(started_ns),
         )
         logging.log_event("INFO", "runtime.worker.stopping")
-        await _cleanup_worker_resources(relay_tasks, http_client, db_engine, cache)
+        await _cleanup_worker_resources(http_client, db_engine, cache)
         state.worker_lifecycle_stopped = True
         logging.log_event("INFO", "runtime.worker.stopped", duration_ms=logging.duration_ms(started_ns))
         raise
@@ -178,54 +334,24 @@ async def worker_startup(state: TaskiqState) -> None:
 
 @broker.on_event(TaskiqEvents.WORKER_SHUTDOWN)
 async def worker_shutdown(state: TaskiqState) -> None:
-    """Stop relays before closing shared HTTP and database resources."""
+    """Close worker-owned resources after Taskiq stops receiving work."""
     if bool(getattr(state, "worker_lifecycle_stopped", False)):
         return
     resources = cast(_WorkerResources | None, getattr(state, "worker_resources", None))
     started_ns = resources.started_ns if resources is not None else monotonic_ns()
     logging.log_event("INFO", "runtime.worker.stopping")
     if resources is not None:
-        await _cleanup_worker_resources(
-            resources.relay_tasks,
-            resources.http_client,
-            resources.db_engine,
-            resources.cache,
-        )
+        await _cleanup_worker_resources(resources.http_client, resources.db_engine, resources.cache)
     state.worker_lifecycle_stopped = True
     logging.log_event("INFO", "runtime.worker.stopped", duration_ms=logging.duration_ms(started_ns))
 
 
 async def _cleanup_worker_resources(
-    relay_tasks: tuple[asyncio.Task[None], ...],
     http_client: httpx.AsyncClient | None,
     db_engine: AsyncEngine | None,
     cache: RedisCache | None = None,
 ) -> None:
     """Close every initialized worker resource even when an earlier close fails."""
-    for task in relay_tasks:
-        task.cancel()
-    if relay_tasks:
-        try:
-            outcomes = await asyncio.gather(*relay_tasks, return_exceptions=True)
-        except Exception as error:
-            logging.log_event(
-                "ERROR",
-                "runtime.worker.resource_close_failed",
-                exception=error,
-                resource="relay",
-                error_type=type(error).__name__,
-            )
-        else:
-            for task, outcome in zip(relay_tasks, outcomes, strict=True):
-                if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
-                    logging.log_event(
-                        "ERROR",
-                        "runtime.worker.resource_close_failed",
-                        exception=outcome,
-                        resource="relay",
-                        relay_task=task.get_name(),
-                        error_type=type(outcome).__name__,
-                    )
     if http_client is not None:
         try:
             await http_client.aclose()
@@ -261,219 +387,60 @@ async def _cleanup_worker_resources(
             )
 
 
-async def _relay_once[Reference](
-    store: _RelayStore[Reference],
-    owner: str,
-    enqueue: _Enqueue[Reference],
-    *,
-    relay: str = "unknown",
-    enqueue_concurrency: int = 1,
-) -> _RelayBatchResult:
-    """Claim and publish one batch while preserving uncertain enqueue leases."""
-    if enqueue_concurrency < 1:
-        raise ValueError("enqueue_concurrency must be positive")
-    references = tuple(await store.claim(owner))
-    enqueued = 0
-    enqueue_failed = 0
-    outcomes: list[tuple[Reference, str | Exception]] = []
-
-    async def enqueue_one(reference: Reference) -> str | Exception:
-        try:
-            return await enqueue(reference)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            return error
-
-    async def preserve_cancelled_tail(unattempted: Sequence[Reference]) -> None:
-        if outcomes:
-            try:
-                await store.record_enqueue_outcomes(outcomes, owner)
-            except Exception as error:
-                logging.log_event(
-                    "ERROR",
-                    "runtime.worker.relay.outcome_persist_failed",
-                    exception=error,
-                    relay=relay,
-                    error_type=type(error).__name__,
-                )
-        if unattempted:
-            try:
-                await store.release(unattempted, owner)
-            except Exception as error:
-                logging.log_event(
-                    "ERROR",
-                    "runtime.worker.relay.release_failed",
-                    exception=error,
-                    relay=relay,
-                    error_type=type(error).__name__,
-                    release_count=len(unattempted),
-                )
-
-    for offset in range(0, len(references), enqueue_concurrency):
-        chunk = references[offset : offset + enqueue_concurrency]
-        tasks = tuple(asyncio.create_task(enqueue_one(reference)) for reference in chunk)
-        try:
-            chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
-        except asyncio.CancelledError:
-            for task in tasks:
-                task.cancel()
-            settled = await asyncio.gather(*tasks, return_exceptions=True)
-            for reference, outcome in zip(chunk, settled, strict=True):
-                if isinstance(outcome, asyncio.CancelledError):
-                    continue
-                if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
-                    continue
-                outcomes.append((reference, cast(str | Exception, outcome)))
-            unattempted = references[offset + len(chunk) :]
-            await preserve_cancelled_tail(unattempted)
-            raise
-        cancelled = False
-        for reference, outcome in zip(chunk, chunk_results, strict=True):
-            if isinstance(outcome, asyncio.CancelledError):
-                cancelled = True
-                continue
-            if isinstance(outcome, Exception):
-                outcomes.append((reference, outcome))
-                enqueue_failed += 1
-                logging.log_event(
-                    "WARNING",
-                    "runtime.worker.relay.enqueue_failed",
-                    exception=outcome,
-                    relay=relay,
-                    error_type=type(outcome).__name__,
-                    **_reference_fields(reference),
-                )
-            elif isinstance(outcome, BaseException):
-                raise outcome
-            else:
-                outcomes.append((reference, outcome))
-                enqueued += 1
-        if cancelled:
-            await preserve_cancelled_tail(references[offset + len(chunk) :])
-            raise asyncio.CancelledError
-    if outcomes:
-        await store.record_enqueue_outcomes(outcomes, owner)
-    return _RelayBatchResult(len(references), enqueued, enqueue_failed)
-
-
-async def _run_relay_loop[Reference](
-    name: str,
-    store: _RelayStore[Reference],
-    owner: str,
-    enqueue: _Enqueue[Reference],
-    *,
-    poll_interval: float,
-    enqueue_concurrency: int = 1,
+async def _dispatch_outbox_delivery(
+    event_id: str,
+    consumer: str,
+    delivery_token: str,
+    context: Context,
 ) -> None:
-    """Run one independently supervised work-family relay."""
-    if poll_interval <= 0:
-        raise ValueError("poll_interval must be positive")
-    started_ns = monotonic_ns()
-    logging.log_event("INFO", "runtime.worker.relay.started", relay=name)
+    """Execute one delivery inside the caller's trace context."""
+    import uuid
+
+    parsed_event_id: uuid.UUID | None = None
     try:
-        while True:
-            iteration_started_ns = monotonic_ns()
-            try:
-                result = await _relay_once(
-                    store,
-                    owner,
-                    enqueue,
-                    relay=name,
-                    enqueue_concurrency=enqueue_concurrency,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                if logging.rate_limit(f"worker-relay:{name}:iteration-failed"):
-                    logging.log_event(
-                        "ERROR",
-                        "runtime.worker.relay.iteration_failed",
-                        exception=error,
-                        relay=name,
-                        error_type=type(error).__name__,
-                    )
-                result = _RelayBatchResult(0, 0, 0)
-            if result.claimed == 0:
-                await asyncio.sleep(poll_interval)
-            else:
-                logging.log_event(
-                    "DEBUG",
-                    "runtime.worker.relay.batch",
-                    relay=name,
-                    claimed=result.claimed,
-                    enqueued=result.enqueued,
-                    enqueue_failed=result.enqueue_failed,
-                    duration_ms=logging.duration_ms(iteration_started_ns),
-                )
-    finally:
+        parsed_event_id = uuid.UUID(event_id)
+        parsed_delivery_token = uuid.UUID(delivery_token)
+    except (AttributeError, TypeError, ValueError) as error:
         logging.log_event(
-            "INFO",
-            "runtime.worker.relay.stopped",
-            relay=name,
-            duration_ms=logging.duration_ms(started_ns),
+            "ERROR",
+            "task.outbox_delivery.malformed_payload",
+            exception=error,
+            event_id=str(parsed_event_id) if parsed_event_id is not None else None,
+            consumer=consumer,
+            error_type=type(error).__name__,
         )
+        raise
 
-
-async def _run_rank_snapshot_loop(
-    maintenance: RankSnapshotMaintenance,
-    *,
-    poll_interval: float,
-) -> None:
-    """Poll durable state and materialize one complete rank snapshot per day."""
-    started_ns = monotonic_ns()
-    logging.log_event("INFO", "runtime.worker.maintenance.started", maintenance="rank-snapshot")
     try:
-        while True:
-            iteration_started_ns = monotonic_ns()
-            try:
-                completed = await maintenance.run_due()
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                if logging.rate_limit("worker-maintenance:rank-snapshot:iteration-failed"):
-                    logging.log_event(
-                        "ERROR",
-                        "runtime.worker.maintenance.iteration_failed",
-                        exception=error,
-                        maintenance="rank-snapshot",
-                        error_type=type(error).__name__,
-                    )
-            else:
-                if completed:
-                    logging.log_event(
-                        "INFO",
-                        "runtime.worker.maintenance.completed",
-                        maintenance="rank-snapshot",
-                        duration_ms=logging.duration_ms(iteration_started_ns),
-                    )
-            await asyncio.sleep(poll_interval)
-    finally:
-        logging.log_event(
-            "INFO",
-            "runtime.worker.maintenance.stopped",
-            maintenance="rank-snapshot",
-            duration_ms=logging.duration_ms(started_ns),
+        processor = cast(OutboxDeliveryProcessor, context.state.outbox_delivery_processor)
+        await processor.execute(
+            OutboxDeliveryReference(
+                event_id=parsed_event_id,
+                consumer=consumer,
+                delivery_token=parsed_delivery_token,
+            )
         )
+    except Exception as error:
+        if not is_handled_outbox_failure(error):
+            logging.log_event(
+                "ERROR",
+                "task.outbox_delivery.failed",
+                exception=error,
+                event_id=str(parsed_event_id),
+                consumer=consumer,
+                error_type=type(error).__name__,
+            )
+        raise
 
 
-def _reference_fields(reference: object) -> _ReferenceLogFields:
-    """Return only non-fencing identifiers approved for relay logs."""
-    if isinstance(reference, OutboxDeliveryReference):
-        fields: _ReferenceLogFields = {"event_id": str(reference.event_id), "consumer": reference.consumer}
-        if reference.trace_id is not None:
-            fields["trace_id"] = reference.trace_id.hex
-        return fields
-    return {}
-
-
-async def _enqueue_outbox(reference: OutboxDeliveryReference) -> str:
-    task = await cast(Any, dispatch_outbox_delivery).kiq(
-        str(reference.event_id),
-        reference.consumer,
-        str(reference.delivery_token),
-        reference.trace_id.hex if reference.trace_id is not None else None,
-        reference.event_type,
-        reference.event_created_at.isoformat() if reference.event_created_at is not None else None,
-    )
-    return str(task.task_id)
+def _consumer_delay_ms(event_created_at: str | None) -> float | None:
+    """Return elapsed milliseconds from durable event creation to consumer start."""
+    if event_created_at is None:
+        return None
+    try:
+        created_at = datetime.fromisoformat(event_created_at)
+    except ValueError:
+        return None
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    return max(0.0, round((datetime.now(UTC) - created_at).total_seconds() * 1000, 3))

@@ -90,13 +90,13 @@ def json_codec(
     encode_value: Callable[[T], Any], decode_value: Callable[[Any], T]
 ) -> tuple[Callable[[T], bytes], Callable[[bytes], T]]:
     """Build a compact JSON codec for an explicitly mapped domain value."""
-    import json
+    import orjson
 
     def encode(value: T) -> bytes:
-        return json.dumps({"v": 1, "value": encode_value(value)}, separators=(",", ":")).encode()
+        return orjson.dumps({"v": 1, "value": encode_value(value)})
 
     def decode(raw: bytes) -> T:
-        payload = json.loads(raw)
+        payload = orjson.loads(raw)
         if payload.get("v") != 1:
             raise ValueError("unknown cache value version")
         return decode_value(payload["value"])

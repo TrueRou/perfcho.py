@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import replace
 from typing import cast
 
+import orjson
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -291,5 +291,5 @@ def _canonical_mods(value: object) -> tuple[CanonicalMod, ...]:
 
 
 def _canonical_digest(value: object) -> bytes:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    encoded = orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
     return hashlib.sha256(encoded).digest()

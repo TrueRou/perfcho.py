@@ -1,8 +1,9 @@
 """Serve deterministic public assets used to verify perfcho forwarding."""
 
 import argparse
-import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import orjson
 
 from tools.fakeclient.fixtures import BEATMAPSET_ID
 
@@ -19,9 +20,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
         """Serve one deterministic response selected by request path."""
         path = self.path.partition("?")[0]
         if path == "/web/osu-getseasonal.php":
-            self._send(json.dumps(["http://127.0.0.1/seasonal.jpg"]).encode(), "application/json")
+            self._send(orjson.dumps(["http://127.0.0.1/seasonal.jpg"]), "application/json")
         elif path == "/menu-content.json":
-            self._send(json.dumps({"images": []}).encode(), "application/json")
+            self._send(orjson.dumps({"images": []}), "application/json")
         elif path.startswith("/thumb/"):
             self._send(_JPEG, "image/jpeg")
         elif path.startswith("/preview/"):

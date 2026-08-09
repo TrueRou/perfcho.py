@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
+
+import orjson
 
 from perfcho.infra.db.enums import BeatmapStatus, Ruleset, ScoreboardVariant, ScoreGrade
 from perfcho.modules.scoring.mods import parse_legacy_mods
@@ -93,13 +94,10 @@ def mod_set(mode: object, legacy_bits: object) -> tuple[int, list[dict[str, obje
 
 def canonical_json_digest(value: object) -> bytes:
     """Hash compact, sorted JSON using perfcho's persisted identity rule."""
-    encoded = json.dumps(
+    encoded = orjson.dumps(
         value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode()
+        option=orjson.OPT_SORT_KEYS,
+    )
     return hashlib.sha256(encoded).digest()
 
 
@@ -155,7 +153,7 @@ def json_object(value: object) -> dict[str, object]:
     """Decode a MySQL JSON object while rejecting arrays and scalar values."""
     if value is None:
         return {}
-    decoded = json.loads(value) if isinstance(value, str) else value
+    decoded = orjson.loads(value) if isinstance(value, str) else value
     if not isinstance(decoded, dict):
         raise ValueError("legacy JSON value must be an object")
     return decoded

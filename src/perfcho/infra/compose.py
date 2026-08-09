@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
+from apscheduler import AsyncScheduler
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -47,6 +48,7 @@ from perfcho.infra.redis import engine as infra_redis
 from perfcho.infra.redis.identity import RedisStableWebVerificationCache
 from perfcho.infra.redis.multiplayer import RedisMultiplayerStateRepository
 from perfcho.infra.redis.realtime import RedisRealtimeRepository
+from perfcho.infra.scheduler import start_scheduler, stop_scheduler
 from perfcho.infra.security.password import Argon2Policy, PasswordPepper
 from perfcho.infra.settings import Settings
 from perfcho.infra.storage import S3ObjectStorage
@@ -198,6 +200,7 @@ class CoreServices:
     ``state_redis`` is the raw DB0 client for online state adapters.
     ``cache_redis`` is a separate DB0 client owned by the process lifecycle.
     ``cache`` is the only cache API exposed to application services.
+    ``scheduler`` owns APScheduler jobs for the API process lifecycle.
     """
 
     config: Settings
@@ -208,6 +211,14 @@ class CoreServices:
     cache: RedisCache
     postgres: AsyncEngine
     session_factory: DbSessionFactory
+    scheduler: AsyncScheduler
+
+    async def aclose(self) -> None:
+        """Stop process-owned scheduling and close shared infrastructure resources."""
+        await stop_scheduler(self.scheduler)
+        await self.cache_redis.aclose()
+        await self.state_redis.aclose()
+        await self.postgres.dispose()
 
 
 async def compose_core_services() -> CoreServices:
@@ -218,6 +229,11 @@ async def compose_core_services() -> CoreServices:
     state_redis = await infra_redis.create_state_redis()
     cache_redis = await infra_redis.create_cache_redis()
     cache = RedisCache(cache_redis, prefix=config.redis_cache_prefix)
+    session_factory = infra_db.create_session_factory(postgres)
+    scheduler = await start_scheduler(
+        session_factory,
+        rank_snapshot_cron=config.rank_snapshot_cron,
+    )
     return CoreServices(
         config=config,
         clock=_SystemClock(),
@@ -226,7 +242,8 @@ async def compose_core_services() -> CoreServices:
         cache_redis=cache_redis,
         cache=cache,
         postgres=postgres,
-        session_factory=infra_db.create_session_factory(postgres),
+        session_factory=session_factory,
+        scheduler=scheduler,
     )
 
 

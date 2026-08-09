@@ -1,4 +1,4 @@
-"""Map structured settings and resumable maintenance state."""
+"""Map migration state and command receipts."""
 
 from datetime import datetime
 
@@ -10,14 +10,11 @@ from perfcho.infra.db.base import DbBase
 from perfcho.infra.db.mixins import CreatedAtMixin, TimestampMixin
 
 
-class MaintenanceState(TimestampMixin, DbBase):
-    """Stores resumable maintenance task state and short-lived leases."""
+class MigrationState(TimestampMixin, DbBase):
+    """Store resumable migration checkpoints."""
 
-    __tablename__ = "maintenance_states"
-    __table_args__ = (
-        CheckConstraint("lease_expires_at IS NULL OR lease_owner IS NOT NULL", name="lease_owner_required"),
-        {"schema": "system"},
-    )
+    __tablename__ = "migration_states"
+    __table_args__ = {"schema": "system"}
 
     task: Mapped[str] = mapped_column(String(100), primary_key=True)
     state: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")

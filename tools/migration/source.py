@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from collections.abc import Iterator, Sequence
 
+import orjson
 import pymysql
 from pymysql.cursors import DictCursor, SSDictCursor
 from sqlalchemy.engine import make_url
@@ -75,7 +75,7 @@ class BanchoSource:
             "tables": {name: sorted(columns) for name, columns in sorted(tables.items())},
             "counts": counts,
         }
-        encoded = json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
+        encoded = orjson.dumps(fingerprint_payload, option=orjson.OPT_SORT_KEYS)
         return SourceSchema(tables, version, counts, hashlib.sha256(encoded).hexdigest())
 
     def count(self, table: str) -> int:

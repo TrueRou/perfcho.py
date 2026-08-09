@@ -1,12 +1,10 @@
-"""Persist and execute ordered outbox delivery leases."""
+"""Persist durable outbox delivery leases and broker enqueue outcomes."""
 
 import uuid
 from collections.abc import Collection, Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from time import monotonic_ns
-from typing import Literal, TypedDict
+from typing import Literal
 
 from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,12 +13,9 @@ from sqlalchemy.orm import aliased
 from perfcho.infra.db.base import DbSessionFactory
 from perfcho.infra.db.enums import OutboxDeliveryStatus
 from perfcho.infra.db.models.events import OutboxDelivery, OutboxEvent
-from perfcho.infra.db.projectors.catalog import ConsumerCatalog
-from perfcho.infra.logging import duration_ms, log_event
+from perfcho.infra.logging import log_event
 
-_HANDLED_FAILURE_ATTRIBUTE = "_perfcho_outbox_failure_handled"
-
-type _DeliveryFailureOutcome = tuple[Literal["retry", "dead"], int]
+type DeliveryFailureOutcome = tuple[Literal["retry", "dead"], int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,19 +30,7 @@ class OutboxDeliveryReference:
     event_created_at: datetime | None = None
 
 
-class _OutboxEventLogFields(TypedDict, total=False):
-    """Describe the complete outbox event context emitted by delivery logs."""
-
-    event_type: str
-    aggregate_type: str
-    aggregate_id: str
-    schema_version: int
-    source_position: int
-    payload_fields: tuple[str, ...]
-    outbox_payload: dict[str, object]
-
-
-class SqlAlchemyOutboxDeliveryRelayStore:
+class SqlAlchemyOutboxDeliveryRepository:
     """Claim ordered deliveries and persist their broker enqueue outcomes."""
 
     def __init__(
@@ -59,7 +42,7 @@ class SqlAlchemyOutboxDeliveryRelayStore:
         max_attempts: int,
         max_retry_seconds: int,
     ) -> None:
-        """Bind relay state to PostgreSQL and explicit retry limits."""
+        """Bind delivery persistence to PostgreSQL and explicit retry limits."""
         if min(batch_size, lease_seconds, max_attempts, max_retry_seconds) < 1:
             raise ValueError("Outbox relay limits must be positive")
         self._session_factory = session_factory
@@ -240,166 +223,17 @@ class SqlAlchemyOutboxDeliveryRelayStore:
         return frozenset(consumers.difference(known_consumers))
 
 
-class OutboxDeliveryProcessor:
-    """Execute one fenced projector transaction and persist bounded failures."""
-
-    def __init__(
-        self,
-        session_factory: DbSessionFactory,
-        consumer_catalog: ConsumerCatalog,
-        *,
-        max_attempts: int,
-        max_retry_seconds: int,
-    ) -> None:
-        """Bind delivery execution to PostgreSQL, consumers, and retry policy."""
-        if min(max_attempts, max_retry_seconds) < 1:
-            raise ValueError("Outbox processor limits must be positive")
-        self._session_factory = session_factory
-        self._consumer_catalog = consumer_catalog
-        self._max_attempts = max_attempts
-        self._max_retry_seconds = max_retry_seconds
-
-    async def execute(self, reference: OutboxDeliveryReference) -> None:
-        """Run one delivery if its lease is current and unexpired at task start."""
-        started_ns = monotonic_ns()
-        outcome: Literal["stale", "succeeded"] = "stale"
-        attempt_count: int | None = None
-        event_fields: _OutboxEventLogFields = {}
-        failure_event_fields: _OutboxEventLogFields = {}
-        event: OutboxEvent | None = None
-        try:
-            async with self._session_factory.begin() as session:
-                delivery = await _locked_delivery(session, reference)
-                if delivery is None:
-                    raise LookupError(f"Outbox delivery does not exist: {reference.event_id}/{reference.consumer}")
-                event = await session.get(OutboxEvent, reference.event_id)
-                if event is not None:
-                    event_fields = _outbox_event_fields(event)
-                    failure_event_fields = _outbox_event_fields(event, include_payload=True)
-                if delivery.status not in {OutboxDeliveryStatus.SUCCEEDED, OutboxDeliveryStatus.DEAD}:
-                    now = await _database_now(session)
-                    if (
-                        delivery.status is OutboxDeliveryStatus.RUNNING
-                        and delivery.delivery_token == reference.delivery_token
-                        and delivery.lease_expires_at is not None
-                        and delivery.lease_expires_at > now
-                    ):
-                        registration = self._consumer_catalog.get(reference.consumer)
-                        if registration is None:
-                            raise LookupError(f"Outbox consumer is not registered: {reference.consumer}")
-                        if event is None:
-                            raise LookupError(f"Outbox event does not exist: {reference.event_id}")
-                        if event.event_type not in registration.event_types:
-                            raise LookupError(
-                                f"Outbox consumer {reference.consumer} does not accept event type {event.event_type}"
-                            )
-
-                        await registration.handler(session, event, delivery.partition_key)
-                        delivery.attempt_count += 1
-                        delivery.status = OutboxDeliveryStatus.SUCCEEDED
-                        delivery.completed_at = now
-                        _clear_delivery_lease(delivery)
-                        delivery.last_error = None
-                        outcome = "succeeded"
-                        attempt_count = delivery.attempt_count
-        except Exception as error:
-            failure = await self._record_failure(reference, error)
-            if failure is None:
-                raise
-            _mark_outbox_failure_handled(error)
-            failure_outcome, failure_attempt_count = failure
-            log_event(
-                "ERROR" if failure_outcome == "dead" else "WARNING",
-                f"outbox.delivery.{failure_outcome}",
-                exception=error,
-                event_id=str(reference.event_id),
-                consumer=reference.consumer,
-                attempt_count=failure_attempt_count,
-                error_type=type(error).__name__,
-                duration_ms=duration_ms(started_ns),
-                **failure_event_fields,
-            )
-            raise
-        if outcome == "succeeded":
-            assert attempt_count is not None
-            log_event(
-                "INFO",
-                "outbox.delivery.succeeded",
-                event_id=str(reference.event_id),
-                consumer=reference.consumer,
-                attempt_count=attempt_count,
-                duration_ms=duration_ms(started_ns),
-                **event_fields,
-            )
-        else:
-            log_event(
-                "DEBUG",
-                "outbox.delivery.stale",
-                event_id=str(reference.event_id),
-                consumer=reference.consumer,
-                duration_ms=duration_ms(started_ns),
-                **event_fields,
-            )
-
-    async def _record_failure(
-        self,
-        reference: OutboxDeliveryReference,
-        error: Exception,
-    ) -> _DeliveryFailureOutcome | None:
-        outcome: _DeliveryFailureOutcome | None = None
-        async with self._session_factory.begin() as session:
-            delivery = await _locked_delivery(session, reference)
-            if (
-                delivery is not None
-                and delivery.status is OutboxDeliveryStatus.RUNNING
-                and delivery.delivery_token == reference.delivery_token
-            ):
-                now = await _database_now(session)
-                delivery.attempt_count += 1
-                delivery.enqueued_at = None
-                delivery.broker_task_id = None
-                delivery.last_error = _error_message(error)
-                if delivery.attempt_count >= self._max_attempts:
-                    delivery.status = OutboxDeliveryStatus.DEAD
-                    delivery.dead_lettered_at = now
-                    outcome = ("dead", delivery.attempt_count)
-                else:
-                    delivery.status = OutboxDeliveryStatus.PENDING
-                    delivery.available_at = now + _retry_delay(
-                        delivery.attempt_count,
-                        self._max_retry_seconds,
-                    )
-                    outcome = ("retry", delivery.attempt_count)
-                _clear_delivery_lease(delivery)
-        return outcome
-
-
-def is_handled_outbox_failure(error: Exception) -> bool:
-    """Return whether the processor already logged a durable failure outcome."""
-    return bool(getattr(error, _HANDLED_FAILURE_ATTRIBUTE, False))
-
-
-def _mark_outbox_failure_handled(error: Exception) -> None:
-    with suppress(AttributeError, TypeError):
-        setattr(error, _HANDLED_FAILURE_ATTRIBUTE, True)
-
-
 async def _database_now(session: AsyncSession) -> datetime:
     now = await session.scalar(select(func.clock_timestamp()))
     if now is None:
-        raise RuntimeError("PostgreSQL did not return a relay timestamp")
+        raise RuntimeError("PostgreSQL did not return an outbox timestamp")
     return now
 
 
-async def _locked_delivery(
-    session: AsyncSession,
-    reference: OutboxDeliveryReference,
-) -> OutboxDelivery | None:
-    return await session.get(
-        OutboxDelivery,
-        {"event_id": reference.event_id, "consumer": reference.consumer},
-        with_for_update=True,
-    )
+def _clear_delivery_lease(delivery: OutboxDelivery) -> None:
+    delivery.lease_owner = None
+    delivery.delivery_token = None
+    delivery.lease_expires_at = None
 
 
 def _owns_live_lease(
@@ -418,34 +252,9 @@ def _owns_live_lease(
     )
 
 
-def _clear_delivery_lease(delivery: OutboxDelivery) -> None:
-    delivery.lease_owner = None
-    delivery.delivery_token = None
-    delivery.lease_expires_at = None
-
-
 def _retry_delay(attempt_count: int, max_seconds: int) -> timedelta:
     return timedelta(seconds=min(2 ** max(attempt_count, 1), max_seconds))
 
 
 def _error_message(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"[:4000]
-
-
-def _outbox_event_fields(
-    event: OutboxEvent,
-    *,
-    include_payload: bool = False,
-) -> _OutboxEventLogFields:
-    """Return event identity, adding the complete payload only for failure diagnostics."""
-    fields: _OutboxEventLogFields = {
-        "event_type": event.event_type,
-        "aggregate_type": event.aggregate_type,
-        "aggregate_id": event.aggregate_id,
-        "schema_version": event.schema_version,
-        "source_position": event.position,
-        "payload_fields": tuple(sorted(event.payload)),
-    }
-    if include_payload:
-        fields["outbox_payload"] = event.payload
-    return fields
