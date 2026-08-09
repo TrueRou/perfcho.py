@@ -7,6 +7,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.models.events import OutboxDelivery, OutboxEvent
+from perfcho.infra.tracing import current_trace_id
 from perfcho.modules.common.models import PendingEvent
 
 
@@ -34,12 +35,14 @@ async def append_outbox_event(session: AsyncSession, event: PendingEvent) -> Out
     available_at = await session.scalar(select(func.clock_timestamp()))
     if available_at is None:
         raise RuntimeError("PostgreSQL did not return an outbox timestamp")
+    trace_id = current_trace_id()
     persisted = OutboxEvent(
         aggregate_type=event.aggregate_type,
         aggregate_id=event.aggregate_id,
         event_type=event.event_type,
         schema_version=event.schema_version,
         payload=dict(event.payload),
+        trace_id=uuid.UUID(hex=trace_id) if trace_id is not None else None,
     )
     session.add(persisted)
     await session.flush()

@@ -1,11 +1,19 @@
 name: perfcho-production
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "5m"
+    max-file: "2"
+
 x-app-environment: &app-environment
   APP_HOST: 0.0.0.0
   APP_PORT: 8000
   APP_DEBUG: ${APP_DEBUG:-false}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
-  LOG_FORMAT: ${LOG_FORMAT:-json}
+  LOKI_URL: http://loki:3100/loki/api/v1/push
+  LOKI_ENVIRONMENT: production
+  LOKI_FLUSH_INTERVAL_SECONDS: ${LOKI_FLUSH_INTERVAL_SECONDS:-5}
   LOG_HTTP_SUCCESS_SAMPLE_RATE: ${LOG_HTTP_SUCCESS_SAMPLE_RATE:-0.05}
   LOG_STABLE_POLL_SAMPLE_RATE: ${LOG_STABLE_POLL_SAMPLE_RATE:-0.01}
   LOG_HOT_PATH_SAMPLE_RATE: ${LOG_HOT_PATH_SAMPLE_RATE:-0.001}
@@ -52,6 +60,7 @@ x-app-environment: &app-environment
 x-app: &app
   image: ${PERFCHO_IMAGE:-perfcho:latest}
   environment: *app-environment
+  logging: *default-logging
   init: true
   restart: unless-stopped
   stop_grace_period: 30s
@@ -59,6 +68,7 @@ x-app: &app
 services:
   postgres:
     image: postgres:17-alpine
+    logging: *default-logging
     environment:
       POSTGRES_DB: perfcho
       POSTGRES_USER: perfcho
@@ -78,6 +88,7 @@ services:
 
   redis:
     image: redis:8-alpine
+    logging: *default-logging
     command:
       - redis-server
       - --appendonly
@@ -105,6 +116,7 @@ services:
 
   minio:
     image: minio/minio:latest
+    logging: *default-logging
     command: [ "server", "/data", "--console-address", ":9001" ]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
@@ -122,6 +134,7 @@ services:
 
   minio-init:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    logging: *default-logging
     depends_on:
       minio:
         condition: service_healthy
@@ -135,8 +148,38 @@ services:
         mc alias set perfcho http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" && mc mb --ignore-existing "perfcho/$${S3_BUCKET}"
     restart: "no"
 
+  loki:
+    image: grafana/loki:3.7.0
+    logging: *default-logging
+    command: [ "-config.file=/etc/loki/config.yaml" ]
+    volumes:
+      - ./observability/loki-config.yaml:/etc/loki/config.yaml:ro
+      - perfcho-loki:/loki
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?GRAFANA_ADMIN_USER must be set}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/perfcho-logs.json
+    ports:
+      - "${GRAFANA_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PUBLISHED_PORT:-53000}:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - perfcho-grafana:/var/lib/grafana
+    depends_on:
+      - loki
+    restart: unless-stopped
+    stop_grace_period: 30s
+
   calculator-dotnet:
     image: hkccr.ccs.tencentyun.com/truerou/perfcho.pp:master
+    logging: *default-logging
     environment:
       CACHE_DISK_ENABLED: ${CACHE_DISK_ENABLED:-false}
       CACHE_MAXIMUM_MEMORY_CACHE_BYTES: ${CACHE_MAXIMUM_MEMORY_CACHE_BYTES:-134217728}
@@ -158,6 +201,8 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      loki:
+        condition: service_started
     healthcheck:
       test:
         - CMD
@@ -189,9 +234,13 @@ services:
         condition: service_completed_successfully
       calculator-dotnet:
         condition: service_started
+      loki:
+        condition: service_started
 
 volumes:
   perfcho-postgres:
   perfcho-redis:
   perfcho-minio:
   perfcho-calculator-cache:
+  perfcho-loki:
+  perfcho-grafana:

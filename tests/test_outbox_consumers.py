@@ -37,6 +37,7 @@ from perfcho.infra.db.relays.outbox_delivery import (
 )
 from perfcho.infra.db.repositories.outbox import append_outbox_event
 from perfcho.infra.settings import settings
+from perfcho.infra.tracing import trace_context
 from perfcho.modules.common.models import JsonValue, PendingEvent
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
@@ -223,6 +224,37 @@ async def test_outbox_dead_delivery_blocks_later_partition_events(postgres_datab
             )
             assert first_delivery is not None and first_delivery.status is OutboxDeliveryStatus.DEAD
             assert second_delivery is not None and second_delivery.status is OutboxDeliveryStatus.PENDING
+    finally:
+        await db_engine.dispose()
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_outbox_trace_id_persists_into_relay_reference(postgres_database_url: str) -> None:
+    del postgres_database_url
+    db_engine = await infra_db.create_engine()
+    session_factory = infra_db.create_session_factory(db_engine)
+    store = SqlAlchemyOutboxDeliveryRelayStore(
+        session_factory,
+        batch_size=1,
+        lease_seconds=30,
+        max_attempts=3,
+        max_retry_seconds=30,
+    )
+    trace_id = uuid.uuid4()
+    try:
+        with trace_context(trace_id.hex):
+            async with session_factory.begin() as session:
+                event = await append_outbox_event(
+                    session,
+                    PendingEvent("test", "1", TEST_EVENT_TYPE, 1, {}, (TEST_CONSUMER,), "test:1"),
+                )
+
+        reference = (await store.claim("tests:trace-owner"))[0]
+        assert event.trace_id == trace_id
+        assert reference.trace_id == trace_id
+        assert reference.event_type == TEST_EVENT_TYPE
+        assert reference.event_created_at == event.created_at
     finally:
         await db_engine.dispose()
 

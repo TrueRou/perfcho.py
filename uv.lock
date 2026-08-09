@@ -738,6 +738,15 @@ wheels = [
 ]
 
 [[package]]
+name = "loki-logger-handler"
+version = "1.1.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/60/6c212ae881abf82e6b85fddd6ef338404c4dbf812c3b1cb88527903c7633/loki_logger_handler-1.1.2.tar.gz", hash = "sha256:b3b588903420197ac9bb477f9c8fd6c18edf3e475b94f3d27d2aeed3930eb5d1", size = 15986, upload-time = "2025-05-26T20:11:54.808Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/09/00/93631b307a801d8fe48867e20923fdb161f5d0aa165ca322b71544c35b96/loki_logger_handler-1.1.2-py3-none-any.whl", hash = "sha256:7ee10259162caf6aa21b784d753dc2f73102225517857bb40051b7e933cfd07d", size = 14272, upload-time = "2025-05-26T20:11:53.595Z" },
+]
+
+[[package]]
 name = "multidict"
 version = "6.7.1"
 source = { registry = "https://pypi.org/simple" }
@@ -864,12 +873,14 @@ dependencies = [
     { name = "greenlet" },
     { name = "httpx" },
     { name = "loguru" },
+    { name = "loki-logger-handler" },
     { name = "prompt-toolkit" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pymysql" },
     { name = "python-multipart" },
     { name = "redis" },
+    { name = "requests" },
     { name = "sqlalchemy" },
     { name = "taskiq" },
     { name = "taskiq-redis" },
@@ -898,12 +909,14 @@ requires-dist = [
     { name = "greenlet", specifier = ">=3.2.0" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "loguru", specifier = ">=0.7.3" },
+    { name = "loki-logger-handler", specifier = ">=1.1.2" },
     { name = "prompt-toolkit", specifier = ">=3.0.53" },
     { name = "pydantic", specifier = ">=2.12.0" },
     { name = "pydantic-settings", specifier = ">=2.7.0" },
     { name = "pymysql", specifier = ">=1.1.2" },
     { name = "python-multipart", specifier = ">=0.0.20" },
     { name = "redis", specifier = ">=8.0.1" },
+    { name = "requests", specifier = ">=2.32.3" },
     { name = "sqlalchemy", specifier = "==2.1.0b3" },
     { name = "taskiq", specifier = ">=0.12.4" },
     { name = "taskiq-redis", specifier = ">=1.2.3" },

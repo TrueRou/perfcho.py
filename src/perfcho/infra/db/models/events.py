@@ -34,6 +34,7 @@ class OutboxEvent(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
         UniqueConstraint("position"),
         UniqueConstraint("id", "position", name="uq_outbox_events_id_position"),
         Index("ix_outbox_events_aggregate", "aggregate_type", "aggregate_id", "created_at"),
+        Index("ix_outbox_events_trace_id", "trace_id", postgresql_where=text("trace_id IS NOT NULL")),
         {"schema": "events"},
     )
 
@@ -43,6 +44,7 @@ class OutboxEvent(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
     payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    trace_id: Mapped[uuid.UUID | None] = mapped_column()
 
 
 class OutboxDelivery(TimestampMixin, DbBase):

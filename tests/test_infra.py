@@ -1,8 +1,8 @@
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlparse
 
 import httpx
@@ -17,13 +17,15 @@ from taskiq_redis import RedisStreamBroker
 from perfcho.infra.db import DbBase
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.models.events import OutboxDelivery
+from perfcho.infra.db.relays.outbox_delivery import OutboxDeliveryReference
 from perfcho.infra.db.repositories.outbox import append_outbox_event
 from perfcho.infra.logging import current_relay_task
 from perfcho.infra.settings import Settings, settings
 from perfcho.infra.taskiq import RelayTaskLoggingMiddleware
+from perfcho.infra.tracing import current_trace_id
 from perfcho.modules.common.models import PendingEvent
 from perfcho.tasks.outbox_delivery import dispatch_outbox_delivery
-from perfcho.worker import _cleanup_worker_resources, broker, worker_shutdown, worker_startup
+from perfcho.worker import _cleanup_worker_resources, _enqueue_outbox, broker, worker_shutdown, worker_startup
 
 
 def test_redis_roles_use_db0_with_distinct_namespaces() -> None:
@@ -62,6 +64,29 @@ def test_relay_task_logging_middleware_scopes_task_name() -> None:
     assert current_relay_task() == "perfcho.outbox.dispatch"
     middleware.post_execute(message, MagicMock())
     assert current_relay_task() is None
+
+
+@pytest.mark.asyncio
+async def test_outbox_enqueue_passes_persisted_trace_to_taskiq(monkeypatch: pytest.MonkeyPatch) -> None:
+    event_id = uuid.uuid4()
+    delivery_token = uuid.uuid4()
+    trace_id = uuid.uuid4()
+    enqueue = AsyncMock(return_value=SimpleNamespace(task_id="task-1"))
+    monkeypatch.setattr(dispatch_outbox_delivery, "kiq", enqueue)
+
+    task_id = await _enqueue_outbox(
+        OutboxDeliveryReference(event_id, "tests-projector.v1", delivery_token, trace_id, "score.accepted.v1")
+    )
+
+    assert task_id == "task-1"
+    enqueue.assert_awaited_once_with(
+        str(event_id),
+        "tests-projector.v1",
+        str(delivery_token),
+        trace_id.hex,
+        "score.accepted.v1",
+        None,
+    )
 
 
 def test_settings_reject_performance_timing_shorter_than_http_window() -> None:
@@ -104,6 +129,7 @@ async def test_task_payload_and_context_failures_include_exception_details() -> 
     records: list[dict[str, Any]] = []
     sink_id = logger.add(lambda message: records.append(cast(dict[str, Any], message.record)))
     empty_context = SimpleNamespace(state=SimpleNamespace())
+    event_created_at = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
 
     try:
         with pytest.raises(AttributeError):
@@ -111,6 +137,9 @@ async def test_task_payload_and_context_failures_include_exception_details() -> 
                 str(event_id),
                 "tests-projector.v1",
                 str(uuid.uuid4()),
+                "0123456789abcdef0123456789abcdef",
+                "score.accepted.v1",
+                event_created_at,
                 empty_context,
             )
     finally:
@@ -119,6 +148,10 @@ async def test_task_payload_and_context_failures_include_exception_details() -> 
     unexpected = next(record for record in records if record["extra"]["event"] == "task.outbox_delivery.failed")
     assert unexpected["extra"]["event_id"] == str(event_id)
     assert unexpected["extra"]["consumer"] == "tests-projector.v1"
+    assert unexpected["extra"]["trace_id"] == "0123456789abcdef0123456789abcdef"
+    assert unexpected["extra"]["event_type"] == "score.accepted.v1"
+    assert cast(float, unexpected["extra"]["delay_ms"]) >= 900
+    assert current_trace_id() is None
     assert all(
         {"lease_token", "delivery_token", "owner", "error"}.isdisjoint(record["extra"]) for record in (unexpected,)
     )

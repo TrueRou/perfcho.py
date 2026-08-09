@@ -30,6 +30,9 @@ class OutboxDeliveryReference:
     event_id: uuid.UUID
     consumer: str
     delivery_token: uuid.UUID
+    trace_id: uuid.UUID | None = None
+    event_type: str | None = None
+    event_created_at: datetime | None = None
 
 
 class _OutboxEventLogFields(TypedDict, total=False):
@@ -116,6 +119,14 @@ class SqlAlchemyOutboxDeliveryRelayStore:
                 )
             )
             lease_expires_at = now + self._lease_duration
+            event_context = {
+                event_id: (trace_id, event_type, created_at)
+                for event_id, trace_id, event_type, created_at in await session.execute(
+                    select(OutboxEvent.id, OutboxEvent.trace_id, OutboxEvent.event_type, OutboxEvent.created_at).where(
+                        OutboxEvent.id.in_(delivery.event_id for delivery in deliveries)
+                    )
+                )
+            }
             references: list[OutboxDeliveryReference] = []
             for delivery in deliveries:
                 delivery_token = uuid.uuid4()
@@ -126,7 +137,14 @@ class SqlAlchemyOutboxDeliveryRelayStore:
                 delivery.enqueued_at = None
                 delivery.broker_task_id = None
                 delivery.enqueue_count += 1
-                references.append(OutboxDeliveryReference(delivery.event_id, delivery.consumer, delivery_token))
+                references.append(
+                    OutboxDeliveryReference(
+                        delivery.event_id,
+                        delivery.consumer,
+                        delivery_token,
+                        *(event_context.get(delivery.event_id) or (None, None, None)),
+                    )
+                )
         if dead_count:
             log_event(
                 "ERROR",

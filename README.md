@@ -14,10 +14,10 @@ outbox runtime. Stable/Lazer protocol services will be implemented against this 
 
 ## Runtime Environment
 
-The repository has separate development and production Compose topologies. `compose.yaml` starts only local
-PostgreSQL, Redis, and MinIO infrastructure; the API and Taskiq Worker run as host processes and read `.env`.
-`compose.prod.yaml` runs PostgreSQL, authenticated Redis, internal MinIO, the perfcho-pp Calculator, the API, and the
-Taskiq Worker in containers. The two application roles share one Python image in production.
+The repository has separate development and production Compose topologies. `compose.yaml` starts local PostgreSQL,
+Redis, MinIO, Loki, and Grafana infrastructure; the API and Taskiq Worker run as host processes and read `.env`.
+`compose.prod.yaml` runs the same infrastructure plus the perfcho-pp Calculator, API, and Taskiq Worker in containers.
+The two application roles share one Python image in production.
 
 ### Environment files
 
@@ -27,40 +27,56 @@ Taskiq Worker in containers. The two application roles share one Python image in
 
 ```bash
 cp .env.example .env
-docker compose --env-file .env up -d --wait postgres redis minio
+docker compose --env-file .env up -d --wait postgres redis minio loki grafana
 docker compose --env-file .env run --rm --no-deps minio-init
 ```
 
-The development infrastructure exposes PostgreSQL on `127.0.0.1:55432`, Redis on `127.0.0.1:56379`, and MinIO on
-`127.0.0.1:59000`; the host-run application roles read the same local endpoints and credentials from `.env`.
+The development infrastructure exposes PostgreSQL on `127.0.0.1:55432`, Redis on `127.0.0.1:56379`, MinIO on
+`127.0.0.1:59000`, Loki on `127.0.0.1:53100`, and Grafana on `127.0.0.1:53000`. Grafana uses `perfcho` /
+`perfcho-development` locally and provisions Loki as its default data source. The host-run application roles send
+structured logs directly to Loki while their consoles always use human-readable output.
+Grafana opens the provisioned `Perfcho Logs` dashboard by default; it is also available directly at
+`http://127.0.0.1:53000/d/perfcho-logs/perfcho-logs`.
+The dashboard provides a level histogram, text search, environment/process/level filters, and concise log rows. Grafana
+renders time and stream labels in the UI while expandable row details retain business context from the JSON payload.
 The first application role to connect creates missing PostgreSQL schemas and mapped tables through SQLAlchemy
 `MetaData.create_all()`; a PostgreSQL advisory lock serializes concurrent initialization. `create_all()` does not alter
 existing columns, constraints, or indexes, so model changes that affect an existing database still require an explicit
 operational rollout.
 
+Existing databases created before Outbox trace propagation require this idempotent upgrade before starting the new API
+or Worker image:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U perfcho -d perfcho \
+  < tools/schema/20260809_add_outbox_trace_id.sql
+```
+
 ## Local development
 
-Start only the infrastructure (PostgreSQL, Redis, MinIO) and run the application roles as host processes:
+Start the infrastructure and run the application roles as host processes:
 
 ```bash
 cp .env.example .env
-docker compose up -d --wait postgres redis minio
+docker compose up -d --wait postgres redis minio loki grafana
 docker compose run --rm --no-deps minio-init
 ```
 
 PostgreSQL listens on `127.0.0.1:55432`; Redis on `127.0.0.1:56379`; MinIO on `127.0.0.1:59000`, with its console on
-`127.0.0.1:59001`. The host processes read the same secrets from `.env`.
+`127.0.0.1:59001`. Loki listens on `127.0.0.1:53100` and Grafana on `127.0.0.1:53000`. The host processes read the
+same configuration from `.env`.
 
 ### VS Code
 
 Select `perfcho: all processes` in Run and Debug and press F5. The compound launch configuration synchronizes locked
-dependencies, creates `.env` from `.env.example` when it is missing, starts and waits for PostgreSQL, Redis, and MinIO,
+dependencies, creates `.env` from `.env.example` when it is missing, starts and waits for PostgreSQL, Redis, MinIO,
+Loki, and Grafana,
 initializes the object-storage bucket, and then debugs these roles in parallel:
 
 - API
 - Taskiq Worker, including the durable Outbox and Performance relay loop
 
-Stopping one debug session stops both application roles. PostgreSQL, Redis, and MinIO remain running so that
+Stopping one debug session stops both application roles. PostgreSQL, Redis, MinIO, Loki, and Grafana remain running so that
 subsequent debug sessions start quickly; stop them explicitly with `docker compose down` when they are no longer needed.
 
 Run the process roles separately:
@@ -69,6 +85,18 @@ Run the process roles separately:
 uv run uvicorn perfcho.main:asgi_app --host 127.0.0.1 --port 8000
 uv run taskiq worker perfcho.worker:broker --ack-type when_executed
 ```
+
+### Trace correlation
+
+Each HTTP request receives a 128-bit trace ID. A valid W3C `traceparent` is inherited; otherwise the API generates a new
+trace and returns it in `X-Trace-ID`. The console prints only time, level, process role, trace ID, and event/message. All
+business context remains in Loki.
+
+Events with `duration_ms` append their execution time. Worker Outbox logs also append the durable `event_type` and
+`delay_ms`, measured from Outbox event creation until the Taskiq consumer starts.
+
+The trace is persisted on the Outbox event and propagated through relay, Taskiq, consumer retries, and downstream Outbox
+events. Paste the CLI or response trace into the Grafana dashboard's `Trace ID` field to isolate the complete chain.
 
 ## Production Compose
 
@@ -81,8 +109,14 @@ docker compose --env-file .env.production -f compose.prod.yaml up -d --build
 docker compose --env-file .env.production -f compose.prod.yaml ps
 ```
 
-Only the API is published, on `127.0.0.1:10727` by default for a same-host reverse proxy. PostgreSQL, Redis, and MinIO
-use named volumes and are not published to the host.
+The API is published on `127.0.0.1:10727` and Grafana on `127.0.0.1:53000` by default for same-host access. PostgreSQL
+and Redis retain their existing published ports; MinIO and Loki stay internal. Loki keeps logs for 30 days; Grafana's
+Loki data source is provisioned automatically. Set a strong `GRAFANA_ADMIN_PASSWORD` before deployment.
+The same provisioned `Perfcho Logs` dashboard is configured as the Grafana home dashboard.
+
+In Grafana Explore, start with `{application="perfcho"}` and refine by labels such as `environment`, `process_role`,
+and `level`. Trace and fixed source fields use Loki structured metadata; caller-provided business fields remain in the
+JSON log line without filtering or redaction.
 
 ## Verification
 

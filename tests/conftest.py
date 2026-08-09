@@ -7,8 +7,6 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from perfcho.infra.db import MODEL_SCHEMAS
-
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 
 if TEST_DATABASE_URL:
@@ -16,6 +14,8 @@ if TEST_DATABASE_URL:
 
 
 async def _reset_database(database_url: str) -> None:
+    from perfcho.infra.db import MODEL_SCHEMAS
+
     engine = create_async_engine(database_url)
     try:
         async with engine.begin() as connection:

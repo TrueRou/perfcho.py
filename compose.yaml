@@ -1,8 +1,15 @@
 name: perfcho
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "5m"
+    max-file: "2"
+
 services:
   postgres:
     image: postgres:17-alpine
+    logging: *default-logging
     environment:
       POSTGRES_DB: perfcho
       POSTGRES_USER: perfcho
@@ -21,6 +28,7 @@ services:
 
   redis:
     image: redis:8-alpine
+    logging: *default-logging
     command:
       - redis-server
       - --appendonly
@@ -43,6 +51,7 @@ services:
 
   minio:
     image: minio/minio:latest
+    logging: *default-logging
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: perfcho
@@ -62,6 +71,7 @@ services:
 
   minio-init:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    logging: *default-logging
     depends_on:
       minio:
         condition: service_healthy
@@ -72,7 +82,38 @@ services:
         mc mb --ignore-existing perfcho/perfcho
     restart: "no"
 
+  loki:
+    image: grafana/loki:3.7.0
+    logging: *default-logging
+    command: ["-config.file=/etc/loki/config.yaml"]
+    ports:
+      - "127.0.0.1:53100:3100"
+    volumes:
+      - ./observability/loki-config.yaml:/etc/loki/config.yaml:ro
+      - perfcho-loki:/loki
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_USER: perfcho
+      GF_SECURITY_ADMIN_PASSWORD: perfcho-development
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/perfcho-logs.json
+    ports:
+      - "127.0.0.1:53000:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - perfcho-grafana:/var/lib/grafana
+    depends_on:
+      - loki
+    restart: unless-stopped
+
 volumes:
   perfcho-postgres:
   perfcho-redis:
   perfcho-minio:
+  perfcho-loki:
+  perfcho-grafana:

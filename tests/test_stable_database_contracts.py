@@ -212,7 +212,10 @@ def test_replies_multiplayer_events_and_outbox_positions_have_integrity() -> Non
     assert not deliveries.c.source_position.nullable
     assert "status" in deliveries.c
     assert "available_at" in deliveries.c
-    assert "available_at" not in _table("events.outbox_events").c
+    outbox_events = _table("events.outbox_events")
+    assert "available_at" not in outbox_events.c
+    assert outbox_events.c.trace_id.nullable
+    assert _index("events.outbox_events", "ix_outbox_events_trace_id")
     assert _constraint("events.outbox_deliveries", "fk_outbox_deliveries_event_position", ForeignKeyConstraint)
     assert _index("events.outbox_deliveries", "ix_outbox_deliveries_consumer_position")
 

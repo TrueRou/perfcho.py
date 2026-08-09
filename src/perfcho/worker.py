@@ -79,6 +79,7 @@ class _ReferenceLogFields(TypedDict):
 
     event_id: NotRequired[str]
     consumer: NotRequired[str]
+    trace_id: NotRequired[str]
 
 
 @broker.on_event(TaskiqEvents.WORKER_STARTUP)
@@ -459,7 +460,10 @@ async def _run_rank_snapshot_loop(
 def _reference_fields(reference: object) -> _ReferenceLogFields:
     """Return only non-fencing identifiers approved for relay logs."""
     if isinstance(reference, OutboxDeliveryReference):
-        return {"event_id": str(reference.event_id), "consumer": reference.consumer}
+        fields: _ReferenceLogFields = {"event_id": str(reference.event_id), "consumer": reference.consumer}
+        if reference.trace_id is not None:
+            fields["trace_id"] = reference.trace_id.hex
+        return fields
     return {}
 
 
@@ -468,5 +472,8 @@ async def _enqueue_outbox(reference: OutboxDeliveryReference) -> str:
         str(reference.event_id),
         reference.consumer,
         str(reference.delivery_token),
+        reference.trace_id.hex if reference.trace_id is not None else None,
+        reference.event_type,
+        reference.event_created_at.isoformat() if reference.event_created_at is not None else None,
     )
     return str(task.task_id)

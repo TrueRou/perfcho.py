@@ -8,6 +8,7 @@ from typing import TypedDict
 from fastapi import FastAPI
 
 from perfcho.api import router
+from perfcho.api.tracing import TraceContextMiddleware
 from perfcho.infra import logging
 from perfcho.infra.compose import CoreServices, StableServices, compose_core_services, compose_stable_services
 
@@ -63,6 +64,7 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    asgi_app.add_middleware(TraceContextMiddleware)
 
     @asgi_app.get("/")
     async def root() -> dict:
