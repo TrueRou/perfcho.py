@@ -18,6 +18,7 @@ from perfcho.modules.scoring.models import (
     CanonicalMod,
     ClientFamily,
     HitStatistic,
+    IssueSoloScoreToken,
     LeaderboardPage,
     LeaderboardScope,
     LeaderboardScopeKind,
@@ -31,6 +32,7 @@ from perfcho.modules.scoring.models import (
     ScoreGrade,
     ScoreOutcome,
     ScoreSubmission,
+    SoloScoreToken,
     StagedReplayManifest,
     weighted_total_performance,
 )
@@ -55,6 +57,7 @@ __all__ = (
     "CanonicalMod",
     "ClientFamily",
     "HitStatistic",
+    "IssueSoloScoreToken",
     "LeaderboardPage",
     "LeaderboardScope",
     "LeaderboardScopeKind",
@@ -78,6 +81,7 @@ __all__ = (
     "ScoreboardUnavailable",
     "ScoreboardVariant",
     "ScoringService",
+    "SoloScoreToken",
     "StagedReplayManifest",
     "weighted_total_performance",
 )

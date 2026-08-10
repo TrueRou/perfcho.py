@@ -49,6 +49,7 @@ from perfcho.infra.db.models.scoring import (
     LeaderboardEntry,
     ModSet,
     PlayAttempt,
+    PlayAttemptToken,
     RankingPolicy,
     Replay,
     ReplayViewEvent,
@@ -86,6 +87,7 @@ from perfcho.modules.scoring.models import (
     ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
+    SoloScoreToken,
     thaw_json_mapping,
 )
 
@@ -355,6 +357,121 @@ class SqlAlchemyScoringRepository:
             resource_type="score",
             resource_id=str(result.score_id),
             result_snapshot=_result_snapshot(result),
+        )
+
+    async def issue_solo_token(
+        self,
+        *,
+        account_id: int,
+        revision: BeatmapRevisionInfo,
+        ruleset: Ruleset,
+        started_at: datetime,
+        expires_at: datetime,
+    ) -> SoloScoreToken:
+        """Create one numeric token matching the osu!lazer client contract."""
+        token = PlayAttemptToken(
+            account_id=account_id,
+            beatmap_id=revision.beatmap_id,
+            beatmap_revision_id=revision.revision_id,
+            ruleset=DbRuleset(ruleset.value),
+            protocol=DbClientFamily.LAZER,
+            expires_at=expires_at,
+        )
+        self._session.add(token)
+        await self._session.flush()
+        if token.id is None:
+            raise RuntimeError("database did not assign a solo score token identifier")
+        return SoloScoreToken(
+            token_id=token.id,
+            account_id=account_id,
+            beatmap_id=revision.beatmap_id,
+            beatmap_revision_id=revision.revision_id,
+            ruleset=ruleset,
+            started_at=started_at,
+            expires_at=expires_at,
+        )
+
+    async def claim_solo_token(
+        self,
+        token_id: int,
+        *,
+        account_id: int,
+        beatmap_id: int,
+        ruleset: Ruleset,
+        at: datetime,
+    ) -> SoloScoreToken:
+        """Lock and return one matching unexpired Lazer solo token."""
+        row = (
+            await self._session.execute(
+                select(PlayAttemptToken).where(PlayAttemptToken.id == token_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise ScoreRejected("solo score token was not found")
+        if (
+            row.protocol is not DbClientFamily.LAZER
+            or row.account_id != account_id
+            or row.beatmap_id != beatmap_id
+            or row.ruleset is not DbRuleset(ruleset.value)
+        ):
+            raise ScoreRejected("solo score token dimensions do not match the submission")
+        if row.expires_at <= at and row.score_id is None:
+            raise ScoreRejected("solo score token has expired")
+        return SoloScoreToken(
+            token_id=row.id,
+            account_id=row.account_id,
+            beatmap_id=row.beatmap_id,
+            beatmap_revision_id=row.beatmap_revision_id,
+            ruleset=Ruleset(row.ruleset.value),
+            started_at=row.created_at,
+            expires_at=row.expires_at,
+            score_id=row.score_id,
+        )
+
+    async def complete_solo_token(self, token_id: int, score_id: int, *, at: datetime) -> None:
+        """Consume a locked token and bind it to the accepted score."""
+        updated_id = await self._session.scalar(
+            update(PlayAttemptToken)
+            .where(
+                PlayAttemptToken.id == token_id,
+                PlayAttemptToken.consumed_at.is_(None),
+                PlayAttemptToken.score_id.is_(None),
+            )
+            .values(consumed_at=at, score_id=score_id)
+            .returning(PlayAttemptToken.id)
+        )
+        if updated_id is None:
+            existing_score_id = await self._session.scalar(
+                select(PlayAttemptToken.score_id).where(PlayAttemptToken.id == token_id)
+            )
+            if existing_score_id != score_id:
+                raise ScoreRejected("solo score token was already consumed")
+
+    async def accepted_result_for_score(self, score_id: int) -> AcceptedScoreResult | None:
+        """Resolve one immutable score into the service result contract."""
+        row = (
+            await self._session.execute(
+                select(
+                    Score.attempt_id,
+                    Score.id,
+                    Score.beatmap_id,
+                    Score.beatmap_revision_id,
+                    Score.scoreboard_id,
+                    Score.mod_set_id,
+                    Score.outcome,
+                ).where(Score.id == score_id)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return AcceptedScoreResult(
+            attempt_id=row.attempt_id,
+            score_id=row.id,
+            beatmap_id=row.beatmap_id,
+            beatmap_revision_id=row.beatmap_revision_id,
+            scoreboard_id=row.scoreboard_id,
+            mod_set_id=row.mod_set_id,
+            outcome=ScoreOutcome(row.outcome.value),
         )
 
     async def get_replay(self, score_id: int) -> ReplayReference | None:

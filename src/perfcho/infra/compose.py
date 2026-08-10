@@ -362,6 +362,7 @@ async def compose_stable_services(
         _achievement_awarder,
         core.clock,
         core.id_generator,
+        solo_token_lifetime=timedelta(seconds=core.config.lazer_solo_score_token_lifetime_seconds),
     )
     multiplayer = MultiplayerService(
         uow_factory,

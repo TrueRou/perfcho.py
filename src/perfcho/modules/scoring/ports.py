@@ -26,6 +26,7 @@ from perfcho.modules.scoring.models import (
     ScoreAcceptanceRecord,
     ScoreboardInfo,
     ScoreboardVariant,
+    SoloScoreToken,
 )
 
 
@@ -74,6 +75,38 @@ class ScoringAcceptanceRepository(Protocol):
 
     async def complete_acceptance(self, idempotency_key: str, result: AcceptedScoreResult) -> None:
         """Attach the non-secret accepted result to its command receipt."""
+        ...
+
+    async def issue_solo_token(
+        self,
+        *,
+        account_id: int,
+        revision: BeatmapRevisionInfo,
+        ruleset: Ruleset,
+        started_at: datetime,
+        expires_at: datetime,
+    ) -> SoloScoreToken:
+        """Create a short-lived Lazer solo score authorization."""
+        ...
+
+    async def claim_solo_token(
+        self,
+        token_id: int,
+        *,
+        account_id: int,
+        beatmap_id: int,
+        ruleset: Ruleset,
+        at: datetime,
+    ) -> SoloScoreToken:
+        """Lock and validate a Lazer solo token for submission."""
+        ...
+
+    async def complete_solo_token(self, token_id: int, score_id: int, *, at: datetime) -> None:
+        """Bind a successfully accepted score to its consumed token."""
+        ...
+
+    async def accepted_result_for_score(self, score_id: int) -> AcceptedScoreResult | None:
+        """Resolve the canonical accepted result for one immutable score."""
         ...
 
 

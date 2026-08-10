@@ -83,6 +83,19 @@ def test_postgresql_ddl_and_mappers_are_coherent() -> None:
             assert str(CreateIndex(index).compile(dialect=dialect))
 
 
+def test_lazer_solo_score_tokens_are_numeric_and_bound_to_authoritative_dimensions() -> None:
+    tokens = _table("scoring.play_attempt_tokens")
+    assert tokens.c.id.type.python_type is int
+    assert not tokens.c.account_id.nullable
+    assert not tokens.c.beatmap_id.nullable
+    assert not tokens.c.beatmap_revision_id.nullable
+    assert not tokens.c.ruleset.nullable
+    assert not tokens.c.protocol.nullable
+    assert tokens.c.score_id.nullable
+    assert "token_digest" not in tokens.c
+    assert "token_prefix" not in tokens.c
+
+
 def test_stable_identity_lifecycle_contracts() -> None:
     credentials = _table("iam.password_credentials")
     algorithm_pepper = _constraint(

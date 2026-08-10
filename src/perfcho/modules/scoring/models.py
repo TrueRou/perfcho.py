@@ -329,11 +329,50 @@ class AcceptScore:
     score: ScoreSubmission
     replay: StagedReplayManifest | None
     attestation: ScoreAttestation
+    solo_token_id: int | None = None
     multiplayer: MultiplayerSubmissionContext | None = None
 
     def __post_init__(self) -> None:
         """Freeze the mod sequence at the command boundary."""
+        if self.solo_token_id is not None and self.solo_token_id < 1:
+            raise ValueError("solo_token_id must be positive")
+        if self.solo_token_id is not None and self.multiplayer is not None:
+            raise ValueError("solo and multiplayer submission contexts are mutually exclusive")
         object.__setattr__(self, "mods", tuple(self.mods))
+
+
+@dataclass(frozen=True, slots=True)
+class IssueSoloScoreToken:
+    """Request a short-lived authorization for one Lazer solo play."""
+
+    meta: CommandMeta
+    beatmap: BeatmapReference
+    ruleset: Ruleset
+
+
+@dataclass(frozen=True, slots=True)
+class SoloScoreToken:
+    """Describe one issued Lazer solo score token."""
+
+    token_id: int
+    account_id: int
+    beatmap_id: int
+    beatmap_revision_id: int
+    ruleset: Ruleset
+    started_at: datetime
+    expires_at: datetime
+    score_id: int | None = None
+
+    def __post_init__(self) -> None:
+        """Require usable identities and a positive validity window."""
+        if min(self.token_id, self.account_id, self.beatmap_id, self.beatmap_revision_id) < 1:
+            raise ValueError("solo score token identifiers must be positive")
+        _require_aware(self.started_at, "solo token started_at")
+        _require_aware(self.expires_at, "solo token expires_at")
+        if self.expires_at <= self.started_at:
+            raise ValueError("solo score token expiry must follow its start")
+        if self.score_id is not None and self.score_id < 1:
+            raise ValueError("solo score token score_id must be positive")
 
 
 @dataclass(frozen=True, slots=True)

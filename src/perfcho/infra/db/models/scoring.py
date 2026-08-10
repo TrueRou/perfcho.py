@@ -256,33 +256,32 @@ class PlayAttempt(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     score: Mapped[Score | None] = relationship(back_populates="attempt", lazy="raise")
 
 
-class PlayAttemptToken(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
-    """Stores single-use opaque tokens authorizing submission for a play attempt."""
+class PlayAttemptToken(BigIntIdentityMixin, CreatedAtMixin, DbBase):
+    """Stores single-use numeric tokens authorizing Lazer solo score submission."""
 
     __tablename__ = "play_attempt_tokens"
     __table_args__ = (
         CheckConstraint("expires_at > created_at", name="valid_period"),
         CheckConstraint("consumed_at IS NULL OR consumed_at >= created_at", name="valid_consumed_at"),
-        CheckConstraint("octet_length(token_digest) = 32", name="token_digest_length"),
-        UniqueConstraint("token_digest"),
-        Index(
-            "uq_play_attempt_tokens_active_attempt",
-            "attempt_id",
-            unique=True,
-            postgresql_where=text("consumed_at IS NULL AND revoked_at IS NULL"),
-        ),
+        CheckConstraint("score_id IS NULL OR consumed_at IS NOT NULL", name="score_requires_consumption"),
+        UniqueConstraint("score_id"),
+        Index("ix_play_attempt_tokens_account_created", "account_id", "created_at"),
         Index("ix_play_attempt_tokens_expiry", "expires_at"),
         {"schema": "scoring"},
     )
 
-    attempt_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("scoring.play_attempts.id", ondelete="CASCADE"), nullable=False
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
+    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="RESTRICT"), nullable=False)
+    beatmap_revision_id: Mapped[int] = mapped_column(
+        ForeignKey("content.beatmap_revisions.id", ondelete="RESTRICT"), nullable=False
     )
-    token_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
-    token_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    ruleset: Mapped[Ruleset] = mapped_column(enum_type(Ruleset, "play_attempt_token_ruleset", 16), nullable=False)
+    protocol: Mapped[ClientFamily] = mapped_column(
+        enum_type(ClientFamily, "play_attempt_token_protocol", 16), nullable=False
+    )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    score_id: Mapped[int | None] = mapped_column(ForeignKey("scoring.scores.id", ondelete="RESTRICT"))
 
 
 class Score(BigIntIdentityMixin, CreatedAtMixin, DbBase):

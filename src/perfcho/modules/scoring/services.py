@@ -27,6 +27,7 @@ from perfcho.modules.scoring.models import (
     AccountStatsView,
     BeatmapGradeView,
     ClientFamily,
+    IssueSoloScoreToken,
     LeaderboardPage,
     LeaderboardScope,
     LeaderboardScopeKind,
@@ -36,6 +37,8 @@ from perfcho.modules.scoring.models import (
     Ruleset,
     ScoreAcceptanceRecord,
     ScoreboardVariant,
+    ScoreOutcome,
+    SoloScoreToken,
 )
 from perfcho.modules.scoring.mods import normalize_mods
 from perfcho.modules.scoring.ports import (
@@ -74,10 +77,13 @@ class ScoringService:
         id_generator: IdGenerator,
         *,
         receipt_ttl: timedelta = _RECEIPT_TTL,
+        solo_token_lifetime: timedelta = timedelta(hours=2),
     ) -> None:
         """Bind transaction, validation, event, clock, and ID ports."""
         if receipt_ttl <= timedelta(0):
             raise ValueError("receipt_ttl must be positive")
+        if solo_token_lifetime <= timedelta(0):
+            raise ValueError("solo_token_lifetime must be positive")
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
         self._outbox_writer_factory = outbox_writer_factory
@@ -87,6 +93,33 @@ class ScoringService:
         self._clock = clock
         self._id_generator = id_generator
         self._receipt_ttl = receipt_ttl
+        self._solo_token_lifetime = solo_token_lifetime
+
+    async def issue_solo_token(self, command: IssueSoloScoreToken) -> SoloScoreToken:
+        """Authorize one Lazer solo play after binding account, map revision, and ruleset."""
+        actor = command.meta.actor
+        if actor is None:
+            raise ScoreRejected("solo score token requires an authenticated actor")
+        if command.meta.client.family != ClientFamily.LAZER.value:
+            raise ScoreRejected("solo score tokens are only available to Lazer clients")
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            await self._account_validator_factory(uow.session).validate(actor.account_id, at=now)
+            revision = await repository.resolve_current_revision(command.beatmap)
+            if revision is None:
+                raise BeatmapRevisionNotFound("current beatmap revision was not found")
+            if revision.ruleset is not command.ruleset and revision.ruleset is not Ruleset.OSU:
+                raise ScoreRejected("native beatmap ruleset cannot be converted to the submitted ruleset")
+            token = await repository.issue_solo_token(
+                account_id=actor.account_id,
+                revision=revision,
+                ruleset=command.ruleset,
+                started_at=now,
+                expires_at=now + self._solo_token_lifetime,
+            )
+            await uow.commit()
+            return token
 
     async def accept(self, command: AcceptScore) -> AcceptedScoreResult:
         """Accept score facts, optional replay evidence, follow-up work, and one durable event."""
@@ -130,22 +163,65 @@ class ScoringService:
                 return claim.prior_result
 
             account_context = await self._account_validator_factory(uow.session).validate(actor.account_id, at=now)
+            solo_token: SoloScoreToken | None = None
+            if command.solo_token_id is not None:
+                solo_token = await repository.claim_solo_token(
+                    command.solo_token_id,
+                    account_id=actor.account_id,
+                    beatmap_id=command.beatmap.beatmap_id or 0,
+                    ruleset=command.ruleset,
+                    at=now,
+                )
+                if solo_token.score_id is not None:
+                    prior = await repository.accepted_result_for_score(solo_token.score_id)
+                    if prior is None:
+                        raise ScoreRejected("solo score token references an unavailable score")
+                    await repository.complete_acceptance(command.meta.idempotency_key, prior)
+                    await uow.commit()
+                    return prior
+                command = replace(
+                    command,
+                    attempt=replace(command.attempt, started_at=solo_token.started_at),
+                )
             revision = await repository.resolve_current_revision(command.beatmap)
             if revision is None:
                 raise BeatmapRevisionNotFound("current beatmap revision was not found")
+            if solo_token is not None and revision.revision_id != solo_token.beatmap_revision_id:
+                raise ScoreRejected("solo score token beatmap revision is no longer current")
+            if solo_token is not None:
+                judged_hits = _judged_hits(command.ruleset, command.score)
+                progress = (
+                    Decimal(1)
+                    if command.score.outcome is ScoreOutcome.PASSED
+                    else min(Decimal(judged_hits) / Decimal(max(revision.object_count, 1)), Decimal(1))
+                )
+                command = replace(command, attempt=replace(command.attempt, progress=progress))
             if revision.ruleset is not command.ruleset and revision.ruleset.value != "osu":
                 raise ScoreRejected("native beatmap ruleset cannot be converted to the submitted ruleset")
             scoreboard = await repository.get_scoreboard(command.ruleset, command.variant)
             if scoreboard is None:
                 raise ScoreboardUnavailable("canonical scoreboard is not active")
             mod_set = await repository.get_or_create_mod_set(scoreboard.scoreboard_id, normalized_mods)
+            score = replace(
+                command.score,
+                perfect=(
+                    command.score.outcome is ScoreOutcome.PASSED
+                    and command.score.max_combo == revision.max_combo
+                    and all(
+                        statistic.actual == 0
+                        for statistic in command.score.hits
+                        if statistic.hit_result in {"miss", "small_tick_miss", "large_tick_miss"}
+                    )
+                ),
+            )
             validated = validate_score(
                 command.ruleset,
                 normalized_mods.mods,
                 command.attempt,
-                command.score,
+                score,
                 revision,
                 command.variant,
+                lazer_grading=protocol is ClientFamily.LAZER,
             )
 
             attempt_claim = await repository.claim_attempt(
@@ -158,7 +234,7 @@ class ScoringService:
                     mod_set_id=mod_set.mod_set_id,
                     protocol=protocol,
                     submission=command.attempt,
-                    outcome=command.score.outcome,
+                    outcome=score.outcome,
                 )
             )
             if attempt_claim.prior_result is not None:
@@ -193,7 +269,7 @@ class ScoringService:
                     scoreboard=scoreboard,
                     mod_set=mod_set,
                     attempt=command.attempt,
-                    score=command.score,
+                    score=score,
                     replay=command.replay,
                     attestation=command.attestation,
                     validated=validated,
@@ -210,12 +286,12 @@ class ScoringService:
                     variant=command.variant.value,
                     beatmap_status=revision.status,
                     outcome=result.outcome.value,
-                    grade=command.score.grade.value,
-                    total_score=command.score.total_score,
-                    classic_score=command.score.classic_score,
+                    grade=score.grade.value,
+                    total_score=score.total_score,
+                    classic_score=score.classic_score,
                     accuracy=validated.accuracy,
-                    max_combo=command.score.max_combo,
-                    perfect=command.score.perfect,
+                    max_combo=score.max_combo,
+                    perfect=score.perfect,
                     total_hits=validated.total_hits,
                     mods=tuple(mod.acronym for mod in normalized_mods.mods),
                 ),
@@ -229,6 +305,8 @@ class ScoringService:
                     score_id=result.score_id,
                     at=now,
                 )
+            if solo_token is not None:
+                await repository.complete_solo_token(solo_token.token_id, result.score_id, at=now)
 
             outbox_writer = self._outbox_writer_factory(uow.session)
             consumers: tuple[str, ...] = (_RANKING_CONSUMER, _STATS_CONSUMER, _PERFORMANCE_CONSUMER)
@@ -251,7 +329,7 @@ class ScoringService:
                         "scoreboard_id": scoreboard.scoreboard_id,
                         "mod_set_id": mod_set.mod_set_id,
                         "outcome": result.outcome.value,
-                        "grade": command.score.grade.value,
+                        "grade": score.grade.value,
                         "total_hits": validated.total_hits,
                         "play_time_ms": int(
                             (command.attempt.ended_at - command.attempt.started_at).total_seconds() * 1000
@@ -273,6 +351,28 @@ class ScoringService:
                 started_ns=started_ns,
             )
             return result
+
+
+def _judged_hits(ruleset: Ruleset, score: object) -> int:
+    """Count ruleset object judgements for Lazer attempt progress."""
+    from perfcho.modules.scoring.models import ScoreSubmission
+
+    if not isinstance(score, ScoreSubmission):
+        raise TypeError("score must be a ScoreSubmission")
+    names = {
+        Ruleset.OSU: {"great", "ok", "meh", "miss"},
+        Ruleset.TAIKO: {"great", "ok", "miss"},
+        Ruleset.FRUITS: {
+            "great",
+            "large_tick_hit",
+            "large_tick_miss",
+            "small_tick_hit",
+            "small_tick_miss",
+            "miss",
+        },
+        Ruleset.MANIA: {"perfect", "great", "good", "ok", "meh", "miss"},
+    }[ruleset]
+    return sum(statistic.actual for statistic in score.hits if statistic.hit_result in names)
 
 
 class ReplayQueryService:

@@ -31,6 +31,8 @@ def validate_score(
     score: ScoreSubmission,
     revision: BeatmapRevisionInfo,
     variant: ScoreboardVariant = ScoreboardVariant.VANILLA,
+    *,
+    lazer_grading: bool = False,
 ) -> ValidatedScore:
     """Validate hits, derived accuracy, grade, outcome, progress, and full combo."""
     values = {statistic.hit_result: statistic.actual for statistic in score.hits}
@@ -53,7 +55,11 @@ def validate_score(
     if score.outcome is ScoreOutcome.PASSED:
         if attempt.progress != 1:
             raise ScoreRejected("passed scores must report complete attempt progress")
-        expected_grade = _passed_grade(ruleset, values, accuracy, mods)
+        expected_grade = (
+            _lazer_passed_grade(ruleset, values, accuracy, mods)
+            if lazer_grading
+            else _passed_grade(ruleset, values, accuracy, mods)
+        )
     elif score.outcome is ScoreOutcome.FAILED:
         expected_grade = ScoreGrade.F
     else:
@@ -72,6 +78,41 @@ def validate_score(
         if variant is ScoreboardVariant.VANILLA and revision.max_combo > 0 and score.max_combo != revision.max_combo:
             raise ScoreRejected("perfect score combo does not match the beatmap revision")
     return ValidatedScore(accuracy, expected_grade, total_hits)
+
+
+def _lazer_passed_grade(
+    ruleset: Ruleset,
+    values: dict[str, int],
+    accuracy: Decimal,
+    mods: tuple[CanonicalMod, ...],
+) -> ScoreGrade:
+    """Match osu!lazer's ScoreProcessor rank thresholds and ruleset overrides."""
+    if accuracy == 1:
+        grade = ScoreGrade.X
+    elif accuracy >= Decimal("0.95"):
+        grade = ScoreGrade.S
+    elif accuracy >= Decimal("0.90"):
+        grade = ScoreGrade.A
+    elif accuracy >= Decimal("0.80"):
+        grade = ScoreGrade.B
+    elif accuracy >= Decimal("0.70"):
+        grade = ScoreGrade.C
+    else:
+        grade = ScoreGrade.D
+
+    if ruleset in {Ruleset.OSU, Ruleset.TAIKO} and grade in {ScoreGrade.S, ScoreGrade.X} and values["miss"] > 0:
+        grade = ScoreGrade.A
+    elif ruleset is Ruleset.MANIA and grade is ScoreGrade.S:
+        imperfect = sum(values[name] for name in ("good", "ok", "meh", "miss"))
+        if imperfect == 0:
+            grade = ScoreGrade.X
+
+    silver = bool({mod.acronym for mod in mods} & {"HD", "FL", "FI"})
+    if silver and grade is ScoreGrade.X:
+        return ScoreGrade.XH
+    if silver and grade is ScoreGrade.S:
+        return ScoreGrade.SH
+    return grade
 
 
 def _judged_total(ruleset: Ruleset, values: dict[str, int]) -> int:

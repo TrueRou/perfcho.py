@@ -465,6 +465,33 @@ def test_score_validation_enforces_object_count_and_vanilla_combo_bounds() -> No
         )
 
 
+def test_lazer_grading_uses_current_score_processor_thresholds() -> None:
+    submitted = command()
+    revision = BeatmapRevisionInfo(10, 20, Ruleset.TAIKO, "ranked", 100, 100)
+    score = replace(
+        submitted.score,
+        accuracy=Decimal("0.95"),
+        max_combo=100,
+        grade=ScoreGrade.S,
+        hits=(
+            HitStatistic("great", 90),
+            HitStatistic("ok", 10),
+            HitStatistic("miss", 0),
+        ),
+    )
+
+    validated = validate_score(
+        Ruleset.TAIKO,
+        (),
+        replace(submitted.attempt, progress=Decimal(1)),
+        score,
+        revision,
+        lazer_grading=True,
+    )
+
+    assert validated.grade is ScoreGrade.S
+
+
 @pytest.mark.asyncio
 async def test_account_stats_without_ranked_stat_returns_unranked_defaults() -> None:
     session = AsyncMock(spec=AsyncSession)
