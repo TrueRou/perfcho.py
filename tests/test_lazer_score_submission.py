@@ -18,8 +18,12 @@ from perfcho.modules.realtime import RealtimeRepository
 from perfcho.modules.scoring import (
     AcceptedScoreResult,
     AcceptScore,
+    CanonicalMod,
     IssueSoloScoreToken,
     Ruleset,
+    ScoreboardVariant,
+    ScoreDetailView,
+    ScoreGrade,
     ScoreOutcome,
     ScoringService,
     SoloScoreToken,
@@ -79,6 +83,37 @@ class FakeScoring:
         )
 
 
+class FakeScoreQuery:
+    async def get(self, score_id: int, ruleset: Ruleset | None = None) -> ScoreDetailView | None:
+        assert score_id == 900
+        if ruleset is not None and ruleset is not Ruleset.OSU:
+            return None
+        return ScoreDetailView(
+            score_id=900,
+            account_id=42,
+            display_name="Alice",
+            country_code="JP",
+            beatmap_id=123,
+            ruleset=Ruleset.OSU,
+            variant=ScoreboardVariant.VANILLA,
+            total_score=987654,
+            classic_score=765432,
+            accuracy=Decimal("0.95"),
+            max_combo=321,
+            grade=ScoreGrade.A,
+            outcome=ScoreOutcome.PASSED,
+            mods=(CanonicalMod("HD"), CanonicalMod("DT", {"speed_change": 1.25})),
+            statistics={"great": 95, "ok": 5, "meh": 0, "miss": 0},
+            maximum_statistics={"great": 100, "ok": 5},
+            started_at=NOW,
+            ended_at=NOW,
+            has_replay=False,
+            ranked=True,
+            pp=None,
+            position=None,
+        )
+
+
 class FixedClock:
     def now(self) -> datetime:
         return NOW
@@ -102,6 +137,7 @@ def lazer_app(identity: FakeIdentity, scoring: FakeScoring) -> FastAPI:
             argon2_parallelism=1,
         ),
         scoring=cast(ScoringService, scoring),
+        score_query=cast(object, FakeScoreQuery()),
     )
     app = FastAPI()
     app.include_router(router)

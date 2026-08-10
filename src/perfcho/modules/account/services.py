@@ -14,7 +14,7 @@ from perfcho.infra.security.password import (
     validate_stable_password_token,
 )
 from perfcho.modules.account.errors import EmailUnavailable, NameUnavailable, RegistrationRejected
-from perfcho.modules.account.models import RegisterAccount, RegistrationRecord, RegistrationResult
+from perfcho.modules.account.models import PublicAccountView, RegisterAccount, RegistrationRecord, RegistrationResult
 from perfcho.modules.account.ports import AccountRepositoryFactory, AccountUnitOfWork
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.normalization import normalize_email, normalize_name
@@ -64,6 +64,26 @@ class AccountService:
                 raise NameUnavailable("account name is already in use")
             if await repository.email_exists(email_key):
                 raise EmailUnavailable("account email is already in use")
+
+    async def get_public(self, lookup: str | int, *, key: str = "id") -> PublicAccountView | None:
+        """Return one public account by numeric ID or normalized username."""
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            if key == "id":
+                try:
+                    account_id = int(lookup)
+                except TypeError, ValueError:
+                    return None
+                if account_id < 1:
+                    return None
+                return await repository.get_public_account(account_id=account_id)
+            if key == "username":
+                try:
+                    name_key = normalize_name(str(lookup))
+                except ValueError:
+                    return None
+                return await repository.get_public_account(name_key=name_key)
+            raise ValueError("public account key must be id or username")
 
     async def register(self, command: RegisterAccount) -> RegistrationResult:
         """Validate, hash, and atomically persist one account registration."""

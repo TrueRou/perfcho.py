@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Annotated, Literal
 
 import orjson
-from fastapi import APIRouter, Body, Form, Header, Request
+from fastapi import APIRouter, Body, Form, Header, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,10 +24,12 @@ from perfcho.modules.scoring import (
     ClientFamily,
     HitStatistic,
     IssueSoloScoreToken,
+    LeaderboardScope,
     PlayAttemptSubmission,
     Ruleset,
     ScoreAttestation,
     ScoreboardVariant,
+    ScoreDetailView,
     ScoreGrade,
     ScoreOutcome,
     ScoreSubmission,
@@ -87,10 +89,12 @@ class SoloScoreResponse(BaseModel):
 
     id: int
     user_id: int
+    user: dict[str, object]
     beatmap_id: int
     ruleset_id: int
     rank: str
     total_score: int
+    total_score_without_mods: int
     accuracy: Decimal
     max_combo: int
     mods: list[APIMod]
@@ -227,24 +231,130 @@ async def submit_solo_score(
             solo_token_id=token,
         )
         result = await scoring.accept(command)
+        detail = await services.score_query.get(result.score_id) if services.score_query is not None else None
     except (ApplicationError, ValueError) as error:
         return _error(422, getattr(error, "code", "invalid_request"), str(error))
 
+    if detail is None:
+        return _error(503, "projection_unavailable", "Accepted score could not be read.")
+    return _score_response(detail)
+
+
+@router.get("/scores/{score_id}", response_model=SoloScoreResponse, tags=["Scores"])
+async def get_score(
+    score_id: int,
+    services: StableServicesDependency,
+) -> SoloScoreResponse | JSONResponse:
+    """Return one canonical score detail."""
+    return await _get_score_response(services, score_id)
+
+
+@router.get("/scores/{ruleset}/{score_id}", response_model=SoloScoreResponse, tags=["Scores"])
+async def get_score_for_ruleset(
+    ruleset: Ruleset,
+    score_id: int,
+    services: StableServicesDependency,
+) -> SoloScoreResponse | JSONResponse:
+    """Return one score only when the URL ruleset matches."""
+    return await _get_score_response(services, score_id, ruleset)
+
+
+@router.get("/beatmaps/{beatmap_id}/scores", response_model=None, tags=["Scores"])
+async def get_beatmap_scores(
+    beatmap_id: int,
+    services: StableServicesDependency,
+    account: V2AccountDependency,
+    mode: Annotated[Ruleset, Query()],
+    type: Annotated[Literal["global", "friend", "country"], Query()] = "global",
+    mods: Annotated[list[str] | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> dict[str, object] | JSONResponse:
+    """Return a Lazer score collection with personal score outside the top limit."""
+    if services.ranking_query is None or services.score_query is None:
+        return _error(503, "service_unavailable", "Ranking is unavailable.")
+    variant = ScoreboardVariant.VANILLA
+    acronyms = frozenset(value.strip().upper() for value in mods or ())
+    assistance = acronyms & {"RX", "AP"}
+    if len(assistance) > 1:
+        return _error(422, "invalid_request", "RX and AP cannot be combined.")
+    if "RX" in assistance:
+        variant = ScoreboardVariant.RELAX
+    elif "AP" in assistance:
+        variant = ScoreboardVariant.AUTOPILOT
+    acronyms -= assistance
+    if mods is not None:
+        scope = LeaderboardScope.exact_mods(acronyms)
+    elif type == "friend":
+        if services.social is None:
+            return _error(503, "service_unavailable", "Social service is unavailable.")
+        friends = await services.social.list_friends(account.account_id)
+        scope = LeaderboardScope.friends(frozenset({account.account_id, *(friend.account_id for friend in friends)}))
+    elif type == "country":
+        if not account.country_code:
+            return {"scores": [], "user_score": None, "score_count": 0}
+        scope = LeaderboardScope.country(account.country_code)
+    else:
+        scope = LeaderboardScope.overall()
+    page = await services.ranking_query.get_combined_leaderboard(
+        beatmap_id=beatmap_id,
+        ruleset=mode,
+        variant=variant,
+        scope=scope,
+        requester_account_id=account.account_id,
+        limit=limit,
+    )
+    details = {
+        score.score_id: await services.score_query.get(score.score_id)
+        for score in (*page.scores, *((page.personal_best,) if page.personal_best else ()))
+    }
+    scores = [
+        _score_response(details[row.score_id]).model_dump(mode="json") for row in page.scores if details[row.score_id]
+    ]
+    user_score = None
+    if page.personal_best is not None and details[page.personal_best.score_id] is not None:
+        user_score = {
+            "position": page.personal_best.rank,
+            "score": _score_response(details[page.personal_best.score_id]).model_dump(mode="json"),
+        }
+    return {"scores": scores, "user_score": user_score, "score_count": page.total_count}
+
+
+async def _get_score_response(
+    services: StableServices, score_id: int, ruleset: Ruleset | None = None
+) -> SoloScoreResponse | JSONResponse:
+    if services.score_query is None:
+        return _error(503, "service_unavailable", "Score queries are unavailable.")
+    detail = await services.score_query.get(score_id, ruleset)
+    if detail is None:
+        return _error(404, "not_found", "Score was not found.")
+    return _score_response(detail)
+
+
+def _score_response(detail: ScoreDetailView) -> SoloScoreResponse:
     return SoloScoreResponse(
-        id=result.score_id,
-        user_id=account.account_id,
-        beatmap_id=result.beatmap_id,
-        ruleset_id=body.ruleset_id,
-        rank=body.rank,
-        total_score=body.total_score,
-        accuracy=body.accuracy,
-        max_combo=body.max_combo,
-        mods=body.mods,
-        statistics=body.statistics,
-        maximum_statistics=body.maximum_statistics,
-        passed=body.passed,
-        ended_at=ended_at,
-        ranked=True,
+        id=detail.score_id,
+        user_id=detail.account_id,
+        user={
+            "id": detail.account_id,
+            "username": detail.display_name,
+            "country_code": (detail.country_code or "XX").upper(),
+        },
+        beatmap_id=detail.beatmap_id,
+        ruleset_id=list(Ruleset).index(detail.ruleset),
+        rank=detail.grade.value,
+        total_score=detail.total_score,
+        total_score_without_mods=detail.classic_score,
+        accuracy=detail.accuracy,
+        max_combo=detail.max_combo,
+        mods=[APIMod(acronym=mod.acronym, settings=dict(mod.settings)) for mod in detail.mods],
+        statistics=dict(detail.statistics),
+        maximum_statistics=dict(detail.maximum_statistics),
+        passed=detail.outcome is ScoreOutcome.PASSED,
+        ended_at=detail.ended_at,
+        position=detail.position,
+        pp=detail.pp,
+        has_replay=detail.has_replay,
+        ranked=detail.ranked,
     )
 
 

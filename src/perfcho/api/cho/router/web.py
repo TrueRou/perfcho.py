@@ -192,7 +192,8 @@ async def _build_leaderboard_scope(
     if leaderboard_type in {0, 1}:
         return LeaderboardScope.overall()
     if leaderboard_type == 2:
-        return LeaderboardScope.exact_mods(legacy_mod_bits)
+        mods, _ = parse_legacy_mods(legacy_mod_bits)
+        return LeaderboardScope.exact_mods(frozenset(mod.acronym for mod in mods if mod.acronym not in {"RX", "AP"}))
     if leaderboard_type == 3:
         friends = await social.list_friends(requester_account_id)
         return LeaderboardScope.friends(frozenset(friend.account_id for friend in friends))

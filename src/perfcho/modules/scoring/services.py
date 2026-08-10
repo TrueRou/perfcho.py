@@ -37,6 +37,7 @@ from perfcho.modules.scoring.models import (
     Ruleset,
     ScoreAcceptanceRecord,
     ScoreboardVariant,
+    ScoreDetailView,
     ScoreOutcome,
     SoloScoreToken,
 )
@@ -48,6 +49,7 @@ from perfcho.modules.scoring.ports import (
     MultiplayerSubmissionValidatorFactory,
     RankingRepositoryFactory,
     ReplayRepositoryFactory,
+    ScoreQueryRepositoryFactory,
     ScoringAcceptanceRepositoryFactory,
     ScoringUnitOfWork,
 )
@@ -549,7 +551,14 @@ class RankingQueryService:
             scope=scope,
             account_id=requester_account_id,
         )
-        return LeaderboardPage(public, personal)
+        async with self._uow_factory() as uow:
+            total_count = await self._repository_factory(uow.session).get_leaderboard_count(
+                beatmap_id=beatmap_id,
+                ruleset=ruleset,
+                variant=variant,
+                scope=scope,
+            )
+        return LeaderboardPage(public, personal, total_count)
 
     def _leaderboard_key(
         self,
@@ -562,8 +571,9 @@ class RankingQueryService:
         generation: str,
     ) -> str:
         dimension = scope.kind.value
-        if scope.legacy_mod_bits is not None:
-            dimension += f":{scope.legacy_mod_bits}"
+        if scope.mod_acronyms is not None:
+            digest = hashlib.sha256(",".join(sorted(scope.mod_acronyms)).encode()).hexdigest()[:16]
+            dimension += f":{digest}"
         if scope.account_ids is not None:
             digest = hashlib.sha256(",".join(map(str, sorted(scope.account_ids))).encode()).hexdigest()[:16]
             dimension += f":{digest}"
@@ -610,6 +620,28 @@ class RankingQueryService:
             return str(int(raw))
         except TypeError, ValueError:
             return "0"
+
+
+class ScoreQueryService:
+    """Read canonical score details without protocol-specific query logic."""
+
+    def __init__(
+        self,
+        uow_factory: Callable[[], ScoringUnitOfWork],
+        repository_factory: ScoreQueryRepositoryFactory,
+    ) -> None:
+        """Bind score-detail persistence dependencies."""
+        self._uow_factory = uow_factory
+        self._repository_factory = repository_factory
+
+    async def get(self, score_id: int, ruleset: Ruleset | None = None) -> ScoreDetailView | None:
+        """Return a score, treating a ruleset mismatch as absence."""
+        _positive_identifier("score_id", score_id)
+        async with self._uow_factory() as uow:
+            detail = await self._repository_factory(uow.session).get_score_detail(score_id)
+        if detail is not None and ruleset is not None and detail.ruleset is not ruleset:
+            return None
+        return detail
 
 
 class AccountStatisticsQueryService:
@@ -728,8 +760,14 @@ def _account_stats_from_cache(raw: bytes) -> AccountStatsView:
         accuracy=_decimal_cache_value(value["accuracy"]),
         play_count=int(value["play_count"]),
         total_score=int(value["total_score"]),
-        global_rank=int(value["global_rank"]),
+        global_rank=int(value["global_rank"]) if value["global_rank"] is not None else None,
         performance=int(value["performance"]),
+        country_rank=int(value["country_rank"]) if value.get("country_rank") is not None else None,
+        play_time_ms=int(value.get("play_time_ms", 0)),
+        total_hits=int(value.get("total_hits", 0)),
+        maximum_combo=int(value.get("maximum_combo", 0)),
+        replay_views=int(value.get("replay_views", 0)),
+        grade_counts=cast(dict[str, int], value.get("grade_counts", {})),
     )
 
 

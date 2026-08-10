@@ -26,6 +26,7 @@ from perfcho.modules.scoring.models import (
     ScoreAcceptanceRecord,
     ScoreboardInfo,
     ScoreboardVariant,
+    ScoreDetailView,
     SoloScoreToken,
 )
 
@@ -160,6 +161,25 @@ class RankingRepository(Protocol):
         """Return one account's best row for one leaderboard scope."""
         ...
 
+    async def get_leaderboard_count(
+        self,
+        *,
+        beatmap_id: int,
+        ruleset: Ruleset,
+        variant: ScoreboardVariant,
+        scope: LeaderboardScope,
+    ) -> int:
+        """Return the complete number of accounts in one scope."""
+        ...
+
+
+class ScoreQueryRepository(Protocol):
+    """Read canonical score facts and current ranking projections."""
+
+    async def get_score_detail(self, score_id: int) -> ScoreDetailView | None:
+        """Return one score detail or None when it does not exist."""
+        ...
+
 
 class AccountStatisticsRepository(Protocol):
     """Read projected account statistics."""
@@ -252,6 +272,14 @@ class RankingRepositoryFactory(Protocol):
 
     def __call__(self, session: object) -> RankingRepository:
         """Return a ranking repository bound to the session."""
+        ...
+
+
+class ScoreQueryRepositoryFactory(Protocol):
+    """Bind score detail queries to one caller-owned transaction."""
+
+    def __call__(self, session: object) -> ScoreQueryRepository:
+        """Return a score query repository bound to the session."""
         ...
 
 

@@ -47,17 +47,21 @@ class LeaderboardScope:
     """Describe the population and optional dimension used by a leaderboard."""
 
     kind: LeaderboardScopeKind
-    legacy_mod_bits: int | None = None
+    mod_acronyms: frozenset[str] | None = None
     account_ids: frozenset[int] | None = None
     country_code: str | None = None
 
     def __post_init__(self) -> None:
         """Reject dimensions that do not belong to the selected scope."""
         if self.kind is LeaderboardScopeKind.EXACT_MODS:
-            if self.legacy_mod_bits is None or self.legacy_mod_bits < 0:
-                raise ValueError("exact-mods scope requires nonnegative legacy_mod_bits")
-        elif self.legacy_mod_bits is not None:
-            raise ValueError("legacy_mod_bits is only valid for exact-mods scope")
+            if self.mod_acronyms is None:
+                raise ValueError("exact-mods scope requires a mod acronym set")
+            normalized = frozenset(acronym.strip().upper() for acronym in self.mod_acronyms)
+            if any(not _MOD_ACRONYM.fullmatch(acronym) for acronym in normalized):
+                raise ValueError("exact-mods scope contains an invalid acronym")
+            object.__setattr__(self, "mod_acronyms", normalized)
+        elif self.mod_acronyms is not None:
+            raise ValueError("mod_acronyms is only valid for exact-mods scope")
         if self.kind is LeaderboardScopeKind.FRIENDS:
             if self.account_ids is None or any(account_id < 1 for account_id in self.account_ids):
                 raise ValueError("friends scope requires positive account IDs")
@@ -75,9 +79,9 @@ class LeaderboardScope:
         return cls(LeaderboardScopeKind.OVERALL)
 
     @classmethod
-    def exact_mods(cls, legacy_mod_bits: int) -> LeaderboardScope:
-        """Build an exact legacy-mods leaderboard scope."""
-        return cls(LeaderboardScopeKind.EXACT_MODS, legacy_mod_bits=legacy_mod_bits)
+    def exact_mods(cls, mod_acronyms: frozenset[str]) -> LeaderboardScope:
+        """Build an exact canonical-mod-acronym leaderboard scope."""
+        return cls(LeaderboardScopeKind.EXACT_MODS, mod_acronyms=mod_acronyms)
 
     @classmethod
     def friends(cls, account_ids: frozenset[int]) -> LeaderboardScope:
@@ -544,6 +548,35 @@ class LeaderboardPage:
 
     scores: tuple[LeaderboardScoreView, ...]
     personal_best: LeaderboardScoreView | None
+    total_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ScoreDetailView:
+    """Describe one canonical score together with current ranking projections."""
+
+    score_id: int
+    account_id: int
+    display_name: str
+    country_code: str | None
+    beatmap_id: int
+    ruleset: Ruleset
+    variant: ScoreboardVariant
+    total_score: int
+    classic_score: int
+    accuracy: Decimal
+    max_combo: int
+    grade: ScoreGrade
+    outcome: ScoreOutcome
+    mods: tuple[CanonicalMod, ...]
+    statistics: Mapping[str, int]
+    maximum_statistics: Mapping[str, int]
+    started_at: datetime
+    ended_at: datetime
+    has_replay: bool
+    ranked: bool
+    pp: Decimal | None
+    position: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,21 +590,42 @@ class BeatmapGradeView:
 
 @dataclass(frozen=True, slots=True)
 class AccountStatsView:
-    """Describe Stable-compatible score totals without protocol fields."""
+    """Describe protocol-neutral projected account gameplay statistics."""
 
     ranked_score: int
     accuracy: Decimal
     play_count: int
     total_score: int
-    global_rank: int
+    global_rank: int | None
     performance: int = 0
+    country_rank: int | None = None
+    play_time_ms: int = 0
+    total_hits: int = 0
+    maximum_combo: int = 0
+    replay_views: int = 0
+    grade_counts: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Require non-negative totals and normalized accuracy."""
-        if min(self.ranked_score, self.play_count, self.total_score, self.global_rank, self.performance) < 0:
+        values = (
+            self.ranked_score,
+            self.play_count,
+            self.total_score,
+            self.performance,
+            self.play_time_ms,
+            self.total_hits,
+            self.maximum_combo,
+            self.replay_views,
+        )
+        if min(values) < 0 or any(rank is not None and rank < 0 for rank in (self.global_rank, self.country_rank)):
             raise ValueError("account statistics must be non-negative")
         if not Decimal(0) <= self.accuracy <= Decimal(1):
             raise ValueError("account statistics accuracy must be between zero and one")
+        object.__setattr__(
+            self,
+            "grade_counts",
+            MappingProxyType({grade: int(self.grade_counts.get(grade, 0)) for grade in ("XH", "X", "SH", "S", "A")}),
+        )
 
 
 def weighted_total_performance(values: Sequence[Decimal]) -> int:

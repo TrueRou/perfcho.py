@@ -709,7 +709,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 beatmap_id=first.beatmap_id,
                 ruleset=Ruleset.OSU,
                 variant=ScoreboardVariant.VANILLA,
-                scope=LeaderboardScope.exact_mods(1 << 3),
+                scope=LeaderboardScope.exact_mods(frozenset({"HD"})),
                 requester_account_id=1,
                 limit=50,
             )

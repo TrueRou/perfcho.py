@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from perfcho.modules.common.models import CommandMeta
+from perfcho.modules.scoring.models import Ruleset
 
 _REGISTRATION_STATUSES = frozenset({"active", "pending"})
 
@@ -72,3 +73,20 @@ class RegistrationClaim:
     def replayed(self) -> bool:
         """Return whether this claim represents a completed exact replay."""
         return self.prior_result is not None
+
+
+@dataclass(frozen=True, slots=True)
+class PublicAccountView:
+    """Describe public account and profile facts independently of an API."""
+
+    account_id: int
+    current_name: str
+    account_type: str
+    country_code: str | None
+    registered_at: datetime
+    last_seen_at: datetime | None
+    default_ruleset: Ruleset
+    location: str | None = None
+    occupation: str | None = None
+    interests: str | None = None
+    website: str | None = None

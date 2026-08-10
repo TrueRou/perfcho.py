@@ -39,6 +39,7 @@ from perfcho.infra.db.repositories.scoring import (
     SqlAlchemyMultiplayerSubmissionValidator,
     SqlAlchemyRankingRepository,
     SqlAlchemyReplayRepository,
+    SqlAlchemyScoreQueryRepository,
     SqlAlchemyScoringAcceptanceRepository,
     SqlAlchemyScoringRepository,
 )
@@ -76,6 +77,7 @@ from perfcho.modules.scoring import (
     RankingQueryService,
     ReplayQueryService,
     ReplayService,
+    ScoreQueryService,
     ScoringService,
 )
 from perfcho.modules.social import SocialQueryService, SocialService, TransactionAchievementAwarder, build_clan_commands
@@ -133,6 +135,10 @@ def _scoring_repository(session: object) -> SqlAlchemyScoringRepository:
 
 def _scoring_acceptance_repository(session: object) -> SqlAlchemyScoringAcceptanceRepository:
     return SqlAlchemyScoringAcceptanceRepository(cast(AsyncSession, session))
+
+
+def _score_query_repository(session: object) -> SqlAlchemyScoreQueryRepository:
+    return SqlAlchemyScoreQueryRepository(cast(AsyncSession, session))
 
 
 def _replay_repository(session: object) -> SqlAlchemyReplayRepository:
@@ -266,6 +272,7 @@ class StableServices:
     community_query: CommunityQueryService | None = None
     object_storage: ObjectStorage | None = None
     scoring: ScoringService | None = None
+    score_query: ScoreQueryService | None = None
     performance_query: PerformanceQueryService | None = None
     replay_query: ReplayQueryService | None = None
     replay: ReplayService | None = None
@@ -434,6 +441,7 @@ async def compose_stable_services(
         community=community,
         object_storage=object_storage,
         scoring=scoring,
+        score_query=ScoreQueryService(uow_factory, _score_query_repository),
         performance_query=PerformanceQueryService(uow_factory, _performance_query_repository),
         replay_query=ReplayQueryService(uow_factory, _replay_repository),
         replay=ReplayService(uow_factory, _replay_repository, _outbox_writer),

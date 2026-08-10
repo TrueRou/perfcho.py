@@ -1,7 +1,8 @@
 """Expose OAuth token exchange and the minimum authenticated API surface."""
 
 import hashlib
-from datetime import timedelta
+from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Form, Header, Request
@@ -17,6 +18,7 @@ from perfcho.modules.identity import (
     PasswordGrant,
     RefreshGrant,
 )
+from perfcho.modules.scoring import AccountStatsView, Ruleset, ScoreboardVariant
 
 router = APIRouter()
 
@@ -110,7 +112,6 @@ async def me(
     ruleset: str | None = None,
 ) -> dict[str, object] | JSONResponse:
     """Return the compact authenticated account shape needed to finish client login."""
-    del ruleset
     if authorization is None or not authorization.startswith("Bearer "):
         return _oauth_error("unauthenticated", "A Bearer access token is required.", status_code=401)
     try:
@@ -118,26 +119,146 @@ async def me(
     except InvalidAccessToken:
         return _oauth_error("unauthenticated", "The access token is invalid or expired.", status_code=401)
 
-    country_code = (account.country_code or "XX").upper()
-    avatar_base = services.settings.stable_avatar_base_url.rstrip("/")
+    selected = _parse_ruleset(ruleset)
+    if ruleset is not None and selected is None:
+        return _oauth_error("invalid_request", "The requested ruleset is invalid.", status_code=422)
+    statistics_rulesets = await _statistics_rulesets(services, account.account_id)
+    response = _user_response(
+        services,
+        account.account_id,
+        account.current_name,
+        account.account_type,
+        account.country_code,
+        account.registered_at,
+        account.last_seen_at,
+        selected or Ruleset.OSU,
+        statistics_rulesets,
+    )
+    if ruleset is not None:
+        response["statistics"] = statistics_rulesets[selected.value] if selected is not None else None
+    return response
+
+
+@router.get("/api/v2/users/{lookup}/{ruleset}", response_model=None)
+async def user(
+    lookup: str,
+    ruleset: str,
+    services: StableServicesDependency,
+    key: Literal["id", "username"] = "id",
+) -> dict[str, object] | JSONResponse:
+    """Return a public account and selected ruleset statistics."""
+    selected = _parse_ruleset(ruleset)
+    if selected is None:
+        return _oauth_error("invalid_request", "The requested ruleset is invalid.", status_code=422)
+    if services.account is None:
+        return _oauth_error("service_unavailable", "Account queries are unavailable.", status_code=503)
+    account = await services.account.get_public(lookup, key=key)
+    if account is None:
+        return _oauth_error("not_found", "The requested user does not exist.", status_code=404)
+    statistics_rulesets = await _statistics_rulesets(services, account.account_id)
+    response = _user_response(
+        services,
+        account.account_id,
+        account.current_name,
+        account.account_type,
+        account.country_code,
+        account.registered_at,
+        account.last_seen_at,
+        account.default_ruleset,
+        statistics_rulesets,
+    )
+    response["statistics"] = statistics_rulesets[selected.value]
+    return response
+
+
+async def _statistics_rulesets(
+    services: object,
+    account_id: int,
+) -> dict[str, dict[str, object]]:
+    statistics = getattr(services, "account_statistics", None)
+    result: dict[str, dict[str, object]] = {}
+    for ruleset in Ruleset:
+        view = (
+            await statistics.get_for_display(account_id, ruleset, ScoreboardVariant.VANILLA)
+            if statistics is not None
+            else AccountStatsView(0, Decimal(0), 0, 0, None)
+        )
+        result[ruleset.value] = _statistics_response(view)
+    return result
+
+
+def _statistics_response(stats: AccountStatsView) -> dict[str, object]:
     return {
-        "id": account.account_id,
-        "username": account.current_name,
-        "join_date": account.registered_at.isoformat(),
-        "country_code": country_code,
-        "avatar_url": f"{avatar_base}/{account.account_id}",
+        "count_100": 0,
+        "count_300": 0,
+        "count_50": 0,
+        "count_miss": 0,
+        "level": {"current": 0, "progress": 0},
+        "global_rank": stats.global_rank or None,
+        "country_rank": stats.country_rank or None,
+        "pp": stats.performance,
+        "ranked_score": stats.ranked_score,
+        "hit_accuracy": float(stats.accuracy * 100),
+        "play_count": stats.play_count,
+        "play_time": stats.play_time_ms // 1000,
+        "total_score": stats.total_score,
+        "total_hits": stats.total_hits,
+        "maximum_combo": stats.maximum_combo,
+        "replays_watched_by_others": stats.replay_views,
+        "grade_counts": {
+            "ssh": stats.grade_counts["XH"],
+            "ss": stats.grade_counts["X"],
+            "sh": stats.grade_counts["SH"],
+            "s": stats.grade_counts["S"],
+            "a": stats.grade_counts["A"],
+        },
+        "is_ranked": bool(stats.global_rank),
+        "global_rank_percent": None,
+        "variants": None,
+    }
+
+
+def _user_response(
+    services: object,
+    account_id: int,
+    username: str,
+    account_type: str,
+    country_code: str | None,
+    registered_at: datetime,
+    last_seen_at: datetime | None,
+    default_ruleset: Ruleset,
+    statistics_rulesets: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    avatar_base = services.settings.stable_avatar_base_url.rstrip("/")
+    registered = registered_at.isoformat()
+    last_seen = last_seen_at.isoformat() if last_seen_at else registered
+    return {
+        "id": account_id,
+        "username": username,
+        "join_date": registered,
+        "country_code": (country_code or "XX").upper(),
+        "avatar_url": f"{avatar_base}/{account_id}",
         "is_active": True,
-        "is_bot": account.account_type == "bot",
+        "is_bot": account_type == "bot",
         "is_online": True,
         "is_supporter": False,
         "support_level": 0,
-        "last_visit": account.last_seen_at.isoformat() if account.last_seen_at else account.registered_at.isoformat(),
+        "last_visit": last_seen,
         "pm_friends_only": False,
-        "playmode": "osu",
+        "playmode": default_ruleset.value,
         "previous_usernames": [],
         "profile_order": [],
-        "statistics_rulesets": {},
+        "statistics_rulesets": statistics_rulesets,
         "groups": [],
         "session_verification_method": None,
         "score_processing_notice_url": "",
     }
+
+
+def _parse_ruleset(value: str | None) -> Ruleset | None:
+    if value is None:
+        return None
+    try:
+        return Ruleset(value)
+    except ValueError:
+        return None

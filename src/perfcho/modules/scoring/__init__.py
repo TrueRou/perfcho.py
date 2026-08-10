@@ -29,6 +29,7 @@ from perfcho.modules.scoring.models import (
     Ruleset,
     ScoreAttestation,
     ScoreboardVariant,
+    ScoreDetailView,
     ScoreGrade,
     ScoreOutcome,
     ScoreSubmission,
@@ -42,6 +43,7 @@ from perfcho.modules.scoring.services import (
     RankingQueryService,
     ReplayQueryService,
     ReplayService,
+    ScoreQueryService,
     ScoringService,
 )
 
@@ -74,6 +76,7 @@ __all__ = (
     "BeatmapScoresQueryService",
     "Ruleset",
     "ScoreAttestation",
+    "ScoreDetailView",
     "ScoreGrade",
     "ScoreOutcome",
     "ScoreRejected",
@@ -81,6 +84,7 @@ __all__ = (
     "ScoreboardUnavailable",
     "ScoreboardVariant",
     "ScoringService",
+    "ScoreQueryService",
     "SoloScoreToken",
     "StagedReplayManifest",
     "weighted_total_performance",

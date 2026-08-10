@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Protocol
 
-from perfcho.modules.account.models import RegistrationClaim, RegistrationRecord, RegistrationResult
+from perfcho.modules.account.models import PublicAccountView, RegistrationClaim, RegistrationRecord, RegistrationResult
 from perfcho.modules.common.ports import UnitOfWork
 
 
@@ -48,6 +48,12 @@ class AccountRepository(Protocol):
 
     async def complete_registration(self, idempotency_key: str, result: RegistrationResult) -> None:
         """Attach the registration result to its command receipt."""
+        ...
+
+    async def get_public_account(
+        self, *, account_id: int | None = None, name_key: str | None = None
+    ) -> PublicAccountView | None:
+        """Return a public account selected by ID or normalized current name."""
         ...
 
 

@@ -7,14 +7,16 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.enums import AccountStatus, AccountType, Ruleset
+from perfcho.infra.db.enums import AccountStatus, AccountType
+from perfcho.infra.db.enums import Ruleset as DbRuleset
 from perfcho.infra.db.idempotency import CommandReceiptRepository, ReceiptClaim, ReceiptClaimState
 from perfcho.infra.db.locks import acquire_transaction_locks, advisory_lock_key
 from perfcho.infra.db.models.authz import AccountRoleGrant, Role
 from perfcho.infra.db.models.core import Account, AccountEmail, AccountName, UserPreference, UserProfile
 from perfcho.infra.db.models.iam import PasswordCredential
 from perfcho.modules.account.errors import EmailUnavailable, NameUnavailable
-from perfcho.modules.account.models import RegistrationClaim, RegistrationRecord, RegistrationResult
+from perfcho.modules.account.models import PublicAccountView, RegistrationClaim, RegistrationRecord, RegistrationResult
+from perfcho.modules.scoring.models import Ruleset
 
 _RECEIPT_SCOPE = "account.register"
 _NAME_CONSTRAINTS = frozenset({"uq_account_names_current_key"})
@@ -114,7 +116,7 @@ class SqlAlchemyAccountRepository:
                     UserProfile(
                         account_id=account_id,
                         social_links={},
-                        default_ruleset=Ruleset.OSU,
+                        default_ruleset=DbRuleset.OSU,
                         play_style=[],
                     ),
                     UserPreference(
@@ -174,6 +176,39 @@ class SqlAlchemyAccountRepository:
                 "email": result.email,
                 "status": result.status,
             },
+        )
+
+    async def get_public_account(
+        self, *, account_id: int | None = None, name_key: str | None = None
+    ) -> PublicAccountView | None:
+        """Read public account and profile fields by one canonical selector."""
+        if (account_id is None) == (name_key is None):
+            raise ValueError("exactly one public account selector is required")
+        statement = (
+            select(Account, AccountName.display_name, UserProfile)
+            .join(AccountName, (AccountName.account_id == Account.id) & AccountName.ended_at.is_(None))
+            .outerjoin(UserProfile, UserProfile.account_id == Account.id)
+        )
+        if account_id is not None:
+            statement = statement.where(Account.id == account_id)
+        else:
+            statement = statement.where(AccountName.name_key == name_key)
+        row = (await self._session.execute(statement)).one_or_none()
+        if row is None:
+            return None
+        profile = row.UserProfile
+        return PublicAccountView(
+            account_id=row.Account.id,
+            current_name=row.display_name,
+            account_type=row.Account.type.value,
+            country_code=row.Account.country_code,
+            registered_at=row.Account.registered_at,
+            last_seen_at=row.Account.last_seen_at,
+            default_ruleset=Ruleset(profile.default_ruleset.value) if profile is not None else Ruleset.OSU,
+            location=profile.location if profile is not None else None,
+            occupation=profile.occupation if profile is not None else None,
+            interests=profile.interests if profile is not None else None,
+            website=profile.website if profile is not None else None,
         )
 
 
