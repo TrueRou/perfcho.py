@@ -29,10 +29,22 @@ from perfcho.infra.security.tokens import (
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.normalization import normalize_email, normalize_name
 from perfcho.modules.common.ports import Clock, IdGenerator, OutboxWriterFactory
-from perfcho.modules.identity.errors import InvalidCredentials, InvalidStableSession, StableSessionAlreadyActive
+from perfcho.modules.identity.errors import (
+    InvalidAccessToken,
+    InvalidCredentials,
+    InvalidOAuthClient,
+    InvalidOAuthGrant,
+    InvalidStableSession,
+    StableSessionAlreadyActive,
+)
 from perfcho.modules.identity.models import (
+    AuthenticatedAccount,
     CredentialSnapshot,
+    OAuthClientSnapshot,
+    OAuthTokenResult,
     OpenStableSession,
+    PasswordGrant,
+    RefreshGrant,
     ResolvedStableSession,
     StableLogin,
     StableSessionResult,
@@ -302,6 +314,232 @@ class IdentityService:
         if result is None:
             raise RuntimeError("Stable login completed without a result")
         return result
+
+    async def exchange_password(self, command: PasswordGrant) -> OAuthTokenResult:
+        """Authenticate an account and atomically create an OAuth token family."""
+        client = await self._authenticate_oauth_client(command.client_key, command.client_secret)
+        normalized_identifier = _normalize_identifier(command.identifier)
+        identifier_hmac = _identifier_hmac(normalized_identifier, command.identifier, key=self._device_hmac_key)
+        snapshot: CredentialSnapshot | None = None
+        if normalized_identifier is not None:
+            async with self._uow_factory() as uow:
+                snapshot = await self._repository_factory(uow.session).find_credential(*normalized_identifier)
+
+        if snapshot is None or snapshot.account_status != "active" or snapshot.must_change:
+            await asyncio.to_thread(
+                verify_dummy_password,
+                pepper=self._password_pepper,
+                policy=self._argon2_policy,
+            )
+            await self._record_oauth_attempt(command, identifier_hmac, snapshot, "invalid_credentials")
+            raise InvalidOAuthGrant("invalid credentials")
+
+        verification = await asyncio.to_thread(
+            _verify_credential,
+            command.password_token,
+            snapshot,
+            pepper=self._password_pepper,
+            policy=self._argon2_policy,
+        )
+        if not verification.verified:
+            await self._record_oauth_attempt(command, identifier_hmac, snapshot, "invalid_credentials")
+            raise InvalidOAuthGrant("invalid credentials")
+
+        replacement_hash: PasswordHash | None = None
+        if snapshot.algorithm == "bcrypt_md5" or verification.needs_rehash:
+            replacement_hash = await asyncio.to_thread(
+                hash_password,
+                command.password_token,
+                pepper=self._password_pepper,
+                policy=self._argon2_policy,
+            )
+
+        now = self._clock.now()
+        session_expires_at = now + command.session_lifetime
+        access_expires_at = min(now + command.access_token_lifetime, session_expires_at)
+        refresh_expires_at = min(now + command.refresh_token_lifetime, session_expires_at)
+        access_token = self._token_factory()
+        refresh_token = self._token_factory()
+        _validate_generated_token(access_token)
+        _validate_generated_token(refresh_token)
+        session_id, family_id = self._id_generator.new(), self._id_generator.new()
+        access_token_id, access_token_jti = self._id_generator.new(), self._id_generator.new()
+        refresh_token_id, refresh_token_jti = self._id_generator.new(), self._id_generator.new()
+
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            current = await repository.get_current_credential(snapshot.account_id)
+            if not _credential_is_current(snapshot, current):
+                await repository.append_auth_attempt(
+                    account_id=snapshot.account_id,
+                    session_id=None,
+                    device_id=None,
+                    identifier_hmac=identifier_hmac,
+                    ip_address=command.ip_address,
+                    client_version=command.client_version,
+                    client_family="lazer",
+                    result="failure",
+                    failure_reason="invalid_credentials",
+                    context={"user_agent": command.user_agent, "oauth_client": command.client_key},
+                    now=now,
+                )
+                await uow.commit()
+                raise InvalidOAuthGrant("invalid credentials")
+
+            if replacement_hash is not None:
+                upgraded = await repository.upgrade_legacy_credential(
+                    account_id=snapshot.account_id,
+                    expected_verifier=snapshot.password_verifier,
+                    expected_password_changed_at=snapshot.password_changed_at,
+                    password_verifier=replacement_hash.verifier,
+                    pepper_version=replacement_hash.pepper_version,
+                    password_changed_at=now,
+                )
+                if not upgraded:
+                    raise InvalidOAuthGrant("invalid credentials")
+
+            await repository.create_oauth_session(
+                session_id=session_id,
+                family_id=family_id,
+                access_token_id=access_token_id,
+                access_token_jti=access_token_jti,
+                refresh_token_id=refresh_token_id,
+                refresh_token_jti=refresh_token_jti,
+                account_id=snapshot.account_id,
+                client_id=client.client_id,
+                client_version=command.client_version,
+                ip_address=command.ip_address,
+                user_agent=command.user_agent,
+                access_digest=digest_opaque_token(access_token, key=self._token_hmac_key),
+                access_prefix=access_token[:_TOKEN_PREFIX_LENGTH],
+                access_expires_at=access_expires_at,
+                refresh_digest=digest_opaque_token(refresh_token, key=self._token_hmac_key),
+                refresh_prefix=refresh_token[:_TOKEN_PREFIX_LENGTH],
+                refresh_expires_at=refresh_expires_at,
+                scope_ids=client.scope_ids,
+                now=now,
+                session_expires_at=session_expires_at,
+            )
+            await repository.append_auth_attempt(
+                account_id=snapshot.account_id,
+                session_id=session_id,
+                device_id=None,
+                identifier_hmac=identifier_hmac,
+                ip_address=command.ip_address,
+                client_version=command.client_version,
+                client_family="lazer",
+                result="success",
+                failure_reason=None,
+                context={"user_agent": command.user_agent, "oauth_client": command.client_key},
+                now=now,
+            )
+            await self._outbox_writer_factory(uow.session).append(
+                _oauth_session_opened_event(
+                    account_id=snapshot.account_id,
+                    session_id=session_id,
+                    client_version=command.client_version,
+                    opened_at=now,
+                    expires_at=session_expires_at,
+                )
+            )
+            await uow.commit()
+
+        return OAuthTokenResult(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=int((access_expires_at - now).total_seconds()),
+        )
+
+    async def exchange_refresh(self, command: RefreshGrant) -> OAuthTokenResult:
+        """Rotate an OAuth refresh token and revoke its family on replay."""
+        client = await self._authenticate_oauth_client(command.client_key, command.client_secret)
+        now = self._clock.now()
+        access_token, refresh_token = self._token_factory(), self._token_factory()
+        _validate_generated_token(access_token)
+        _validate_generated_token(refresh_token)
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            snapshot = await repository.resolve_refresh_token(
+                digest_opaque_token(command.refresh_token, key=self._token_hmac_key),
+                client_id=client.client_id,
+                at=now,
+            )
+            if snapshot is None:
+                raise InvalidOAuthGrant("invalid refresh token")
+            if snapshot.consumed_at is not None:
+                await repository.compromise_token_family(snapshot.family_id, now=now, reason="refresh_reuse")
+                await uow.commit()
+                raise InvalidOAuthGrant("invalid refresh token")
+
+            access_expires_at = min(now + command.access_token_lifetime, snapshot.session_expires_at)
+            refresh_expires_at = min(now + command.refresh_token_lifetime, snapshot.session_expires_at)
+            await repository.rotate_refresh_token(
+                snapshot,
+                access_token_id=self._id_generator.new(),
+                access_token_jti=self._id_generator.new(),
+                refresh_token_id=self._id_generator.new(),
+                refresh_token_jti=self._id_generator.new(),
+                access_digest=digest_opaque_token(access_token, key=self._token_hmac_key),
+                access_prefix=access_token[:_TOKEN_PREFIX_LENGTH],
+                access_expires_at=access_expires_at,
+                refresh_digest=digest_opaque_token(refresh_token, key=self._token_hmac_key),
+                refresh_prefix=refresh_token[:_TOKEN_PREFIX_LENGTH],
+                refresh_expires_at=refresh_expires_at,
+                now=now,
+            )
+            await uow.commit()
+        return OAuthTokenResult(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=int((access_expires_at - now).total_seconds()),
+        )
+
+    async def authenticate_access_token(self, raw_token: str) -> AuthenticatedAccount:
+        """Resolve a Bearer access token to the current authenticated account."""
+        async with self._uow_factory() as uow:
+            account = await self._repository_factory(uow.session).resolve_access_token(
+                digest_opaque_token(raw_token, key=self._token_hmac_key),
+                at=self._clock.now(),
+            )
+        if account is None:
+            raise InvalidAccessToken("invalid access token")
+        return account
+
+    async def _authenticate_oauth_client(self, client_key: str, client_secret: str) -> OAuthClientSnapshot:
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            client = await self._repository_factory(uow.session).find_oauth_client(
+                client_key,
+                digest_opaque_token(client_secret, key=self._token_hmac_key),
+                at=now,
+            )
+        if client is None or not client.first_party:
+            raise InvalidOAuthClient("invalid OAuth client")
+        return client
+
+    async def _record_oauth_attempt(
+        self,
+        command: PasswordGrant,
+        identifier_hmac: bytes,
+        snapshot: CredentialSnapshot | None,
+        failure_reason: str,
+    ) -> None:
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            await self._repository_factory(uow.session).append_auth_attempt(
+                account_id=snapshot.account_id if snapshot is not None else None,
+                session_id=None,
+                device_id=None,
+                identifier_hmac=identifier_hmac,
+                ip_address=command.ip_address,
+                client_version=command.client_version,
+                client_family="lazer",
+                result="failure",
+                failure_reason=failure_reason,
+                context={"user_agent": command.user_agent, "oauth_client": command.client_key},
+                now=now,
+            )
+            await uow.commit()
 
     async def resolve_stable_session(self, raw_token: str) -> ResolvedStableSession:
         """Resolve an opaque bearer token to current active account context."""
@@ -711,3 +949,36 @@ def _session_closed_event(
 def _validate_close_reason(reason: str) -> None:
     if not reason or len(reason) > 64:
         raise ValueError("session close reasons must contain at most 64 characters")
+
+
+def _validate_generated_token(token: str) -> None:
+    if len(token) <= _TOKEN_PREFIX_LENGTH:
+        raise RuntimeError("token factory returned a token too short for a non-secret prefix")
+
+
+def _oauth_session_opened_event(
+    *,
+    account_id: int,
+    session_id: uuid.UUID,
+    client_version: str | None,
+    opened_at: datetime,
+    expires_at: datetime,
+) -> PendingEvent:
+    return PendingEvent(
+        aggregate_type="identity_session",
+        aggregate_id=str(session_id),
+        event_type="identity.session-opened.v1",
+        schema_version=1,
+        payload={
+            "account_id": account_id,
+            "session_id": str(session_id),
+            "device_id": None,
+            "client_family": "lazer",
+            "client_version": client_version,
+            "client_variant": None,
+            "opened_at": opened_at.isoformat(),
+            "expires_at": expires_at.isoformat(),
+        },
+        consumers=_IDENTITY_CONSUMERS,
+        partition_key=f"account:{account_id}",
+    )

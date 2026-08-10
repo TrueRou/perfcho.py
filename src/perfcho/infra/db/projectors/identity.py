@@ -37,9 +37,9 @@ async def project_identity_event(session: AsyncSession, event: OutboxEvent, part
         activity_type = "identity_session_opened"
         snapshot: dict[str, object] = {
             "session_id": str(session_id),
-            "device_id": str(payload_uuid(event.payload, "device_id")),
+            "device_id": payload_optional_string(event.payload, "device_id"),
             "client_family": payload_string(event.payload, "client_family"),
-            "client_version": payload_string(event.payload, "client_version"),
+            "client_version": payload_optional_string(event.payload, "client_version"),
             "client_variant": payload_optional_string(event.payload, "client_variant"),
             "expires_at": payload_datetime(event.payload, "expires_at").isoformat(),
         }

@@ -23,7 +23,7 @@ from perfcho.infra.db.models.authz import AccountRoleGrant, Entitlement, Permiss
 from perfcho.infra.db.models.community import Channel
 from perfcho.infra.db.models.content import ContentSource
 from perfcho.infra.db.models.core import Account, AccountName, UserPreference, UserProfile
-from perfcho.infra.db.models.iam import Scope
+from perfcho.infra.db.models.iam import OAuthClient, OAuthClientScope, OAuthClientSecret, Scope
 from perfcho.infra.db.models.scoring import (
     CalculationFormula,
     CalculationFormulaScoreboard,
@@ -33,6 +33,8 @@ from perfcho.infra.db.models.scoring import (
     RankingPolicy,
     Scoreboard,
 )
+from perfcho.infra.security.tokens import digest_opaque_token
+from perfcho.infra.settings import settings
 
 
 def test_bootstrap_catalog_has_stable_ids_and_complete_role_links() -> None:
@@ -129,6 +131,21 @@ async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_databa
             assert await session.get(UserPreference, 1) is not None
 
             assert await session.scalar(select(func.count()).select_from(Scope)) == len(OAUTH_SCOPES)
+            lazer_client = await session.scalar(select(OAuthClient).where(OAuthClient.client_key == "5"))
+            assert lazer_client is not None
+            assert lazer_client.first_party is True
+            assert lazer_client.active is True
+            assert await session.scalar(
+                select(func.count()).select_from(OAuthClientScope).where(OAuthClientScope.client_id == lazer_client.id)
+            ) == len(OAUTH_SCOPES)
+            lazer_secret = await session.scalar(
+                select(OAuthClientSecret).where(OAuthClientSecret.client_id == lazer_client.id)
+            )
+            assert lazer_secret is not None
+            assert lazer_secret.secret_digest == digest_opaque_token(
+                "FGc9GAtyHzeQDshWP5Ah7dega8hJACAJpQtw6OXk",
+                key=settings.token_hmac_key.get_secret_value().encode(),
+            )
             assert await session.scalar(select(func.count()).select_from(Permission)) == len(PERMISSIONS)
             assert await session.scalar(select(func.count()).select_from(Role)) == len(ROLES)
             assert await session.scalar(select(func.count()).select_from(RolePermission)) == sum(

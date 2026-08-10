@@ -99,6 +99,9 @@ class Settings(BaseSettings):
     stable_spectator_frame_batch_size: int = Field(default=256, ge=1, le=4096)
     stable_lobby_match_limit: int = Field(default=100, ge=1, le=256)
     stable_presence_batch_size: int = Field(default=2048, ge=1, le=8192)
+    oauth_session_lifetime_seconds: int = Field(default=30 * 24 * 60 * 60, ge=300)
+    oauth_access_token_lifetime_seconds: int = Field(default=24 * 60 * 60, ge=60)
+    oauth_refresh_token_lifetime_seconds: int = Field(default=30 * 24 * 60 * 60, ge=300)
 
     bot_account_id: int = Field(default=1, ge=1)
     bot_name: str = Field(default="BanchoBot", min_length=1, max_length=32)
@@ -160,6 +163,10 @@ class Settings(BaseSettings):
             raise ValueError("Redis socket timeout must exceed the Stable mailbox wait")
         if self.stable_session_touch_interval_seconds >= self.stable_session_stale_grace_seconds:
             raise ValueError("Stable session touch interval must be shorter than stale grace")
+        if self.oauth_access_token_lifetime_seconds > self.oauth_session_lifetime_seconds:
+            raise ValueError("OAuth access token lifetime must not exceed session lifetime")
+        if self.oauth_refresh_token_lifetime_seconds > self.oauth_session_lifetime_seconds:
+            raise ValueError("OAuth refresh token lifetime must not exceed session lifetime")
         minimum_window = ceil(self.performance_http_timeout_seconds) + 30
         if self.performance_beatmap_url_expiry_seconds < minimum_window:
             raise ValueError("performance Beatmap URL expiry must exceed the HTTP timeout by at least 30 seconds")

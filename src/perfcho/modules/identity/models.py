@@ -1,4 +1,4 @@
-"""Define immutable Stable identity commands and results."""
+"""Define immutable identity commands and results shared by protocol adapters."""
 
 import ipaddress
 import uuid
@@ -56,6 +56,121 @@ class StableLogin:
         if not normalized_components:
             raise ValueError("at least one device component is required")
         object.__setattr__(self, "device_components", tuple(normalized_components))
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordGrant:
+    """Request a password-authenticated OAuth session."""
+
+    identifier: str
+    password_token: str = field(repr=False)
+    client_key: str
+    client_secret: str = field(repr=False)
+    requested_scope: str
+    client_version: str | None
+    ip_address: str
+    user_agent: str | None
+    session_lifetime: timedelta
+    access_token_lifetime: timedelta
+    refresh_token_lifetime: timedelta
+
+    def __post_init__(self) -> None:
+        """Validate bounded transport evidence while leaving proofs opaque."""
+        if not self.identifier or not self.client_key or not self.client_secret:
+            raise ValueError("password grants require identifier and client credentials")
+        if self.requested_scope != "*":
+            raise ValueError("password grants currently require wildcard scope")
+        if self.client_version is not None and len(self.client_version) > 64:
+            raise ValueError("client_version must contain at most 64 characters")
+        if self.user_agent is not None and len(self.user_agent) > 512:
+            raise ValueError("user_agent must contain at most 512 characters")
+        try:
+            ipaddress.ip_address(self.ip_address)
+        except ValueError as error:
+            raise ValueError("ip_address must be a valid IPv4 or IPv6 address") from error
+        if min(self.session_lifetime, self.access_token_lifetime, self.refresh_token_lifetime) <= timedelta(0):
+            raise ValueError("password grant lifetimes must be positive")
+        if self.access_token_lifetime > self.session_lifetime:
+            raise ValueError("access token lifetime must not exceed session lifetime")
+        if self.refresh_token_lifetime > self.session_lifetime:
+            raise ValueError("refresh token lifetime must not exceed session lifetime")
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshGrant:
+    """Request rotation of an OAuth refresh token."""
+
+    refresh_token: str = field(repr=False)
+    client_key: str
+    client_secret: str = field(repr=False)
+    requested_scope: str
+    access_token_lifetime: timedelta
+    refresh_token_lifetime: timedelta
+
+    def __post_init__(self) -> None:
+        """Validate the refresh request without exposing bearer values."""
+        if not self.refresh_token or not self.client_key or not self.client_secret:
+            raise ValueError("refresh grants require token and client credentials")
+        if self.requested_scope != "*":
+            raise ValueError("refresh grants currently require wildcard scope")
+        if min(self.access_token_lifetime, self.refresh_token_lifetime) <= timedelta(0):
+            raise ValueError("refresh grant lifetimes must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthClientSnapshot:
+    """Describe an active OAuth client and its effective scopes."""
+
+    client_id: uuid.UUID
+    client_key: str
+    first_party: bool
+    scope_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthTokenResult:
+    """Return a newly issued OAuth access/refresh token pair."""
+
+    access_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
+    expires_in: int
+    scope: str = "*"
+    token_type: str = "Bearer"
+
+    def __post_init__(self) -> None:
+        """Require a complete client-facing token response."""
+        if not self.access_token or not self.refresh_token or self.expires_in < 1:
+            raise ValueError("OAuth token results require non-empty tokens and positive expiry")
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshTokenSnapshot:
+    """Carry locked refresh-token lineage needed for atomic rotation."""
+
+    token_id: uuid.UUID
+    family_id: uuid.UUID
+    session_id: uuid.UUID
+    account_id: int
+    client_id: uuid.UUID
+    rotation_number: int
+    session_expires_at: datetime
+    token_expires_at: datetime
+    consumed_at: datetime | None
+    scope_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedAccount:
+    """Describe the account represented by an active OAuth access token."""
+
+    account_id: int
+    current_name: str
+    account_type: str
+    country_code: str | None
+    registered_at: datetime
+    last_seen_at: datetime | None
+    session_id: uuid.UUID
+    scope_codes: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)

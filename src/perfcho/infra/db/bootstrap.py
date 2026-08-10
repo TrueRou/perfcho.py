@@ -32,7 +32,7 @@ from perfcho.infra.db.models.authz import (
 from perfcho.infra.db.models.community import Channel
 from perfcho.infra.db.models.content import ContentSource
 from perfcho.infra.db.models.core import Account, AccountName, UserPreference, UserProfile
-from perfcho.infra.db.models.iam import Scope
+from perfcho.infra.db.models.iam import OAuthClient, OAuthClientScope, OAuthClientSecret, Scope
 from perfcho.infra.db.models.scoring import (
     CalculationFormula,
     CalculationFormulaScoreboard,
@@ -42,6 +42,8 @@ from perfcho.infra.db.models.scoring import (
     RankingPolicy,
     Scoreboard,
 )
+from perfcho.infra.security.tokens import digest_opaque_token
+from perfcho.infra.settings import settings
 
 STABLE_PROTOCOL_VERSION = 19
 
@@ -53,6 +55,8 @@ _DEFAULT_PERFORMANCE_FORMULA_CODE = "official"
 _DEFAULT_DIFFICULTY_FORMULA_CODE = "official-difficulty"
 _DEFAULT_RELEASE_VERSION = "2026.07.1"
 _EMPTY_TABLE_CACHE_KEY = "perfcho.bootstrap.empty_tables"
+_LAZER_CLIENT_KEY = "5"
+_LAZER_CLIENT_SECRET = "FGc9GAtyHzeQDshWP5Ah7dega8hJACAJpQtw6OXk"
 
 OAUTH_SCOPES = (
     (1, "public", "Read public data."),
@@ -350,6 +354,67 @@ async def _seed_access_catalog(session: AsyncSession) -> None:
         tuple({"id": item_id, "code": code, "description": description} for item_id, code, description in OAUTH_SCOPES),
         conflict_columns=("id",),
         update_columns=("code", "description"),
+    )
+    lazer_client_id = _bootstrap_uuid("oauth-client:lazer")
+    lazer_client_id = await session.scalar(
+        insert(OAuthClient)
+        .values(
+            id=lazer_client_id,
+            client_key=_LAZER_CLIENT_KEY,
+            name="osu!lazer",
+            owner_account_id=None,
+            is_confidential=False,
+            first_party=True,
+            active=True,
+            created_at=_BOOTSTRAP_EPOCH,
+            updated_at=_BOOTSTRAP_EPOCH,
+        )
+        .on_conflict_do_update(
+            index_elements=(OAuthClient.client_key,),
+            set_={
+                "name": "osu!lazer",
+                "is_confidential": False,
+                "first_party": True,
+                "active": True,
+                "updated_at": _BOOTSTRAP_EPOCH,
+            },
+        )
+        .returning(OAuthClient.id)
+    )
+    if lazer_client_id is None:
+        raise RuntimeError("database did not return the bootstrapped lazer OAuth client")
+    await session.execute(
+        insert(OAuthClientSecret)
+        .values(
+            id=_bootstrap_uuid("oauth-client-secret:lazer:production"),
+            client_id=lazer_client_id,
+            secret_digest=digest_opaque_token(
+                _LAZER_CLIENT_SECRET,
+                key=settings.token_hmac_key.get_secret_value().encode(),
+            ),
+            secret_prefix=_LAZER_CLIENT_SECRET[:16],
+            created_at=_BOOTSTRAP_EPOCH,
+            expires_at=None,
+            revoked_at=None,
+        )
+        .on_conflict_do_update(
+            index_elements=(OAuthClientSecret.id,),
+            set_={
+                "client_id": lazer_client_id,
+                "secret_digest": digest_opaque_token(
+                    _LAZER_CLIENT_SECRET,
+                    key=settings.token_hmac_key.get_secret_value().encode(),
+                ),
+                "secret_prefix": _LAZER_CLIENT_SECRET[:16],
+                "expires_at": None,
+                "revoked_at": None,
+            },
+        )
+    )
+    await session.execute(
+        insert(OAuthClientScope)
+        .values([{"client_id": lazer_client_id, "scope_id": item_id} for item_id, *_ in OAUTH_SCOPES])
+        .on_conflict_do_nothing(index_elements=(OAuthClientScope.client_id, OAuthClientScope.scope_id))
     )
     await _upsert_catalog(
         session,

@@ -5,7 +5,14 @@ from datetime import datetime, timedelta
 from typing import Protocol
 
 from perfcho.modules.common.ports import UnitOfWork
-from perfcho.modules.identity.models import CredentialSnapshot, OpenStableSession, ResolvedStableSession
+from perfcho.modules.identity.models import (
+    AuthenticatedAccount,
+    CredentialSnapshot,
+    OAuthClientSnapshot,
+    OpenStableSession,
+    RefreshTokenSnapshot,
+    ResolvedStableSession,
+)
 
 
 class IdentityUnitOfWork(UnitOfWork, Protocol):
@@ -18,7 +25,13 @@ class IdentityUnitOfWork(UnitOfWork, Protocol):
 
 
 class IdentityRepository(Protocol):
-    """Persist Stable identity facts without exposing ORM entities."""
+    """Persist identity facts without exposing ORM entities."""
+
+    async def find_oauth_client(
+        self, client_key: str, secret_digest: bytes, *, at: datetime
+    ) -> OAuthClientSnapshot | None:
+        """Resolve an active OAuth client with one currently valid secret."""
+        ...
 
     async def find_credential(self, identifier_kind: str, identifier_key: str) -> CredentialSnapshot | None:
         """Look up a scalar credential snapshot by ID, current name, or active email."""
@@ -92,6 +105,70 @@ class IdentityRepository(Protocol):
         """Create a normal Stable session and digest-only bearer token."""
         ...
 
+    async def create_oauth_session(
+        self,
+        *,
+        session_id: uuid.UUID,
+        family_id: uuid.UUID,
+        access_token_id: uuid.UUID,
+        access_token_jti: uuid.UUID,
+        refresh_token_id: uuid.UUID,
+        refresh_token_jti: uuid.UUID,
+        account_id: int,
+        client_id: uuid.UUID,
+        client_version: str | None,
+        ip_address: str,
+        user_agent: str | None,
+        access_digest: bytes,
+        access_prefix: str,
+        access_expires_at: datetime,
+        refresh_digest: bytes,
+        refresh_prefix: str,
+        refresh_expires_at: datetime,
+        scope_ids: tuple[int, ...],
+        now: datetime,
+        session_expires_at: datetime,
+    ) -> None:
+        """Create an OAuth session, token family, and initial token pair."""
+        ...
+
+    async def resolve_refresh_token(
+        self,
+        token_digest: bytes,
+        *,
+        client_id: uuid.UUID,
+        at: datetime,
+    ) -> RefreshTokenSnapshot | None:
+        """Lock and resolve one refresh token with its active session lineage."""
+        ...
+
+    async def rotate_refresh_token(
+        self,
+        snapshot: RefreshTokenSnapshot,
+        *,
+        access_token_id: uuid.UUID,
+        access_token_jti: uuid.UUID,
+        refresh_token_id: uuid.UUID,
+        refresh_token_jti: uuid.UUID,
+        access_digest: bytes,
+        access_prefix: str,
+        access_expires_at: datetime,
+        refresh_digest: bytes,
+        refresh_prefix: str,
+        refresh_expires_at: datetime,
+        now: datetime,
+    ) -> None:
+        """Consume one refresh token and append the next token pair."""
+        ...
+
+    async def compromise_token_family(self, family_id: uuid.UUID, *, now: datetime, reason: str) -> None:
+        """Revoke a refresh family and its session after replay detection."""
+        ...
+
+    async def resolve_access_token(self, token_digest: bytes, *, at: datetime) -> AuthenticatedAccount | None:
+        """Resolve an active OAuth access token to its current account."""
+        ...
+
     async def append_auth_attempt(
         self,
         *,
@@ -101,6 +178,7 @@ class IdentityRepository(Protocol):
         identifier_hmac: bytes,
         ip_address: str,
         client_version: str | None,
+        client_family: str = "stable",
         result: str,
         failure_reason: str | None,
         context: dict[str, object],

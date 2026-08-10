@@ -18,12 +18,25 @@ from perfcho.infra.db.models.iam import (
     AuthAttempt,
     AuthSession,
     AuthToken,
+    AuthTokenFamily,
+    AuthTokenScope,
     Device,
     DeviceIdentifier,
+    OAuthClient,
+    OAuthClientScope,
+    OAuthClientSecret,
     PasswordCredential,
+    Scope,
 )
 from perfcho.modules.identity.errors import StableSessionAlreadyActive
-from perfcho.modules.identity.models import CredentialSnapshot, OpenStableSession, ResolvedStableSession
+from perfcho.modules.identity.models import (
+    AuthenticatedAccount,
+    CredentialSnapshot,
+    OAuthClientSnapshot,
+    OpenStableSession,
+    RefreshTokenSnapshot,
+    ResolvedStableSession,
+)
 
 _ACTIVE_STABLE_SESSION_CONSTRAINT = "uq_auth_sessions_active_normal_stable_account"
 
@@ -48,6 +61,39 @@ class SqlAlchemyIdentityRepository:
     def __init__(self, session: AsyncSession) -> None:
         """Bind all operations to the caller-owned session."""
         self._session = session
+
+    async def find_oauth_client(
+        self,
+        client_key: str,
+        secret_digest: bytes,
+        *,
+        at: datetime,
+    ) -> OAuthClientSnapshot | None:
+        """Resolve one active OAuth client and its configured scopes."""
+        row = (
+            await self._session.execute(
+                select(OAuthClient.id, OAuthClient.client_key, OAuthClient.first_party)
+                .join(OAuthClientSecret, OAuthClientSecret.client_id == OAuthClient.id)
+                .where(
+                    OAuthClient.client_key == client_key,
+                    OAuthClient.active.is_(True),
+                    OAuthClientSecret.secret_digest == secret_digest,
+                    OAuthClientSecret.revoked_at.is_(None),
+                    (OAuthClientSecret.expires_at.is_(None) | (OAuthClientSecret.expires_at > at)),
+                )
+                .limit(1)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        scope_ids = tuple(
+            await self._session.scalars(
+                select(OAuthClientScope.scope_id)
+                .where(OAuthClientScope.client_id == row.id)
+                .order_by(OAuthClientScope.scope_id)
+            )
+        )
+        return OAuthClientSnapshot(row.id, row.client_key, row.first_party, scope_ids)
 
     async def find_credential(self, identifier_kind: str, identifier_key: str) -> CredentialSnapshot | None:
         """Look up credentials by numeric ID, current normalized name, or active normalized email."""
@@ -342,6 +388,299 @@ class SqlAlchemyIdentityRepository:
                 raise StableSessionAlreadyActive("a normal Stable session is already active") from error
             raise
 
+    async def create_oauth_session(
+        self,
+        *,
+        session_id: uuid.UUID,
+        family_id: uuid.UUID,
+        access_token_id: uuid.UUID,
+        access_token_jti: uuid.UUID,
+        refresh_token_id: uuid.UUID,
+        refresh_token_jti: uuid.UUID,
+        account_id: int,
+        client_id: uuid.UUID,
+        client_version: str | None,
+        ip_address: str,
+        user_agent: str | None,
+        access_digest: bytes,
+        access_prefix: str,
+        access_expires_at: datetime,
+        refresh_digest: bytes,
+        refresh_prefix: str,
+        refresh_expires_at: datetime,
+        scope_ids: tuple[int, ...],
+        now: datetime,
+        session_expires_at: datetime,
+    ) -> None:
+        """Insert one OAuth session, refresh family, and initial token pair."""
+        await self._session.execute(update(Account).where(Account.id == account_id).values(last_seen_at=now))
+        session = AuthSession(
+            id=session_id,
+            account_id=account_id,
+            oauth_client_id=client_id,
+            client_family=ClientFamily.LAZER,
+            session_class="normal",
+            client_version=client_version,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            expires_at=session_expires_at,
+            last_activity_at=now,
+            created_at=now,
+        )
+        family = AuthTokenFamily(
+            id=family_id,
+            session_id=session_id,
+            account_id=account_id,
+            created_at=now,
+        )
+        access = AuthToken(
+            id=access_token_id,
+            session_id=session_id,
+            account_id=account_id,
+            kind=TokenKind.ACCESS,
+            digest=access_digest,
+            prefix=access_prefix,
+            jti=access_token_jti,
+            expires_at=access_expires_at,
+            created_at=now,
+        )
+        refresh = AuthToken(
+            id=refresh_token_id,
+            session_id=session_id,
+            account_id=account_id,
+            family_id=family_id,
+            rotation_number=0,
+            kind=TokenKind.REFRESH,
+            digest=refresh_digest,
+            prefix=refresh_prefix,
+            jti=refresh_token_jti,
+            expires_at=refresh_expires_at,
+            created_at=now,
+        )
+        self._session.add_all((session, family))
+        await self._session.flush()
+        self._session.add_all((access, refresh))
+        await self._session.flush()
+        if scope_ids:
+            self._session.add_all(
+                [
+                    AuthTokenScope(token_id=token_id, scope_id=scope_id)
+                    for token_id in (access_token_id, refresh_token_id)
+                    for scope_id in scope_ids
+                ]
+            )
+        await self._session.flush()
+
+    async def resolve_refresh_token(
+        self,
+        token_digest: bytes,
+        *,
+        client_id: uuid.UUID,
+        at: datetime,
+    ) -> RefreshTokenSnapshot | None:
+        """Lock one refresh token and return its active lineage."""
+        row = (
+            await self._session.execute(
+                select(
+                    AuthToken.id,
+                    AuthToken.family_id,
+                    AuthToken.session_id,
+                    AuthToken.account_id,
+                    AuthSession.oauth_client_id,
+                    AuthToken.rotation_number,
+                    AuthSession.expires_at.label("session_expires_at"),
+                    AuthToken.expires_at.label("token_expires_at"),
+                    AuthToken.consumed_at,
+                )
+                .join(AuthSession, AuthSession.id == AuthToken.session_id)
+                .join(AuthTokenFamily, AuthTokenFamily.id == AuthToken.family_id)
+                .join(Account, Account.id == AuthToken.account_id)
+                .where(
+                    AuthToken.digest == token_digest,
+                    AuthToken.kind == TokenKind.REFRESH,
+                    AuthToken.revoked_at.is_(None),
+                    AuthToken.expires_at > at,
+                    AuthSession.oauth_client_id == client_id,
+                    AuthSession.client_family == ClientFamily.LAZER,
+                    AuthSession.closed_at.is_(None),
+                    AuthSession.revoked_at.is_(None),
+                    AuthSession.expires_at > at,
+                    AuthTokenFamily.revoked_at.is_(None),
+                    Account.status == AccountStatus.ACTIVE,
+                    Account.deleted_at.is_(None),
+                )
+                .with_for_update(of=AuthToken)
+            )
+        ).one_or_none()
+        if row is None or row.family_id is None or row.rotation_number is None or row.oauth_client_id is None:
+            return None
+        scope_ids = tuple(
+            await self._session.scalars(
+                select(AuthTokenScope.scope_id)
+                .where(AuthTokenScope.token_id == row.id)
+                .order_by(AuthTokenScope.scope_id)
+            )
+        )
+        return RefreshTokenSnapshot(
+            token_id=row.id,
+            family_id=row.family_id,
+            session_id=row.session_id,
+            account_id=row.account_id,
+            client_id=row.oauth_client_id,
+            rotation_number=row.rotation_number,
+            session_expires_at=row.session_expires_at,
+            token_expires_at=row.token_expires_at,
+            consumed_at=row.consumed_at,
+            scope_ids=scope_ids,
+        )
+
+    async def rotate_refresh_token(
+        self,
+        snapshot: RefreshTokenSnapshot,
+        *,
+        access_token_id: uuid.UUID,
+        access_token_jti: uuid.UUID,
+        refresh_token_id: uuid.UUID,
+        refresh_token_jti: uuid.UUID,
+        access_digest: bytes,
+        access_prefix: str,
+        access_expires_at: datetime,
+        refresh_digest: bytes,
+        refresh_prefix: str,
+        refresh_expires_at: datetime,
+        now: datetime,
+    ) -> None:
+        """Consume the current refresh token and append its successor pair."""
+        consumed = await self._session.scalar(
+            update(AuthToken)
+            .where(AuthToken.id == snapshot.token_id, AuthToken.consumed_at.is_(None))
+            .values(consumed_at=now)
+            .returning(AuthToken.id)
+        )
+        if consumed is None:
+            raise RuntimeError("refresh token changed after it was locked")
+        self._session.add_all(
+            (
+                AuthToken(
+                    id=access_token_id,
+                    session_id=snapshot.session_id,
+                    account_id=snapshot.account_id,
+                    kind=TokenKind.ACCESS,
+                    digest=access_digest,
+                    prefix=access_prefix,
+                    jti=access_token_jti,
+                    expires_at=access_expires_at,
+                    created_at=now,
+                ),
+                AuthToken(
+                    id=refresh_token_id,
+                    session_id=snapshot.session_id,
+                    account_id=snapshot.account_id,
+                    family_id=snapshot.family_id,
+                    parent_token_id=snapshot.token_id,
+                    rotation_number=snapshot.rotation_number + 1,
+                    kind=TokenKind.REFRESH,
+                    digest=refresh_digest,
+                    prefix=refresh_prefix,
+                    jti=refresh_token_jti,
+                    expires_at=refresh_expires_at,
+                    created_at=now,
+                ),
+            )
+        )
+        if snapshot.scope_ids:
+            self._session.add_all(
+                [
+                    AuthTokenScope(token_id=token_id, scope_id=scope_id)
+                    for token_id in (access_token_id, refresh_token_id)
+                    for scope_id in snapshot.scope_ids
+                ]
+            )
+        await self._session.execute(
+            update(AuthSession)
+            .where(AuthSession.id == snapshot.session_id)
+            .values(last_activity_at=func.greatest(AuthSession.last_activity_at, now))
+        )
+        await self._session.flush()
+
+    async def compromise_token_family(self, family_id: uuid.UUID, *, now: datetime, reason: str) -> None:
+        """Revoke a refresh family, all session tokens, and the owning session."""
+        family = await self._session.scalar(
+            select(AuthTokenFamily).where(AuthTokenFamily.id == family_id).with_for_update()
+        )
+        if family is None:
+            return
+        family.compromised_at = now
+        family.revoked_at = now
+        family.revoke_reason = reason
+        await self._session.execute(
+            update(AuthToken)
+            .where(AuthToken.session_id == family.session_id, AuthToken.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+        await self._session.execute(
+            update(AuthSession)
+            .where(AuthSession.id == family.session_id, AuthSession.revoked_at.is_(None))
+            .values(revoked_at=now, close_reason=reason)
+        )
+        await self._session.flush()
+
+    async def resolve_access_token(self, token_digest: bytes, *, at: datetime) -> AuthenticatedAccount | None:
+        """Resolve one active OAuth access token and its effective scopes."""
+        current_name = aliased(AccountName)
+        row = (
+            await self._session.execute(
+                select(
+                    Account.id,
+                    current_name.display_name,
+                    Account.type,
+                    Account.country_code,
+                    Account.registered_at,
+                    Account.last_seen_at,
+                    AuthSession.id.label("session_id"),
+                )
+                .select_from(AuthToken)
+                .join(AuthSession, AuthSession.id == AuthToken.session_id)
+                .join(Account, Account.id == AuthToken.account_id)
+                .join(current_name, current_name.account_id == Account.id)
+                .where(
+                    AuthToken.digest == token_digest,
+                    AuthToken.kind == TokenKind.ACCESS,
+                    AuthToken.consumed_at.is_(None),
+                    AuthToken.revoked_at.is_(None),
+                    AuthToken.expires_at > at,
+                    AuthSession.client_family == ClientFamily.LAZER,
+                    AuthSession.closed_at.is_(None),
+                    AuthSession.revoked_at.is_(None),
+                    AuthSession.expires_at > at,
+                    Account.status == AccountStatus.ACTIVE,
+                    Account.deleted_at.is_(None),
+                    current_name.ended_at.is_(None),
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        scope_codes = tuple(
+            await self._session.scalars(
+                select(Scope.code)
+                .join(AuthTokenScope, AuthTokenScope.scope_id == Scope.id)
+                .join(AuthToken, AuthToken.id == AuthTokenScope.token_id)
+                .where(AuthToken.digest == token_digest)
+                .order_by(Scope.id)
+            )
+        )
+        return AuthenticatedAccount(
+            account_id=row.id,
+            current_name=row.display_name,
+            account_type=str(row.type),
+            country_code=row.country_code,
+            registered_at=row.registered_at,
+            last_seen_at=row.last_seen_at,
+            session_id=row.session_id,
+            scope_codes=scope_codes,
+        )
+
     async def append_auth_attempt(
         self,
         *,
@@ -351,6 +690,7 @@ class SqlAlchemyIdentityRepository:
         identifier_hmac: bytes,
         ip_address: str,
         client_version: str | None,
+        client_family: str = "stable",
         result: str,
         failure_reason: str | None,
         context: dict[str, object],
@@ -364,7 +704,7 @@ class SqlAlchemyIdentityRepository:
                 device_id=device_id,
                 identifier_hmac=identifier_hmac,
                 ip_address=ip_address,
-                client_family=ClientFamily.STABLE,
+                client_family=ClientFamily(client_family),
                 client_version=client_version,
                 result=result,
                 failure_reason=failure_reason,
