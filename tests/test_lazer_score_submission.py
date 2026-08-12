@@ -8,13 +8,13 @@ import pytest
 from fastapi import FastAPI
 
 from perfcho.api import router
-from perfcho.api.cho.dependencies import get_stable_services
+from perfcho.api.canonical.dependencies import get_canonical_services
 from perfcho.infra.compose import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator
 from perfcho.modules.identity import AuthenticatedAccount, IdentityService, InvalidAccessToken
-from perfcho.modules.realtime import RealtimeRepository
+from perfcho.modules.realtime import RealtimeStateRepository
 from perfcho.modules.scoring import (
     AcceptedScoreResult,
     AcceptScore,
@@ -128,7 +128,7 @@ def lazer_app(identity: FakeIdentity, scoring: FakeScoring) -> FastAPI:
     services = StableServices(
         identity=cast(IdentityService, identity),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=cast(RealtimeRepository, object()),
+        realtime=cast(RealtimeStateRepository, object()),
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, FakeIds()),
         settings=Settings(
@@ -141,7 +141,7 @@ def lazer_app(identity: FakeIdentity, scoring: FakeScoring) -> FastAPI:
     )
     app = FastAPI()
     app.include_router(router)
-    app.dependency_overrides[get_stable_services] = lambda: services
+    app.dependency_overrides[get_canonical_services] = lambda: services
     return app
 
 

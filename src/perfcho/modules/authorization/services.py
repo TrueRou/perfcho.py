@@ -5,12 +5,11 @@ from perfcho.infra.cache.backend import CacheBackend
 from perfcho.infra.cache.values import decode_json, encode_json
 from perfcho.modules.authorization.models import EffectiveAuthorization
 from perfcho.modules.authorization.ports import AuthorizationRepository
-from perfcho.modules.authorization.stable import StablePrivilege, project_stable_privileges
 from perfcho.modules.common.ports import Clock
 
 
 class AuthorizationQueryService:
-    """Evaluate current authorization and protocol projections for an account."""
+    """Evaluate current authorization for an account."""
 
     def __init__(self, repository: AuthorizationRepository, clock: Clock, cache: CacheBackend) -> None:
         """Bind authoritative grant storage and the application clock."""
@@ -28,10 +27,6 @@ class AuthorizationQueryService:
     async def get_effective(self, account_id: int) -> EffectiveAuthorization:
         """Return the account's authorization at one consistent current instant."""
         return await self._repository.get_effective(account_id, at=self._clock.now())
-
-    async def get_stable_privileges(self, account_id: int) -> StablePrivilege:
-        """Return Stable client bits projected from current canonical authorization."""
-        return project_stable_privileges(await self.get_effective(account_id))
 
 
 def _authorization_from_cache(raw: bytes) -> EffectiveAuthorization:

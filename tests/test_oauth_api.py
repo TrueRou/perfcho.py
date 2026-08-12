@@ -6,7 +6,7 @@ import pytest
 from fastapi import FastAPI
 
 from perfcho.api import router
-from perfcho.api.cho.dependencies import get_stable_services
+from perfcho.api.canonical.dependencies import get_canonical_services
 from perfcho.infra.compose import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
@@ -20,7 +20,7 @@ from perfcho.modules.identity import (
     PasswordGrant,
     RefreshGrant,
 )
-from perfcho.modules.realtime import RealtimeRepository
+from perfcho.modules.realtime import RealtimeStateRepository
 
 NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 
@@ -62,7 +62,7 @@ def oauth_app(identity: FakeIdentity) -> FastAPI:
     services = StableServices(
         identity=cast(IdentityService, identity),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=cast(RealtimeRepository, object()),
+        realtime=cast(RealtimeStateRepository, object()),
         clock=cast(Clock, object()),
         id_generator=cast(IdGenerator, object()),
         settings=Settings(
@@ -73,7 +73,7 @@ def oauth_app(identity: FakeIdentity) -> FastAPI:
     )
     app = FastAPI()
     app.include_router(router)
-    app.dependency_overrides[get_stable_services] = lambda: services
+    app.dependency_overrides[get_canonical_services] = lambda: services
     return app
 
 
@@ -110,7 +110,7 @@ async def test_password_grant_matches_lazer_form_and_returns_token_contract() ->
     assert grant.client_key == "5"
     assert grant.client_version == "20260810"
     assert grant.ip_address == "127.0.0.1"
-    assert grant.password_token == "3cb4e732631f47e6eb961f34554b7cde"
+    assert grant.password_preverification == "3cb4e732631f47e6eb961f34554b7cde"
 
 
 @pytest.mark.asyncio

@@ -8,25 +8,27 @@ import pytest
 
 from perfcho.modules.common.errors import InputRejected, ResourceConflict, ResourceNotFound
 from perfcho.modules.realtime import (
-    MAX_FRAME_SEQUENCE,
     MAX_REVISION,
     MAX_SEQUENCE,
+    CanonicalReplayFrame,
+    CanonicalScoreFrame,
     InvalidFrame,
-    MailboxBatch,
-    MailboxOverflow,
-    MailboxPacket,
-    PollLeaseConflict,
+    PlayerActivity,
+    PlayerStatistics,
+    PresenceIdentity,
     PresenceSnapshot,
-    RealtimeRepository,
     RealtimeSession,
     RealtimeSessionFenced,
     RealtimeSessionNotFound,
+    RealtimeStateRepository,
     SessionFence,
     SpectatorAttachment,
     SpectatorFrame,
+    SpectatorFrameAction,
     SpectatorFramePublish,
     SpectatorFrameWindow,
     SpectatorHostOffline,
+    SpectatorRecipient,
     SpectatorRelation,
 )
 
@@ -34,6 +36,18 @@ INSTANT = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 EXPIRY = INSTANT + timedelta(minutes=5)
 HOST_FENCE = SessionFence(uuid.uuid7(), 2)
 SPECTATOR_FENCE = SessionFence(uuid.uuid7(), 3)
+
+
+def presence(revision: int = 1, expiry: datetime = EXPIRY) -> PresenceSnapshot:
+    return PresenceSnapshot(
+        42,
+        revision,
+        PresenceIdentity("player", "JP", 9, frozenset({"account.login"})),
+        PlayerActivity("idle"),
+        PlayerStatistics(),
+        expiry,
+        uuid.uuid7(),
+    )
 
 
 def relation(revision: int = 1, expiry: datetime = EXPIRY) -> SpectatorRelation:
@@ -45,6 +59,18 @@ def relation(revision: int = 1, expiry: datetime = EXPIRY) -> SpectatorRelation:
         HOST_FENCE,
         SPECTATOR_FENCE,
         expiry,
+    )
+
+
+def frame(cursor: int = 1, sequence: int = 0) -> SpectatorFrame:
+    return SpectatorFrame(
+        cursor,
+        42,
+        sequence,
+        SpectatorFrameAction.UPDATE,
+        (CanonicalReplayFrame(10, 1.0, 2.0, 1, 0),),
+        CanonicalScoreFrame(10, 1, 1, 0, 0, 0, 0, 0, 300, 1, 1, True, 255, 0, False),
+        0,
     )
 
 
@@ -68,7 +94,7 @@ def test_revisions_are_bounded(revision: int) -> None:
     with pytest.raises(ValueError, match="revision must be between"):
         RealtimeSession(uuid.uuid7(), 42, revision, EXPIRY)
     with pytest.raises(ValueError, match="revision must be between"):
-        PresenceSnapshot(42, revision, b"presence", EXPIRY)
+        presence(revision)
     with pytest.raises(ValueError, match="revision must be between"):
         relation(revision)
 
@@ -77,8 +103,7 @@ def test_revisions_are_bounded(revision: int) -> None:
     "factory",
     [
         lambda expiry: RealtimeSession(uuid.uuid7(), 42, 0, expiry),
-        lambda expiry: PresenceSnapshot(42, 0, b"presence", expiry),
-        lambda expiry: MailboxBatch(uuid.uuid7(), (), expiry),
+        lambda expiry: presence(0, expiry),
         lambda expiry: relation(expiry=expiry),
     ],
 )
@@ -87,46 +112,44 @@ def test_expiries_must_be_timezone_aware(factory: Callable[[datetime], object]) 
         factory(datetime(2026, 7, 29, 12, 5))
 
 
-def test_payloads_and_packet_collections_are_defensively_frozen() -> None:
-    presence_payload = bytearray(b"presence")
-    packet_payload = bytearray(b"packet")
-    presence = PresenceSnapshot(42, 1, cast(bytes, presence_payload), EXPIRY)
-    packet = MailboxPacket(1, cast(bytes, memoryview(packet_payload)))
-    packets = [packet]
-    batch = MailboxBatch(uuid.uuid7(), cast(tuple[MailboxPacket, ...], packets), EXPIRY)
+def test_canonical_presence_collections_are_defensively_frozen() -> None:
+    privileges = {"account.login"}
+    mods = ["HD"]
+    snapshot = PresenceSnapshot(
+        42,
+        1,
+        PresenceIdentity("player", "JP", 9, cast(frozenset[str], privileges)),
+        PlayerActivity("playing", mods=cast(tuple[str, ...], mods)),
+        PlayerStatistics(),
+        EXPIRY,
+        uuid.uuid7(),
+    )
+    privileges.clear()
+    mods.clear()
 
-    presence_payload[:] = b"modified"
-    packet_payload[:] = b"change"
-    packets.clear()
-
-    assert presence.payload == b"presence"
-    assert type(presence.payload) is bytes
-    assert packet.payload == b"packet"
-    assert type(packet.payload) is bytes
-    assert batch.packets == (packet,)
+    assert snapshot.identity.privileges == frozenset({"account.login"})
+    assert snapshot.activity.mods == ("HD",)
 
 
-@pytest.mark.parametrize("sequence", [-1, MAX_SEQUENCE + 1, True])
-def test_mailbox_sequence_is_bounded(sequence: int) -> None:
+def test_spectator_frame_uses_a_protocol_neutral_bounded_sequence() -> None:
+    assert frame(sequence=0).sequence == 0
+    assert frame(sequence=MAX_SEQUENCE).sequence == MAX_SEQUENCE
     with pytest.raises(ValueError, match="sequence must be between"):
-        MailboxPacket(sequence, b"packet")
-
-
-def test_spectator_frame_supports_zero_and_full_u16_sequence_range() -> None:
-    assert SpectatorFrame(1, 0, b"zero").sequence == 0
-    assert SpectatorFrame(2, MAX_FRAME_SEQUENCE, b"max").sequence == MAX_FRAME_SEQUENCE
-    with pytest.raises(ValueError, match="sequence must be between"):
-        SpectatorFrame(3, MAX_FRAME_SEQUENCE + 1, b"overflow")
+        frame(sequence=MAX_SEQUENCE + 1)
 
 
 def test_frame_windows_and_attachment_results_are_frozen() -> None:
-    frame = SpectatorFrame(7, 0, b"frame")
-    window = SpectatorFrameWindow((frame,), 7, 7, False)
+    replay_frame = frame(cursor=7)
+    window = SpectatorFrameWindow((replay_frame,), 7, 7, False)
     attached = SpectatorAttachment(relation(), window)
-    published = SpectatorFramePublish(frame, (43, 44))
+    recipients = (
+        SpectatorRecipient(43, SPECTATOR_FENCE, EXPIRY),
+        SpectatorRecipient(44, SessionFence(uuid.uuid7(), 1), EXPIRY),
+    )
+    published = SpectatorFramePublish(replay_frame, recipients)
 
-    assert attached.history.frames == (frame,)
-    assert published.recipient_account_ids == (43, 44)
+    assert attached.history.frames == (replay_frame,)
+    assert published.recipients == recipients
     with pytest.raises(ValueError, match="both be present"):
         SpectatorFrameWindow((), None, 1, False)
 
@@ -164,27 +187,20 @@ def test_repository_protocol_covers_the_realtime_state_lifecycle() -> None:
         "join_channel",
         "leave_channel",
         "list_channel_members",
-        "enqueue_mailbox",
-        "lease_mailbox",
-        "wait_mailbox",
-        "ack_mailbox",
-        "release_mailbox",
         "attach_spectator",
         "detach_spectator",
         "publish_spectator_frame",
         "read_spectator_frames",
     }
 
-    assert getattr(RealtimeRepository, "_is_protocol", False)
-    assert operations <= RealtimeRepository.__dict__.keys()
+    assert getattr(RealtimeStateRepository, "_is_protocol", False)
+    assert operations <= RealtimeStateRepository.__dict__.keys()
 
 
 def test_realtime_errors_have_typed_categories_and_stable_codes() -> None:
     expected = (
         (RealtimeSessionNotFound, ResourceNotFound, "realtime_session_not_found"),
         (RealtimeSessionFenced, ResourceConflict, "realtime_session_fenced"),
-        (PollLeaseConflict, ResourceConflict, "poll_lease_conflict"),
-        (MailboxOverflow, ResourceConflict, "mailbox_overflow"),
         (SpectatorHostOffline, ResourceConflict, "spectator_host_offline"),
         (InvalidFrame, InputRejected, "invalid_frame"),
     )

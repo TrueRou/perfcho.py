@@ -1,4 +1,6 @@
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
@@ -7,26 +9,13 @@ import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
 
-from perfcho.api.cho import router
-from perfcho.api.cho.canonize.login import StableLoginParseError, parse_stable_login
-from perfcho.api.cho.dependencies import get_stable_services
-from perfcho.api.cho.dispatcher import StableRuntimeContext
-from perfcho.infra.compose import StableServices
-from perfcho.infra.settings import Settings
-from perfcho.modules.authorization import AuthorizationQueryService, StablePrivilege
-from perfcho.modules.common import Clock, IdGenerator
-from perfcho.modules.community import CommunityService, OfflineDirectMessage, StableChannel
-from perfcho.modules.identity import IdentityService, ResolvedStableSession, StableLogin, StableSessionResult
-from perfcho.modules.realtime import (
-    MailboxBatch,
-    MailboxPacket,
-    PresenceCapacityReached,
-    PresenceSnapshot,
-    RealtimeRepository,
-    RealtimeSession,
-    SessionFence,
-)
-from perfcho.modules.realtime.stable import (
+from perfcho.api.stable import router
+from perfcho.api.stable.authorization import StablePrivilege
+from perfcho.api.stable.bubbles import StableBubbleRenderer, canonicalize_presence
+from perfcho.api.stable.canonize.login import StableLoginParseError, parse_stable_login
+from perfcho.api.stable.dependencies import get_stable_services
+from perfcho.api.stable.dispatcher import StableRuntimeContext
+from perfcho.api.stable.realtime import (
     ClientPacket,
     LoginFailureReason,
     PacketReader,
@@ -34,12 +23,55 @@ from perfcho.modules.realtime.stable import (
     UserPresence,
     UserStats,
     build_packet,
-    user_presence,
-    user_stats,
+)
+from perfcho.infra.compose import StableServices
+from perfcho.infra.settings import Settings
+from perfcho.modules.authorization import AuthorizationQueryService, EffectiveAuthorization
+from perfcho.modules.common import Clock, IdGenerator
+from perfcho.modules.community import ChannelView, CommunityService, OfflineDirectMessage
+from perfcho.modules.identity import (
+    AuthenticateClientSession,
+    ClientSessionResult,
+    IdentityService,
+    ResolvedClientSession,
+)
+from perfcho.modules.realtime import (
+    NotificationBubble,
+    PresenceCapacityReached,
+    PresenceSnapshot,
+    RealtimeBubble,
+    RealtimeBubbleBus,
+    RealtimeBubbleSubscription,
+    RealtimePollGate,
+    RealtimeSession,
+    RealtimeStateRepository,
+    SessionFence,
+    presence_updated_bubble,
 )
 from perfcho.modules.social import SocialService
 
 NOW = datetime(2026, 7, 29, tzinfo=UTC)
+
+
+def presence_snapshot(
+    presence: UserPresence,
+    stats: UserStats,
+    revision: int,
+    expires_at: datetime,
+    session_id: uuid.UUID,
+    *,
+    country_code: str | None = "OC",
+) -> PresenceSnapshot:
+    identity, activity, statistics = canonicalize_presence(presence, stats, country_code=country_code)
+    return PresenceSnapshot(
+        presence.user_id,
+        revision,
+        identity,
+        activity,
+        statistics,
+        expires_at,
+        session_id,
+    )
 
 
 class FakeClock:
@@ -52,18 +84,99 @@ class FakeIds:
         return uuid.uuid7()
 
 
+class FakeBubbleSubscription:
+    def __init__(self, bus: FakeBubbleBus) -> None:
+        self.bus = bus
+
+    async def receive(self, *, timeout: float) -> RealtimeBubble | None:
+        del timeout
+        self.bus.receive_calls += 1
+        if self.bus.pending:
+            return self.bus.pending.pop(0)
+        bubble = self.bus.wait_bubble
+        self.bus.wait_bubble = None
+        return bubble
+
+    async def drain(self, *, limit: int) -> tuple[RealtimeBubble, ...]:
+        self.bus.drain_calls += 1
+        if self.bus.drain_error is not None:
+            raise self.bus.drain_error
+        drained = tuple(self.bus.pending[:limit])
+        del self.bus.pending[:limit]
+        return drained
+
+    async def aclose(self) -> None:
+        self.bus.subscribed = False
+
+
+class FakeBubbleBus:
+    def __init__(self) -> None:
+        self.pending: list[RealtimeBubble] = []
+        self.wait_bubble: RealtimeBubble | None = None
+        self.published: list[tuple[SessionFence, RealtimeBubble]] = []
+        self.subscribed = False
+        self.receive_calls = 0
+        self.drain_calls = 0
+        self.drain_error: Exception | None = None
+        self.subscribe_calls: list[SessionFence] = []
+
+    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
+        self.published.append((recipient_fence, bubble))
+        return int(self.subscribed and self.subscribe_calls[-1] == recipient_fence)
+
+    @asynccontextmanager
+    async def subscribe(
+        self,
+        recipient_fence: SessionFence,
+    ) -> AsyncIterator[RealtimeBubbleSubscription]:
+        self.subscribe_calls.append(recipient_fence)
+        self.subscribed = True
+        subscription = FakeBubbleSubscription(self)
+        try:
+            yield subscription
+        finally:
+            await subscription.aclose()
+
+
+class FakePollGate:
+    def __init__(self) -> None:
+        self.active = False
+        self.conflict = False
+        self.acquired: list[tuple[int, SessionFence, uuid.UUID]] = []
+        self.released: list[tuple[int, SessionFence, uuid.UUID]] = []
+
+    async def acquire(
+        self,
+        account_id: int,
+        recipient_fence: SessionFence,
+        gate_id: uuid.UUID,
+        *,
+        expires_at: datetime,
+    ) -> bool:
+        del expires_at
+        if self.conflict or self.active:
+            return False
+        self.active = True
+        self.acquired.append((account_id, recipient_fence, gate_id))
+        return True
+
+    async def release(self, account_id: int, recipient_fence: SessionFence, gate_id: uuid.UUID) -> None:
+        self.released.append((account_id, recipient_fence, gate_id))
+        self.active = False
+
+
 class FakeIdentity:
     def __init__(self) -> None:
-        self.login_command: StableLogin | None = None
+        self.login_command: AuthenticateClientSession | None = None
         self.session_id = uuid.uuid7()
         self.device_id = uuid.uuid7()
         self.touch_calls = 0
         self.close_calls: list[tuple[str, str]] = []
         self.close_error: Exception | None = None
 
-    async def login_stable(self, command: StableLogin) -> StableSessionResult:
+    async def authenticate_client_session(self, command: AuthenticateClientSession) -> ClientSessionResult:
         self.login_command = command
-        return StableSessionResult(
+        return ClientSessionResult(
             account_id=3,
             current_name="player",
             session_id=self.session_id,
@@ -72,12 +185,12 @@ class FakeIdentity:
             expires_at=NOW + timedelta(hours=1),
         )
 
-    async def resolve_stable_session(self, raw_token: str) -> ResolvedStableSession:
+    async def resolve_client_session(self, raw_token: str) -> ResolvedClientSession:
         if raw_token != "stable-token-value":
-            from perfcho.modules.identity import InvalidStableSession
+            from perfcho.modules.identity import InvalidSession
 
-            raise InvalidStableSession()
-        return ResolvedStableSession(
+            raise InvalidSession()
+        return ResolvedClientSession(
             account_id=3,
             current_name="player",
             auth_version=1,
@@ -88,37 +201,35 @@ class FakeIdentity:
             expires_at=NOW + timedelta(hours=1),
         )
 
-    async def touch_stable_session(self, raw_token: str) -> ResolvedStableSession:
+    async def touch_client_session(self, raw_token: str) -> ResolvedClientSession:
         self.touch_calls += 1
-        return await self.resolve_stable_session(raw_token)
+        return await self.resolve_client_session(raw_token)
 
-    async def close_stable_session(self, raw_token: str, *, reason: str = "client_closed") -> None:
+    async def close_client_session(self, raw_token: str, *, reason: str = "client_closed") -> None:
         self.close_calls.append((raw_token, reason))
         if self.close_error is not None:
             raise self.close_error
 
 
 class FakeAuthorization:
-    async def get_stable_privileges(self, account_id: int) -> StablePrivilege:
+    async def get_effective(self, account_id: int) -> EffectiveAuthorization:
         assert account_id == 3
-        return StablePrivilege.PLAYER
+        return EffectiveAuthorization(
+            account_id=3,
+            evaluated_at=NOW,
+            permission_codes=frozenset({"account.login"}),
+            role_codes=frozenset(),
+            entitlement_codes=frozenset(),
+        )
 
 
 class FakeRealtime:
     def __init__(self) -> None:
         self.session: RealtimeSession | None = None
         self.presence: PresenceSnapshot | None = None
-        self.mailbox: list[MailboxPacket] = []
         self.online_presences: dict[int, PresenceSnapshot] = {}
         self.channel_members: dict[int, set[int]] = {}
-        self.enqueued: list[tuple[int, bytes, SessionFence]] = []
         self.fenced: list[SessionFence] = []
-        self.lease_fences: list[SessionFence] = []
-        self.active_lease = False
-        self.release_calls = 0
-        self.lease_conflict = False
-        self.wait_calls = 0
-        self.wait_payload: bytes | None = None
         self.fail_set_presence = False
         self.fail_presence_capacity = False
         self.open_calls = 0
@@ -194,79 +305,6 @@ class FakeRealtime:
     async def list_channel_members(self, channel_id: int) -> frozenset[int]:
         return frozenset(self.channel_members.get(channel_id, set()))
 
-    async def enqueue_mailbox(
-        self,
-        account_id: int,
-        payload: bytes,
-        *,
-        recipient_fence: SessionFence,
-        expires_at: datetime,
-    ) -> MailboxPacket:
-        del expires_at
-        self.enqueued.append((account_id, payload, recipient_fence))
-        return MailboxPacket(len(self.enqueued), payload)
-
-    async def lease_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        lease_id: uuid.UUID,
-        limit: int,
-        expires_at: datetime,
-    ) -> MailboxBatch:
-        del account_id, limit
-        if self.lease_conflict:
-            from perfcho.modules.realtime import PollLeaseConflict
-
-            raise PollLeaseConflict()
-        self.lease_fences.append(recipient_fence)
-        self.active_lease = True
-        return MailboxBatch(lease_id, tuple(self.mailbox), expires_at)
-
-    async def wait_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        timeout: float,
-    ) -> bool:
-        del account_id, recipient_fence, timeout
-        self.wait_calls += 1
-        if self.wait_payload is None:
-            return False
-        sequence = self.mailbox[-1].sequence + 1 if self.mailbox else 1
-        self.mailbox.append(MailboxPacket(sequence, self.wait_payload))
-        self.wait_payload = None
-        return True
-
-    async def ack_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        lease_id: uuid.UUID,
-        through_sequence: int,
-    ) -> None:
-        del account_id, lease_id
-        self.release_calls += 1
-        assert self.session is not None
-        assert recipient_fence == self.session.fence
-        self.mailbox = [packet for packet in self.mailbox if packet.sequence > through_sequence]
-        self.active_lease = False
-
-    async def release_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        lease_id: uuid.UUID,
-    ) -> None:
-        del account_id, lease_id
-        assert self.session is not None
-        assert recipient_fence == self.session.fence
-        self.active_lease = False
-
     async def get_spectator_relation(
         self,
         account_id: int,
@@ -282,7 +320,6 @@ class FakeRealtime:
         assert (session_id, expected_revision) == (self.session.session_id, self.session.revision)
         self.fenced.append(self.session.fence)
         self.online_presences.pop(self.session.account_id, None)
-        self.active_lease = False
         self.session = None
 
 
@@ -297,9 +334,9 @@ class FakeCommunity:
         self.policy: str | None = None
         self.silence_seconds = 91
         self.channels = (
-            StableChannel(7, "#general", "General", True, 2000, True, False),
-            StableChannel(8, "#announcements", "News", False, 2000, False, False),
-            StableChannel(9, "#lobby", "Lobby", True, 2000, True, False),
+            ChannelView(7, "general", "General", True, 2000, True, False),
+            ChannelView(8, "announcements", "News", False, 2000, False, False),
+            ChannelView(9, "lobby", "Lobby", True, 2000, True, False),
         )
         self.offline_messages = (OfflineDirectMessage(10, 20, 8, "online", uuid.uuid7(), "older message", False, NOW),)
         self.realtime: FakeRealtime | None = None
@@ -309,7 +346,7 @@ class FakeCommunity:
         self.policy = policy
         return policy
 
-    async def list_public_channels(self, account_id: int) -> tuple[StableChannel, ...]:
+    async def list_public_channels(self, account_id: int) -> tuple[ChannelView, ...]:
         assert account_id == 3
         return self.channels
 
@@ -340,12 +377,22 @@ def stable_services() -> tuple[StableServices, FakeIdentity, FakeRealtime]:
     services = StableServices(
         identity=cast(IdentityService, identity),
         authorization=cast(AuthorizationQueryService, FakeAuthorization()),
-        realtime=cast(RealtimeRepository, realtime),
+        realtime=cast(RealtimeStateRepository, realtime),
         clock=cast(Clock, FakeClock()),
         id_generator=cast(IdGenerator, FakeIds()),
         settings=config,
+        bubbles=cast(RealtimeBubbleBus, FakeBubbleBus()),
+        poll_gate=cast(RealtimePollGate, FakePollGate()),
     )
     return services, identity, realtime
+
+
+def fake_bubbles(services: StableServices) -> FakeBubbleBus:
+    return cast(FakeBubbleBus, services.bubbles)
+
+
+def fake_poll_gate(services: StableServices) -> FakePollGate:
+    return cast(FakePollGate, services.poll_gate)
 
 
 def configure_community(services: StableServices, realtime: FakeRealtime) -> FakeCommunity:
@@ -423,7 +470,7 @@ async def test_old_build_and_non_osu_user_agent_fail_in_protocol() -> None:
 
 
 @pytest.mark.asyncio
-async def test_authenticated_client_keepalive_drains_mailbox_and_opens_short_poll_window() -> None:
+async def test_authenticated_client_keepalive_drains_buffered_bubble() -> None:
     services, identity, realtime = stable_services()
     await realtime.open_session(
         session_id=identity.session_id,
@@ -431,7 +478,7 @@ async def test_authenticated_client_keepalive_drains_mailbox_and_opens_short_pol
         expires_at=NOW + timedelta(minutes=5),
         durable_expires_at=NOW + timedelta(hours=1),
     )
-    realtime.mailbox.append(MailboxPacket(1, build_packet(ServerPacket.NOTIFICATION, b"\x00")))
+    fake_bubbles(services).pending.append(NotificationBubble("ready"))
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_stable_services] = lambda: services
@@ -445,15 +492,13 @@ async def test_authenticated_client_keepalive_drains_mailbox_and_opens_short_pol
 
     assert [packet.packet_type for packet in PacketReader(response.content, packet_enum=ServerPacket)] == [
         ServerPacket.NOTIFICATION,
-        ServerPacket.PONG,
     ]
-    assert realtime.mailbox == []
     assert identity.touch_calls == 1
-    assert realtime.lease_fences == [SessionFence(identity.session_id, 1)]
+    assert fake_bubbles(services).drain_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_idle_ping_waits_for_mailbox_signal_and_releases_latest_packets() -> None:
+async def test_idle_ping_waits_for_bubble_and_returns_it_immediately() -> None:
     services, identity, realtime = stable_services()
     await realtime.open_session(
         session_id=identity.session_id,
@@ -461,7 +506,7 @@ async def test_idle_ping_waits_for_mailbox_signal_and_releases_latest_packets() 
         expires_at=NOW + timedelta(minutes=5),
         durable_expires_at=NOW + timedelta(hours=1),
     )
-    realtime.wait_payload = build_packet(ServerPacket.NOTIFICATION, b"\x00")
+    fake_bubbles(services).wait_bubble = NotificationBubble("ready")
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_stable_services] = lambda: services
@@ -475,14 +520,8 @@ async def test_idle_ping_waits_for_mailbox_signal_and_releases_latest_packets() 
 
     assert [packet.packet_type for packet in PacketReader(response.content, packet_enum=ServerPacket)] == [
         ServerPacket.NOTIFICATION,
-        ServerPacket.PONG,
     ]
-    assert realtime.wait_calls == 1
-    assert realtime.lease_fences == [
-        SessionFence(identity.session_id, 1),
-        SessionFence(identity.session_id, 1),
-    ]
-    assert realtime.mailbox == []
+    assert fake_bubbles(services).receive_calls == 1
 
 
 @pytest.mark.asyncio
@@ -509,7 +548,121 @@ async def test_authenticated_client_keepalive_returns_empty_success() -> None:
     assert response.headers["content-type"].startswith("application/octet-stream")
     assert response.content == b""
     assert identity.touch_calls == 1
-    assert realtime.wait_calls == 1
+    assert fake_bubbles(services).receive_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_renders_local_and_remote_bubbles_without_publishing_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    services, identity, realtime = stable_services()
+    await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    bus = fake_bubbles(services)
+    bus.pending.append(NotificationBubble("remote"))
+
+    async def local_dispatch(
+        body: bytes,
+        context: StableRuntimeContext,
+        dispatched_services: StableServices,
+    ) -> tuple[RealtimeBubble, ...]:
+        del body, context
+        assert dispatched_services is services
+        assert bus.subscribed
+        return (NotificationBubble("local"),)
+
+    monkeypatch.setattr(cho_module, "dispatch_packets", local_dispatch)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    messages = [packet.payload.read_string() for packet in PacketReader(response.content, packet_enum=ServerPacket)]
+    assert messages == ["local", "remote"]
+    assert bus.published == []
+
+
+@pytest.mark.asyncio
+async def test_poll_drops_over_budget_bubble_without_caching_it() -> None:
+    services, identity, realtime = stable_services()
+    maximum = len(StableBubbleRenderer().render(NotificationBubble("fits")))
+    object.__setattr__(services, "settings", Settings(stable_max_response_bytes=maximum))
+    await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    fake_bubbles(services).pending.append(NotificationBubble("x" * 200))
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        first = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+        second = await client.post(
+            "/",
+            content=b"",
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    assert first.content == second.content == b""
+    assert fake_bubbles(services).pending == []
+
+
+@pytest.mark.asyncio
+async def test_poll_subscription_failure_returns_existing_local_bubbles(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    services, identity, realtime = stable_services()
+    await realtime.open_session(
+        session_id=identity.session_id,
+        account_id=3,
+        expires_at=NOW + timedelta(minutes=5),
+        durable_expires_at=NOW + timedelta(hours=1),
+    )
+    fake_bubbles(services).drain_error = RuntimeError("subscription failed")
+
+    async def local_dispatch(
+        body: bytes,
+        context: StableRuntimeContext,
+        dispatched_services: StableServices,
+    ) -> tuple[RealtimeBubble, ...]:
+        del body, context, dispatched_services
+        return (NotificationBubble("local"),)
+
+    monkeypatch.setattr(cho_module, "dispatch_packets", local_dispatch)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_stable_services] = lambda: services
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
+        response = await client.post(
+            "/",
+            content=build_packet(ClientPacket.PING),
+            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
+        )
+
+    packet = next(PacketReader(response.content, packet_enum=ServerPacket))
+    assert packet.payload.read_string() == "local"
 
 
 @pytest.mark.asyncio
@@ -533,7 +686,7 @@ async def test_multiple_keepalives_do_not_enter_the_short_wait_window() -> None:
         )
 
     assert response.content == b""
-    assert realtime.wait_calls == 0
+    assert fake_bubbles(services).receive_calls == 0
 
 
 @pytest.mark.asyncio
@@ -557,11 +710,11 @@ async def test_keepalive_with_payload_is_rejected_without_waiting() -> None:
         )
 
     assert list(PacketReader(response.content, packet_enum=ServerPacket))[-1].packet_type is ServerPacket.RESTART
-    assert realtime.wait_calls == 0
+    assert fake_bubbles(services).receive_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_logout_poll_does_not_cleanup_fenced_mailbox_again() -> None:
+async def test_logout_poll_fences_realtime_session_once() -> None:
     services, identity, realtime = stable_services()
     await realtime.open_session(
         session_id=identity.session_id,
@@ -584,16 +737,14 @@ async def test_logout_poll_does_not_cleanup_fenced_mailbox_again() -> None:
     assert response.content == b""
     assert identity.close_calls == [("stable-token-value", "client_logout")]
     assert realtime.fenced == [SessionFence(identity.session_id, 1)]
-    assert realtime.release_calls == 0
-    assert not realtime.active_lease
 
 
 @pytest.mark.asyncio
 async def test_login_and_sampled_poll_logs_are_structured_and_secret_free(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    cho_module = importlib.import_module("perfcho.api.cho.router.cho")
-    dispatcher_module = importlib.import_module("perfcho.api.cho.dispatcher.packets")
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
     events: list[tuple[str, str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -618,57 +769,17 @@ async def test_login_and_sampled_poll_logs_are_structured_and_secret_free(monkey
     event_fields = {event: fields for _, event, fields in events}
     assert event_fields["stable.login.completed"]["outcome"] == "success"
     assert event_fields["stable.packet.dispatch_summary"]["packet_histogram"] == {"PING": 1}
-    assert event_fields["stable.poll.completed"]["mailbox_stage"] == "wait_timeout"
+    assert event_fields["stable.poll.completed"]["bubble_waited"] is True
     rendered = repr(events)
     for secret in ("player", "stable-token-value", "a" * 32, "path:adapters"):
         assert secret not in rendered
 
 
 @pytest.mark.asyncio
-async def test_poll_response_budget_defers_mailbox_packets_without_acknowledging_them() -> None:
-    services, identity, realtime = stable_services()
-    stats_packet_size = len(user_stats(UserStats(3, 0, "", "", 0, 0, 0, 0, 0.0, 0, 0, 0, 0)))
-    object.__setattr__(services, "settings", Settings(stable_max_response_bytes=stats_packet_size))
-    await realtime.open_session(
-        session_id=identity.session_id,
-        account_id=3,
-        expires_at=NOW + timedelta(minutes=5),
-        durable_expires_at=NOW + timedelta(hours=1),
-    )
-    realtime.mailbox.append(MailboxPacket(1, build_packet(ServerPacket.PONG)))
-    app = FastAPI()
-    app.include_router(router)
-    app.dependency_overrides[get_stable_services] = lambda: services
-
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c.test") as client:
-        full = await client.post(
-            "/",
-            content=build_packet(ClientPacket.REQUEST_STATUS_UPDATE),
-            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
-        )
-        drained = await client.post(
-            "/",
-            content=b"",
-            headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
-        )
-
-    assert len(full.content) == services.settings.stable_max_response_bytes
-    assert [packet.packet_type for packet in PacketReader(full.content, packet_enum=ServerPacket)] == [
-        ServerPacket.USER_STATS
-    ]
-    assert [packet.packet_type for packet in PacketReader(drained.content, packet_enum=ServerPacket)] == [
-        ServerPacket.PONG,
-        ServerPacket.PONG,
-    ]
-    assert realtime.mailbox == []
-    assert realtime.wait_calls == 0
-
-
-@pytest.mark.asyncio
 async def test_invalid_token_and_malformed_packet_request_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    cho_module = importlib.import_module("perfcho.api.cho.router.cho")
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -696,10 +807,9 @@ async def test_invalid_token_and_malformed_packet_request_reconnect(monkeypatch:
 
     assert list(PacketReader(expired.content, packet_enum=ServerPacket))[-1].packet_type is ServerPacket.RESTART
     assert list(PacketReader(malformed.content, packet_enum=ServerPacket))[-1].packet_type is ServerPacket.RESTART
-    assert not realtime.active_lease
     invalid_session = next(fields for event, fields in events if event == "stable.poll.invalid_session")
-    assert invalid_session["error_code"] == "invalid_stable_session"
-    assert invalid_session["error_type"] == "InvalidStableSession"
+    assert invalid_session["error_code"] == "invalid_session"
+    assert invalid_session["error_type"] == "InvalidSession"
     assert "exception" not in invalid_session
 
 
@@ -724,7 +834,7 @@ async def test_login_bootstrap_failure_closes_durable_session_and_fences_realtim
 async def test_login_cleanup_failure_is_logged_with_exception_details(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    cho_module = importlib.import_module("perfcho.api.cho.router.cho")
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -760,7 +870,7 @@ async def test_poll_with_lost_redis_epoch_closes_durable_session_and_restarts(
 ) -> None:
     import importlib
 
-    cho_module = importlib.import_module("perfcho.api.cho.router.cho")
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -791,12 +901,12 @@ async def test_poll_with_lost_redis_epoch_closes_durable_session_and_restarts(
 
 
 @pytest.mark.asyncio
-async def test_poll_acquires_fenced_mailbox_lease_before_dispatch_and_conflict_is_empty(
+async def test_poll_subscribes_before_dispatch_and_gate_conflict_is_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import importlib
 
-    cho_module = importlib.import_module("perfcho.api.cho.router.cho")
+    cho_module = importlib.import_module("perfcho.api.stable.router.cho")
     services, identity, realtime = stable_services()
     await realtime.open_session(
         session_id=identity.session_id,
@@ -810,13 +920,15 @@ async def test_poll_acquires_fenced_mailbox_lease_before_dispatch_and_conflict_i
         body: bytes,
         context: StableRuntimeContext,
         dispatched_services: StableServices,
-    ) -> bytes:
+    ) -> tuple[RealtimeBubble, ...]:
         nonlocal dispatched
-        del body, context
+        del body
         assert dispatched_services is services
-        assert realtime.active_lease
+        assert fake_bubbles(services).subscribed
+        assert fake_poll_gate(services).active
+        context.stable_output.extend(build_packet(ServerPacket.PONG))
         dispatched = True
-        return build_packet(ServerPacket.PONG)
+        return ()
 
     monkeypatch.setattr(cho_module, "dispatch_packets", checked_dispatch)
     app = FastAPI()
@@ -828,7 +940,7 @@ async def test_poll_acquires_fenced_mailbox_lease_before_dispatch_and_conflict_i
             content=build_packet(ClientPacket.PING),
             headers={"User-Agent": "osu!", "osu-token": "stable-token-value"},
         )
-        realtime.lease_conflict = True
+        fake_poll_gate(services).conflict = True
         conflict = await client.post(
             "/",
             content=build_packet(ClientPacket.PING),
@@ -840,19 +952,18 @@ async def test_poll_acquires_fenced_mailbox_lease_before_dispatch_and_conflict_i
         ServerPacket.PONG
     ]
     assert conflict.content == b""
+    assert len(fake_poll_gate(services).acquired) == 1
+    assert len(fake_poll_gate(services).released) == 1
 
 
 @pytest.mark.asyncio
 async def test_login_bootstraps_online_users_channels_silence_and_timestamped_mail() -> None:
     services, identity, realtime = stable_services()
     other_session_id = uuid.uuid7()
-    other_payload = user_presence(UserPresence(8, "online", 0, 1, 1, 0, 0.0, 0.0, 50)) + user_stats(
-        UserStats(8, 0, "", "", 0, 0, 0, 0, 0.0, 0, 0, 50, 0)
-    )
-    realtime.online_presences[8] = PresenceSnapshot(
-        8,
+    realtime.online_presences[8] = presence_snapshot(
+        UserPresence(8, "online", 0, 1, 1, 0, 0.0, 0.0, 50),
+        UserStats(8, 0, "", "", 0, 0, 0, 0, 0.0, 0, 0, 50, 0),
         4,
-        other_payload,
         NOW + timedelta(minutes=5),
         other_session_id,
     )
@@ -882,8 +993,9 @@ async def test_login_bootstraps_online_users_channels_silence_and_timestamped_ma
     assert community.policy == "friends"
     assert realtime.channel_members == {7: {3}}
     assert realtime.presence is not None
-    assert realtime.enqueued == [(8, realtime.presence.payload, SessionFence(other_session_id, 4))]
-    broadcast_packets = list(PacketReader(realtime.enqueued[0][1], packet_enum=ServerPacket))
+    published = fake_bubbles(services).published
+    assert published == [(SessionFence(other_session_id, 4), presence_updated_bubble(realtime.presence))]
+    broadcast_packets = list(PacketReader(StableBubbleRenderer().render(published[0][1]), packet_enum=ServerPacket))
     assert [packet.packet_type for packet in broadcast_packets] == [
         ServerPacket.USER_PRESENCE,
         ServerPacket.USER_STATS,
@@ -896,10 +1008,10 @@ async def test_login_capacity_closes_new_durable_session_before_presence_truncat
     services, identity, realtime = stable_services()
     object.__setattr__(services, "settings", Settings(stable_presence_batch_size=1))
     other_session_id = uuid.uuid7()
-    realtime.online_presences[8] = PresenceSnapshot(
-        8,
+    realtime.online_presences[8] = presence_snapshot(
+        UserPresence(8, "online", 0, 1, 1, 0, 0.0, 0.0, 0),
+        UserStats(8, 0, "", "", 0, 0, 0, 0, 0.0, 0, 0, 0, 0),
         1,
-        user_presence(UserPresence(8, "online", 0, 1, 1, 0, 0.0, 0.0, 0)),
         NOW + timedelta(minutes=5),
         other_session_id,
     )

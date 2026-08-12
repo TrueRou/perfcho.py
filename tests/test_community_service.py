@@ -25,6 +25,7 @@ from perfcho.modules.community import (
 )
 from perfcho.modules.community.models import (
     ChannelRecord,
+    ChannelSelector,
     DirectConversationResult,
     DirectMessageContext,
     MessageResult,
@@ -135,12 +136,12 @@ class FakeCommunityRepository:
     async def acquire_pair_lock(self, first_account_id: int, second_account_id: int) -> None:
         return None
 
-    async def get_public_channel_by_stable_name(
+    async def get_public_channel_by_name(
         self,
-        stable_name: str,
+        name: str,
         account_id: int,
     ) -> ChannelRecord | None:
-        return self.channel if stable_name == self.channel.stable_name else None
+        return self.channel if name == self.channel.name else None
 
     async def get_channel(self, channel_id: int, account_id: int) -> ChannelRecord | None:
         return self.channel if channel_id == self.channel.channel_id else None
@@ -259,7 +260,7 @@ def _public_channel() -> ChannelRecord:
     return ChannelRecord(
         channel_id=7,
         kind="public",
-        stable_name="#general",
+        name="general",
         description="General",
         owner_account_id=None,
         team_id=None,
@@ -379,7 +380,7 @@ async def test_public_message_requires_authoritative_active_membership_even_with
     service, outbox, units = _service(repository, memberships=memberships)
 
     with pytest.raises(ChannelAccessDenied, match="active channel member"):
-        await service.send_public_message(20, "#general", uuid.uuid7(), "not joined")
+        await service.send_public_message(20, ChannelSelector(name="general"), uuid.uuid7(), "not joined")
 
     assert memberships.member_calls == [(7, 20, INSTANT)]
     assert repository.insert_calls == 0
@@ -401,8 +402,9 @@ async def test_public_message_replay_with_same_deterministic_uuid_persists_and_e
         lambda level, event, **fields: logged.append((level, event, fields)),
     )
 
-    created = await service.send_public_message(20, "#general", client_message_id, "hello")
-    replayed = await service.send_public_message(20, "#general", client_message_id, "hello")
+    selector = ChannelSelector(name="general")
+    created = await service.send_public_message(20, selector, client_message_id, "hello")
+    replayed = await service.send_public_message(20, selector, client_message_id, "hello")
 
     assert created.created
     assert not replayed.created

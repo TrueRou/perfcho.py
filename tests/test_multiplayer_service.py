@@ -257,12 +257,18 @@ def service(
     )
 
 
+def test_round_participant_slot_uses_canonical_room_capacity() -> None:
+    participant = RoundParticipantSelection(10, 16, 0)
+
+    assert participant.slot_position == 16
+
+
 @pytest.mark.asyncio
 async def test_create_hashes_password_and_publishes_no_secret() -> None:
     repository = FakeRepository()
     state = FakeState()
 
-    created = await service(repository, state).create_room(CreateRoom(meta(10, "create"), settings(), "secret"))
+    created = await service(repository, state).create_room(CreateRoom(meta(10, "create"), settings(), 16, "secret"))
 
     assert repository.created_password is not None
     salt, verifier = repository.created_password
@@ -278,7 +284,7 @@ async def test_join_rejects_wrong_password_before_persisting_presence() -> None:
     repository = FakeRepository()
     state = FakeState()
     multiplayer = service(repository, state)
-    await multiplayer.create_room(CreateRoom(meta(10, "create"), settings(), "secret"))
+    await multiplayer.create_room(CreateRoom(meta(10, "create"), settings(), 16, "secret"))
 
     with pytest.raises(MatchPasswordRejected):
         await multiplayer.join_room(
@@ -293,7 +299,7 @@ async def test_missing_redis_state_is_rebuilt_from_durable_participants() -> Non
     repository = FakeRepository()
     state = FakeState()
     multiplayer = service(repository, state)
-    await multiplayer.create_room(CreateRoom(meta(10, "create"), settings()))
+    await multiplayer.create_room(CreateRoom(meta(10, "create"), settings(), 16))
     repository.accounts = (10, 11)
     state.state = None
 
@@ -309,7 +315,7 @@ async def test_only_current_host_can_transfer_host() -> None:
     repository = FakeRepository()
     state = FakeState()
     multiplayer = service(repository, state)
-    created = await multiplayer.create_room(CreateRoom(meta(10, "create"), settings()))
+    created = await multiplayer.create_room(CreateRoom(meta(10, "create"), settings(), 16))
     repository.accounts = (10, 11)
     state.state = replace(
         created,
@@ -339,7 +345,7 @@ async def test_committed_create_returns_durable_snapshot_when_redis_is_down(
         lambda level, event, **fields: logged.append((level, event, fields)),
     )
 
-    created = await service(repository, state).create_room(CreateRoom(meta(10, "create"), settings()))
+    created = await service(repository, state).create_room(CreateRoom(meta(10, "create"), settings(), 16))
 
     assert created.projection_status is ProjectionStatus.DURABLE_RECOVERY
     assert created.slot_for(10) is not None
@@ -363,7 +369,7 @@ async def test_admission_token_is_bound_to_room_session_and_recipient() -> None:
     repository = FakeRepository()
     state = FakeState()
     multiplayer = service(repository, state)
-    await multiplayer.create_room(CreateRoom(meta(10, "create"), settings(), "secret"))
+    await multiplayer.create_room(CreateRoom(meta(10, "create"), settings(), 16, "secret"))
 
     token = await multiplayer.issue_admission_token(7, inviter_account_id=10, recipient_account_id=11)
 
@@ -378,7 +384,7 @@ async def test_admission_token_is_bound_to_room_session_and_recipient() -> None:
 async def test_same_idempotency_key_replays_create_without_new_room() -> None:
     repository = FakeRepository()
     multiplayer = service(repository, FakeState())
-    command = CreateRoom(meta(10, "same-create"), settings())
+    command = CreateRoom(meta(10, "same-create"), settings(), 16)
 
     first = await multiplayer.create_room(command)
     replayed = await multiplayer.create_room(command)
@@ -392,7 +398,7 @@ async def test_same_join_command_after_leave_creates_new_presence() -> None:
     repository = FakeRepository()
     state = FakeState()
     multiplayer = service(repository, state)
-    await multiplayer.create_room(CreateRoom(meta(10, "create"), settings(), "secret"))
+    await multiplayer.create_room(CreateRoom(meta(10, "create"), settings(), 16, "secret"))
     command = JoinRoom(meta(11, "same-join"), 7, "secret")
 
     first = await multiplayer.join_room(command)
@@ -434,7 +440,7 @@ async def test_canonical_service_enforces_host_permission_before_create() -> Non
     multiplayer = service(repository, FakeState(), access_policy=DenyMultiplayer())
 
     with pytest.raises(MatchPermissionDenied):
-        await multiplayer.create_room(CreateRoom(meta(10, "denied-create"), settings()))
+        await multiplayer.create_room(CreateRoom(meta(10, "denied-create"), settings(), 16))
     assert repository.room is None
 
 
@@ -463,7 +469,7 @@ async def test_personal_free_mods_cannot_change_during_an_active_round() -> None
     state = FakeState()
     multiplayer = service(repository, state)
     created = await multiplayer.create_room(
-        CreateRoom(meta(10, "create-free-mod"), replace(settings(), free_mods=True))
+        CreateRoom(meta(10, "create-free-mod"), replace(settings(), free_mods=True), 16)
     )
     round_id = uuid.uuid7()
     repository.round_id = round_id
@@ -484,7 +490,7 @@ async def test_complete_round_writes_results_projection_event_in_command_transac
     repository = FakeRepository()
     state = FakeState()
     multiplayer = service(repository, state)
-    created = await multiplayer.create_room(CreateRoom(meta(10, "create-complete"), settings()))
+    created = await multiplayer.create_room(CreateRoom(meta(10, "create-complete"), settings(), 16))
     round_id = uuid.uuid7()
     repository.round_id = round_id
     repository.round_participants = (RoundParticipantSelection(10, 0, 0),)

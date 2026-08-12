@@ -9,8 +9,8 @@ from fastapi import APIRouter, Form, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from perfcho.api.cho.canonize.ipaddr import resolve_client_ip
-from perfcho.api.cho.dependencies import StableServicesDependency
+from perfcho.api.canonical.dependencies import CanonicalServicesDependency
+from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
 from perfcho.modules.identity import (
     InvalidAccessToken,
     InvalidOAuthClient,
@@ -44,7 +44,7 @@ def _oauth_error(error: str, hint: str, *, status_code: int = 400) -> JSONRespon
 @router.post("/oauth/token", response_model=TokenResponse)
 async def token(
     request: Request,
-    services: StableServicesDependency,
+    services: CanonicalServicesDependency,
     grant_type: Annotated[Literal["password", "refresh_token"], Form()],
     client_id: Annotated[str, Form()],
     client_secret: Annotated[str, Form()],
@@ -63,10 +63,11 @@ async def token(
             result = await services.identity.exchange_password(
                 PasswordGrant(
                     identifier=username,
-                    password_token=hashlib.md5(password.encode(), usedforsecurity=False).hexdigest(),
+                    password_preverification=hashlib.md5(password.encode(), usedforsecurity=False).hexdigest(),
                     client_key=client_id,
                     client_secret=client_secret,
                     requested_scope=scope,
+                    client_family="lazer",
                     client_version=x_api_version,
                     ip_address=resolve_client_ip(request, settings.trusted_proxy_cidrs),
                     user_agent=request.headers.get("user-agent"),
@@ -107,7 +108,7 @@ async def token(
 @router.get("/api/v2/me", response_model=None)
 @router.get("/api/v2/me/{ruleset}", response_model=None)
 async def me(
-    services: StableServicesDependency,
+    services: CanonicalServicesDependency,
     authorization: Annotated[str | None, Header()] = None,
     ruleset: str | None = None,
 ) -> dict[str, object] | JSONResponse:
@@ -143,7 +144,7 @@ async def me(
 async def user(
     lookup: str,
     ruleset: str,
-    services: StableServicesDependency,
+    services: CanonicalServicesDependency,
     key: Literal["id", "username"] = "id",
 ) -> dict[str, object] | JSONResponse:
     """Return a public account and selected ruleset statistics."""

@@ -280,7 +280,7 @@ class SocialService:
             return await repository.get_pair_relationship(first_account_id, second_account_id)
 
     async def resolve_account_by_name(self, display_name: str) -> AccountIdentityView:
-        """Resolve one current active account through the Stable name normalization rule."""
+        """Resolve one current active account through canonical name normalization."""
         try:
             name_key = normalize_name(display_name)
         except ValueError as error:
@@ -297,7 +297,7 @@ class SocialService:
         return relationship.mutual_friends and not relationship.blocked
 
     async def list_friends(self, account_id: int) -> tuple[FollowView, ...]:
-        """Return outgoing Stable friend entries with a derived mutual flag."""
+        """Return outgoing follows with a derived mutual flag."""
         _validate_account_id(account_id)
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).list_friends(account_id)
@@ -323,7 +323,7 @@ class SocialService:
             )
 
     async def list_blocks(self, account_id: int) -> tuple[BlockView, ...]:
-        """Return outgoing block entries with current Stable names."""
+        """Return outgoing block entries with current display names."""
         _validate_account_id(account_id)
         async with self._uow_factory() as uow:
             return await self._repository_factory(uow.session).list_blocks(account_id)

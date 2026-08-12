@@ -42,6 +42,8 @@ class Settings(BaseSettings):
 
     redis_state_url: str = Field(default="redis://127.0.0.1:56379/0")
     redis_state_prefix: str = Field(default="perfcho:state")
+    redis_bubble_url: str | None = Field(default=None)
+    redis_bubble_max_connections: int = Field(default=256, ge=1)
     redis_socket_timeout: float = Field(default=5.0, gt=0)
     redis_cache_url: str = Field(default="redis://127.0.0.1:56379/0")
     redis_cache_prefix: str = Field(default="perfcho:cache")
@@ -49,9 +51,6 @@ class Settings(BaseSettings):
     redis_cache_ttl_seconds: int = Field(default=60, ge=1, le=3600)
     redis_session_ttl_seconds: int = Field(default=360, ge=60)
     redis_presence_ttl_seconds: int = Field(default=360, ge=60)
-    redis_mailbox_ttl_seconds: int = Field(default=600, ge=60)
-    redis_mailbox_max_packets: int = Field(default=4096, ge=128)
-    redis_mailbox_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
     redis_realtime_max_channels_per_session: int = Field(default=256, ge=1, le=4096)
     redis_spectator_max_frames: int = Field(default=4096, ge=1)
     redis_spectator_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
@@ -64,13 +63,13 @@ class Settings(BaseSettings):
     stable_max_body_bytes: int = Field(default=1024 * 1024, ge=1024, le=16 * 1024 * 1024)
     stable_max_response_bytes: int = Field(default=1024 * 1024, ge=7, le=16 * 1024 * 1024)
     stable_session_lifetime_seconds: int = Field(default=12 * 60 * 60, ge=60)
-    stable_session_stale_grace_seconds: int = Field(default=120, ge=30, le=30 * 60)
-    stable_session_touch_interval_seconds: int = Field(default=30, ge=1, le=5 * 60)
-    stable_web_auth_cache_ttl_seconds: int = Field(default=60, ge=1, le=300)
+    client_session_stale_grace_seconds: int = Field(default=120, ge=30, le=30 * 60)
+    client_session_touch_interval_seconds: int = Field(default=30, ge=1, le=5 * 60)
+    online_credential_cache_ttl_seconds: int = Field(default=60, ge=1, le=300)
     stable_presence_fanout_concurrency: int = Field(default=32, ge=1, le=256)
-    stable_mailbox_batch_size: int = Field(default=256, ge=1, le=4096)
-    stable_mailbox_lease_seconds: int = Field(default=10, ge=1, le=60)
-    stable_mailbox_wait_seconds: float = Field(default=0.3, ge=0.2, le=0.5)
+    stable_bubble_wait_seconds: float = Field(default=0.3, ge=0.2, le=0.5)
+    stable_bubble_batch_size: int = Field(default=256, ge=1, le=4096)
+    stable_poll_gate_seconds: int = Field(default=10, ge=1, le=60)
     stable_welcome_notification: str = Field(default="Welcome to perfcho.py.", max_length=1024)
     stable_beatmap_download_base_url: str = Field(
         default="https://osu.ppy.sh/beatmapsets",
@@ -160,9 +159,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_timing_windows(self) -> Self:
         """Keep blocking operations within their transport and lease windows."""
-        if self.redis_socket_timeout <= self.stable_mailbox_wait_seconds:
-            raise ValueError("Redis socket timeout must exceed the Stable mailbox wait")
-        if self.stable_session_touch_interval_seconds >= self.stable_session_stale_grace_seconds:
+        if self.redis_socket_timeout <= self.stable_bubble_wait_seconds:
+            raise ValueError("Redis socket timeout must exceed the Stable bubble wait")
+        if self.client_session_touch_interval_seconds >= self.client_session_stale_grace_seconds:
             raise ValueError("Stable session touch interval must be shorter than stale grace")
         if self.oauth_access_token_lifetime_seconds > self.oauth_session_lifetime_seconds:
             raise ValueError("OAuth access token lifetime must not exceed session lifetime")

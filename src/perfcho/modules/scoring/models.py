@@ -94,15 +94,6 @@ class LeaderboardScope:
         return cls(LeaderboardScopeKind.COUNTRY, country_code=country_code.strip().upper())
 
 
-class ClientFamily(StrEnum):
-    """Identify the protocol family which supplied score evidence."""
-
-    STABLE = "stable"
-    LAZER = "lazer"
-    WEB = "web"
-    API = "api"
-
-
 class ScoreOutcome(StrEnum):
     """Describe how a play ended."""
 
@@ -128,7 +119,7 @@ class ScoreGrade(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CanonicalMod:
-    """Store one Lazer-facing mod and its immutable settings."""
+    """Store one canonical mod and its immutable settings."""
 
     acronym: str
     settings: Mapping[str, JsonValue] = field(default_factory=dict)
@@ -174,13 +165,13 @@ class HitStatistic:
 
 @dataclass(frozen=True, slots=True)
 class BeatmapReference:
-    """Select a current beatmap revision by logical ID, MD5, or both."""
+    """Select a current beatmap revision by logical ID, checksum, or both."""
 
     beatmap_id: int | None = None
     md5: bytes | None = None
 
     def __post_init__(self) -> None:
-        """Require at least one well-formed stable content identity."""
+        """Require at least one well-formed content identity."""
         if self.beatmap_id is None and self.md5 is None:
             raise ValueError("beatmap reference requires beatmap_id or md5")
         if self.beatmap_id is not None and (isinstance(self.beatmap_id, bool) or self.beatmap_id < 1):
@@ -191,7 +182,7 @@ class BeatmapReference:
 
 @dataclass(frozen=True, slots=True)
 class PlayAttemptSubmission:
-    """Describe the protocol-level play attempt being completed."""
+    """Describe the client play attempt being completed."""
 
     idempotency_key: str
     started_at: datetime
@@ -281,7 +272,7 @@ class StagedReplayManifest:
 class ScoreAttestation:
     """Carry normalized client and integrity evidence for one score."""
 
-    client_family: ClientFamily
+    source: str
     client_version: str
     verification_state: str
     client_flags: int = 0
@@ -322,7 +313,7 @@ class MultiplayerSubmissionContext:
 
 @dataclass(frozen=True, slots=True)
 class AcceptScore:
-    """Request canonical acceptance of one Stable or Lazer score."""
+    """Request canonical acceptance of one score."""
 
     meta: CommandMeta
     beatmap: BeatmapReference
@@ -333,6 +324,7 @@ class AcceptScore:
     score: ScoreSubmission
     replay: StagedReplayManifest | None
     attestation: ScoreAttestation
+    uses_threshold_grading: bool = False
     solo_token_id: int | None = None
     multiplayer: MultiplayerSubmissionContext | None = None
 
@@ -347,7 +339,7 @@ class AcceptScore:
 
 @dataclass(frozen=True, slots=True)
 class IssueSoloScoreToken:
-    """Request a short-lived authorization for one Lazer solo play."""
+    """Request a short-lived authorization for one solo play."""
 
     meta: CommandMeta
     beatmap: BeatmapReference
@@ -356,7 +348,7 @@ class IssueSoloScoreToken:
 
 @dataclass(frozen=True, slots=True)
 class SoloScoreToken:
-    """Describe one issued Lazer solo score token."""
+    """Describe one issued solo score token."""
 
     token_id: int
     account_id: int
@@ -403,12 +395,11 @@ class ScoreboardInfo:
 
 @dataclass(frozen=True, slots=True)
 class NormalizedModSet:
-    """Carry deterministic mod JSON, digest, and Stable query bits."""
+    """Carry deterministic mod JSON and its persistence identity."""
 
     mods: tuple[CanonicalMod, ...]
     canonical: tuple[dict[str, object], ...]
     canonical_digest: bytes
-    legacy_bits: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,7 +410,6 @@ class ModSetInfo:
     scoreboard_id: int
     canonical: tuple[dict[str, object], ...]
     canonical_digest: bytes
-    legacy_bits: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,7 +431,7 @@ class ValidatedScore:
 
 @dataclass(frozen=True, slots=True)
 class AcceptedScoreResult:
-    """Return stable identities from an accepted score transaction."""
+    """Return durable identities from an accepted score transaction."""
 
     attempt_id: uuid.UUID
     score_id: int
@@ -463,7 +453,7 @@ class PlayAttemptRecord:
     beatmap_revision_id: int
     scoreboard_id: int
     mod_set_id: int
-    protocol: ClientFamily
+    source: str
     submission: PlayAttemptSubmission
     outcome: ScoreOutcome
 
@@ -522,7 +512,7 @@ class ReplayReference:
 
 @dataclass(frozen=True, slots=True)
 class LeaderboardScoreView:
-    """Describe one Stable-compatible projected leaderboard score."""
+    """Describe one projected leaderboard score."""
 
     score_id: int
     account_id: int
@@ -536,7 +526,7 @@ class LeaderboardScoreView:
     nkatu: int
     ngeki: int
     perfect: bool
-    legacy_mod_bits: int
+    mods: tuple[CanonicalMod, ...]
     rank: int
     ended_at: datetime
     has_replay: bool
@@ -629,7 +619,7 @@ class AccountStatsView:
 
 
 def weighted_total_performance(values: Sequence[Decimal]) -> int:
-    """Calculate Stable's integer total PP from descending personal bests."""
+    """Calculate weighted integer performance from descending personal bests."""
     weighted = sum((value * Decimal("0.95") ** index for index, value in enumerate(values)), Decimal(0))
     bonus = (Decimal(1) - Decimal("0.9994") ** len(values)) * Decimal("416.6667")
     return int((weighted + bonus).quantize(Decimal("1"), rounding=ROUND_HALF_UP))

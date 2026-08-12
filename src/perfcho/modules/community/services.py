@@ -30,6 +30,8 @@ from perfcho.modules.community.models import (
     ChannelMembershipResult,
     ChannelPermissions,
     ChannelRecord,
+    ChannelSelector,
+    ChannelView,
     ConversationReadCursor,
     DirectConversationResult,
     DirectMessageContext,
@@ -37,7 +39,6 @@ from perfcho.modules.community.models import (
     OfflineDirectMessage,
     OfflineDirectMessagePage,
     ReadCursorResult,
-    StableChannel,
 )
 from perfcho.modules.community.ports import (
     ActiveChannelMembershipQuery,
@@ -74,34 +75,34 @@ class CommunityService:
         self._clock = clock
         self._active_memberships = active_memberships
 
-    async def list_public_channels(self, account_id: int) -> tuple[StableChannel, ...]:
+    async def list_public_channels(self, account_id: int) -> tuple[ChannelView, ...]:
         """Return active public channels readable by current canonical authorization."""
         _validate_account_id(account_id)
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
             authorization = await self._authorization.get_effective(account_id)
             channels = await repository.list_public_channels(account_id)
-            visible: list[StableChannel] = []
+            visible: list[ChannelView] = []
             for channel in channels:
                 permissions = _evaluate_permissions(channel, account_id, authorization)
                 if permissions.can_read:
-                    visible.append(_stable_channel(channel, permissions))
+                    visible.append(_channel_view(channel, permissions))
             return tuple(visible)
 
-    async def get_public_channel_by_stable_name(self, account_id: int, stable_name: str) -> StableChannel:
-        """Resolve one readable public channel by a normalized Stable name."""
+    async def get_public_channel(self, account_id: int, selector: ChannelSelector) -> ChannelView:
+        """Resolve one readable public channel by canonical selector."""
         _validate_account_id(account_id)
-        normalized_name = _normalize_stable_channel_name(stable_name)
+        selector = _normalize_channel_selector(selector)
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
-            channel = await repository.get_public_channel_by_stable_name(normalized_name, account_id)
+            channel = await _load_public_channel(repository, account_id, selector)
             if channel is None:
                 raise ChannelNotFound("public channel does not exist")
             authorization = await self._authorization.get_effective(account_id)
             permissions = _evaluate_permissions(channel, account_id, authorization)
             if not permissions.can_read:
                 raise ChannelNotFound("public channel does not exist")
-            return _stable_channel(channel, permissions)
+            return _channel_view(channel, permissions)
 
     async def get_channel_permissions(self, account_id: int, channel_id: int) -> ChannelPermissions:
         """Evaluate account-specific channel permissions through canonical authorization."""
@@ -145,7 +146,7 @@ class CommunityService:
     async def send_public_message(
         self,
         sender_account_id: int,
-        stable_channel_name: str,
+        channel_selector: ChannelSelector,
         client_message_id: uuid.UUID,
         content: str,
         *,
@@ -158,11 +159,11 @@ class CommunityService:
         _validate_client_message_id(client_message_id)
         if reply_to_id is not None:
             _validate_account_id(reply_to_id)
-        normalized_name = _normalize_stable_channel_name(stable_channel_name)
+        selector = _normalize_channel_selector(channel_selector)
         now = self._clock.now()
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
-            channel = await repository.get_public_channel_by_stable_name(normalized_name, sender_account_id)
+            channel = await _load_public_channel(repository, sender_account_id, selector)
             if channel is None:
                 raise ChannelNotFound("public channel does not exist")
             authorization = await self._authorization.get_effective(sender_account_id)
@@ -174,7 +175,7 @@ class CommunityService:
                 await uow.commit()
                 replay = _as_replay(previous)
                 _log_message(replay, started_ns=started_ns)
-                return replace(replay, resolved_channel=_stable_channel(channel, permissions))
+                return replace(replay, resolved_channel=_channel_view(channel, permissions))
             _validate_message_content(content, channel.message_length_limit)
             authorization = await self._authorization.get_effective(sender_account_id)
             permissions = _evaluate_permissions(channel, sender_account_id, authorization)
@@ -203,7 +204,7 @@ class CommunityService:
                 await self._append_message_event(uow.session, message)
             await uow.commit()
             _log_message(message, started_ns=started_ns)
-            return replace(message, resolved_channel=_stable_channel(channel, permissions))
+            return replace(message, resolved_channel=_channel_view(channel, permissions))
 
     async def send_direct_message(
         self,
@@ -317,7 +318,7 @@ class CommunityService:
         *,
         limit: int = 100,
     ) -> tuple[OfflineDirectMessage, ...]:
-        """Return the first unread incoming direct-message page for legacy callers."""
+        """Return the first unread incoming direct-message page."""
         page = await self.list_unread_offline_direct_message_page(account_id, limit=limit)
         return page.messages
 
@@ -328,7 +329,7 @@ class CommunityService:
         after_message_id: int | None = None,
         limit: int = 100,
     ) -> OfflineDirectMessagePage:
-        """Return an ascending keyset page that can continue beyond Stable's first batch."""
+        """Return an ascending keyset page with an optional continuation cursor."""
         _validate_account_id(account_id)
         if after_message_id is not None:
             _validate_account_id(after_message_id)
@@ -349,7 +350,7 @@ class CommunityService:
         account_id: int,
         cursors: tuple[ConversationReadCursor, ...],
     ) -> tuple[ReadCursorResult, ...]:
-        """Atomically advance delivered Stable mail to one cursor per direct conversation."""
+        """Atomically advance delivered mail to one cursor per direct conversation."""
         _validate_account_id(account_id)
         if not isinstance(cursors, tuple) or any(not isinstance(cursor, ConversationReadCursor) for cursor in cursors):
             raise CommunityInputRejected("direct-message cursors must be a tuple of conversation cursors")
@@ -406,7 +407,7 @@ class CommunityService:
             return result
 
     async def get_global_silence_remaining_seconds(self, account_id: int) -> int:
-        """Return the Stable-compatible remaining duration of an active global silence."""
+        """Return the bounded remaining duration of an active global silence."""
         _validate_account_id(account_id)
         now = self._clock.now()
         async with self._uow_factory() as uow:
@@ -652,12 +653,12 @@ def _evaluate_permissions(
     return ChannelPermissions(channel.channel_id, account_id, can_read, can_write, can_manage)
 
 
-def _stable_channel(channel: ChannelRecord, permissions: ChannelPermissions) -> StableChannel:
-    if channel.stable_name is None:
-        raise RuntimeError("public channel has no Stable-facing name")
-    return StableChannel(
+def _channel_view(channel: ChannelRecord, permissions: ChannelPermissions) -> ChannelView:
+    if channel.name is None:
+        raise RuntimeError("public channel has no name")
+    return ChannelView(
         channel_id=channel.channel_id,
-        name=channel.stable_name,
+        name=channel.name,
         topic=channel.description or "",
         auto_join=channel.auto_join,
         message_length_limit=channel.message_length_limit,
@@ -752,13 +753,30 @@ def _remaining_seconds(ends_at: datetime | None, now: datetime) -> int | None:
     return max(0, ceil((ends_at - now).total_seconds()))
 
 
-def _normalize_stable_channel_name(stable_name: str) -> str:
-    normalized = stable_name.strip().casefold()
-    if normalized and not normalized.startswith("#"):
-        normalized = f"#{normalized}"
-    if len(normalized) < 2 or len(normalized) > 100:
-        raise CommunityInputRejected("invalid Stable channel name")
-    return normalized
+async def _load_public_channel(
+    repository: CommunityRepository,
+    account_id: int,
+    selector: ChannelSelector,
+) -> ChannelRecord | None:
+    if selector.channel_id is not None:
+        channel = await repository.get_channel(selector.channel_id, account_id)
+        if channel is None or channel.kind != "public" or channel.archived:
+            return None
+        return channel
+    if selector.name is None:
+        raise RuntimeError("normalized channel selector is empty")
+    return await repository.get_public_channel_by_name(selector.name, account_id)
+
+
+def _normalize_channel_selector(selector: ChannelSelector) -> ChannelSelector:
+    if not isinstance(selector, ChannelSelector):
+        raise CommunityInputRejected("channel_selector must be a ChannelSelector")
+    if selector.name is None:
+        return selector
+    normalized = selector.name.strip().casefold()
+    if not 1 <= len(normalized) <= 100:
+        raise CommunityInputRejected("invalid channel name")
+    return ChannelSelector(name=normalized)
 
 
 def _validate_message_content(content: str, limit: int) -> None:

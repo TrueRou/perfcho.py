@@ -8,15 +8,15 @@ import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
 
-from perfcho.api.cho import router
-from perfcho.api.cho.dependencies import get_stable_services
+from perfcho.api.stable import router
+from perfcho.api.stable.dependencies import get_stable_services
 from perfcho.infra.compose import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.account import AccountService, EmailUnavailable, RegisterAccount, RegistrationResult
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.common import Clock, IdGenerator
 from perfcho.modules.identity import IdentityService
-from perfcho.modules.realtime import RealtimeRepository
+from perfcho.modules.realtime import RealtimeStateRepository
 
 NOW = datetime(2026, 7, 31, 12, 30, tzinfo=UTC)
 REQUEST_ID = uuid.UUID("019867b2-1d40-7000-8000-000000000001")
@@ -54,7 +54,7 @@ def registration_app(account: FakeAccount) -> FastAPI:
     services = StableServices(
         identity=cast(IdentityService, object()),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=cast(RealtimeRepository, object()),
+        realtime=cast(RealtimeStateRepository, object()),
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, FixedIdGenerator()),
         settings=Settings(device_hmac_key=SecretStr("registration-test-hmac-key")),

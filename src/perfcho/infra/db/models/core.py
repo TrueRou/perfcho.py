@@ -51,7 +51,7 @@ class Account(DbBase):
     country_code: Mapped[str | None] = mapped_column(String(2))
     registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    first_stable_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_client_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     auth_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")

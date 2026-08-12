@@ -1,6 +1,7 @@
 """Process-role composition roots for the perfcho application."""
 
 import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -46,9 +47,10 @@ from perfcho.infra.db.repositories.scoring import (
 from perfcho.infra.db.repositories.social import SqlAlchemySocialRepository
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
 from perfcho.infra.redis import engine as infra_redis
-from perfcho.infra.redis.identity import RedisStableWebVerificationCache
+from perfcho.infra.redis.bubbles import RedisRealtimeBubbleBus, RedisRealtimePollGate
+from perfcho.infra.redis.identity import RedisOnlineCredentialVerificationCache
 from perfcho.infra.redis.multiplayer import RedisMultiplayerStateRepository
-from perfcho.infra.redis.realtime import RedisRealtimeRepository
+from perfcho.infra.redis.realtime import RedisRealtimeStateRepository
 from perfcho.infra.scheduler import start_scheduler, stop_scheduler
 from perfcho.infra.security.password import Argon2Policy, PasswordPepper
 from perfcho.infra.settings import Settings
@@ -70,7 +72,7 @@ from perfcho.modules.multiplayer import (
     build_pool_commands,
 )
 from perfcho.modules.performance.services import PerformanceQueryService
-from perfcho.modules.realtime import RealtimeRepository
+from perfcho.modules.realtime import RealtimeBubbleBus, RealtimePollGate, RealtimeStateRepository
 from perfcho.modules.scoring import (
     AccountStatisticsQueryService,
     BeatmapScoresQueryService,
@@ -87,6 +89,20 @@ core_services: CoreServices | None = None
 stable_services: StableServices | None = None
 
 _ACHIEVEMENT_EVALUATORS = default_achievement_evaluator_registry()
+
+type AsyncCleanup = tuple[str, Callable[[], Awaitable[None]]]
+
+
+async def _run_cleanups(cleanups: Sequence[AsyncCleanup], *, message: str) -> None:
+    errors: list[BaseException] = []
+    for name, cleanup in cleanups:
+        try:
+            await cleanup()
+        except BaseException as error:
+            error.add_note(f"while closing {name}")
+            errors.append(error)
+    if errors:
+        raise BaseExceptionGroup(message, errors)
 
 
 def _authorization_repository(session: object) -> SqlAlchemyAuthorizationRepository:
@@ -204,7 +220,7 @@ class CoreServices:
     """Collect process-owned services used by all request scopes.
 
     ``state_redis`` is the raw DB0 client for online state adapters.
-    ``cache_redis`` is a separate DB0 client owned by the process lifecycle.
+    ``bubble_redis`` and ``cache_redis`` are separate DB0 clients owned by the process lifecycle.
     ``cache`` is the only cache API exposed to application services.
     ``scheduler`` owns APScheduler jobs for the API process lifecycle.
     """
@@ -218,28 +234,46 @@ class CoreServices:
     postgres: AsyncEngine
     session_factory: DbSessionFactory
     scheduler: AsyncScheduler
+    bubble_redis: Redis | None = None
 
     async def aclose(self) -> None:
         """Stop process-owned scheduling and close shared infrastructure resources."""
-        await stop_scheduler(self.scheduler)
-        await self.cache_redis.aclose()
-        await self.state_redis.aclose()
-        await self.postgres.dispose()
+        cleanups: list[AsyncCleanup] = [
+            ("scheduler", lambda: stop_scheduler(self.scheduler)),
+            ("cache Redis", self.cache_redis.aclose),
+            ("state Redis", self.state_redis.aclose),
+        ]
+        if self.bubble_redis is not None:
+            cleanups.append(("bubble Redis", self.bubble_redis.aclose))
+        cleanups.append(("PostgreSQL", self.postgres.dispose))
+        await _run_cleanups(cleanups, message="core service shutdown failed")
 
 
 async def compose_core_services() -> CoreServices:
     """Build process-owned services used by all request scopes."""
     config = Settings()
-    postgres = await infra_db.create_engine()
-
-    state_redis = await infra_redis.create_state_redis()
-    cache_redis = await infra_redis.create_cache_redis()
-    cache = RedisCache(cache_redis, prefix=config.redis_cache_prefix)
-    session_factory = infra_db.create_session_factory(postgres)
-    scheduler = await start_scheduler(
-        session_factory,
-        rank_snapshot_cron=config.rank_snapshot_cron,
-    )
+    cleanups: list[AsyncCleanup] = []
+    try:
+        postgres = await infra_db.create_engine()
+        cleanups.append(("PostgreSQL", postgres.dispose))
+        state_redis = await infra_redis.create_state_redis()
+        cleanups.append(("state Redis", state_redis.aclose))
+        bubble_redis = await infra_redis.create_bubble_redis()
+        cleanups.append(("bubble Redis", bubble_redis.aclose))
+        cache_redis = await infra_redis.create_cache_redis()
+        cleanups.append(("cache Redis", cache_redis.aclose))
+        cache = RedisCache(cache_redis, prefix=config.redis_cache_prefix)
+        session_factory = infra_db.create_session_factory(postgres)
+        scheduler = await start_scheduler(
+            session_factory,
+            rank_snapshot_cron=config.rank_snapshot_cron,
+        )
+    except BaseException as startup_error:
+        try:
+            await _run_cleanups(tuple(reversed(cleanups)), message="core service startup cleanup failed")
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup("core service startup failed", [startup_error, cleanup_error]) from None
+        raise
     return CoreServices(
         config=config,
         clock=_SystemClock(),
@@ -250,6 +284,7 @@ async def compose_core_services() -> CoreServices:
         postgres=postgres,
         session_factory=session_factory,
         scheduler=scheduler,
+        bubble_redis=bubble_redis,
     )
 
 
@@ -259,10 +294,12 @@ class StableServices:
 
     identity: IdentityService
     authorization: AuthorizationQueryService
-    realtime: RealtimeRepository
+    realtime: RealtimeStateRepository
     clock: Clock
     id_generator: IdGenerator
     settings: Settings
+    bubbles: RealtimeBubbleBus | None = None
+    poll_gate: RealtimePollGate | None = None
     content_query: ContentQueryService | None = None
     content: ContentService | None = None
     content_sync: ContentSyncService | None = None
@@ -305,26 +342,30 @@ async def compose_stable_services(
         core.config.device_hmac_key.get_secret_value().encode(),
         core.clock,
         core.id_generator,
-        stable_session_stale_grace=timedelta(seconds=core.config.stable_session_stale_grace_seconds),
-        stable_session_touch_interval=timedelta(seconds=core.config.stable_session_touch_interval_seconds),
-        stable_web_verification_cache=RedisStableWebVerificationCache(
+        client_session_stale_grace=timedelta(seconds=core.config.client_session_stale_grace_seconds),
+        client_session_touch_interval=timedelta(seconds=core.config.client_session_touch_interval_seconds),
+        online_credential_verification_cache=RedisOnlineCredentialVerificationCache(
             core.state_redis,
             prefix=core.config.redis_state_prefix,
-            ttl_seconds=core.config.stable_web_auth_cache_ttl_seconds,
+            ttl_seconds=core.config.online_credential_cache_ttl_seconds,
         ),
     )
-    realtime = RedisRealtimeRepository(
+    realtime = RedisRealtimeStateRepository(
         core.state_redis,
         prefix=core.config.redis_state_prefix,
         session_ttl=timedelta(seconds=core.config.redis_session_ttl_seconds),
         presence_ttl=timedelta(seconds=core.config.redis_presence_ttl_seconds),
-        mailbox_ttl=timedelta(seconds=core.config.redis_mailbox_ttl_seconds),
-        max_packet_count=core.config.redis_mailbox_max_packets,
-        max_packet_bytes=core.config.redis_mailbox_max_bytes,
         max_frame_count=core.config.redis_spectator_max_frames,
         max_frame_bytes=core.config.redis_spectator_max_bytes,
         max_channels_per_session=core.config.redis_realtime_max_channels_per_session,
         max_spectators_per_host=core.config.redis_spectator_max_viewers,
+    )
+    bubble_redis = core.bubble_redis or core.state_redis
+    bubbles = RedisRealtimeBubbleBus(bubble_redis, prefix=core.config.redis_state_prefix)
+    poll_gate = RedisRealtimePollGate(
+        bubble_redis,
+        prefix=core.config.redis_state_prefix,
+        max_ttl_seconds=core.config.stable_poll_gate_seconds,
     )
     uow_factory = SqlAlchemyUnitOfWorkFactory(core.session_factory)
     authorization = AuthorizationQueryService(
@@ -433,6 +474,8 @@ async def compose_stable_services(
         clock=core.clock,
         id_generator=core.id_generator,
         settings=core.config,
+        bubbles=bubbles,
+        poll_gate=poll_gate,
         content_query=content_query,
         content=content,
         content_sync=content_sync,

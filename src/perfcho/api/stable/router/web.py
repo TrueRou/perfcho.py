@@ -17,21 +17,23 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Qu
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from starlette.formparsers import MultiPartException
 
-from perfcho.api.cho.canonize.ipaddr import resolve_client_ip
-from perfcho.api.cho.canonize.scoring import (
+from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
+from perfcho.api.stable.canonize.scoring import (
     ParsedStableScore,
     decrypt_stable_score,
     normalize_stable_attestation,
+    parse_legacy_mods,
     parse_stable_submission_form,
+    project_legacy_mods,
     read_stable_replay,
     stable_submission_digest,
     validate_stable_submission_evidence,
     validate_stable_submission_time,
     verify_stable_online_checksum,
 )
-from perfcho.api.cho.dependencies import StableServicesDependency
+from perfcho.api.stable.dependencies import StableServicesDependency
 from perfcho.infra.logging import duration_ms, log_event, rate_limit
-from perfcho.infra.security.password import preverify_lazer_password
+from perfcho.infra.security.password import preverify_password
 from perfcho.modules.account import (
     AccountService,
     EmailUnavailable,
@@ -62,7 +64,7 @@ from perfcho.modules.content import (
     RatingSummary,
     UpstreamContentUnavailable,
 )
-from perfcho.modules.identity import InvalidCredentials, StableWebPrincipal
+from perfcho.modules.identity import InvalidCredentials, OnlineCredentialPrincipal
 from perfcho.modules.realtime import RealtimeSessionFenced, RealtimeSessionNotFound
 from perfcho.modules.scoring import (
     AcceptScore,
@@ -78,12 +80,12 @@ from perfcho.modules.scoring import (
     ReplayQueryService,
     ReplayService,
     Ruleset,
+    ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
     ScoringService,
     StagedReplayManifest,
 )
-from perfcho.modules.scoring.mods import parse_legacy_mods
 from perfcho.modules.social import AchievementUnlockView, SocialService
 
 router = APIRouter(default_response_class=Response)
@@ -112,7 +114,7 @@ _REGISTRATION_PASSWORD_MIN_UNIQUE_CHARACTERS = 4
 
 @dataclass(frozen=True, slots=True)
 class _WebAuthentication:
-    principal: StableWebPrincipal | None
+    principal: OnlineCredentialPrincipal | None
 
 
 def _account(services: StableServicesDependency) -> AccountService:
@@ -210,7 +212,7 @@ async def _authenticate(
     password_token: str,
 ) -> _WebAuthentication:
     try:
-        principal = await services.identity.verify_stable_web(username, password_token)
+        principal = await services.identity.verify_online_credentials(username, password_token)
         realtime = await services.realtime.resolve_session(principal.session_id, at=services.clock.now())
         if realtime.account_id != principal.account_id:
             raise RealtimeSessionFenced("Stable Web principal does not own the realtime session")
@@ -504,7 +506,7 @@ async def register_account(
             return _registration_error("username", [str(error)])
         return Response(b"ok")
 
-    password_preverification = preverify_lazer_password(password)
+    password_preverification = preverify_password(password)
     request_id = services.id_generator.new()
     request_digest = _registration_digest(
         services,
@@ -1214,9 +1216,9 @@ async def get_scores(
             f"{beatmap.external_beatmapset_id}|{len(page.scores)}|0|"
         ),
         f"0\n{beatmap.artist} - {beatmap.title} [{beatmap.difficulty_name}]\n{average_rating}",
-        _format_leaderboard_score(page.personal_best) if page.personal_best is not None else "",
+        _format_leaderboard_score(page.personal_best, variant) if page.personal_best is not None else "",
     ]
-    lines.extend(_format_leaderboard_score(score) for score in page.scores)
+    lines.extend(_format_leaderboard_score(score, variant) for score in page.scores)
     if not page.scores:
         lines.append("")
     return Response("\n".join(lines))
@@ -1322,10 +1324,11 @@ def _chart_accuracy(stats: AccountStatsView | None) -> str:
     return "" if stats is None else format(stats.accuracy * 100, ".2f")
 
 
-def _format_leaderboard_score(score: LeaderboardScoreView) -> str:
+def _format_leaderboard_score(score: LeaderboardScoreView, variant: ScoreboardVariant) -> str:
+    legacy_mod_bits = project_legacy_mods(score.mods, variant)
     return (
         f"{score.score_id}|{score.display_name}|{round(score.metric_value)}|{score.max_combo}|"
         f"{score.n50}|{score.n100}|{score.n300}|{score.nmiss}|{score.nkatu}|{score.ngeki}|"
-        f"{int(score.perfect)}|{score.legacy_mod_bits}|{score.account_id}|{score.rank}|"
+        f"{int(score.perfect)}|{legacy_mod_bits}|{score.account_id}|{score.rank}|"
         f"{int(score.ended_at.timestamp())}|{int(score.has_replay)}"
     )

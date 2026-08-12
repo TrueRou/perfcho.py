@@ -1,4 +1,4 @@
-"""Define immutable Stable-facing channel and canonical messaging values."""
+"""Define immutable channel and messaging values."""
 
 import uuid
 from dataclasses import dataclass
@@ -21,7 +21,7 @@ class ChannelRecord:
 
     channel_id: int
     kind: str
-    stable_name: str | None
+    name: str | None
     description: str | None
     owner_account_id: int | None
     team_id: int | None
@@ -53,8 +53,25 @@ class ChannelRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class StableChannel:
-    """Describe a public channel using fields directly consumable by Stable adapters."""
+class ChannelSelector:
+    """Select one channel by its canonical identifier or name."""
+
+    channel_id: int | None = None
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        """Require exactly one valid selector value."""
+        if (self.channel_id is None) == (self.name is None):
+            raise ValueError("channel selector must contain exactly one of channel_id or name")
+        if self.channel_id is not None:
+            _require_positive_id("channel_id", self.channel_id)
+        if self.name is not None and (not isinstance(self.name, str) or not 1 <= len(self.name.strip()) <= 100):
+            raise ValueError("channel name must contain between 1 and 100 characters")
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelView:
+    """Describe a readable public channel and account-specific capabilities."""
 
     channel_id: int
     name: str
@@ -65,10 +82,10 @@ class StableChannel:
     can_manage: bool
 
     def __post_init__(self) -> None:
-        """Validate the Stable channel identity."""
+        """Validate the channel identity and display name."""
         _require_positive_id("channel_id", self.channel_id)
-        if not self.name.startswith("#"):
-            raise ValueError("Stable channel names must start with #")
+        if not self.name:
+            raise ValueError("channel name must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +167,7 @@ class MessageResult:
     created_at: datetime
     direct_recipient_account_id: int | None = None
     created: bool = True
-    resolved_channel: StableChannel | None = None
+    resolved_channel: ChannelView | None = None
 
     def __post_init__(self) -> None:
         """Validate identifiers and creation time."""
@@ -182,7 +199,7 @@ class ReadCursorResult:
 
 @dataclass(frozen=True, slots=True)
 class OfflineDirectMessage:
-    """Describe one unread durable direct message for Stable offline delivery."""
+    """Describe one unread durable direct message for deferred delivery."""
 
     message_id: int
     channel_id: int

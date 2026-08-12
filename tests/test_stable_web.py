@@ -9,8 +9,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from perfcho.api.cho import router
-from perfcho.api.cho.dependencies import get_stable_services
+from perfcho.api.stable import router
+from perfcho.api.stable.dependencies import get_stable_services
 from perfcho.infra.compose import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
@@ -27,8 +27,8 @@ from perfcho.modules.content import (
     FavouriteResult,
     RatingSummary,
 )
-from perfcho.modules.identity import IdentityService, InvalidCredentials, StableWebPrincipal
-from perfcho.modules.realtime import RealtimeRepository, RealtimeSession, RealtimeSessionNotFound
+from perfcho.modules.identity import IdentityService, InvalidCredentials, OnlineCredentialPrincipal
+from perfcho.modules.realtime import RealtimeSession, RealtimeSessionNotFound, RealtimeStateRepository
 from perfcho.modules.scoring import BeatmapGradeView, BeatmapScoresQueryService, Ruleset, ScoreGrade
 from perfcho.modules.social import AccountIdentityView, FollowView, SocialService
 
@@ -44,10 +44,12 @@ class FixedClock:
 
 
 class FakeIdentity:
-    async def verify_stable_web(self, identifier: str, password_token: str) -> StableWebPrincipal:
-        if identifier != "player" or password_token != PASSWORD_MD5:
+    async def verify_online_credentials(
+        self, identifier: str, password_preverification: str
+    ) -> OnlineCredentialPrincipal:
+        if identifier != "player" or password_preverification != PASSWORD_MD5:
             raise InvalidCredentials()
-        return StableWebPrincipal(3, "player", SESSION_ID, NOW + timedelta(hours=1))
+        return OnlineCredentialPrincipal(3, "player", SESSION_ID, NOW + timedelta(hours=1))
 
 
 class FakeRealtime:
@@ -257,7 +259,7 @@ def stable_services() -> tuple[StableServices, FakeContentQuery, FakeContent, Fa
     services = StableServices(
         identity=cast(IdentityService, FakeIdentity()),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=cast(RealtimeRepository, FakeRealtime()),
+        realtime=cast(RealtimeStateRepository, FakeRealtime()),
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, object()),
         settings=Settings(),
@@ -295,7 +297,7 @@ async def test_web_credentials_require_the_matching_realtime_epoch() -> None:
 async def test_web_auth_rejection_log_excludes_identifier_and_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    web_module = importlib.import_module("perfcho.api.cho.router.web")
+    web_module = importlib.import_module("perfcho.api.stable.router.web")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:

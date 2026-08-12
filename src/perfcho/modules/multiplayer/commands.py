@@ -183,7 +183,7 @@ def build_multiplayer_commands(dependency: MultiplayerCommandDependencies) -> Co
                 ("invite", ("inv",), "Invite a player to the match"),
                 ("lock", (), "Lock all empty slots"),
                 ("unlock", (), "Unlock all locked slots"),
-                ("size", (), "Set the match size (1-16)"),
+                ("size", (), "Set the match capacity"),
                 ("move", (), "Move a player to a slot"),
                 ("team", (), "Set player team color"),
                 ("ban", (), "Ban a player from the match"),

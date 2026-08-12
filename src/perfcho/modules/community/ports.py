@@ -64,8 +64,8 @@ class CommunityRepository(Protocol):
         """List active public channels with permission codes in one query."""
         ...
 
-    async def get_public_channel_by_stable_name(self, stable_name: str, account_id: int) -> ChannelRecord | None:
-        """Resolve one active public channel by its Stable-facing name."""
+    async def get_public_channel_by_name(self, name: str, account_id: int) -> ChannelRecord | None:
+        """Resolve one active public channel by its canonical name."""
         ...
 
     async def get_channel(self, channel_id: int, account_id: int) -> ChannelRecord | None:

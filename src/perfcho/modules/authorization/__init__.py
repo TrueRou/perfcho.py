@@ -1,4 +1,4 @@
-"""Expose canonical authorization commands, queries, and projections."""
+"""Expose canonical authorization commands and queries."""
 
 from perfcho.modules.authorization.commands import (
     AuthorizationGrant,
@@ -13,7 +13,6 @@ from perfcho.modules.authorization.management import AuthorizationManagementServ
 from perfcho.modules.authorization.models import EffectiveAuthorization
 from perfcho.modules.authorization.ports import AuthorizationManagementRepository, AuthorizationRepository
 from perfcho.modules.authorization.services import AuthorizationQueryService
-from perfcho.modules.authorization.stable import StablePrivilege, project_stable_privileges
 
 __all__ = (
     "AuthorizationQueryService",
@@ -29,6 +28,4 @@ __all__ = (
     "RevokeEntitlement",
     "RevokePermission",
     "RevokeRole",
-    "StablePrivilege",
-    "project_stable_privileges",
 )

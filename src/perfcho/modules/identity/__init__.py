@@ -1,24 +1,23 @@
-"""Expose canonical Stable identity lifecycle operations."""
+"""Expose canonical identity lifecycle operations."""
 
 from perfcho.modules.identity.errors import (
     InvalidAccessToken,
     InvalidCredentials,
     InvalidOAuthClient,
     InvalidOAuthGrant,
-    InvalidStableSession,
-    StableLoginRejected,
-    StableSessionAlreadyActive,
+    InvalidSession,
+    SessionAlreadyActive,
 )
 from perfcho.modules.identity.models import (
+    AuthenticateClientSession,
     AuthenticatedAccount,
+    ClientSessionResult,
     CredentialSnapshot,
     OAuthTokenResult,
+    OnlineCredentialPrincipal,
     PasswordGrant,
     RefreshGrant,
-    ResolvedStableSession,
-    StableLogin,
-    StableSessionResult,
-    StableWebPrincipal,
+    ResolvedClientSession,
 )
 from perfcho.modules.identity.ports import IdentityRepository
 from perfcho.modules.identity.services import IdentityService
@@ -32,14 +31,13 @@ __all__ = (
     "InvalidCredentials",
     "InvalidOAuthClient",
     "InvalidOAuthGrant",
-    "InvalidStableSession",
+    "InvalidSession",
     "OAuthTokenResult",
     "PasswordGrant",
     "RefreshGrant",
-    "ResolvedStableSession",
-    "StableLogin",
-    "StableLoginRejected",
-    "StableSessionAlreadyActive",
-    "StableSessionResult",
-    "StableWebPrincipal",
+    "AuthenticateClientSession",
+    "ClientSessionResult",
+    "OnlineCredentialPrincipal",
+    "ResolvedClientSession",
+    "SessionAlreadyActive",
 )

@@ -11,7 +11,7 @@ _NAME_PUNCTUATION = frozenset("_[]-")
 
 
 def normalize_name(name: str) -> str:
-    """Validate a Stable-compatible display name and return its canonical key."""
+    """Validate a canonical display name and return its lookup key."""
     normalized = unicodedata.normalize("NFKC", name)
     if not _NAME_MIN_LENGTH <= len(normalized) <= _NAME_MAX_LENGTH:
         raise ValueError("Names must contain between 2 and 15 characters after NFKC normalization")
@@ -25,7 +25,7 @@ def normalize_name(name: str) -> str:
         raise ValueError("Names may contain underscores or whitespace, but not both")
     key = "".join("_" if character.isspace() else character for character in normalized.casefold())
     if len(key) > _NAME_KEY_MAX_LENGTH:
-        raise ValueError("normalized Stable names must not exceed 32 characters")
+        raise ValueError("normalized name keys must not exceed 32 characters")
     return key
 
 

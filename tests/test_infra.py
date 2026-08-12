@@ -91,7 +91,7 @@ async def test_outbox_enqueue_passes_persisted_trace_to_taskiq(monkeypatch: pyte
 
 def test_settings_reject_performance_timing_shorter_than_http_window() -> None:
     with pytest.raises(ValidationError, match="Redis socket timeout must exceed"):
-        Settings(redis_socket_timeout=0.2, stable_mailbox_wait_seconds=0.3)
+        Settings(redis_socket_timeout=0.2, stable_bubble_wait_seconds=0.3)
     with pytest.raises(ValidationError, match="URL expiry must exceed"):
         Settings(
             performance_http_timeout_seconds=60,

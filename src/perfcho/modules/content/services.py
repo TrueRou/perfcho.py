@@ -108,7 +108,7 @@ class ContentQueryService:
         ttl_seconds=900,
     )
     async def lookup_md5(self, md5: str | bytes) -> BeatmapRevisionView:
-        """Resolve an immutable revision by Stable MD5."""
+        """Resolve an immutable revision by its MD5 checksum."""
         digest = _md5_bytes(md5)
         async with self._uow_factory() as uow:
             result = await self._repository_factory(uow.session).lookup_md5(digest)
@@ -138,7 +138,7 @@ class ContentQueryService:
         ttl_seconds=300,
     )
     async def lookup_filename(self, file_name: str) -> BeatmapRevisionView:
-        """Resolve the current revision by normalized Stable filename."""
+        """Resolve the current revision by normalized filename."""
         normalized = _filename_key(file_name)
         async with self._uow_factory() as uow:
             result = await self._repository_factory(uow.session).lookup_filename(normalized)
@@ -151,7 +151,7 @@ class ContentQueryService:
         file_names: tuple[str, ...],
         external_beatmap_ids: tuple[int, ...],
     ) -> tuple[BeatmapRevisionView, ...]:
-        """Resolve Stable song-select maps in one repository round trip."""
+        """Resolve a mixed beatmap selector batch in one repository round trip."""
         if len(file_names) + len(external_beatmap_ids) > 2048:
             raise ContentInputRejected("beatmap batch exceeds 2048 selectors")
         keys = tuple(_filename_key(name) for name in file_names)
@@ -195,7 +195,7 @@ class ContentQueryService:
             return await self._repository_factory(uow.session).get_rating(beatmap_id, account_id)
 
     async def list_comments(self, target: str, external_target_id: int) -> tuple[CommentView, ...]:
-        """List visible comments for one Stable timeline target."""
+        """List visible position-aware comments for one content target."""
         _comment_target(target)
         _positive("external_target_id", external_target_id)
         async with self._uow_factory() as uow:
@@ -261,7 +261,7 @@ class ContentService:
         position_ms: int,
         body: str,
     ) -> CommentView:
-        """Persist one bounded Stable timeline comment."""
+        """Persist one bounded position-aware content comment."""
         _positive("account_id", account_id)
         _positive("external_target_id", external_target_id)
         _comment_target(target)

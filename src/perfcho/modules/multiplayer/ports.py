@@ -36,6 +36,8 @@ class MultiplayerRepository(Protocol):
         connection_session_id: uuid.UUID,
         settings: RoomSettings,
         capacity: int,
+        public_id_limit: int,
+        protocol: str,
         password_salt: str | None,
         password_verifier: str | None,
         now: datetime,

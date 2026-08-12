@@ -36,7 +36,6 @@ from perfcho.modules.performance.models import (
 )
 from perfcho.modules.scoring.models import (
     CanonicalMod,
-    ClientFamily,
     HitStatistic,
     Ruleset,
     ScoreboardInfo,
@@ -166,7 +165,7 @@ class SqlAlchemyPerformanceProjectionRepository:
                 ),
                 mod_set_id=score.mod_set_id,
                 mods=_canonical_mods(row.canonical),
-                client_family=ClientFamily(row.protocol.value),
+                source=row.protocol.value,
                 score=ScoreSubmission(
                     total_score=score.total_score,
                     classic_score=score.classic_score,

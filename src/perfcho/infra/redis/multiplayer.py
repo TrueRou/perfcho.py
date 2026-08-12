@@ -134,8 +134,8 @@ class RedisMultiplayerStateRepository(MultiplayerStateRepository):
         seconds = state_ttl.total_seconds() if isinstance(state_ttl, timedelta) else float(state_ttl)
         if seconds <= 0:
             raise ValueError("state_ttl must be positive")
-        if not 1 <= max_rooms <= 32767:
-            raise ValueError("max_rooms must be between 1 and 32767")
+        if not 1 <= max_rooms <= 2_147_483_647:
+            raise ValueError("max_rooms must be between 1 and 2147483647")
         if not 1 <= cas_attempts <= 32:
             raise ValueError("cas_attempts must be between 1 and 32")
         self._redis = redis

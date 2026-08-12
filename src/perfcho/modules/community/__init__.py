@@ -18,13 +18,14 @@ from perfcho.modules.community.models import (
     ActiveSilence,
     ChannelMembershipResult,
     ChannelPermissions,
+    ChannelSelector,
+    ChannelView,
     ConversationReadCursor,
     DirectConversationResult,
     MessageResult,
     OfflineDirectMessage,
     OfflineDirectMessagePage,
     ReadCursorResult,
-    StableChannel,
 )
 from perfcho.modules.community.ports import ActiveChannelMembershipQuery, ActiveSilencePolicy, CommunityRepository
 from perfcho.modules.community.queries import CommunityQueryService
@@ -41,6 +42,8 @@ __all__ = (
     "ChannelMembershipUnavailable",
     "ChannelNotFound",
     "ChannelPermissions",
+    "ChannelSelector",
+    "ChannelView",
     "CommunityInputRejected",
     "CommunityRepository",
     "CommunityService",
@@ -56,6 +59,5 @@ __all__ = (
     "OfflineDirectMessagePage",
     "PrivateMessageRejected",
     "ReadCursorResult",
-    "StableChannel",
     "TargetAccountSilenced",
 )

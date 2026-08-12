@@ -9,8 +9,8 @@ from zoneinfo import ZoneInfo
 
 import orjson
 
+from perfcho.api.stable.canonize.scoring import parse_legacy_mods
 from perfcho.infra.db.enums import BeatmapStatus, Ruleset, ScoreboardVariant, ScoreGrade
-from perfcho.modules.scoring.mods import parse_legacy_mods
 
 _SCOREBOARD_IDS = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 8: 8}
 _RULESETS = {0: Ruleset.OSU, 1: Ruleset.TAIKO, 2: Ruleset.FRUITS, 3: Ruleset.MANIA}

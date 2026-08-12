@@ -1,13 +1,15 @@
 """Define the infrastructure-neutral repository for ephemeral realtime state."""
 
 import uuid
+from collections.abc import Sequence
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
+from perfcho.modules.realtime.bubbles import RealtimeBubble, SpectatorFrameBubble
 from perfcho.modules.realtime.models import (
-    MailboxBatch,
-    MailboxPacket,
     PresenceSnapshot,
+    PresenceSubscription,
     RealtimeSession,
     SessionFence,
     SpectatorAttachment,
@@ -18,8 +20,8 @@ from perfcho.modules.realtime.models import (
 
 
 @runtime_checkable
-class RealtimeRepository(Protocol):
-    """Coordinate fenced sessions, presence, delivery, and spectating state."""
+class RealtimeStateRepository(Protocol):
+    """Coordinate fenced sessions, presence, channels, and spectating state."""
 
     async def open_session(
         self,
@@ -72,19 +74,19 @@ class RealtimeRepository(Protocol):
         """Remove presence only when its full stored session epoch matches."""
         ...
 
-    async def set_presence_filter(
+    async def set_presence_subscription(
         self,
         account_id: int,
         *,
         session_id: uuid.UUID,
         expected_revision: int,
-        value: int,
+        subscription: PresenceSubscription,
     ) -> None:
-        """Persist the current fenced session's Stable presence filter."""
+        """Persist the current fenced session's presence subscription."""
         ...
 
-    async def get_presence_filter(self, account_id: int) -> int:
-        """Return the Stable presence filter, defaulting to no subscription."""
+    async def get_presence_subscription(self, account_id: int) -> PresenceSubscription:
+        """Return the current subscription, defaulting to no updates."""
         ...
 
     async def set_away_message(
@@ -124,60 +126,6 @@ class RealtimeRepository(Protocol):
 
     async def list_channel_members(self, channel_id: int) -> frozenset[int]:
         """Return the immutable account IDs currently joined to a channel."""
-        ...
-
-    async def enqueue_mailbox(
-        self,
-        account_id: int,
-        payload: bytes,
-        *,
-        recipient_fence: SessionFence,
-        expires_at: datetime,
-    ) -> MailboxPacket:
-        """Append an immutable packet or raise MailboxOverflow at the bound."""
-        ...
-
-    async def lease_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        lease_id: uuid.UUID,
-        limit: int,
-        expires_at: datetime,
-    ) -> MailboxBatch:
-        """Acquire an exclusive bounded poll lease and return ordered packets."""
-        ...
-
-    async def wait_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        timeout: float,
-    ) -> bool:
-        """Wait briefly for the fenced mailbox to receive a packet."""
-        ...
-
-    async def ack_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        lease_id: uuid.UUID,
-        through_sequence: int,
-    ) -> None:
-        """Delete leased packets through an acknowledged sequence."""
-        ...
-
-    async def release_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        lease_id: uuid.UUID,
-    ) -> None:
-        """Release a poll lease without acknowledging its packets."""
         ...
 
     async def attach_spectator(
@@ -232,12 +180,11 @@ class RealtimeRepository(Protocol):
         host_account_id: int,
         *,
         host_fence: SessionFence,
-        sequence: int,
-        reset_sequence: bool,
-        payload: bytes,
+        frame: SpectatorFrameBubble,
+        reset_history: bool,
         expires_at: datetime,
     ) -> SpectatorFramePublish:
-        """Roll per-play history and atomically queue one live frame to fenced viewers."""
+        """Advance canonical history and return currently valid spectator targets."""
         ...
 
     async def read_spectator_frames(
@@ -250,4 +197,58 @@ class RealtimeRepository(Protocol):
         at: datetime,
     ) -> SpectatorFrameWindow:
         """Read a latest window or frames strictly after an internal cursor."""
+        ...
+
+
+@runtime_checkable
+class RealtimeBubbleSubscription(Protocol):
+    """Consume best-effort Bubbles for one session fence."""
+
+    async def receive(self, *, timeout: float) -> RealtimeBubble | None:
+        """Wait for one valid Bubble or return None at timeout."""
+        ...
+
+    async def drain(self, *, limit: int) -> tuple[RealtimeBubble, ...]:
+        """Return up to limit currently buffered valid Bubbles."""
+        ...
+
+    async def aclose(self) -> None:
+        """Release the dedicated subscription connection."""
+        ...
+
+
+@runtime_checkable
+class RealtimeBubbleBus(Protocol):
+    """Publish and subscribe to ephemeral session-scoped Bubbles."""
+
+    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
+        """Publish one Bubble and return the subscriber count."""
+        ...
+
+    async def publish_many(self, recipient_fences: Sequence[SessionFence], bubble: RealtimeBubble) -> int:
+        """Publish one Bubble to many exact session epochs and return total subscribers."""
+        ...
+
+    def subscribe(self, recipient_fence: SessionFence) -> AbstractAsyncContextManager[RealtimeBubbleSubscription]:
+        """Open a subscription confirmed before entering its context."""
+        ...
+
+
+@runtime_checkable
+class RealtimePollGate(Protocol):
+    """Prevent concurrent Polls from consuming the same session channel."""
+
+    async def acquire(
+        self,
+        account_id: int,
+        recipient_fence: SessionFence,
+        gate_id: uuid.UUID,
+        *,
+        expires_at: datetime,
+    ) -> bool:
+        """Acquire a short gate only for the current session fence."""
+        ...
+
+    async def release(self, account_id: int, recipient_fence: SessionFence, gate_id: uuid.UUID) -> None:
+        """Release the gate only when all owner components match."""
         ...

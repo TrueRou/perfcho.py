@@ -1,6 +1,6 @@
 """Define protocol-neutral identity lifecycle errors."""
 
-from perfcho.modules.common.errors import AuthenticationFailed, InputRejected, ResourceConflict
+from perfcho.modules.common.errors import AuthenticationFailed, ResourceConflict
 
 
 class InvalidCredentials(AuthenticationFailed):
@@ -9,22 +9,16 @@ class InvalidCredentials(AuthenticationFailed):
     code = "invalid_credentials"
 
 
-class StableLoginRejected(InputRejected):
-    """Reject malformed non-credential Stable login evidence."""
+class SessionAlreadyActive(ResourceConflict):
+    """Prevent a second direct client session for one account."""
 
-    code = "stable_login_rejected"
-
-
-class StableSessionAlreadyActive(ResourceConflict):
-    """Prevent a second normal Stable session for one account."""
-
-    code = "stable_session_already_active"
+    code = "session_already_active"
 
 
-class InvalidStableSession(AuthenticationFailed):
-    """Reject a missing, expired, closed, or revoked Stable bearer session."""
+class InvalidSession(AuthenticationFailed):
+    """Reject a missing, expired, closed, or revoked bearer session."""
 
-    code = "invalid_stable_session"
+    code = "invalid_session"
 
 
 class InvalidOAuthClient(AuthenticationFailed):

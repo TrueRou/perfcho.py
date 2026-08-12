@@ -682,10 +682,10 @@ async def _seed_default_calculations(session: AsyncSession) -> None:
 async def _seed_community_catalog(session: AsyncSession) -> None:
     permission_ids = {code: item_id for item_id, code, _ in PERMISSIONS}
     channels = (
-        ("osu", "#osu", "General discussion.", True, "chat.write"),
-        ("announce", "#announce", "Official server announcements.", True, "chat.announce"),
-        ("help", "#help", "Gameplay and server help.", True, "chat.write"),
-        ("lobby", "#lobby", "Multiplayer lobby discussion.", False, "chat.write"),
+        ("osu", "osu", "General discussion.", True, "chat.write"),
+        ("announce", "announce", "Official server announcements.", True, "chat.announce"),
+        ("help", "help", "Gameplay and server help.", True, "chat.write"),
+        ("lobby", "lobby", "Multiplayer lobby discussion.", False, "chat.write"),
     )
     await _upsert_catalog(
         session,

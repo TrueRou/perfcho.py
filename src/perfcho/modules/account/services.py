@@ -11,7 +11,7 @@ from perfcho.infra.security.password import (
     Argon2Policy,
     PasswordPepper,
     hash_password,
-    validate_stable_password_token,
+    validate_password_preverification,
 )
 from perfcho.modules.account.errors import EmailUnavailable, NameUnavailable, RegistrationRejected
 from perfcho.modules.account.models import PublicAccountView, RegisterAccount, RegistrationRecord, RegistrationResult
@@ -92,7 +92,7 @@ class AccountService:
             display_name = unicodedata.normalize("NFKC", command.display_name)
             name_key = normalize_name(display_name)
             email = normalize_email(command.email)
-            password_preverification = validate_stable_password_token(command.password_preverification)
+            password_preverification = validate_password_preverification(command.password_preverification)
         except ValueError as error:
             raise RegistrationRejected(str(error)) from error
 

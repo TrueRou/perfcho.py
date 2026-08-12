@@ -57,7 +57,7 @@ class PairRelationship:
 
 @dataclass(frozen=True, slots=True)
 class AccountIdentityView:
-    """Describe one active account using its current Stable-facing name."""
+    """Describe one active account using its current display name."""
 
     account_id: int
     display_name: str
@@ -71,7 +71,7 @@ class AccountIdentityView:
 
 @dataclass(frozen=True, slots=True)
 class FollowView:
-    """Describe one outgoing follow using current Stable-facing account identity."""
+    """Describe one outgoing follow using current account identity."""
 
     account_id: int
     display_name: str
@@ -87,7 +87,7 @@ class FollowView:
 
 @dataclass(frozen=True, slots=True)
 class BlockView:
-    """Describe one outgoing block using current Stable-facing account identity."""
+    """Describe one outgoing block using current account identity."""
 
     account_id: int
     display_name: str
@@ -239,7 +239,7 @@ class AchievementUnlockView:
     unlocked_at: datetime
 
     def __post_init__(self) -> None:
-        """Validate the Stable chart projection."""
+        """Validate the achievement chart projection."""
         _require_positive_id("achievement_id", self.achievement_id)
         _require_aware("unlocked_at", self.unlocked_at)
 

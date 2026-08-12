@@ -32,7 +32,7 @@ def validate_score(
     revision: BeatmapRevisionInfo,
     variant: ScoreboardVariant = ScoreboardVariant.VANILLA,
     *,
-    lazer_grading: bool = False,
+    uses_threshold_grading: bool = False,
 ) -> ValidatedScore:
     """Validate hits, derived accuracy, grade, outcome, progress, and full combo."""
     values = {statistic.hit_result: statistic.actual for statistic in score.hits}
@@ -56,8 +56,8 @@ def validate_score(
         if attempt.progress != 1:
             raise ScoreRejected("passed scores must report complete attempt progress")
         expected_grade = (
-            _lazer_passed_grade(ruleset, values, accuracy, mods)
-            if lazer_grading
+            _threshold_passed_grade(ruleset, values, accuracy, mods)
+            if uses_threshold_grading
             else _passed_grade(ruleset, values, accuracy, mods)
         )
     elif score.outcome is ScoreOutcome.FAILED:
@@ -80,13 +80,13 @@ def validate_score(
     return ValidatedScore(accuracy, expected_grade, total_hits)
 
 
-def _lazer_passed_grade(
+def _threshold_passed_grade(
     ruleset: Ruleset,
     values: dict[str, int],
     accuracy: Decimal,
     mods: tuple[CanonicalMod, ...],
 ) -> ScoreGrade:
-    """Match osu!lazer's ScoreProcessor rank thresholds and ruleset overrides."""
+    """Apply the supplied threshold-based grade policy."""
     if accuracy == 1:
         grade = ScoreGrade.X
     elif accuracy >= Decimal("0.95"):

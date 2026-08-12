@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from perfcho.modules.realtime.stable import (
+from perfcho.api.stable.realtime import (
     BodyTooLargeError,
     Channel,
     ClientPacket,
@@ -528,7 +528,6 @@ def test_score_v2_frame_and_replay_bundle_round_trip_with_exact_raw_view() -> No
         action=ReplayAction.COMPLETION,
         extra=-1,
         sequence=42,
-        raw_data=memoryview(b"ignored on encode"),
     )
     writer = payload_writer()
     writer.write_replay_frame_bundle(bundle)
@@ -541,30 +540,25 @@ def test_score_v2_frame_and_replay_bundle_round_trip_with_exact_raw_view() -> No
     assert decoded.action == bundle.action
     assert decoded.extra == bundle.extra
     assert decoded.sequence == bundle.sequence
-    assert decoded.raw_data.readonly
-    assert decoded.raw_data.tobytes() == encoded
     reader.require_exhausted()
 
 
-def test_replay_bundle_accepts_legacy_payload_without_sequence() -> None:
+def test_replay_bundle_requires_sequence() -> None:
     score = ScoreFrame(100, 0, 1, 0, 0, 0, 0, 0, 300, 1, 1, True, 255, 0, False)
-    bundle = ReplayFrameBundle((), score, ReplayAction.STANDARD, 0, None, memoryview(b""))
+    bundle = ReplayFrameBundle((), score, ReplayAction.STANDARD, 0, 1)
     writer = payload_writer()
     writer.write_replay_frame_bundle(bundle)
 
-    reader = PacketReader(writer.to_bytes())
-    parsed = reader.read_replay_frame_bundle()
-
-    assert parsed.sequence is None
-    reader.require_exhausted()
+    with pytest.raises(TruncatedPayloadError):
+        PacketReader(writer.to_bytes()[:-2]).read_replay_frame_bundle()
 
 
 def test_replay_bundle_rejects_actions_outside_stable_inventory() -> None:
     score = ScoreFrame(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, False, 0, 0, False)
     with pytest.raises(ValueError, match="between 0 and 8"):
-        call_runtime(ReplayFrameBundle, (), score, 9, 0, 0, memoryview(b""))
+        call_runtime(ReplayFrameBundle, (), score, 9, 0, 0)
 
-    valid = ReplayFrameBundle((), score, ReplayAction.STANDARD, 0, 0, memoryview(b""))
+    valid = ReplayFrameBundle((), score, ReplayAction.STANDARD, 0, 0)
     writer = payload_writer()
     writer.write_replay_frame_bundle(valid)
     encoded = bytearray(writer.to_bytes())
@@ -589,9 +583,13 @@ def test_score_frame_rejects_invalid_boolean_bytes_and_inconsistent_v2_fields() 
     assert writer.to_bytes() == b""
 
 
-def test_spectator_builder_preserves_frame_bytes_exactly() -> None:
-    raw_frames = b"\x01\x02\x03"
-    assert spectate_frames(raw_frames) == b"\x0f\x00\x00\x03\x00\x00\x00\x01\x02\x03"
+def test_spectator_builder_encodes_complete_frame_bundle() -> None:
+    score = ScoreFrame(100, 0, 1, 0, 0, 0, 0, 0, 300, 1, 1, True, 255, 0, False)
+    bundle = ReplayFrameBundle((), score, ReplayAction.STANDARD, 0, 1)
+    packet = next(PacketReader(spectate_frames(bundle), packet_enum=ServerPacket))
+
+    assert packet.packet_type is ServerPacket.SPECTATE_FRAMES
+    assert packet.payload.read_replay_frame_bundle() == bundle
 
 
 @pytest.mark.parametrize("data", [b"\x00", b"\x00" * 6])
@@ -664,7 +662,6 @@ def test_writer_enforces_body_packet_string_list_packet_count_and_frame_bounds()
         action=ReplayAction.STANDARD,
         extra=0,
         sequence=0,
-        raw_data=memoryview(b""),
     )
     with pytest.raises(FrameCountExceededError):
         payload_writer(limits=CodecLimits(max_frame_count=0)).write_replay_frame_bundle(bundle)

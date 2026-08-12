@@ -62,14 +62,14 @@ class SqlAlchemyCommunityRepository:
         ).all()
         return tuple(_channel_record(row._tuple()) for row in rows)
 
-    async def get_public_channel_by_stable_name(self, stable_name: str, account_id: int) -> ChannelRecord | None:
-        """Resolve one active public channel case-insensitively by Stable name."""
+    async def get_public_channel_by_name(self, name: str, account_id: int) -> ChannelRecord | None:
+        """Resolve one active public channel case-insensitively by name."""
         row = (
             await self._session.execute(
                 _channel_statement(account_id).where(
                     Channel.kind == ChannelKind.PUBLIC,
                     Channel.archived_at.is_(None),
-                    func.lower(Channel.name) == stable_name,
+                    func.lower(Channel.name) == name,
                 )
             )
         ).one_or_none()
@@ -639,7 +639,7 @@ def _channel_record(
     (
         channel_id,
         kind,
-        stable_name,
+        name,
         description,
         owner_account_id,
         team_id,
@@ -657,7 +657,7 @@ def _channel_record(
     return ChannelRecord(
         channel_id=channel_id,
         kind=kind.value,
-        stable_name=stable_name,
+        name=name,
         description=description,
         owner_account_id=owner_account_id,
         team_id=team_id,

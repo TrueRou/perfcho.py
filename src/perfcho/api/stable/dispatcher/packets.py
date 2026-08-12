@@ -8,14 +8,35 @@ from datetime import datetime, timedelta
 from time import monotonic_ns
 from typing import Protocol, runtime_checkable
 
-from perfcho.api.cho.dispatcher.models import StableRuntimeContext
-from perfcho.api.cho.dispatcher.multiplayer import (
+from perfcho.api.stable.bubbles import StableBubbleRenderer, canonicalize_presence, canonicalize_spectator_frame
+from perfcho.api.stable.canonize.scoring import LEGACY_MOD_BITS, parse_legacy_mods
+from perfcho.api.stable.channels import parse_stable_channel_selector, stable_channel_name
+from perfcho.api.stable.dispatcher.models import StableRuntimeContext
+from perfcho.api.stable.dispatcher.multiplayer import (
     MULTIPLAYER_PACKETS,
     _broadcast_lobby,
     _broadcast_state,
-    _enqueue,
+    _publish,
     dispatch_multiplayer_mutation,
     dispatch_multiplayer_packet,
+)
+from perfcho.api.stable.realtime.builders import (
+    channel_join,
+    channel_kick,
+    friends_list,
+    notification,
+    target_is_silenced,
+    user_dm_blocked,
+    user_stats,
+)
+from perfcho.api.stable.realtime.codec import Packet, PacketReader, ProtocolError, build_packet
+from perfcho.api.stable.realtime.models import (
+    ClientPacket,
+    ClientStatus,
+    Message,
+    ServerPacket,
+    UserPresence,
+    UserStats,
 )
 from perfcho.infra.compose import StableServices
 from perfcho.infra.logging import duration_ms, log_event, rate_limit, sampled
@@ -35,56 +56,42 @@ from perfcho.modules.community import (
     PrivateMessageRejected,
     TargetAccountSilenced,
 )
-from perfcho.modules.identity import ResolvedStableSession
+from perfcho.modules.identity import ResolvedClientSession
 from perfcho.modules.multiplayer import CleanupPresence, MultiplayerMutationResult
 from perfcho.modules.realtime import (
+    ChannelMembershipAction,
+    ChannelUpdatedBubble,
+    ChatMessageBubble,
     InvalidFrame,
-    MailboxOverflow,
+    MultiplayerRoomAction,
+    MultiplayerRoomBubble,
+    MultiplayerSignalBubble,
+    MultiplayerSignalKind,
+    NotificationBubble,
     PresenceSnapshot,
+    PresenceSubscription,
+    RealtimeBubble,
     RealtimeSessionFenced,
     RealtimeSessionNotFound,
+    SessionControlAction,
+    SessionControlBubble,
     SessionFence,
+    SpectatorAction,
+    SpectatorFrame,
+    SpectatorFrameAction,
+    SpectatorFrameBubble,
     SpectatorHostOffline,
+    SpectatorLifecycleBubble,
     SpectatorRelation,
-)
-from perfcho.modules.realtime.stable.builders import (
-    channel_info,
-    channel_join,
-    channel_kick,
-    dispose_match,
-    fellow_spectator_joined,
-    fellow_spectator_left,
-    friends_list,
-    match_transfer_host,
-    notification,
-    restart,
-    send_message,
-    spectate_frames,
-    spectator_cant_spectate,
-    spectator_joined,
-    spectator_left,
-    target_is_silenced,
-    user_dm_blocked,
-    user_logout,
-    user_presence,
-    user_stats,
-)
-from perfcho.modules.realtime.stable.codec import Packet, PacketReader, ProtocolError, build_packet
-from perfcho.modules.realtime.stable.models import (
-    Channel,
-    ClientPacket,
-    ClientStatus,
-    Message,
-    ReplayAction,
-    ServerPacket,
-    UserPresence,
-    UserStats,
+    UserLogoutBubble,
+    multiplayer_room_snapshot,
+    presence_updated_bubble,
 )
 from perfcho.modules.scoring import AccountStatsView, Ruleset, ScoreboardVariant
-from perfcho.modules.scoring.mods import LEGACY_MOD_BITS, parse_legacy_mods
 from perfcho.modules.social import SocialAccountNotFound, SocialInteractionBlocked, SocialRelationRejected
 
 _MESSAGE_ID_WINDOW_SECONDS = 5
+_BUBBLE_RENDERER = StableBubbleRenderer()
 
 
 @runtime_checkable
@@ -94,26 +101,33 @@ class _LegacyAccountStatisticsQuery(Protocol):
     ) -> AccountStatsView: ...
 
 
-async def dispatch_packets(body: bytes, context: StableRuntimeContext, services: StableServices) -> bytes:
-    """Map application failures into bounded Stable responses instead of JSON errors."""
+async def dispatch_packets(
+    body: bytes,
+    context: StableRuntimeContext,
+    services: StableServices,
+) -> tuple[RealtimeBubble, ...]:
+    """Dispatch packets and return request-local protocol-neutral Bubbles."""
     started_ns = monotonic_ns()
     collect_summary = sampled(started_ns, services.settings.log_hot_path_sample_rate)
     packet_histogram: dict[str, int] | None = {} if collect_summary else None
     outcome = "success"
+    context.local_bubbles.clear()
+    context.stable_output.clear()
     output = b""
     dispatch_error: BaseException | None = None
     try:
         output = await _dispatch_packets(body, context, services, packet_histogram)
+        context.stable_output.extend(output)
     except (RealtimeSessionFenced, RealtimeSessionNotFound) as error:
         dispatch_error = error
         outcome = "realtime_fenced"
-        local_output = bytearray()
-        _extend_response(
-            local_output,
-            notification("Session state changed. Please reconnect.") + restart(0),
-            services.settings.stable_max_response_bytes,
+        context.local_bubbles.extend(
+            (
+                NotificationBubble("Session state changed. Please reconnect."),
+                SessionControlBubble(SessionControlAction.RECONNECT),
+            )
         )
-        output = bytes(local_output)
+        output = b""
         if rate_limit(f"stable-packet-fenced:{error.code}", interval_seconds=5):
             log_event(
                 "WARNING",
@@ -127,13 +141,8 @@ async def dispatch_packets(body: bytes, context: StableRuntimeContext, services:
     except ApplicationError as error:
         dispatch_error = error
         outcome = "application_rejected"
-        local_output = bytearray()
-        _extend_response(
-            local_output,
-            notification("The request could not be completed."),
-            services.settings.stable_max_response_bytes,
-        )
-        output = bytes(local_output)
+        context.local_bubbles.append(NotificationBubble("The request could not be completed."))
+        output = b""
         if rate_limit(f"stable-packet-rejected:{error.code}", interval_seconds=5):
             log_event(
                 "INFO",
@@ -162,10 +171,10 @@ async def dispatch_packets(body: bytes, context: StableRuntimeContext, services:
                 packet_count=sum(packet_histogram.values()),
                 packet_histogram=packet_histogram,
                 input_bytes=len(body),
-                output_bytes=len(output),
+                output_bytes=len(context.stable_output),
                 duration_ms=duration_ms(started_ns),
             )
-    return output
+    return tuple(context.local_bubbles)
 
 
 async def _dispatch_packets(
@@ -204,9 +213,12 @@ async def _dispatch_packets(
             )
             current_stats = _stats_from_status(current_stats, status)
             current_presence = _presence_from_stats(current_presence, current_stats)
-            payload = user_presence(current_presence) + user_stats(current_stats)
-            await _store_presence(current_presence, current_stats, context, services)
-            await broadcast_presence_update(payload, context.identity.account_id, services)
+            snapshot = await _store_presence(current_presence, current_stats, context, services)
+            await broadcast_presence_update(
+                presence_updated_bubble(snapshot),
+                context.identity.account_id,
+                services,
+            )
             _extend_response(output, user_stats(current_stats), response_limit)
         elif packet_type is ClientPacket.USER_STATS_REQUEST:
             account_ids = packet.payload.read_i32_list_u16(
@@ -253,24 +265,26 @@ async def _dispatch_packets(
             packet.payload.require_exhausted()
             if update_filter not in {0, 1, 2}:
                 raise ValueError("invalid Stable presence update filter")
-            await services.realtime.set_presence_filter(
+            subscription = {
+                0: PresenceSubscription.NONE,
+                1: PresenceSubscription.ALL,
+                2: PresenceSubscription.FOLLOWED,
+            }[update_filter]
+            await services.realtime.set_presence_subscription(
                 context.identity.account_id,
                 session_id=context.identity.session_id,
                 expected_revision=context.realtime.revision,
-                value=update_filter,
+                subscription=subscription,
             )
         elif packet_type is ClientPacket.START_SPECTATING:
             host_account_id = packet.payload.read_i32()
             packet.payload.require_exhausted()
-            _extend_response(
-                output,
+            context.local_bubbles.extend(
                 await _start_spectating(
                     host_account_id,
                     context,
                     services,
-                    max_bytes=response_limit - len(output),
-                ),
-                response_limit,
+                )
             )
         elif packet_type is ClientPacket.STOP_SPECTATING:
             packet.payload.require_exhausted()
@@ -278,13 +292,10 @@ async def _dispatch_packets(
         elif packet_type is ClientPacket.SPECTATE_FRAMES:
             bundle = packet.payload.read_replay_frame_bundle()
             packet.payload.require_exhausted()
-            sequence = bundle.sequence if bundle.sequence is not None else bundle.score_frame.time & 0xFFFF
             await _publish_spectator_frames(
-                sequence,
-                bundle.raw_data,
+                canonicalize_spectator_frame(context.identity.account_id, bundle),
                 context,
                 services,
-                reset_sequence=bundle.action is ReplayAction.NEW_SONG,
             )
         elif packet_type is ClientPacket.CANT_SPECTATE:
             packet.payload.require_exhausted()
@@ -412,7 +423,12 @@ async def _requested_packets(
         snapshot = await services.realtime.get_presence(account_id, at=now)
         if snapshot is None:
             continue
-        wire = _packet_from_snapshot(snapshot, packet_type)
+        bubble = presence_updated_bubble(snapshot)
+        wire = _BUBBLE_RENDERER.render_presence(
+            bubble,
+            include_identity=packet_type is ServerPacket.USER_PRESENCE,
+            include_statistics=packet_type is ServerPacket.USER_STATS,
+        )
         if wire and not _extend_response(output, wire, max_bytes):
             break
     return bytes(output)
@@ -425,20 +441,20 @@ async def _all_presence_packets(services: StableServices, *, max_bytes: int) -> 
     )
     output = bytearray()
     for snapshot in snapshots:
-        wire = _packet_from_snapshot(snapshot, ServerPacket.USER_PRESENCE)
+        wire = _BUBBLE_RENDERER.render_presence(
+            presence_updated_bubble(snapshot),
+            include_statistics=False,
+        )
         if wire and not _extend_response(output, wire, max_bytes):
             break
     return bytes(output)
 
 
-def _packet_from_snapshot(snapshot: PresenceSnapshot, packet_type: ServerPacket) -> bytes:
-    for packet in PacketReader(snapshot.payload, packet_enum=ServerPacket):
-        if packet.packet_type is packet_type:
-            return build_packet(packet.packet_id, packet.payload_view)
-    return b""
-
-
-async def broadcast_presence_update(payload: bytes, account_id: int, services: StableServices) -> None:
+async def broadcast_presence_update(
+    bubble: RealtimeBubble,
+    account_id: int,
+    services: StableServices,
+) -> None:
     """Fan out one presence change according to each online recipient's filter."""
     snapshots = await services.realtime.list_presences(
         at=services.clock.now(),
@@ -451,20 +467,19 @@ async def broadcast_presence_update(payload: bytes, account_id: int, services: S
         else frozenset()
     )
 
-    async def enqueue_snapshot(snapshot: PresenceSnapshot) -> BaseException | None:
+    async def publish_snapshot(snapshot: PresenceSnapshot) -> BaseException | None:
         if snapshot.account_id == account_id:
             return None
-        update_filter = await services.realtime.get_presence_filter(snapshot.account_id)
-        if update_filter != 1 and not (update_filter == 2 and snapshot.account_id in followers):
+        subscription = await services.realtime.get_presence_subscription(snapshot.account_id)
+        if subscription is not PresenceSubscription.ALL and not (
+            subscription is PresenceSubscription.FOLLOWED and snapshot.account_id in followers
+        ):
             return None
+        if services.bubbles is None:
+            return RuntimeError("realtime Bubble bus is unavailable")
         try:
-            await services.realtime.enqueue_mailbox(
-                snapshot.account_id,
-                payload,
-                recipient_fence=snapshot.fence,
-                expires_at=snapshot.expires_at,
-            )
-        except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+            await services.bubbles.publish(snapshot.fence, bubble)
+        except Exception as error:
             return error
         return None
 
@@ -472,7 +487,7 @@ async def broadcast_presence_update(payload: bytes, account_id: int, services: S
         error
         for error in await _bounded_gather(
             snapshots,
-            enqueue_snapshot,
+            publish_snapshot,
             limit=services.settings.stable_presence_fanout_concurrency,
         )
         if error is not None
@@ -525,17 +540,26 @@ async def _store_presence(
     stats: UserStats,
     context: StableRuntimeContext,
     services: StableServices,
-) -> None:
-    await services.realtime.set_presence(
-        PresenceSnapshot(
-            account_id=context.identity.account_id,
-            revision=context.realtime.revision,
-            payload=user_presence(presence) + user_stats(stats),
-            expires_at=context.realtime.expires_at,
-            session_id=context.identity.session_id,
-        ),
+) -> PresenceSnapshot:
+    identity, activity, statistics = canonicalize_presence(
+        presence,
+        stats,
+        country_code=context.identity.country_code,
+    )
+    snapshot = PresenceSnapshot(
+        account_id=context.identity.account_id,
+        revision=context.realtime.revision,
+        identity=identity,
+        activity=activity,
+        statistics=statistics,
+        expires_at=context.realtime.expires_at,
         session_id=context.identity.session_id,
     )
+    await services.realtime.set_presence(
+        snapshot,
+        session_id=context.identity.session_id,
+    )
+    return snapshot
 
 
 def _presence_from_stats(presence: UserPresence, stats: UserStats) -> UserPresence:
@@ -648,7 +672,10 @@ async def _join_channel(name: str, context: StableRuntimeContext, services: Stab
     if services.community is None:
         return b""
     try:
-        channel = await services.community.get_public_channel_by_stable_name(context.identity.account_id, name)
+        channel = await services.community.get_public_channel(
+            context.identity.account_id,
+            parse_stable_channel_selector(name),
+        )
         if _is_lobby_channel(name):
             members = await services.realtime.list_channel_members(channel.channel_id)
             if context.identity.account_id not in members:
@@ -666,9 +693,17 @@ async def _join_channel(name: str, context: StableRuntimeContext, services: Stab
         )
     except ApplicationError as error:
         return _channel_error_response(error)
-    info = channel_info(Channel(channel.name, channel.topic, min(count, 0xFFFF)))
-    await _broadcast_channel_count(info, members, context.identity.account_id, services)
-    return channel_join(channel.name) + info
+    wire_name = stable_channel_name(channel)
+    bubble = ChannelUpdatedBubble(
+        channel.channel_id,
+        wire_name,
+        channel.topic,
+        min(count, 0xFFFF),
+        ChannelMembershipAction.JOINED,
+    )
+    await _broadcast_channel_count(bubble, members, context.identity.account_id, services)
+    context.local_bubbles.append(bubble)
+    return b""
 
 
 async def _part_channel(name: str, context: StableRuntimeContext, services: StableServices) -> bytes:
@@ -677,7 +712,10 @@ async def _part_channel(name: str, context: StableRuntimeContext, services: Stab
     if _is_lobby_channel(name) or _is_multiplayer_channel(name):
         return b""
     try:
-        channel = await services.community.get_public_channel_by_stable_name(context.identity.account_id, name)
+        channel = await services.community.get_public_channel(
+            context.identity.account_id,
+            parse_stable_channel_selector(name),
+        )
     except ChannelNotFound:
         return b""
     try:
@@ -693,9 +731,17 @@ async def _part_channel(name: str, context: StableRuntimeContext, services: Stab
         members = await services.realtime.list_channel_members(channel.channel_id)
     except ApplicationError as error:
         return _channel_error_response(error)
-    info = channel_info(Channel(channel.name, channel.topic, min(count, 0xFFFF)))
-    await _broadcast_channel_count(info, members, context.identity.account_id, services)
-    return channel_kick(channel.name)
+    wire_name = stable_channel_name(channel)
+    bubble = ChannelUpdatedBubble(
+        channel.channel_id,
+        wire_name,
+        channel.topic,
+        min(count, 0xFFFF),
+        ChannelMembershipAction.LEFT,
+    )
+    await _broadcast_channel_count(bubble, members, context.identity.account_id, services)
+    context.local_bubbles.append(bubble)
+    return b""
 
 
 async def _send_public_message(message: Message, context: StableRuntimeContext, services: StableServices) -> bytes:
@@ -710,7 +756,7 @@ async def _send_public_message(message: Message, context: StableRuntimeContext, 
     try:
         result = await services.community.send_public_message(
             context.identity.account_id,
-            message.recipient,
+            parse_stable_channel_selector(message.recipient),
             _stable_message_id("public", message.recipient, content, context, services),
             content,
         )
@@ -718,12 +764,14 @@ async def _send_public_message(message: Message, context: StableRuntimeContext, 
         if channel is None:
             community_query = services.community_query
             if community_query is not None:
-                channel = await community_query.get_public_channel_by_stable_name(
-                    context.identity.account_id, message.recipient
+                channel = await community_query.get_public_channel(
+                    context.identity.account_id,
+                    parse_stable_channel_selector(message.recipient),
                 )
             else:
-                channel = await services.community.get_public_channel_by_stable_name(
-                    context.identity.account_id, message.recipient
+                channel = await services.community.get_public_channel(
+                    context.identity.account_id,
+                    parse_stable_channel_selector(message.recipient),
                 )
         channel_member_ids = tuple(sorted(await services.realtime.list_channel_members(channel.channel_id)))
         member_ids = tuple(account_id for account_id in channel_member_ids if account_id != context.identity.account_id)
@@ -750,23 +798,26 @@ async def _send_public_message(message: Message, context: StableRuntimeContext, 
         )
         return await _execute_bot_command(
             content,
-            channel.name,
+            stable_channel_name(channel),
             private=False,
             context=context,
             services=services,
             public_recipient_ids=channel_member_ids,
         )
-    wire = send_message(
-        Message(
-            sender=context.identity.current_name,
-            text=result.content,
-            recipient=channel.name,
-            sender_id=context.identity.account_id,
-        )
+    bubble = ChatMessageBubble(
+        result.message_id,
+        result.channel_id,
+        stable_channel_name(channel),
+        context.identity.account_id,
+        context.identity.current_name,
+        result.content,
+        result.is_action,
+        result.created_at,
+        False,
     )
     delivered_count = 0
     for account_id in member_ids:
-        delivered_count += int(await _enqueue_online_recipient(account_id, wire, services))
+        delivered_count += int(await _publish_online_recipient(account_id, bubble, services))
     _log_message_state(
         "public",
         "persisted",
@@ -777,7 +828,7 @@ async def _send_public_message(message: Message, context: StableRuntimeContext, 
     )
     return await _execute_bot_command(
         content,
-        channel.name,
+        stable_channel_name(channel),
         private=False,
         context=context,
         services=services,
@@ -825,17 +876,20 @@ async def _send_multiplayer_message(
             context.identity.account_id,
             recipient_ids,
         )
-    wire = send_message(
-        Message(
-            sender=context.identity.current_name,
-            text=content,
-            recipient="#multiplayer",
-            sender_id=context.identity.account_id,
-        )
+    bubble = ChatMessageBubble(
+        None,
+        None,
+        "#multiplayer",
+        context.identity.account_id,
+        context.identity.current_name,
+        content,
+        False,
+        services.clock.now(),
+        False,
     )
     delivered_count = 0
     for account_id in recipient_ids:
-        delivered_count += int(await _enqueue_online_recipient(account_id, wire, services))
+        delivered_count += int(await _publish_online_recipient(account_id, bubble, services))
     _log_message_state(
         "multiplayer",
         "delivered",
@@ -932,13 +986,16 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
             message_length=len(content),
         )
         return b""
-    wire = send_message(
-        Message(
-            sender=context.identity.current_name,
-            text=result.content,
-            recipient=target.display_name,
-            sender_id=context.identity.account_id,
-        )
+    bubble = ChatMessageBubble(
+        result.message_id,
+        result.channel_id,
+        target.display_name,
+        context.identity.account_id,
+        context.identity.current_name,
+        result.content,
+        result.is_action,
+        result.created_at,
+        True,
     )
     target_presence = await services.realtime.get_presence(target.account_id, at=services.clock.now())
     if target_presence is None:
@@ -950,43 +1007,42 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
             recipient_count=1,
         )
         return notification(f"{target.display_name} is offline and will receive your message on their next login.")
-    try:
-        await services.realtime.enqueue_mailbox(
-            target.account_id,
-            wire,
-            recipient_fence=target_presence.fence,
-            expires_at=target_presence.expires_at,
-        )
-    except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+    if not await _publish_to_presence(target_presence, bubble, services):
         _log_message_state(
             "direct",
             "delivery_deferred",
             context.identity.account_id,
             message_length=len(content),
             recipient_count=1,
-            error=error,
         )
         return notification("The recipient is temporarily unable to receive messages.")
 
-    target_stats_packet = _packet_from_snapshot(target_presence, ServerPacket.USER_STATS)
-    if target_stats_packet:
-        packet = next(PacketReader(target_stats_packet, packet_enum=ServerPacket))
-        target_stats = packet.payload.read_user_stats()
-        if target_stats.action == 1:
-            away_message = await services.realtime.get_away_message(target.account_id)
-            if away_message:
-                _log_message_state(
-                    "direct",
-                    "delivered_with_away_reply",
-                    context.identity.account_id,
-                    message_length=len(content),
-                    recipient_count=1,
-                    delivered_count=1,
-                    away_message_length=len(away_message),
+    if target_presence.activity.action == "away":
+        away_message = await services.realtime.get_away_message(target.account_id)
+        if away_message:
+            _log_message_state(
+                "direct",
+                "delivered_with_away_reply",
+                context.identity.account_id,
+                message_length=len(content),
+                recipient_count=1,
+                delivered_count=1,
+                away_message_length=len(away_message),
+            )
+            context.local_bubbles.append(
+                ChatMessageBubble(
+                    None,
+                    None,
+                    context.identity.current_name,
+                    target.account_id,
+                    target.display_name,
+                    away_message,
+                    False,
+                    services.clock.now(),
+                    True,
                 )
-                return send_message(
-                    Message(target.display_name, away_message, context.identity.current_name, target.account_id)
-                )
+            )
+            return b""
     _log_message_state(
         "direct",
         "delivered",
@@ -1039,22 +1095,25 @@ async def _execute_bot_command(
     output = bytearray()
     if result.response:
         target = context.identity.current_name if private else recipient
-        wire = send_message(
-            Message(
-                services.bot.bot_name,
-                result.response[:2000],
-                target,
-                services.bot.bot_account_id,
-            )
+        bubble = ChatMessageBubble(
+            None,
+            None,
+            target,
+            services.bot.bot_account_id,
+            services.bot.bot_name,
+            result.response[:2000],
+            False,
+            services.clock.now(),
+            private,
         )
-        _extend_response(output, wire, services.settings.stable_max_response_bytes)
+        context.local_bubbles.append(bubble)
         if not private:
             for account_id in public_recipient_ids:
                 if account_id != context.identity.account_id:
-                    await _enqueue_online_recipient(account_id, wire, services)
+                    await _publish_online_recipient(account_id, bubble, services)
 
     if result.directive is BotDirective.RECONNECT:
-        _extend_response(output, restart(0), services.settings.stable_max_response_bytes)
+        context.local_bubbles.append(SessionControlBubble(SessionControlAction.RECONNECT))
     elif result.directive is BotDirective.QUIT:
         context.session_closed = True
         _extend_response(output, await _logout(context, services), services.settings.stable_max_response_bytes)
@@ -1062,7 +1121,9 @@ async def _execute_bot_command(
     if isinstance(result.effect, MultiplayerMutationResult):
         _extend_response(
             output,
-            await dispatch_multiplayer_mutation(result.effect, context.identity.account_id, services),
+            await dispatch_multiplayer_mutation(
+                result.effect, context.identity.account_id, services, context.local_bubbles
+            ),
             services.settings.stable_max_response_bytes,
         )
 
@@ -1183,35 +1244,50 @@ def _public_message_error_response(error: ApplicationError) -> bytes:
 
 
 async def _broadcast_channel_count(
-    payload: bytes,
+    bubble: ChannelUpdatedBubble,
     member_ids: frozenset[int],
     excluded_account_id: int,
     services: StableServices,
 ) -> None:
+    remote_bubble = ChannelUpdatedBubble(
+        bubble.channel_id,
+        bubble.name,
+        bubble.topic,
+        bubble.member_count,
+    )
     for account_id in member_ids:
         if account_id != excluded_account_id:
-            await _enqueue_online_recipient(account_id, payload, services)
+            await _publish_online_recipient(account_id, remote_bubble, services)
 
 
-async def _enqueue_online_recipient(account_id: int, payload: bytes, services: StableServices) -> bool:
+async def _publish_online_recipient(
+    account_id: int,
+    bubble: RealtimeBubble,
+    services: StableServices,
+) -> bool:
     presence = await services.realtime.get_presence(account_id, at=services.clock.now())
     if presence is None:
         return False
+    return await _publish_to_presence(presence, bubble, services)
+
+
+async def _publish_to_presence(
+    presence: PresenceSnapshot,
+    bubble: RealtimeBubble,
+    services: StableServices,
+) -> bool:
+    if services.bubbles is None:
+        return False
     try:
-        await services.realtime.enqueue_mailbox(
-            account_id,
-            payload,
-            recipient_fence=presence.fence,
-            expires_at=presence.expires_at,
-        )
-    except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+        await services.bubbles.publish(presence.fence, bubble)
+    except Exception as error:
         if rate_limit("stable-message-delivery-failed", interval_seconds=5):
             log_event(
                 "WARNING",
                 "stable.message.delivery_failed",
                 exception=error,
                 outcome="deferred",
-                account_id=account_id,
+                account_id=presence.account_id,
                 failure_count=1,
             )
         return False
@@ -1260,7 +1336,10 @@ async def _logout(context: StableRuntimeContext, services: StableServices) -> by
             if previous is not None:
                 if state is None:
                     await _broadcast_lobby(
-                        dispose_match(previous.room.public_id),
+                        MultiplayerRoomBubble(
+                            MultiplayerRoomAction.DISPOSED,
+                            multiplayer_room_snapshot(previous),
+                        ),
                         context.identity.account_id,
                         services,
                     )
@@ -1270,9 +1349,13 @@ async def _logout(context: StableRuntimeContext, services: StableServices) -> by
                         previous.room.host_account_id == context.identity.account_id
                         and state.room.host_account_id != context.identity.account_id
                     ):
-                        await _enqueue(
+                        await _publish(
                             state.room.host_account_id,
-                            match_transfer_host(),
+                            MultiplayerSignalBubble(
+                                MultiplayerSignalKind.HOST_TRANSFERRED,
+                                state.room.public_id,
+                                actor_account_id=state.room.host_account_id,
+                            ),
                             state,
                             services,
                         )
@@ -1291,7 +1374,7 @@ async def _logout(context: StableRuntimeContext, services: StableServices) -> by
     if context.raw_token is not None:
         durable_session_outcome = "closed"
         try:
-            await services.identity.close_stable_session(context.raw_token, reason="client_logout")
+            await services.identity.close_client_session(context.raw_token, reason="client_logout")
         except ApplicationError as error:
             durable_session_outcome = "failed"
             log_event(
@@ -1321,23 +1404,15 @@ async def _logout(context: StableRuntimeContext, services: StableServices) -> by
             error_code=error.code,
             error_type=type(error).__name__,
         )
-    wire = user_logout(context.identity.account_id)
+    bubble = UserLogoutBubble(context.identity.account_id)
     recipient_count = 0
     delivery_failure_count = 0
     delivery_error: BaseException | None = None
     for snapshot in snapshots:
         if snapshot.account_id != context.identity.account_id:
             recipient_count += 1
-            try:
-                await services.realtime.enqueue_mailbox(
-                    snapshot.account_id,
-                    wire,
-                    recipient_fence=snapshot.fence,
-                    expires_at=snapshot.expires_at,
-                )
-            except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+            if not await _publish_to_presence(snapshot, bubble, services):
                 delivery_failure_count += 1
-                delivery_error = delivery_error or error
     log_event(
         "INFO",
         "stable.logout.completed",
@@ -1401,9 +1476,7 @@ async def _start_spectating(
     host_account_id: int,
     context: StableRuntimeContext,
     services: StableServices,
-    *,
-    max_bytes: int,
-) -> bytes:
+) -> tuple[RealtimeBubble, ...]:
     if host_account_id < 1 or host_account_id == context.identity.account_id:
         log_event(
             "INFO",
@@ -1411,7 +1484,7 @@ async def _start_spectating(
             outcome="invalid_target",
             spectator_account_id=context.identity.account_id,
         )
-        return b""
+        return ()
     now = services.clock.now()
     host_presence = await services.realtime.get_presence(host_account_id, at=now)
     if host_presence is None:
@@ -1422,7 +1495,7 @@ async def _start_spectating(
             host_account_id=host_account_id,
             spectator_account_id=context.identity.account_id,
         )
-        return b""
+        return ()
     try:
         current = await services.realtime.get_spectator_relation(
             context.identity.account_id,
@@ -1437,7 +1510,7 @@ async def _start_spectating(
                 host_account_id=host_account_id,
                 spectator_account_id=context.identity.account_id,
             )
-            return b""
+            return ()
         if current is not None:
             await _detach_spectator(current, services, at=now)
         existing = await services.realtime.list_spectators(
@@ -1456,7 +1529,7 @@ async def _start_spectating(
             error_code=error.code,
             error_type=type(error).__name__,
         )
-        return b""
+        return ()
     expiry = min(context.realtime.expires_at, host_presence.expires_at)
     try:
         attachment = await services.realtime.attach_spectator(
@@ -1479,41 +1552,44 @@ async def _start_spectating(
             error_code=error.code,
             error_type=type(error).__name__,
         )
-        return b""
+        return ()
     relation = attachment.relation
     delivery_failure_count = int(
-        not await _enqueue_spectator_packet(
-            host_account_id,
-            spectator_joined(context.identity.account_id),
+        not await _publish_spectator_bubble(
             relation.host_fence,
-            relation.expires_at,
+            SpectatorLifecycleBubble(
+                SpectatorAction.ATTACHED_TO_HOST,
+                host_account_id,
+                context.identity.account_id,
+            ),
             services,
         )
     )
-    output = bytearray()
+    local_bubbles: list[RealtimeBubble] = []
     fellow_count = 0
     for existing_relation in existing:
         if existing_relation.spectator_account_id == context.identity.account_id:
             continue
         fellow_count += 1
-        _extend_response(
-            output,
-            fellow_spectator_joined(existing_relation.spectator_account_id),
-            max_bytes,
+        local_bubbles.append(
+            SpectatorLifecycleBubble(
+                SpectatorAction.FELLOW_ATTACHED,
+                host_account_id,
+                existing_relation.spectator_account_id,
+            )
         )
-        delivered = await _enqueue_spectator_packet(
-            existing_relation.spectator_account_id,
-            fellow_spectator_joined(context.identity.account_id),
+        delivered = await _publish_spectator_bubble(
             existing_relation.spectator_fence,
-            min(relation.expires_at, existing_relation.expires_at),
+            SpectatorLifecycleBubble(
+                SpectatorAction.FELLOW_ATTACHED,
+                host_account_id,
+                context.identity.account_id,
+            ),
             services,
         )
         delivery_failure_count += int(not delivered)
-    history_frame_count = 0
-    for frame in attachment.history.frames:
-        if not _extend_response(output, frame.payload, max_bytes):
-            break
-        history_frame_count += 1
+    local_bubbles.extend(_spectator_frame_bubble(frame) for frame in attachment.history.frames)
+    history_frame_count = len(attachment.history.frames)
     log_event(
         "INFO",
         "stable.spectator.attach",
@@ -1524,7 +1600,7 @@ async def _start_spectating(
         history_frame_count=history_frame_count,
         delivery_failure_count=delivery_failure_count,
     )
-    return bytes(output)
+    return tuple(local_bubbles)
 
 
 async def _stop_spectating(context: StableRuntimeContext, services: StableServices) -> None:
@@ -1570,24 +1646,27 @@ async def _detach_spectator(
         )
         return
     delivery_failure_count = int(
-        not await _enqueue_spectator_packet(
-            relation.host_account_id,
-            spectator_left(relation.spectator_account_id),
+        not await _publish_spectator_bubble(
             relation.host_fence,
-            relation.expires_at,
+            SpectatorLifecycleBubble(
+                SpectatorAction.DETACHED_FROM_HOST,
+                relation.host_account_id,
+                relation.spectator_account_id,
+            ),
             services,
         )
     )
-    wire = fellow_spectator_left(relation.spectator_account_id)
     fellow_count = 0
     for spectator in spectators:
         if spectator.spectator_account_id != relation.spectator_account_id:
             fellow_count += 1
-            delivered = await _enqueue_spectator_packet(
-                spectator.spectator_account_id,
-                wire,
+            delivered = await _publish_spectator_bubble(
                 spectator.spectator_fence,
-                min(relation.expires_at, spectator.expires_at),
+                SpectatorLifecycleBubble(
+                    SpectatorAction.FELLOW_DETACHED,
+                    relation.host_account_id,
+                    relation.spectator_account_id,
+                ),
                 services,
             )
             delivery_failure_count += int(not delivered)
@@ -1603,47 +1682,46 @@ async def _detach_spectator(
 
 
 async def _publish_spectator_frames(
-    sequence: int,
-    raw_data: memoryview,
+    frame: SpectatorFrameBubble,
     context: StableRuntimeContext,
     services: StableServices,
-    *,
-    reset_sequence: bool,
 ) -> None:
     started_ns = monotonic_ns()
-    wire = spectate_frames(raw_data)
     try:
         result = await services.realtime.publish_spectator_frame(
             context.identity.account_id,
             host_fence=context.realtime.fence,
-            sequence=sequence,
-            reset_sequence=reset_sequence,
-            payload=wire,
+            frame=frame,
+            reset_history=frame.action is SpectatorFrameAction.NEW_PLAY,
             expires_at=context.realtime.expires_at,
         )
     except (InvalidFrame, SpectatorHostOffline, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
-        if sampled((started_ns, sequence, "spectator_frame"), services.settings.log_hot_path_sample_rate):
+        if sampled((started_ns, frame.sequence, "spectator_frame"), services.settings.log_hot_path_sample_rate):
             log_event(
                 "DEBUG",
                 "stable.spectator.frame_summary",
                 exception=error,
                 outcome="rejected",
                 host_account_id=context.identity.account_id,
-                frame_bytes=len(raw_data),
+                frame_count=len(frame.frames),
                 recipient_count=0,
                 error_code=error.code,
                 error_type=type(error).__name__,
                 duration_ms=duration_ms(started_ns),
             )
         return
-    if sampled((started_ns, sequence, "spectator_frame"), services.settings.log_hot_path_sample_rate):
+    delivered = await _publish_spectator_many(
+        tuple(recipient.fence for recipient in result.recipients), frame, services
+    )
+    if sampled((started_ns, frame.sequence, "spectator_frame"), services.settings.log_hot_path_sample_rate):
         log_event(
             "DEBUG",
             "stable.spectator.frame_summary",
             outcome="published",
             host_account_id=context.identity.account_id,
-            frame_bytes=len(raw_data),
-            recipient_count=len(result.recipient_account_ids),
+            frame_count=len(frame.frames),
+            recipient_count=len(result.recipients),
+            subscriber_count=delivered,
             duration_ms=duration_ms(started_ns),
         )
 
@@ -1657,7 +1735,6 @@ async def _cant_spectate(context: StableRuntimeContext, services: StableServices
     )
     if relation is None:
         return
-    wire = spectator_cant_spectate(context.identity.account_id)
     try:
         recipients = await services.realtime.list_spectators(
             relation.host_account_id,
@@ -1667,41 +1744,56 @@ async def _cant_spectate(context: StableRuntimeContext, services: StableServices
     except (RealtimeSessionFenced, RealtimeSessionNotFound) as error:
         recipients = ()
         _log_spectator_delivery_failure("list_spectators", error, host_account_id=relation.host_account_id)
-    await _enqueue_spectator_packet(
+    bubble = SpectatorLifecycleBubble(
+        SpectatorAction.PLAYBACK_UNAVAILABLE,
         relation.host_account_id,
-        wire,
-        relation.host_fence,
-        relation.expires_at,
+        context.identity.account_id,
+    )
+    await _publish_spectator_many(
+        (relation.host_fence, *(recipient.spectator_fence for recipient in recipients)),
+        bubble,
         services,
     )
-    for recipient in recipients:
-        await _enqueue_spectator_packet(
-            recipient.spectator_account_id,
-            wire,
-            recipient.spectator_fence,
-            recipient.expires_at,
-            services,
-        )
 
 
-async def _enqueue_spectator_packet(
-    account_id: int,
-    payload: bytes,
+async def _publish_spectator_bubble(
     recipient_fence: SessionFence,
-    expires_at: datetime,
+    bubble: RealtimeBubble,
     services: StableServices,
 ) -> bool:
+    if services.bubbles is None:
+        return False
     try:
-        await services.realtime.enqueue_mailbox(
-            account_id,
-            payload,
-            recipient_fence=recipient_fence,
-            expires_at=expires_at,
-        )
-    except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
-        _log_spectator_delivery_failure("enqueue_mailbox", error, account_id=account_id)
+        await services.bubbles.publish(recipient_fence, bubble)
+    except Exception as error:
+        _log_spectator_delivery_failure("publish", error)
         return False
     return True
+
+
+async def _publish_spectator_many(
+    recipient_fences: tuple[SessionFence, ...],
+    bubble: RealtimeBubble,
+    services: StableServices,
+) -> int:
+    if services.bubbles is None or not recipient_fences:
+        return 0
+    try:
+        return await services.bubbles.publish_many(recipient_fences, bubble)
+    except Exception as error:
+        _log_spectator_delivery_failure("publish_many", error)
+        return 0
+
+
+def _spectator_frame_bubble(frame: SpectatorFrame) -> SpectatorFrameBubble:
+    return SpectatorFrameBubble(
+        frame.host_account_id,
+        frame.sequence,
+        frame.action,
+        frame.frames,
+        frame.score,
+        frame.extra,
+    )
 
 
 def _log_spectator_delivery_failure(
@@ -1729,7 +1821,7 @@ def _ignore_unsupported(packet: Packet) -> None:
     del packet
 
 
-def realtime_expiry(context: ResolvedStableSession, services: StableServices) -> datetime:
+def realtime_expiry(context: ResolvedClientSession, services: StableServices) -> datetime:
     """Bound Redis state by both durable session expiry and configured online TTL."""
     online_expiry = services.clock.now() + timedelta(seconds=services.settings.redis_session_ttl_seconds)
     return min(context.expires_at, online_expiry)

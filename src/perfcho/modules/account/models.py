@@ -22,7 +22,7 @@ class RegisterAccount:
 
 @dataclass(frozen=True, slots=True)
 class RegistrationResult:
-    """Return the stable, non-secret result of account registration."""
+    """Return the durable, non-secret result of account registration."""
 
     account_id: int
     display_name: str

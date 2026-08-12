@@ -14,8 +14,8 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.api.cho import router
-from perfcho.api.cho.dependencies import get_stable_services
+from perfcho.api.stable import router
+from perfcho.api.stable.dependencies import get_stable_services
 from perfcho.infra.compose import StableServices
 from perfcho.infra.db.models.scoring import RankingPolicy, Score
 from perfcho.infra.db.projectors.ranking import _metric_value, _tie_break_value
@@ -31,8 +31,8 @@ from perfcho.modules.content import (
     RatingSummary,
     UpstreamContentUnavailable,
 )
-from perfcho.modules.identity import IdentityService, InvalidCredentials, StableWebPrincipal
-from perfcho.modules.realtime import RealtimeRepository, RealtimeSession, RealtimeSessionNotFound
+from perfcho.modules.identity import IdentityService, InvalidCredentials, OnlineCredentialPrincipal
+from perfcho.modules.realtime import RealtimeSession, RealtimeSessionNotFound, RealtimeStateRepository
 from perfcho.modules.scoring import (
     AcceptedScoreResult,
     AcceptScore,
@@ -77,10 +77,12 @@ class FakeIds:
 
 
 class FakeIdentity:
-    async def verify_stable_web(self, identifier: str, password_token: str) -> StableWebPrincipal:
-        if identifier != "player" or password_token != PASSWORD_MD5:
+    async def verify_online_credentials(
+        self, identifier: str, password_preverification: str
+    ) -> OnlineCredentialPrincipal:
+        if identifier != "player" or password_preverification != PASSWORD_MD5:
             raise InvalidCredentials()
-        return StableWebPrincipal(3, "player", SESSION_ID, NOW + timedelta(hours=1))
+        return OnlineCredentialPrincipal(3, "player", SESSION_ID, NOW + timedelta(hours=1))
 
 
 class FakeRealtime:
@@ -230,7 +232,7 @@ class FakeRankingQuery:
             nkatu=0,
             ngeki=0,
             perfect=True,
-            legacy_mod_bits=0,
+            mods=(),
             rank=1,
             ended_at=NOW,
             has_replay=True,
@@ -302,7 +304,7 @@ def stable_services() -> tuple[StableServices, FakeScoring, FakeStorage, FakeRep
     services = StableServices(
         identity=cast(IdentityService, FakeIdentity()),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=cast(RealtimeRepository, FakeRealtime()),
+        realtime=cast(RealtimeStateRepository, FakeRealtime()),
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, FakeIds()),
         settings=Settings(),
@@ -459,7 +461,7 @@ async def test_score_submission_logs_stages_domain_code_and_no_submission_secret
 ) -> None:
     import importlib
 
-    web_module = importlib.import_module("perfcho.api.cho.router.web")
+    web_module = importlib.import_module("perfcho.api.stable.router.web")
     events: list[tuple[str, str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:

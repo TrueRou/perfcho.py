@@ -59,7 +59,6 @@ from perfcho.modules.scoring import (
     AcceptScore,
     BeatmapReference,
     CanonicalMod,
-    ClientFamily,
     HitStatistic,
     LeaderboardScope,
     MultiplayerSubmissionContext,
@@ -160,7 +159,7 @@ class FakeRepository:
 
     async def get_or_create_mod_set(self, scoreboard_id: int, normalized: NormalizedModSet) -> ModSetInfo:
         self.calls.append("mod-set")
-        return ModSetInfo(30, scoreboard_id, normalized.canonical, normalized.canonical_digest, normalized.legacy_bits)
+        return ModSetInfo(30, scoreboard_id, normalized.canonical, normalized.canonical_digest)
 
     async def claim_attempt(self, record: PlayAttemptRecord) -> AttemptClaim:
         self.calls.append("attempt")
@@ -273,7 +272,7 @@ def command() -> AcceptScore:
         ),
         replay=StagedReplayManifest("stable", b"r" * 32, 100, "replays/test.osr", "b20260711.1"),
         attestation=ScoreAttestation(
-            ClientFamily.STABLE,
+            "stable",
             "b20260711.1",
             "verified",
             checksum=b"a" * 32,
@@ -465,7 +464,7 @@ def test_score_validation_enforces_object_count_and_vanilla_combo_bounds() -> No
         )
 
 
-def test_lazer_grading_uses_current_score_processor_thresholds() -> None:
+def test_threshold_grading_uses_current_score_processor_thresholds() -> None:
     submitted = command()
     revision = BeatmapRevisionInfo(10, 20, Ruleset.TAIKO, "ranked", 100, 100)
     score = replace(
@@ -486,7 +485,7 @@ def test_lazer_grading_uses_current_score_processor_thresholds() -> None:
         replace(submitted.attempt, progress=Decimal(1)),
         score,
         revision,
-        lazer_grading=True,
+        uses_threshold_grading=True,
     )
 
     assert validated.grade is ScoreGrade.S

@@ -4,8 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection
 
-from .codec import DEFAULT_LIMITS, CodecLimits, PacketWriter, ReadableBuffer
-from .models import Channel, Message, MultiplayerMatch, ScoreFrame, ServerPacket, UserPresence, UserStats
+from .codec import DEFAULT_LIMITS, CodecLimits, PacketWriter
+from .models import (
+    Channel,
+    Message,
+    MultiplayerMatch,
+    ReplayFrameBundle,
+    ScoreFrame,
+    ServerPacket,
+    UserPresence,
+    UserStats,
+)
 
 
 def _build(
@@ -231,9 +240,9 @@ def spectator_cant_spectate(user_id: int, *, limits: CodecLimits = DEFAULT_LIMIT
     return _build(ServerPacket.SPECTATOR_CANT_SPECTATE, lambda writer: writer.write_i32(user_id), limits=limits)
 
 
-def spectate_frames(data: ReadableBuffer, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
-    """Wrap an already validated spectator frame bundle without decoding it again."""
-    return _build(ServerPacket.SPECTATE_FRAMES, lambda writer: writer.write_raw(data), limits=limits)
+def spectate_frames(bundle: ReplayFrameBundle, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build a spectator frame packet from parsed Stable fields."""
+    return _build(ServerPacket.SPECTATE_FRAMES, lambda writer: writer.write_replay_frame_bundle(bundle), limits=limits)
 
 
 def update_match(

@@ -8,7 +8,7 @@ from decimal import Decimal
 from types import MappingProxyType
 
 from perfcho.modules.common.models import JsonValue
-from perfcho.modules.scoring.models import CanonicalMod, ClientFamily, ScoreboardInfo, ScoreSubmission
+from perfcho.modules.scoring.models import CanonicalMod, ScoreboardInfo, ScoreSubmission
 
 _CALCULATION_QUANTUM = Decimal("0.00001")
 
@@ -37,7 +37,7 @@ class PerformanceCalculationInput:
     scoreboard: ScoreboardInfo
     mod_set_id: int
     mods: tuple[CanonicalMod, ...]
-    client_family: ClientFamily
+    source: str
     score: ScoreSubmission
 
     def __post_init__(self) -> None:
@@ -84,7 +84,7 @@ class PerformanceCalculationInput:
             "variant": self.scoreboard.variant.value,
             "mod_set_id": self.mod_set_id,
             "mods": [mod.as_json() for mod in self.mods],
-            "client_family": self.client_family.value,
+            "client_family": self.source,
             "score": {
                 "total_score": self.score.total_score,
                 "classic_score": self.score.classic_score,

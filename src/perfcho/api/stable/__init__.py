@@ -2,8 +2,8 @@
 
 from fastapi import APIRouter
 
-from perfcho.api.cho.router.cho import router as bancho_router
-from perfcho.api.cho.router.web import router as web_router
+from perfcho.api.stable.router.cho import router as bancho_router
+from perfcho.api.stable.router.web import router as web_router
 
 router = APIRouter(tags=["osu! Stable Protocol"])
 router.include_router(web_router)

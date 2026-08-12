@@ -188,11 +188,11 @@ class AuthSession(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
             postgresql_where=text("revoked_at IS NULL AND closed_at IS NULL"),
         ),
         Index(
-            "uq_auth_sessions_active_normal_stable_account",
+            "uq_auth_sessions_active_client_account",
             "account_id",
             unique=True,
             postgresql_where=text(
-                "client_family = 'stable' AND session_class = 'normal' AND revoked_at IS NULL AND closed_at IS NULL"
+                "oauth_client_id IS NULL AND session_class = 'normal' AND revoked_at IS NULL AND closed_at IS NULL"
             ),
         ),
         {"schema": "iam"},

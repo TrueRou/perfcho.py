@@ -79,7 +79,7 @@ class ContentRepository(Protocol):
         target: str,
         external_target_id: int,
     ) -> tuple[CommentView, ...]:
-        """List visible comments for one public Stable target."""
+        """List visible comments for one public content target."""
         ...
 
     async def create_comment(
@@ -90,7 +90,7 @@ class ContentRepository(Protocol):
         position_ms: int,
         body: str,
     ) -> CommentView:
-        """Persist one visible comment for a public Stable target."""
+        """Persist one visible comment for a public content target."""
         ...
 
     async def synchronize_beatmapset(

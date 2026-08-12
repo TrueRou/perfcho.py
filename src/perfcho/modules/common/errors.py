@@ -2,7 +2,7 @@
 
 
 class ApplicationError(Exception):
-    """Base an expected application failure on a stable machine-readable code."""
+    """Base an expected application failure on a durable machine-readable code."""
 
     code = "application_error"
 

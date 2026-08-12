@@ -69,46 +69,6 @@ local function session_status(session_key, epoch_key, account, session_id, revis
 end
 """
 
-_ORDERED = """
-local function ordered_stats(key, at, maximum, remove_expired)
-    local members = redis.call('ZRANGE', key, 0, maximum)
-    if #members > maximum then
-        return -1, 0, 0
-    end
-    local count = 0
-    local bytes = 0
-    local deadline = 0
-    for _, member in ipairs(members) do
-        local separator = string.find(member, ':', 21, true)
-        if not separator then
-            return -1, 0, 0
-        end
-        local expiry = tonumber(string.sub(member, 21, separator - 1))
-        if not expiry then
-            return -1, 0, 0
-        end
-        if expiry <= at and remove_expired then
-            redis.call('ZREM', key, member)
-        elseif expiry > at then
-            count = count + 1
-            bytes = bytes + #member - separator
-            if expiry > deadline then deadline = expiry end
-        end
-    end
-    return count, bytes, deadline
-end
-
-local function expire_ordered(data_key, bytes_key, count, bytes, deadline)
-    if count == 0 then
-        redis.call('DEL', data_key, bytes_key)
-        return
-    end
-    redis.call('SET', bytes_key, tostring(bytes))
-    redis.call('PEXPIREAT', data_key, deadline)
-    redis.call('PEXPIREAT', bytes_key, deadline)
-end
-"""
-
 _FRAMES = """
 local function frame_parts(member)
     local second = string.find(member, ':', 21, true)
@@ -184,7 +144,7 @@ end
 -- small wall-clock skew cannot reject an otherwise valid login.
 local expiry = math.min(requested_expiry, durable_expiry, now + ttl)
 if expiry <= now then return {'INVALID_EXPIRY'} end
-if redis.call('GET', KEYS[17]) == ARGV[6] then return {'REVISION_OVERFLOW'} end
+if redis.call('GET', KEYS[13]) == ARGV[6] then return {'REVISION_OVERFLOW'} end
 local previous_account = redis.call('HGET', KEYS[1], 'account_id')
 if previous_account and previous_account ~= ARGV[1] then return {'FENCED'} end
 local old_epoch = redis.call('GET', KEYS[2])
@@ -193,7 +153,6 @@ if old_epoch then
     local old_session_id = separator and string.sub(old_epoch, 1, separator - 1)
     local old_revision = separator and string.sub(old_epoch, separator + 1)
     if old_session_id and old_revision then
-        redis.call('DEL', ARGV[12] .. ARGV[1] .. ':signal:' .. old_session_id .. ':' .. old_revision)
         local old_channels = ARGV[8] .. old_session_id .. ':channels'
         for _, channel_id in ipairs(redis.call('SMEMBERS', old_channels)) do
             local members = ARGV[9] .. channel_id .. ':members'
@@ -205,7 +164,7 @@ if old_epoch then
             end
         end
         redis.call('DEL', old_channels)
-        local old_relation = redis.call('HGETALL', KEYS[11])
+        local old_relation = redis.call('HGETALL', KEYS[7])
         local relation_values = {}
         for index = 1, #old_relation, 2 do relation_values[old_relation[index]] = old_relation[index + 1] end
         if relation_values['spectator_session_id'] == old_session_id
@@ -213,24 +172,24 @@ if old_epoch then
             local old_viewers = ARGV[11] .. relation_values['host_account_id'] .. ':viewers'
             redis.call('ZREM', old_viewers, ARGV[1])
             refresh_viewers(old_viewers)
-            redis.call('DEL', KEYS[11])
+            redis.call('DEL', KEYS[7])
         end
-        for _, spectator in ipairs(redis.call('ZRANGE', KEYS[13], 0, -1)) do
+        for _, spectator in ipairs(redis.call('ZRANGE', KEYS[9], 0, -1)) do
             local relation_key = ARGV[10] .. spectator .. ':host'
             if redis.call('HGET', relation_key, 'host_session_id') == old_session_id
                 and redis.call('HGET', relation_key, 'host_revision') == old_revision then
                 redis.call('DEL', relation_key)
             end
         end
-        redis.call('DEL', KEYS[13])
+        redis.call('DEL', KEYS[9])
         if old_session_id ~= ARGV[2] then redis.call('DEL', ARGV[7] .. old_session_id) end
     end
 end
 redis.call('DEL', KEYS[3], KEYS[5], KEYS[6], KEYS[7], KEYS[8], KEYS[9], KEYS[10],
-    KEYS[11], KEYS[12], KEYS[13], KEYS[14], KEYS[15], KEYS[16])
+    KEYS[11], KEYS[12])
 redis.call('ZREM', KEYS[4], ARGV[1])
-local revision = redis.call('INCR', KEYS[17])
-redis.call('PEXPIREAT', KEYS[17], durable_expiry)
+local revision = redis.call('INCR', KEYS[13])
+redis.call('PEXPIREAT', KEYS[13], durable_expiry)
 redis.call('HSET', KEYS[1], 'account_id', ARGV[1], 'revision', revision, 'expires_at', expiry,
     'durable_expires_at', ARGV[4])
 redis.call('PEXPIREAT', KEYS[1], expiry)
@@ -361,7 +320,6 @@ local now = now_ms()
 local status = session_status(KEYS[1], KEYS[2], ARGV[1], ARGV[2], ARGV[3], now)
 if status ~= 'OK' then return {status} end
 local epoch = ARGV[2] .. '|' .. ARGV[3]
-redis.call('DEL', ARGV[7] .. ARGV[1] .. ':signal:' .. ARGV[2] .. ':' .. ARGV[3])
 for _, channel_id in ipairs(redis.call('SMEMBERS', KEYS[6])) do
     local members = ARGV[4] .. channel_id .. ':members'
     local epochs = ARGV[4] .. channel_id .. ':epochs'
@@ -371,15 +329,15 @@ for _, channel_id in ipairs(redis.call('SMEMBERS', KEYS[6])) do
         refresh_channel(members, epochs)
     end
 end
-local relation_host = redis.call('HGET', KEYS[11], 'host_account_id')
-if relation_host and redis.call('HGET', KEYS[11], 'spectator_session_id') == ARGV[2]
-    and redis.call('HGET', KEYS[11], 'spectator_revision') == ARGV[3] then
+local relation_host = redis.call('HGET', KEYS[7], 'host_account_id')
+if relation_host and redis.call('HGET', KEYS[7], 'spectator_session_id') == ARGV[2]
+    and redis.call('HGET', KEYS[7], 'spectator_revision') == ARGV[3] then
     local host_viewers = ARGV[6] .. relation_host .. ':viewers'
     redis.call('ZREM', host_viewers, ARGV[1])
     refresh_viewers(host_viewers)
-    redis.call('DEL', KEYS[11])
+    redis.call('DEL', KEYS[7])
 end
-for _, spectator in ipairs(redis.call('ZRANGE', KEYS[13], 0, -1)) do
+for _, spectator in ipairs(redis.call('ZRANGE', KEYS[9], 0, -1)) do
     local relation_key = ARGV[5] .. spectator .. ':host'
     if redis.call('HGET', relation_key, 'host_session_id') == ARGV[2]
         and redis.call('HGET', relation_key, 'host_revision') == ARGV[3] then
@@ -387,7 +345,7 @@ for _, spectator in ipairs(redis.call('ZRANGE', KEYS[13], 0, -1)) do
     end
 end
 redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[5], KEYS[6], KEYS[7], KEYS[8],
-    KEYS[9], KEYS[10], KEYS[12], KEYS[13], KEYS[14], KEYS[15], KEYS[16])
+    KEYS[9], KEYS[10], KEYS[11], KEYS[12])
 redis.call('ZREM', KEYS[4], ARGV[1])
 refresh_expiring_index(KEYS[4])
 return {'OK'}
@@ -420,7 +378,7 @@ if capacity > 0 then
     end
 end
 redis.call('HSET', KEYS[3], 'account_id', ARGV[1], 'session_id', ARGV[2],
-    'revision', ARGV[3], 'expires_at', ARGV[4], 'payload', ARGV[6])
+    'revision', ARGV[3], 'expires_at', ARGV[4], 'state', ARGV[6])
 redis.call('PEXPIREAT', KEYS[3], expiry)
 redis.call('ZADD', KEYS[4], expiry, ARGV[1])
 refresh_expiring_index(KEYS[4])
@@ -529,117 +487,6 @@ for index = 1, #accounts, 2 do
 end
 refresh_channel(KEYS[1], KEYS[2])
 return result
-"""
-)
-
-ENQUEUE_MAILBOX = (
-    "-- perfcho:enqueue-mailbox:v2\n"
-    + _NOW
-    + _SESSION
-    + _ORDERED
-    + """
-local now = now_ms()
-local status, session_expiry = session_status(
-    KEYS[1], KEYS[2], ARGV[1], ARGV[2], ARGV[3], now)
-if status ~= 'OK' then return {status} end
-local expiry = tonumber(ARGV[5])
-if not expiry or expiry <= now or expiry > session_expiry
-    or expiry - now > tonumber(ARGV[6]) then
-    return {'INVALID_EXPIRY'}
-end
-local count, bytes, deadline = ordered_stats(KEYS[3], now, tonumber(ARGV[7]), true)
-if count < 0 then return {'CORRUPT'} end
-expire_ordered(KEYS[3], KEYS[4], count, bytes, deadline)
-if count >= tonumber(ARGV[7]) or bytes + #ARGV[4] > tonumber(ARGV[8]) then
-    return {'OVERFLOW'}
-end
-if redis.call('GET', KEYS[5]) == ARGV[9] then return {'SEQUENCE_OVERFLOW'} end
-local previous_deadline = redis.call('PEXPIRETIME', KEYS[5])
-local sequence = redis.call('INCR', KEYS[5])
-local token = string.rep('0', 19 - #tostring(sequence)) .. sequence
-redis.call('ZADD', KEYS[3], 0, token .. ':' .. ARGV[5] .. ':' .. ARGV[4])
-count = count + 1
-bytes = bytes + #ARGV[4]
-deadline = math.max(deadline, expiry)
-expire_ordered(KEYS[3], KEYS[4], count, bytes, deadline)
-redis.call('PEXPIREAT', KEYS[5], math.max(deadline, previous_deadline))
-redis.call('LPUSH', KEYS[6], token)
-redis.call('LTRIM', KEYS[6], 0, 0)
-redis.call('PEXPIREAT', KEYS[6], deadline)
-return {'OK', tostring(sequence)}
-"""
-)
-
-LEASE_MAILBOX = (
-    "-- perfcho:lease-mailbox:v2\n"
-    + _NOW
-    + _SESSION
-    + _ORDERED
-    + """
-local now = now_ms()
-local status, session_expiry = session_status(
-    KEYS[1], KEYS[2], ARGV[1], ARGV[2], ARGV[3], now)
-if status ~= 'OK' then return {status} end
-local expiry = tonumber(ARGV[6])
-if not expiry or expiry <= now or expiry > session_expiry
-    or expiry - now > tonumber(ARGV[7]) then
-    return {'INVALID_EXPIRY'}
-end
-if redis.call('EXISTS', KEYS[5]) == 1 then return {'CONFLICT'} end
-local count, bytes, deadline = ordered_stats(KEYS[3], now, tonumber(ARGV[8]), true)
-if count < 0 then return {'CORRUPT'} end
-expire_ordered(KEYS[3], KEYS[4], count, bytes, deadline)
-local packets = redis.call('ZRANGE', KEYS[3], 0, tonumber(ARGV[5]) - 1)
-if #packets == 0 then redis.call('DEL', KEYS[6]) end
-local through = string.rep('0', 19)
-if #packets > 0 then through = string.sub(packets[#packets], 1, 19) end
-redis.call('SET', KEYS[5], ARGV[2] .. '|' .. ARGV[3] .. '|' .. ARGV[4] .. '|' .. through)
-redis.call('PEXPIREAT', KEYS[5], expiry)
-local result = {'OK'}
-for _, packet in ipairs(packets) do result[#result + 1] = packet end
-return result
-"""
-)
-
-ACK_MAILBOX = (
-    "-- perfcho:ack-mailbox:v2\n"
-    + _NOW
-    + _SESSION
-    + _ORDERED
-    + """
-local status = session_status(KEYS[1], KEYS[2], ARGV[1], ARGV[2], ARGV[3], now_ms())
-if status ~= 'OK' then return {status} end
-local lease = redis.call('GET', KEYS[5])
-local expected_prefix = ARGV[2] .. '|' .. ARGV[3] .. '|' .. ARGV[4] .. '|'
-if not lease or string.sub(lease, 1, #expected_prefix) ~= expected_prefix then return {'CONFLICT'} end
-local leased_through = string.sub(lease, #expected_prefix + 1)
-if ARGV[5] > leased_through then return {'INVALID_ACK'} end
-local members = redis.call('ZRANGE', KEYS[3], 0, tonumber(ARGV[6]))
-if #members > tonumber(ARGV[6]) then return {'CORRUPT'} end
-for _, member in ipairs(members) do
-    if string.sub(member, 1, 19) <= ARGV[5] then redis.call('ZREM', KEYS[3], member) end
-end
-local count, bytes, deadline = ordered_stats(KEYS[3], 0, tonumber(ARGV[6]), false)
-expire_ordered(KEYS[3], KEYS[4], count, bytes, deadline)
-redis.call('DEL', KEYS[5])
-if count == 0 then redis.call('DEL', KEYS[6]) end
-return {'OK'}
-"""
-)
-
-RELEASE_MAILBOX = (
-    "-- perfcho:release-mailbox:v2\n"
-    + _NOW
-    + _SESSION
-    + """
-local status = session_status(KEYS[1], KEYS[2], ARGV[1], ARGV[2], ARGV[3], now_ms())
-if status ~= 'OK' then return {status} end
-local lease = redis.call('GET', KEYS[3])
-if not lease then return {'OK'} end
-local expected_prefix = ARGV[2] .. '|' .. ARGV[3] .. '|' .. ARGV[4] .. '|'
-if string.sub(lease, 1, #expected_prefix) ~= expected_prefix then return {'CONFLICT'} end
-redis.call('DEL', KEYS[3])
-return {'OK'}
 """
 )
 
@@ -803,7 +650,6 @@ PUBLISH_FRAME = (
     + _NOW
     + _SESSION
     + _VIEWER_EXPIRY
-    + _ORDERED
     + _FRAMES
     + """
 local now = now_ms()
@@ -822,18 +668,53 @@ if not expiry or expiry <= now or expiry > math.min(host_expiry, tonumber(presen
     or expiry - now > tonumber(ARGV[7]) then
     return {'INVALID_EXPIRY'}
 end
-local reset_sequence = ARGV[20] == '1'
+local reset_sequence = ARGV[16] == '1'
 local stored_session = redis.call('HGET', KEYS[7], 'session_id')
 if reset_sequence or (stored_session and (stored_session ~= ARGV[2]
     or redis.call('HGET', KEYS[7], 'revision') ~= ARGV[3])) then
     redis.call('DEL', KEYS[4], KEYS[5], KEYS[7])
 end
-local previous_sequence = redis.call('HGET', KEYS[7], 'wire_sequence')
+local previous_sequence = redis.call('HGET', KEYS[7], 'sequence')
 if previous_sequence then
     local delta = (tonumber(ARGV[4]) - tonumber(previous_sequence) + 65536) % 65536
     if delta == 0 or delta > 32768 then return {'NON_MONOTONIC'} end
 end
 if redis.call('HGET', KEYS[7], 'cursor') == ARGV[11] then return {'SEQUENCE_OVERFLOW'} end
+local recipients = {}
+for _, spectator in ipairs(redis.call('ZRANGE', KEYS[6], 0, -1)) do
+    local relation_key = ARGV[15] .. spectator .. ':host'
+    local relation = redis.call('HMGET', relation_key, 'host_account_id', 'spectator_account_id',
+        'relation_id', 'revision', 'host_session_id', 'host_revision',
+        'spectator_session_id', 'spectator_revision', 'expires_at')
+    local complete = true
+    for index = 1, #relation do
+        if not relation[index] then complete = false break end
+    end
+    local valid = complete
+        and relation[1] == ARGV[1]
+        and relation[2] == spectator
+        and relation[5] == ARGV[2]
+        and relation[6] == ARGV[3]
+        and tonumber(relation[9]) > now
+    if valid then
+        local spectator_status = session_status(
+            ARGV[14] .. relation[7], ARGV[13] .. spectator .. ':session',
+            spectator, relation[7], relation[8], now)
+        valid = spectator_status == 'OK'
+    end
+    if valid then
+        recipients[#recipients + 1] = spectator
+        recipients[#recipients + 1] = relation[7]
+        recipients[#recipients + 1] = relation[8]
+        recipients[#recipients + 1] = relation[9]
+    else
+        if relation[1] == ARGV[1] and relation[5] == ARGV[2] and relation[6] == ARGV[3] then
+            redis.call('DEL', relation_key)
+        end
+        redis.call('ZREM', KEYS[6], spectator)
+    end
+end
+refresh_viewers(KEYS[6])
 local count, bytes, deadline = frame_stats(KEYS[4], now, tonumber(ARGV[9]))
 if count < 0 then
     redis.call('DEL', KEYS[4], KEYS[5])
@@ -855,58 +736,10 @@ count = count + 1
 bytes = bytes + #ARGV[5]
 deadline = math.max(deadline, expiry)
 expire_frames(KEYS[4], KEYS[5], count, bytes, deadline)
-redis.call('HSET', KEYS[7], 'wire_sequence', ARGV[4], 'session_id', ARGV[2], 'revision', ARGV[3])
+redis.call('HSET', KEYS[7], 'sequence', ARGV[4], 'session_id', ARGV[2], 'revision', ARGV[3])
 redis.call('PEXPIREAT', KEYS[7], deadline)
 local result = {'OK', tostring(cursor)}
-for _, spectator in ipairs(redis.call('ZRANGE', KEYS[6], 0, -1)) do
-    local relation_key = ARGV[18] .. spectator .. ':host'
-    local spectator_session_id = redis.call('HGET', relation_key, 'spectator_session_id')
-    local spectator_revision = redis.call('HGET', relation_key, 'spectator_revision')
-    local relation_expiry = redis.call('HGET', relation_key, 'expires_at')
-    local spectator_session_key = ARGV[17] .. spectator_session_id
-    local spectator_expiry = redis.call('HGET', spectator_session_key, 'expires_at')
-    local valid = redis.call('HGET', relation_key, 'host_account_id') == ARGV[1]
-        and redis.call('HGET', relation_key, 'host_session_id') == ARGV[2]
-        and redis.call('HGET', relation_key, 'host_revision') == ARGV[3]
-        and relation_expiry and tonumber(relation_expiry) > now
-        and redis.call('GET', ARGV[16] .. spectator .. ':session') == spectator_session_id .. '|' .. spectator_revision
-        and spectator_expiry and tonumber(spectator_expiry) > now
-    if valid then
-        local mailbox_base = ARGV[19] .. spectator
-        local packets_key = mailbox_base .. ':packets'
-        local bytes_key = mailbox_base .. ':bytes'
-        local sequence_key = mailbox_base .. ':sequence'
-        local signal_key = mailbox_base .. ':signal:' .. spectator_session_id .. ':' .. spectator_revision
-        local packet_expiry = math.min(expiry, tonumber(relation_expiry), tonumber(spectator_expiry),
-            now + tonumber(ARGV[12]))
-        local packet_count, packet_bytes, packet_deadline = ordered_stats(
-            packets_key, now, tonumber(ARGV[13]), true)
-        if packet_count >= 0 and packet_count < tonumber(ARGV[13])
-            and packet_bytes + #ARGV[5] <= tonumber(ARGV[14])
-            and redis.call('GET', sequence_key) ~= ARGV[11] then
-            local packet_sequence = redis.call('INCR', sequence_key)
-            local packet_token = string.rep('0', 19 - #tostring(packet_sequence)) .. packet_sequence
-            redis.call('ZADD', packets_key, 0,
-                packet_token .. ':' .. packet_expiry .. ':' .. ARGV[5])
-            packet_count = packet_count + 1
-            packet_bytes = packet_bytes + #ARGV[5]
-            packet_deadline = math.max(packet_deadline, packet_expiry)
-            expire_ordered(packets_key, bytes_key, packet_count, packet_bytes, packet_deadline)
-            redis.call('PEXPIREAT', sequence_key, packet_deadline)
-            redis.call('LPUSH', signal_key, packet_token)
-            redis.call('LTRIM', signal_key, 0, 0)
-            redis.call('PEXPIREAT', signal_key, packet_deadline)
-            result[#result + 1] = spectator
-        end
-    else
-        if redis.call('HGET', relation_key, 'host_session_id') == ARGV[2]
-            and redis.call('HGET', relation_key, 'host_revision') == ARGV[3] then
-            redis.call('DEL', relation_key)
-        end
-        redis.call('ZREM', KEYS[6], spectator)
-    end
-end
-refresh_viewers(KEYS[6])
+for _, value in ipairs(recipients) do result[#result + 1] = value end
 return result
 """
 )
@@ -968,10 +801,6 @@ class RealtimeScripts:
     join_channel: AsyncScript
     leave_channel: AsyncScript
     list_channel: AsyncScript
-    enqueue_mailbox: AsyncScript
-    lease_mailbox: AsyncScript
-    ack_mailbox: AsyncScript
-    release_mailbox: AsyncScript
     attach_spectator: AsyncScript
     detach_spectator: AsyncScript
     get_spectator: AsyncScript
@@ -993,10 +822,6 @@ class RealtimeScripts:
             join_channel=redis.register_script(JOIN_CHANNEL),
             leave_channel=redis.register_script(LEAVE_CHANNEL),
             list_channel=redis.register_script(LIST_CHANNEL),
-            enqueue_mailbox=redis.register_script(ENQUEUE_MAILBOX),
-            lease_mailbox=redis.register_script(LEASE_MAILBOX),
-            ack_mailbox=redis.register_script(ACK_MAILBOX),
-            release_mailbox=redis.register_script(RELEASE_MAILBOX),
             attach_spectator=redis.register_script(ATTACH_SPECTATOR),
             detach_spectator=redis.register_script(DETACH_SPECTATOR),
             get_spectator=redis.register_script(GET_SPECTATOR),

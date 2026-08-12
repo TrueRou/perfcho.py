@@ -8,7 +8,7 @@ import hmac
 import re
 import struct
 from base64 import b64decode
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -20,7 +20,6 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 from perfcho.infra.security.rijndael import Rijndael256Cbc
 from perfcho.modules.scoring import (
     CanonicalMod,
-    ClientFamily,
     HitStatistic,
     PlayAttemptSubmission,
     Ruleset,
@@ -30,7 +29,6 @@ from perfcho.modules.scoring import (
     ScoreOutcome,
     ScoreSubmission,
 )
-from perfcho.modules.scoring.mods import parse_legacy_mods
 
 _OSU_VERSION = re.compile(r"^\d{8}$")
 _INTEGER = re.compile(r"^-?\d{1,20}$")
@@ -42,6 +40,40 @@ _MAX_INT64 = 9_223_372_036_854_775_807
 _MIN_REPLAY_BYTES = 24
 _MAX_SUBMISSION_AGE = timedelta(days=30)
 _MAX_CLOCK_SKEW = timedelta(minutes=5)
+LEGACY_MOD_BITS = {
+    "NF": 1 << 0,
+    "EZ": 1 << 1,
+    "TD": 1 << 2,
+    "HD": 1 << 3,
+    "HR": 1 << 4,
+    "SD": 1 << 5,
+    "DT": 1 << 6,
+    "RX": 1 << 7,
+    "HT": 1 << 8,
+    "NC": 1 << 9,
+    "FL": 1 << 10,
+    "AT": 1 << 11,
+    "SO": 1 << 12,
+    "AP": 1 << 13,
+    "PF": 1 << 14,
+    "4K": 1 << 15,
+    "5K": 1 << 16,
+    "6K": 1 << 17,
+    "7K": 1 << 18,
+    "8K": 1 << 19,
+    "FI": 1 << 20,
+    "RD": 1 << 21,
+    "CN": 1 << 22,
+    "TP": 1 << 23,
+    "9K": 1 << 24,
+    "CO": 1 << 25,
+    "1K": 1 << 26,
+    "3K": 1 << 27,
+    "2K": 1 << 28,
+    "SV2": 1 << 29,
+    "MR": 1 << 30,
+}
+_KNOWN_LEGACY_MOD_MASK = sum(LEGACY_MOD_BITS.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +108,52 @@ class ParsedStableScore:
     attestation: ScoreAttestation
     client_hash: str
     legacy_mod_bits: int
+
+
+def parse_legacy_mods(legacy_bits: int) -> tuple[tuple[CanonicalMod, ...], ScoreboardVariant]:
+    """Convert bounded Stable mod flags into canonical mods and a scoreboard variant."""
+    if isinstance(legacy_bits, bool) or not isinstance(legacy_bits, int) or legacy_bits < 0:
+        raise ValueError("legacy mod bits must be a non-negative integer")
+    if legacy_bits & ~_KNOWN_LEGACY_MOD_MASK:
+        raise ValueError("legacy mod bits contain unknown flags")
+    if legacy_bits & LEGACY_MOD_BITS["RX"] and legacy_bits & LEGACY_MOD_BITS["AP"]:
+        raise ValueError("relax and autopilot cannot be combined")
+    variant = (
+        ScoreboardVariant.AUTOPILOT
+        if legacy_bits & LEGACY_MOD_BITS["AP"]
+        else ScoreboardVariant.RELAX
+        if legacy_bits & LEGACY_MOD_BITS["RX"]
+        else ScoreboardVariant.VANILLA
+    )
+    mods: list[CanonicalMod] = []
+    for acronym, bit in LEGACY_MOD_BITS.items():
+        if not legacy_bits & bit:
+            continue
+        if acronym in {"RX", "AP"}:
+            mods.append(CanonicalMod(acronym))
+        elif (acronym == "DT" and legacy_bits & LEGACY_MOD_BITS["NC"]) or (
+            acronym == "SD" and legacy_bits & LEGACY_MOD_BITS["PF"]
+        ):
+            continue
+        else:
+            mods.append(CanonicalMod(acronym))
+    return tuple(mods), variant
+
+
+def project_legacy_mods(mods: Iterable[CanonicalMod], variant: ScoreboardVariant) -> int:
+    """Project canonical mods and assistance into the Stable mod bitset."""
+    bits = 0
+    for mod in mods:
+        bits |= LEGACY_MOD_BITS.get(mod.acronym, 0)
+    if variant is ScoreboardVariant.RELAX:
+        bits |= LEGACY_MOD_BITS["RX"]
+    elif variant is ScoreboardVariant.AUTOPILOT:
+        bits |= LEGACY_MOD_BITS["AP"]
+    if bits & LEGACY_MOD_BITS["NC"]:
+        bits |= LEGACY_MOD_BITS["DT"]
+    if bits & LEGACY_MOD_BITS["PF"]:
+        bits |= LEGACY_MOD_BITS["SD"]
+    return bits
 
 
 async def parse_stable_submission_form(request: Request, maximum: int) -> StableScoreSubmissionForm:
@@ -290,7 +368,7 @@ def decrypt_stable_score(
             online_checksum=online_checksum,
         ),
         attestation=ScoreAttestation(
-            client_family=ClientFamily.STABLE,
+            source="stable",
             client_version=supported_build,
             verification_state="pending",
             client_flags=client_flags,

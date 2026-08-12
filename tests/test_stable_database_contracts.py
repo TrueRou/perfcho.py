@@ -121,10 +121,10 @@ def test_stable_identity_lifecycle_contracts() -> None:
     )
     assert isinstance(activity_period, CheckConstraint)
     assert "last_activity_at >= created_at" in str(activity_period.sqltext)
-    active_stable = _index("iam.auth_sessions", "uq_auth_sessions_active_normal_stable_account")
-    assert active_stable.unique
-    assert _column_names(active_stable.columns) == ("account_id",)
-    assert "client_family = 'stable'" in str(active_stable.dialect_options["postgresql"]["where"])
+    active_client = _index("iam.auth_sessions", "uq_auth_sessions_active_client_account")
+    assert active_client.unique
+    assert _column_names(active_client.columns) == ("account_id",)
+    assert "oauth_client_id IS NULL" in str(active_client.dialect_options["postgresql"]["where"])
 
     tokens = _table("iam.auth_tokens")
     assert {"family_id", "rotation_number"} <= set(tokens.c.keys())
@@ -203,7 +203,7 @@ def test_replies_multiplayer_events_and_outbox_positions_have_integrity() -> Non
     rooms = _table("multiplayer.rooms")
     assert {"password_verifier", "password_prefix"} <= set(rooms.c.keys())
     assert any(
-        isinstance(constraint, CheckConstraint) and constraint.name == "ck_rooms_stable_public_id_range"
+        isinstance(constraint, CheckConstraint) and constraint.name == "ck_rooms_public_id_range"
         for constraint in rooms.constraints
     )
     public_id = _index("multiplayer.rooms", "uq_rooms_active_public_id")

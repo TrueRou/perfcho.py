@@ -38,7 +38,7 @@ class TokenKind(StrEnum):
     ACCESS = "access"
     REFRESH = "refresh"
     API_KEY = "api_key"
-    STABLE_SESSION = "stable_session"
+    CLIENT_SESSION = "client_session"
 
 
 class ChallengeKind(StrEnum):

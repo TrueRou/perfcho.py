@@ -5,7 +5,8 @@ from decimal import Decimal
 
 import pytest
 
-from perfcho.api.cho.canonize.scoring import (
+from perfcho.api.stable.canonize.scoring import (
+    LEGACY_MOD_BITS,
     ParsedStableScore,
     decrypt_stable_score,
     stable_online_checksum,
@@ -13,7 +14,6 @@ from perfcho.api.cho.canonize.scoring import (
 )
 from perfcho.infra.security.rijndael import Rijndael256Cbc
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant, ScoreGrade, ScoreOutcome
-from perfcho.modules.scoring.mods import LEGACY_MOD_BITS
 
 OSU_VERSION = "20260711"
 SUPPORTED_BUILD = "b20260711.1"

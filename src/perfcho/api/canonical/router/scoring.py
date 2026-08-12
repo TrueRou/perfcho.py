@@ -11,9 +11,8 @@ from fastapi import APIRouter, Body, Form, Header, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from perfcho.api.cho.canonize.ipaddr import resolve_client_ip
-from perfcho.api.cho.dependencies import StableServicesDependency
-from perfcho.api.v2.dependencies import V2AccountDependency
+from perfcho.api.canonical.dependencies import CanonicalAccountDependency, CanonicalServicesDependency
+from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
 from perfcho.infra.compose import StableServices
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
 from perfcho.modules.common.errors import ApplicationError
@@ -21,7 +20,6 @@ from perfcho.modules.scoring import (
     AcceptScore,
     BeatmapReference,
     CanonicalMod,
-    ClientFamily,
     HitStatistic,
     IssueSoloScoreToken,
     LeaderboardScope,
@@ -116,8 +114,8 @@ class SoloScoreResponse(BaseModel):
 async def create_solo_score_token(
     request: Request,
     beatmap_id: int,
-    services: StableServicesDependency,
-    account: V2AccountDependency,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
     beatmap_hash: Annotated[str, Form(min_length=32, max_length=32)],
     ruleset_id: Annotated[int, Form(ge=0, le=3)],
     version_hash: Annotated[str, Form()] = "",
@@ -171,8 +169,8 @@ async def submit_solo_score(
     request: Request,
     beatmap_id: int,
     token: int,
-    services: StableServicesDependency,
-    account: V2AccountDependency,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
     body: Annotated[SoloScoreSubmissionRequest, Body()],
     x_api_version: Annotated[str | None, Header(alias="x-api-version")] = None,
 ) -> SoloScoreResponse | JSONResponse:
@@ -223,11 +221,12 @@ async def submit_solo_score(
             ),
             replay=None,
             attestation=ScoreAttestation(
-                client_family=ClientFamily.LAZER,
+                source="lazer",
                 client_version=client_version,
                 verification_state="pending",
                 evidence={},
             ),
+            uses_threshold_grading=True,
             solo_token_id=token,
         )
         result = await scoring.accept(command)
@@ -243,7 +242,7 @@ async def submit_solo_score(
 @router.get("/scores/{score_id}", response_model=SoloScoreResponse, tags=["Scores"])
 async def get_score(
     score_id: int,
-    services: StableServicesDependency,
+    services: CanonicalServicesDependency,
 ) -> SoloScoreResponse | JSONResponse:
     """Return one canonical score detail."""
     return await _get_score_response(services, score_id)
@@ -253,7 +252,7 @@ async def get_score(
 async def get_score_for_ruleset(
     ruleset: Ruleset,
     score_id: int,
-    services: StableServicesDependency,
+    services: CanonicalServicesDependency,
 ) -> SoloScoreResponse | JSONResponse:
     """Return one score only when the URL ruleset matches."""
     return await _get_score_response(services, score_id, ruleset)
@@ -262,8 +261,8 @@ async def get_score_for_ruleset(
 @router.get("/beatmaps/{beatmap_id}/scores", response_model=None, tags=["Scores"])
 async def get_beatmap_scores(
     beatmap_id: int,
-    services: StableServicesDependency,
-    account: V2AccountDependency,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
     mode: Annotated[Ruleset, Query()],
     type: Annotated[Literal["global", "friend", "country"], Query()] = "global",
     mods: Annotated[list[str] | None, Query()] = None,
@@ -376,7 +375,7 @@ def _command_meta(
         request_digest=request_digest,
         actor=Actor(account_id, session_id),
         client=ClientContext(
-            family=ClientFamily.LAZER.value,
+            family="lazer",
             version=client_version or "unknown",
             variant=None,
             ip_address=resolve_client_ip(request, settings.trusted_proxy_cidrs),

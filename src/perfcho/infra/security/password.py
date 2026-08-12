@@ -1,4 +1,4 @@
-"""Create and verify the shared Stable/Lazer password representation."""
+"""Create and verify the canonical password preverification representation."""
 
 import hashlib
 import re
@@ -13,7 +13,7 @@ from argon2.low_level import Type
 
 from perfcho.infra.logging import log_event
 
-_STABLE_PASSWORD_TOKEN = re.compile(r"[0-9a-f]{32}")
+_PASSWORD_PREVERIFICATION = re.compile(r"[0-9a-f]{32}")
 _DUMMY_PASSWORD_TOKEN = "0" * 32
 _DUMMY_PASSWORD_MISMATCH = "1" * 32
 
@@ -85,21 +85,21 @@ class PasswordVerification:
         return self.status is PasswordVerificationStatus.MATCH
 
 
-def validate_stable_password_token(token: str) -> str:
-    """Return a Stable password token only when it is exactly 32 lowercase hex characters."""
-    if _STABLE_PASSWORD_TOKEN.fullmatch(token) is None:
-        raise ValueError("Stable password token must be exactly 32 lowercase hexadecimal characters")
+def validate_password_preverification(token: str) -> str:
+    """Validate the canonical lowercase hexadecimal password representation."""
+    if _PASSWORD_PREVERIFICATION.fullmatch(token) is None:
+        raise ValueError("password preverification must be exactly 32 lowercase hexadecimal characters")
     return token
 
 
-def preverify_lazer_password(plaintext: str) -> str:
-    """Convert Lazer plaintext into Stable's lowercase MD5 preverification representation."""
+def preverify_password(plaintext: str) -> str:
+    """Convert plaintext into the canonical password preverification representation."""
     return hashlib.md5(plaintext.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 def hash_password(preverification: str, *, pepper: PasswordPepper, policy: Argon2Policy) -> PasswordHash:
     """Hash a validated preverification token with an appended, versioned pepper."""
-    token = validate_stable_password_token(preverification)
+    token = validate_password_preverification(preverification)
     verifier = _make_hasher(policy).hash(_append_pepper(token, pepper))
     return PasswordHash(verifier=verifier, pepper_version=pepper.version)
 
@@ -113,7 +113,7 @@ def verify_password(
 ) -> PasswordVerification:
     """Verify a preverification token without exposing malformed credentials as errors."""
     try:
-        token = validate_stable_password_token(preverification)
+        token = validate_password_preverification(preverification)
     except ValueError:
         return PasswordVerification(PasswordVerificationStatus.MISMATCH)
 
@@ -138,7 +138,7 @@ def verify_password(
 def verify_legacy_bcrypt_md5(preverification: str, verifier: str) -> PasswordVerification:
     """Verify a legacy bancho.py bcrypt hash of a Stable MD5 password token."""
     try:
-        token = validate_stable_password_token(preverification)
+        token = validate_password_preverification(preverification)
     except TypeError, UnicodeError, ValueError:
         return PasswordVerification(PasswordVerificationStatus.MISMATCH)
     try:

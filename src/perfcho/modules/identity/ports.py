@@ -1,4 +1,4 @@
-"""Define transaction-bound ports consumed by Stable identity operations."""
+"""Define transaction-bound ports consumed by identity operations."""
 
 import uuid
 from datetime import datetime, timedelta
@@ -9,9 +9,9 @@ from perfcho.modules.identity.models import (
     AuthenticatedAccount,
     CredentialSnapshot,
     OAuthClientSnapshot,
-    OpenStableSession,
+    OpenClientSession,
     RefreshTokenSnapshot,
-    ResolvedStableSession,
+    ResolvedClientSession,
 )
 
 
@@ -54,22 +54,22 @@ class IdentityRepository(Protocol):
         """Conditionally replace an exact legacy credential with current Argon2id."""
         ...
 
-    async def acquire_stable_session_lock(self, account_id: int) -> None:
-        """Serialize normal Stable session transitions for one account."""
+    async def acquire_session_lock(self, account_id: int) -> None:
+        """Serialize direct client session transitions for one account."""
         ...
 
-    async def find_open_stable_session(self, account_id: int) -> OpenStableSession | None:
-        """Return the account's unclosed normal Stable session, including stale rows."""
+    async def find_open_client_session(self, account_id: int) -> OpenClientSession | None:
+        """Return the account's unclosed direct client session, including stale rows."""
         ...
 
-    async def find_stable_web_candidate(
+    async def find_online_credential_candidate(
         self,
         identifier_kind: str,
         identifier_key: str,
         *,
         at: datetime,
-    ) -> tuple[CredentialSnapshot, OpenStableSession] | None:
-        """Return credentials only when the account has an active Stable session."""
+    ) -> tuple[CredentialSnapshot, OpenClientSession] | None:
+        """Return credentials only when the account has an active client session."""
         ...
 
     async def get_or_create_device(
@@ -85,13 +85,14 @@ class IdentityRepository(Protocol):
         """Upsert HMAC-only device and account-device facts."""
         ...
 
-    async def create_stable_session(
+    async def create_client_session(
         self,
         *,
         session_id: uuid.UUID,
         token_id: uuid.UUID,
         token_jti: uuid.UUID,
         account_id: int,
+        client_family: str,
         device_id: uuid.UUID,
         client_version: str,
         client_variant: str | None,
@@ -102,7 +103,7 @@ class IdentityRepository(Protocol):
         now: datetime,
         expires_at: datetime,
     ) -> None:
-        """Create a normal Stable session and digest-only bearer token."""
+        """Create a direct client session and digest-only bearer token."""
         ...
 
     async def create_oauth_session(
@@ -116,6 +117,7 @@ class IdentityRepository(Protocol):
         refresh_token_jti: uuid.UUID,
         account_id: int,
         client_id: uuid.UUID,
+        client_family: str,
         client_version: str | None,
         ip_address: str,
         user_agent: str | None,
@@ -178,7 +180,7 @@ class IdentityRepository(Protocol):
         identifier_hmac: bytes,
         ip_address: str,
         client_version: str | None,
-        client_family: str = "stable",
+        client_family: str,
         result: str,
         failure_reason: str | None,
         context: dict[str, object],
@@ -187,25 +189,25 @@ class IdentityRepository(Protocol):
         """Append non-secret success or failure authentication evidence."""
         ...
 
-    async def resolve_stable_session(self, token_digest: bytes, *, at: datetime) -> ResolvedStableSession | None:
+    async def resolve_client_session(self, token_digest: bytes, *, at: datetime) -> ResolvedClientSession | None:
         """Resolve a digest only when token, session, account, and name are active."""
         ...
 
-    async def touch_stable_session(
+    async def touch_client_session(
         self,
         token_digest: bytes,
         *,
         at: datetime,
         minimum_interval: timedelta,
-    ) -> tuple[ResolvedStableSession, bool] | None:
-        """Resolve a Stable session and report whether its durable heartbeat advanced."""
+    ) -> tuple[ResolvedClientSession, bool] | None:
+        """Resolve a client session and report whether its durable heartbeat advanced."""
         ...
 
-    async def get_stable_session_account_id(self, session_id: uuid.UUID) -> int | None:
-        """Return the owning account for a normal Stable session."""
+    async def get_client_session_account_id(self, session_id: uuid.UUID) -> int | None:
+        """Return the owning account for a direct client session."""
         ...
 
-    async def close_stable_session(
+    async def close_client_session(
         self,
         session_id: uuid.UUID,
         *,
@@ -225,8 +227,8 @@ class IdentityRepositoryFactory(Protocol):
         ...
 
 
-class StableWebVerificationCache(Protocol):
-    """Cache only a bounded proof of a previously verified Stable Web credential."""
+class OnlineCredentialVerificationCache(Protocol):
+    """Cache only a bounded proof of a previously verified online credential."""
 
     async def matches(
         self,

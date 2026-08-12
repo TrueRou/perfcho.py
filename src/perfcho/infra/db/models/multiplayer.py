@@ -41,7 +41,7 @@ class Room(Uuid7PrimaryKeyMixin, TimestampMixin, DbBase):
     __tablename__ = "rooms"
     __table_args__ = (
         CheckConstraint("capacity BETWEEN 1 AND 1024", name="capacity_range"),
-        CheckConstraint("public_id BETWEEN 1 AND 32767", name="stable_public_id_range"),
+        CheckConstraint("public_id BETWEEN 1 AND 2147483647", name="public_id_range"),
         CheckConstraint(
             "num_nonnulls(password_verifier, password_prefix) IN (0, 2)",
             name="complete_password_credentials",
@@ -368,7 +368,7 @@ class RoundParticipant(DbBase):
 
     __tablename__ = "round_participants"
     __table_args__ = (
-        CheckConstraint("slot_number IS NULL OR slot_number BETWEEN 0 AND 15", name="slot_range"),
+        CheckConstraint("slot_number IS NULL OR slot_number BETWEEN 0 AND 1023", name="slot_range"),
         CheckConstraint("team_number BETWEEN 0 AND 2", name="team_range"),
         Index(
             "uq_round_participants_slot",

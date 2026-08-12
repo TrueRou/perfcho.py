@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from perfcho.modules.realtime.stable import builders as packets
-from perfcho.modules.realtime.stable.codec import PacketReader
-from perfcho.modules.realtime.stable.models import (
+from perfcho.api.stable.realtime import builders as packets
+from perfcho.api.stable.realtime.codec import PacketReader
+from perfcho.api.stable.realtime.models import (
     Channel,
     Message,
     MultiplayerMatch,

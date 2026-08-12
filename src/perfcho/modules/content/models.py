@@ -55,7 +55,7 @@ class BeatmapRevisionView:
 
     @property
     def md5_hex(self) -> str:
-        """Return the Stable hexadecimal beatmap identity."""
+        """Return the hexadecimal revision checksum."""
         return self.md5.hex()
 
 
@@ -86,7 +86,7 @@ class ContentSearch:
     page_size: int = 100
 
     def __post_init__(self) -> None:
-        """Validate bounded Stable Direct search input."""
+        """Validate bounded content search input."""
         if self.page < 0 or not 1 <= self.page_size <= 100:
             raise ValueError("content search page is invalid")
         if len(self.query) > 255:
@@ -123,7 +123,7 @@ class RatingSummary:
 
 @dataclass(frozen=True, slots=True)
 class CommentView:
-    """Describe one visible Stable timeline comment."""
+    """Describe one visible position-aware content comment."""
 
     comment_id: int
     author_account_id: int
@@ -178,7 +178,7 @@ class UpstreamBeatmapSnapshot:
 
     @property
     def object_count(self) -> int:
-        """Return the canonical sum of Stable hit object counts."""
+        """Return the canonical sum of hit object counts."""
         return self.circle_count + self.slider_count + self.spinner_count
 
 

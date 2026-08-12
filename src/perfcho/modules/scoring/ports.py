@@ -87,7 +87,7 @@ class ScoringAcceptanceRepository(Protocol):
         started_at: datetime,
         expires_at: datetime,
     ) -> SoloScoreToken:
-        """Create a short-lived Lazer solo score authorization."""
+        """Create a short-lived solo score authorization."""
         ...
 
     async def claim_solo_token(
@@ -99,7 +99,7 @@ class ScoringAcceptanceRepository(Protocol):
         ruleset: Ruleset,
         at: datetime,
     ) -> SoloScoreToken:
-        """Lock and validate a Lazer solo token for submission."""
+        """Lock and validate a solo token for submission."""
         ...
 
     async def complete_solo_token(self, token_id: int, score_id: int, *, at: datetime) -> None:
@@ -190,7 +190,7 @@ class AccountStatisticsRepository(Protocol):
         ruleset: Ruleset,
         variant: ScoreboardVariant,
     ) -> AccountStatsView:
-        """Aggregate Stable-facing account statistics without calculating PP."""
+        """Aggregate account statistics without calculating PP."""
         ...
 
 

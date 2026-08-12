@@ -6,13 +6,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from perfcho.api.stable.authorization import StablePrivilege, project_stable_privileges
 from perfcho.infra.db.enums import GrantEffect
 from perfcho.infra.db.repositories.authorization import SqlAlchemyAuthorizationRepository
 from perfcho.modules.authorization import (
     AuthorizationQueryService,
     EffectiveAuthorization,
-    StablePrivilege,
-    project_stable_privileges,
 )
 from perfcho.modules.authorization.ports import AuthorizationRepository
 from tests.cache_support import MemoryCache
@@ -97,7 +96,6 @@ async def test_query_service_uses_one_clock_instant_for_the_repository() -> None
 
     assert await service.get_effective(42) is authorization
     assert repository.requested == (42, instant)
-    assert await service.get_stable_privileges(42) == StablePrivilege.PLAYER
 
 
 def test_stable_projection_uses_canonical_codes() -> None:

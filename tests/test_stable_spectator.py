@@ -1,29 +1,15 @@
 import struct
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
 
-from perfcho.api.cho.dispatcher import StableRuntimeContext, dispatch_packets
-from perfcho.infra.compose import StableServices
-from perfcho.infra.redis.realtime import RedisRealtimeRepository
-from perfcho.infra.settings import Settings
-from perfcho.modules.authorization import AuthorizationQueryService
-from perfcho.modules.common import Clock, IdGenerator
-from perfcho.modules.identity import IdentityService, ResolvedStableSession
-from perfcho.modules.realtime import (
-    MailboxPacket,
-    PresenceSnapshot,
-    RealtimeSession,
-    SessionFence,
-    SpectatorAttachment,
-    SpectatorFrame,
-    SpectatorFramePublish,
-    SpectatorFrameWindow,
-    SpectatorRelation,
-)
-from perfcho.modules.realtime.stable import (
+from perfcho.api.stable.bubbles import StableBubbleRenderer, canonicalize_spectator_frame
+from perfcho.api.stable.dispatcher import StableRuntimeContext
+from perfcho.api.stable.dispatcher import dispatch_packets as dispatch_bubbles
+from perfcho.api.stable.realtime import (
     ClientPacket,
     PacketReader,
     PacketWriter,
@@ -34,9 +20,40 @@ from perfcho.modules.realtime.stable import (
     ServerPacket,
     build_packet,
 )
-from perfcho.modules.realtime.stable.models import UserPresence, UserStats
+from perfcho.api.stable.realtime.models import UserPresence, UserStats
+from perfcho.infra.compose import StableServices
+from perfcho.infra.redis.realtime import RedisRealtimeStateRepository
+from perfcho.infra.settings import Settings
+from perfcho.modules.authorization import AuthorizationQueryService
+from perfcho.modules.common import Clock, IdGenerator
+from perfcho.modules.identity import IdentityService, ResolvedClientSession
+from perfcho.modules.realtime import (
+    PlayerActivity,
+    PlayerStatistics,
+    PresenceIdentity,
+    PresenceSnapshot,
+    RealtimeBubble,
+    RealtimeBubbleBus,
+    RealtimeSession,
+    SessionFence,
+    SpectatorAttachment,
+    SpectatorFrame,
+    SpectatorFrameBubble,
+    SpectatorFramePublish,
+    SpectatorFrameWindow,
+    SpectatorRecipient,
+    SpectatorRelation,
+)
 
 NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
+
+
+async def dispatch_packets(body: bytes, context: StableRuntimeContext, services: StableServices) -> bytes:
+    bubbles = await dispatch_bubbles(body, context, services)
+    rendered = StableBubbleRenderer().render_many(bubbles, max_bytes=services.settings.stable_max_response_bytes)
+    return rendered + bytes(context.stable_output)
+
+
 EXPIRY = NOW + timedelta(minutes=5)
 
 
@@ -50,14 +67,30 @@ class FakeIds:
         return uuid.uuid7()
 
 
-class SpectatorRealtime(RedisRealtimeRepository):
+class FakeBubbleBus:
     def __init__(self) -> None:
+        self.published: list[tuple[SessionFence, RealtimeBubble]] = []
+
+    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
+        self.published.append((recipient_fence, bubble))
+        return 1
+
+    async def publish_many(self, recipient_fences: Sequence[SessionFence], bubble: RealtimeBubble) -> int:
+        self.published.extend((fence, bubble) for fence in recipient_fences)
+        return len(recipient_fences)
+
+
+class SpectatorRealtime(RedisRealtimeStateRepository):
+    def __init__(self) -> None:
+        self.bubbles = FakeBubbleBus()
         self.fences = {account_id: SessionFence(uuid.uuid7(), 1) for account_id in (2, 3, 9)}
         self.presences = {
             account_id: PresenceSnapshot(
                 account_id,
                 fence.revision,
-                b"presence",
+                PresenceIdentity(f"user-{account_id}", None, 0, frozenset({"account.login"})),
+                PlayerActivity("idle"),
+                PlayerStatistics(),
                 EXPIRY,
                 fence.session_id,
             )
@@ -74,7 +107,6 @@ class SpectatorRealtime(RedisRealtimeRepository):
                 EXPIRY,
             )
         }
-        self.mailboxes: dict[int, list[bytes]] = {}
         self.frames: dict[int, list[SpectatorFrame]] = {}
         self.detach_current = True
 
@@ -158,46 +190,39 @@ class SpectatorRealtime(RedisRealtimeRepository):
             return True
         return False
 
-    async def enqueue_mailbox(
-        self,
-        account_id: int,
-        payload: bytes,
-        *,
-        recipient_fence: SessionFence,
-        expires_at: datetime,
-    ) -> MailboxPacket:
-        assert expires_at > NOW
-        assert recipient_fence == self.fences[account_id]
-        packets = self.mailboxes.setdefault(account_id, [])
-        packets.append(payload)
-        return MailboxPacket(len(packets), payload)
-
     async def publish_spectator_frame(
         self,
         host_account_id: int,
         *,
         host_fence: SessionFence,
-        sequence: int,
-        reset_sequence: bool,
-        payload: bytes,
+        frame: SpectatorFrameBubble,
+        reset_history: bool,
         expires_at: datetime,
     ) -> SpectatorFramePublish:
         assert expires_at > NOW
         assert host_fence == self.fences[host_account_id]
-        if reset_sequence:
+        if reset_history:
             self.frames.pop(host_account_id, None)
-        frame = SpectatorFrame(len(self.frames.get(host_account_id, ())) + 1, sequence, payload)
-        self.frames.setdefault(host_account_id, []).append(frame)
-        recipients: list[int] = []
+        stored = SpectatorFrame(
+            len(self.frames.get(host_account_id, ())) + 1,
+            frame.host_account_id,
+            frame.sequence,
+            frame.action,
+            frame.frames,
+            frame.score,
+            frame.extra,
+        )
+        self.frames.setdefault(host_account_id, []).append(stored)
+        recipients: list[SpectatorRecipient] = []
         for relation in await self.list_spectators(host_account_id, host_fence=host_fence, at=NOW):
-            await self.enqueue_mailbox(
-                relation.spectator_account_id,
-                payload,
-                recipient_fence=relation.spectator_fence,
-                expires_at=relation.expires_at,
+            recipients.append(
+                SpectatorRecipient(
+                    relation.spectator_account_id,
+                    relation.spectator_fence,
+                    relation.expires_at,
+                )
             )
-            recipients.append(relation.spectator_account_id)
-        return SpectatorFramePublish(frame, tuple(recipients))
+        return SpectatorFramePublish(stored, tuple(recipients))
 
     async def read_spectator_frames(
         self,
@@ -230,7 +255,7 @@ def _frame_window(frames: tuple[SpectatorFrame, ...]) -> SpectatorFrameWindow:
 def context(account_id: int, name: str, realtime: SpectatorRealtime) -> StableRuntimeContext:
     fence = realtime.fences[account_id]
     return StableRuntimeContext(
-        identity=ResolvedStableSession(
+        identity=ResolvedClientSession(
             account_id,
             name,
             1,
@@ -254,6 +279,7 @@ def services(realtime: SpectatorRealtime) -> StableServices:
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, FakeIds()),
         settings=Settings(),
+        bubbles=cast(RealtimeBubbleBus, realtime.bubbles),
     )
 
 
@@ -264,7 +290,6 @@ def spectator_frame_packet(sequence: int, *, action: ReplayAction = ReplayAction
         action=action,
         extra=0,
         sequence=sequence,
-        raw_data=memoryview(b""),
     )
     writer = PacketWriter()
     with writer.packet(ClientPacket.SPECTATE_FRAMES):
@@ -281,11 +306,40 @@ def packet_types(payloads: list[bytes] | bytes) -> list[ServerPacket]:
     return result
 
 
+def delivered_packet_types(realtime: SpectatorRealtime, account_id: int) -> list[ServerPacket]:
+    fence = realtime.fences[account_id]
+    rendered = [
+        StableBubbleRenderer().render(bubble) for target, bubble in realtime.bubbles.published if target == fence
+    ]
+    return packet_types(rendered)
+
+
+@pytest.mark.parametrize("action", tuple(ReplayAction))
+def test_stable_frame_decode_canonical_encode_preserves_complete_bundle(action: ReplayAction) -> None:
+    bundle = ReplayFrameBundle(
+        frames=(ReplayFrame(3, 4, 12.5, -8.25, -10),),
+        score_frame=ScoreFrame(10, 2, 3, 4, 5, 6, 7, 8, 9000, 10, 9, False, 200, 11, True, 0.25, 0.75),
+        action=action,
+        extra=-3,
+        sequence=65535,
+    )
+    writer = PacketWriter()
+    with writer.packet(ClientPacket.SPECTATE_FRAMES):
+        writer.write_replay_frame_bundle(bundle)
+    ingress = next(PacketReader(writer.to_bytes()))
+    canonical = canonicalize_spectator_frame(2, ingress.payload.read_replay_frame_bundle())
+    rendered = next(PacketReader(StableBubbleRenderer().render(canonical), packet_enum=ServerPacket))
+
+    assert rendered.packet_type is ServerPacket.SPECTATE_FRAMES
+    assert rendered.payload.read_replay_frame_bundle() == bundle
+    rendered.payload.require_exhausted()
+
+
 @pytest.mark.asyncio
 async def test_spectator_join_frames_and_stop_notify_host_and_fellows(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    dispatcher_module = importlib.import_module("perfcho.api.cho.dispatcher.packets")
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
     events: list[tuple[str, str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -304,13 +358,13 @@ async def test_spectator_join_frames_and_stop_notify_host_and_fellows(monkeypatc
 
     assert realtime.relations[3].host_account_id == 2
     assert packet_types(joined) == [ServerPacket.FELLOW_SPECTATOR_JOINED]
-    assert packet_types(realtime.mailboxes[2]) == [ServerPacket.SPECTATOR_JOINED]
-    assert packet_types(realtime.mailboxes[9]) == [ServerPacket.FELLOW_SPECTATOR_JOINED]
+    assert delivered_packet_types(realtime, 2) == [ServerPacket.SPECTATOR_JOINED]
+    assert delivered_packet_types(realtime, 9) == [ServerPacket.FELLOW_SPECTATOR_JOINED]
 
     await dispatch_packets(spectator_frame_packet(1), context(2, "host", realtime), stable_services)
 
-    assert packet_types(realtime.mailboxes[3]) == [ServerPacket.SPECTATE_FRAMES]
-    assert packet_types(realtime.mailboxes[9])[-1] is ServerPacket.SPECTATE_FRAMES
+    assert delivered_packet_types(realtime, 3) == [ServerPacket.SPECTATE_FRAMES]
+    assert delivered_packet_types(realtime, 9)[-1] is ServerPacket.SPECTATE_FRAMES
 
     await dispatch_packets(
         build_packet(ClientPacket.STOP_SPECTATING),
@@ -319,8 +373,8 @@ async def test_spectator_join_frames_and_stop_notify_host_and_fellows(monkeypatc
     )
 
     assert 3 not in realtime.relations
-    assert packet_types(realtime.mailboxes[2])[-1] is ServerPacket.SPECTATOR_LEFT
-    assert packet_types(realtime.mailboxes[9])[-1] is ServerPacket.FELLOW_SPECTATOR_LEFT
+    assert delivered_packet_types(realtime, 2)[-1] is ServerPacket.SPECTATOR_LEFT
+    assert delivered_packet_types(realtime, 9)[-1] is ServerPacket.FELLOW_SPECTATOR_LEFT
     assert any(event == "stable.spectator.attach" and fields["outcome"] == "attached" for _, event, fields in events)
     assert any(event == "stable.spectator.detach" and fields["outcome"] == "detached" for _, event, fields in events)
     frame_event = next(
@@ -348,21 +402,23 @@ async def test_new_song_resets_spectator_frame_history_before_sequence_restarts(
 @pytest.mark.asyncio
 async def test_spectator_attach_returns_atomic_history_and_duplicate_start_is_noop() -> None:
     realtime = SpectatorRealtime()
-    history_wire = build_packet(ServerPacket.SPECTATE_FRAMES, b"history")
-    realtime.frames[2] = [SpectatorFrame(1, 1, history_wire)]
     stable_services = services(realtime)
+    await dispatch_packets(spectator_frame_packet(1), context(2, "host", realtime), stable_services)
     start = build_packet(ClientPacket.START_SPECTATING, struct.pack("<i", 2))
     spectator = context(3, "spectator", realtime)
 
     joined = await dispatch_packets(start, spectator, stable_services)
     relation_id = realtime.relations[3].relation_id
-    mailbox_sizes = {account_id: len(payloads) for account_id, payloads in realtime.mailboxes.items()}
+    published_count = len(realtime.bubbles.published)
     duplicate = await dispatch_packets(start, spectator, stable_services)
 
     assert packet_types(joined) == [ServerPacket.FELLOW_SPECTATOR_JOINED, ServerPacket.SPECTATE_FRAMES]
     assert duplicate == b""
     assert realtime.relations[3].relation_id == relation_id
-    assert {account_id: len(payloads) for account_id, payloads in realtime.mailboxes.items()} == mailbox_sizes
+    assert len(realtime.bubbles.published) == published_count
+
+    await dispatch_packets(spectator_frame_packet(2), context(2, "host", realtime), stable_services)
+    assert delivered_packet_types(realtime, 3)[-1] is ServerPacket.SPECTATE_FRAMES
 
 
 @pytest.mark.asyncio
@@ -375,13 +431,13 @@ async def test_stale_spectator_detach_does_not_emit_leave_notifications() -> Non
         spectator,
         stable_services,
     )
-    mailbox_sizes = {account_id: len(payloads) for account_id, payloads in realtime.mailboxes.items()}
+    published_count = len(realtime.bubbles.published)
     realtime.detach_current = False
 
     await dispatch_packets(build_packet(ClientPacket.STOP_SPECTATING), spectator, stable_services)
 
     assert 3 in realtime.relations
-    assert {account_id: len(payloads) for account_id, payloads in realtime.mailboxes.items()} == mailbox_sizes
+    assert len(realtime.bubbles.published) == published_count
 
 
 @pytest.mark.asyncio
@@ -394,10 +450,15 @@ async def test_cant_spectate_uses_each_relation_recipient_fence() -> None:
         spectator,
         stable_services,
     )
-    realtime.mailboxes.clear()
+    realtime.bubbles.published.clear()
 
     await dispatch_packets(build_packet(ClientPacket.CANT_SPECTATE), spectator, stable_services)
 
-    assert set(realtime.mailboxes) == {2, 3, 9}
-    for payloads in realtime.mailboxes.values():
-        assert packet_types(payloads) == [ServerPacket.SPECTATOR_CANT_SPECTATE]
+    assert {fence for fence, _ in realtime.bubbles.published} == {
+        realtime.fences[2],
+        realtime.fences[3],
+        realtime.fences[9],
+    }
+    assert [
+        packet_type for account_id in (2, 3, 9) for packet_type in delivered_packet_types(realtime, account_id)
+    ] == [ServerPacket.SPECTATOR_CANT_SPECTATE] * 3

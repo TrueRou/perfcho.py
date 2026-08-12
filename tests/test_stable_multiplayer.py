@@ -5,15 +5,28 @@ from typing import Protocol, cast
 
 import pytest
 
-from perfcho.api.cho.dispatcher import StableRuntimeContext, dispatch_packets
-from perfcho.api.cho.dispatcher.multiplayer import _settings_from_wire
+from perfcho.api.stable.bubbles import StableBubbleRenderer, canonicalize_presence
+from perfcho.api.stable.dispatcher import StableRuntimeContext
+from perfcho.api.stable.dispatcher import dispatch_packets as dispatch_bubbles
+from perfcho.api.stable.dispatcher.multiplayer import _broadcast_lobby, _settings_from_wire
+from perfcho.api.stable.realtime import (
+    ClientPacket,
+    Message,
+    MultiplayerMatch,
+    PacketReader,
+    PacketWriter,
+    ScoreFrame,
+    ServerPacket,
+    UserPresence,
+    UserStats,
+)
 from perfcho.infra.compose import StableServices
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.bot import BotCommandService
 from perfcho.modules.common import Clock, IdGenerator
 from perfcho.modules.community import CommunityService
-from perfcho.modules.identity import IdentityService, ResolvedStableSession
+from perfcho.modules.identity import IdentityService, ResolvedClientSession
 from perfcho.modules.multiplayer import (
     CreateRoom,
     MultiplayerMutationKind,
@@ -33,24 +46,37 @@ from perfcho.modules.multiplayer.commands import (
     MultiplayerCommandDependencies,
     build_multiplayer_commands,
 )
-from perfcho.modules.realtime import PresenceSnapshot, RealtimeRepository, RealtimeSession
-from perfcho.modules.realtime.stable import (
-    ClientPacket,
-    Message,
-    MultiplayerMatch,
-    PacketReader,
-    PacketWriter,
-    ScoreFrame,
-    ServerPacket,
-    UserPresence,
-    UserStats,
-    user_presence,
+from perfcho.modules.realtime import (
+    MultiplayerRoomAction,
+    MultiplayerRoomBubble,
+    PresenceSnapshot,
+    RealtimeBubble,
+    RealtimeBubbleBus,
+    RealtimeSession,
+    RealtimeStateRepository,
+    SessionFence,
+    multiplayer_room_snapshot,
 )
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant
 from perfcho.modules.social import SocialService
 
 NOW = datetime(2026, 7, 29, 12, tzinfo=UTC)
+
+
+async def dispatch_packets(body: bytes, context: StableRuntimeContext, services: StableServices) -> bytes:
+    bubbles = await dispatch_bubbles(body, context, services)
+    rendered = StableBubbleRenderer().render_many(bubbles, max_bytes=services.settings.stable_max_response_bytes)
+    return rendered + bytes(context.stable_output)
+
+
 EXPIRY = NOW + timedelta(minutes=5)
+
+
+def presence_snapshot(account_id: int, name: str) -> PresenceSnapshot:
+    presence = UserPresence(account_id, name, 0, 0, 1, 0, 0.0, 0.0, 0)
+    stats = UserStats(account_id, 0, "", "", 0, 0, 0, 0, 0.0, 0, 0, 0, 0)
+    identity, activity, statistics = canonicalize_presence(presence, stats, country_code=None)
+    return PresenceSnapshot(account_id, 1, identity, activity, statistics, EXPIRY, uuid.uuid7())
 
 
 class FixedClock:
@@ -114,6 +140,28 @@ class FakeMultiplayer:
         self.state = replace(self.state, state_revision=self.state.state_revision + 1, slots=slots)
         return self.state
 
+    async def mark_loaded(self, public_id: int, account_id: int) -> RoomState:
+        assert public_id == self.state.room.public_id
+        self.state = replace(
+            self.state,
+            state_revision=self.state.state_revision + 1,
+            slots=tuple(
+                replace(slot, loaded=True) if slot.account_id == account_id else slot for slot in self.state.slots
+            ),
+        )
+        return self.state
+
+    async def mark_failed(self, public_id: int, account_id: int) -> RoomState:
+        assert public_id == self.state.room.public_id
+        self.state = replace(
+            self.state,
+            state_revision=self.state.state_revision + 1,
+            slots=tuple(
+                replace(slot, failed=True) if slot.account_id == account_id else slot for slot in self.state.slots
+            ),
+        )
+        return self.state
+
     async def start_round(self, command: object) -> MultiplayerMutationResult:
         self.started = command
         slots = tuple(
@@ -171,58 +219,38 @@ class FakeMultiplayer:
 class InviteRealtime:
     def __init__(self) -> None:
         self.delivered: list[tuple[int, bytes]] = []
-        self.target = PresenceSnapshot(
-            11,
-            1,
-            user_presence(UserPresence(11, "target", 0, 0, 1, 0, 0.0, 0.0, 0)),
-            EXPIRY,
-            uuid.uuid7(),
-        )
+        self.target = presence_snapshot(11, "target")
 
     async def get_presence(self, account_id: int, *, at: datetime) -> PresenceSnapshot | None:
         del at
         return self.target if account_id == self.target.account_id else None
 
-    async def enqueue_mailbox(
-        self,
-        account_id: int,
-        payload: bytes,
-        *,
-        recipient_fence: object,
-        expires_at: datetime,
-    ) -> None:
-        del recipient_fence, expires_at
-        self.delivered.append((account_id, payload))
-
 
 class RoomRealtime:
     def __init__(self, *account_ids: int) -> None:
-        self.presences = {
-            account_id: PresenceSnapshot(
-                account_id,
-                1,
-                user_presence(UserPresence(account_id, f"user-{account_id}", 0, 0, 1, 0, 0.0, 0.0, 0)),
-                EXPIRY,
-                uuid.uuid7(),
-            )
-            for account_id in account_ids
-        }
+        self.presences = {account_id: presence_snapshot(account_id, f"user-{account_id}") for account_id in account_ids}
         self.delivered: list[tuple[int, bytes]] = []
 
     async def get_presence(self, account_id: int, *, at: datetime) -> PresenceSnapshot | None:
         del at
         return self.presences.get(account_id)
 
-    async def enqueue_mailbox(
-        self,
-        account_id: int,
-        payload: bytes,
-        *,
-        recipient_fence: object,
-        expires_at: datetime,
-    ) -> None:
-        del recipient_fence, expires_at
-        self.delivered.append((account_id, payload))
+
+class FakeBubbleBus:
+    def __init__(self, realtime: object | None) -> None:
+        self.realtime = realtime
+
+    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
+        if isinstance(self.realtime, RoomRealtime):
+            account_id = next(
+                account_id
+                for account_id, presence in self.realtime.presences.items()
+                if presence.fence == recipient_fence
+            )
+            self.realtime.delivered.append((account_id, StableBubbleRenderer().render(bubble)))
+        elif isinstance(self.realtime, InviteRealtime) and self.realtime.target.fence == recipient_fence:
+            self.realtime.delivered.append((self.realtime.target.account_id, StableBubbleRenderer().render(bubble)))
+        return 1
 
 
 class FakeCommunity:
@@ -237,6 +265,18 @@ class FakeCommunity:
         del args, kwargs
         self.public_message_calls += 1
         raise AssertionError("virtual multiplayer chat must not use a persistent public channel")
+
+
+class LobbyCommunity(FakeCommunity):
+    async def get_public_channel(self, account_id: int, selector: object) -> object:
+        del account_id, selector
+        return type("Lobby", (), {"channel_id": 7})()
+
+
+class LobbyRealtime(RoomRealtime):
+    async def list_channel_members(self, channel_id: int) -> frozenset[int]:
+        assert channel_id == 7
+        return frozenset(self.presences)
 
 
 class FakeSocial:
@@ -270,7 +310,7 @@ def room_state() -> RoomState:
 def context() -> StableRuntimeContext:
     session_id = uuid.uuid7()
     return StableRuntimeContext(
-        ResolvedStableSession(10, "host", 1, session_id, None, "b20260711.1", None, EXPIRY),
+        ResolvedClientSession(10, "host", 1, session_id, None, "b20260711.1", None, EXPIRY),
         RealtimeSession(session_id, 10, 1, EXPIRY),
         UserPresence(10, "host", 0, 0, 1, 0, 0.0, 0.0, 0),
         UserStats(10, 0, "", "", 0, 0, 0, 0, 0.0, 0, 0, 0, 0),
@@ -288,10 +328,11 @@ def services(
     return StableServices(
         identity=cast(IdentityService, object()),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=cast(RealtimeRepository, realtime if realtime is not None else object()),
+        realtime=cast(RealtimeStateRepository, realtime if realtime is not None else object()),
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, FakeIds()),
         settings=Settings(),
+        bubbles=cast(RealtimeBubbleBus, FakeBubbleBus(realtime)),
         multiplayer=cast(MultiplayerService, multiplayer),
         community=cast(CommunityService, community) if community is not None else None,
         social=cast(SocialService, social) if social is not None else None,
@@ -329,7 +370,7 @@ def client_packet(packet_type: ClientPacket, write: object | None = None) -> byt
 async def test_create_match_maps_wire_settings_and_returns_join_success(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    multiplayer_module = importlib.import_module("perfcho.api.cho.dispatcher.multiplayer")
+    multiplayer_module = importlib.import_module("perfcho.api.stable.dispatcher.multiplayer")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -365,6 +406,8 @@ async def test_create_match_maps_wire_settings_and_returns_join_success(monkeypa
     assert match.match_id == 7 and match.password == "secret"
     assert multiplayer.created is not None
     assert multiplayer.created.settings.external_beatmap_id == 42
+    assert multiplayer.created.capacity == 16
+    assert multiplayer.created.public_id_limit == 32767
     lifecycle = next(fields for event, fields in events if event == "stable.multiplayer.room_lifecycle")
     assert lifecycle == {
         "action": "created",
@@ -376,6 +419,39 @@ async def test_create_match_maps_wire_settings_and_returns_join_success(monkeypa
     }
     for secret in ("Room", "secret", "Artist - Title [Hard]", (b"m" * 16).hex()):
         assert secret not in repr(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capacity", "public_id", "action"),
+    [
+        (1024, 7, MultiplayerRoomAction.CREATED),
+        (16, 32768, MultiplayerRoomAction.DISPOSED),
+    ],
+)
+async def test_canonical_rooms_outside_stable_bounds_are_not_published_to_lobby(
+    capacity: int,
+    public_id: int,
+    action: MultiplayerRoomAction,
+) -> None:
+    base = room_state()
+    state = replace(
+        base,
+        room=replace(base.room, capacity=capacity, public_id=public_id),
+        slots=(RoomSlot(0, SlotStatus.NOT_READY, 10),)
+        + tuple(RoomSlot(position, SlotStatus.OPEN) for position in range(1, capacity)),
+    )
+    realtime = LobbyRealtime(20)
+    stable_services = services(FakeMultiplayer(state), community=LobbyCommunity(), realtime=realtime)
+
+    failed = await _broadcast_lobby(
+        MultiplayerRoomBubble(action, multiplayer_room_snapshot(state)),
+        None,
+        stable_services,
+    )
+
+    assert failed == frozenset()
+    assert realtime.delivered == []
 
 
 @pytest.mark.asyncio
@@ -545,7 +621,7 @@ async def test_multiplayer_public_message_uses_room_members_instead_of_persisten
 ) -> None:
     import importlib
 
-    dispatcher_module = importlib.import_module("perfcho.api.cho.dispatcher.packets")
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
     multiplayer = FakeMultiplayer(room_state())
     multiplayer.state = replace(
         multiplayer.state,
@@ -558,12 +634,12 @@ async def test_multiplayer_public_message_uses_room_members_instead_of_persisten
     community = FakeCommunity()
     delivered: list[tuple[int, bytes]] = []
 
-    async def capture(account_id: int, payload: bytes, stable_services: StableServices) -> bool:
+    async def capture(account_id: int, bubble: RealtimeBubble, stable_services: StableServices) -> bool:
         del stable_services
-        delivered.append((account_id, payload))
+        delivered.append((account_id, StableBubbleRenderer().render(bubble)))
         return True
 
-    monkeypatch.setattr(dispatcher_module, "_enqueue_online_recipient", capture)
+    monkeypatch.setattr(dispatcher_module, "_publish_online_recipient", capture)
 
     response = await dispatch_packets(
         client_packet(ClientPacket.SEND_PUBLIC_MESSAGE, Message("", "hello", "#multiplayer", 0)),
@@ -609,6 +685,20 @@ async def test_ready_updates_slot_and_returns_hidden_password_match_state() -> N
     match = packet.payload.read_multiplayer_match()
     assert match.slot_statuses[0] == 8
     assert match.password == ""
+
+
+@pytest.mark.asyncio
+async def test_change_slot_rejects_positions_outside_stable_projection() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+    writer = PacketWriter()
+    with writer.packet(ClientPacket.MATCH_CHANGE_SLOT):
+        writer.write_i32(16)
+
+    response = await dispatch_packets(writer.to_bytes(), context(), services(multiplayer))
+
+    packet = next(PacketReader(response, packet_enum=ServerPacket))
+    assert packet.packet_type is ServerPacket.NOTIFICATION
+    assert packet.payload.read_string() == "The multiplayer request is invalid."
 
 
 def test_map_change_sentinel_is_preserved_in_canonical_settings() -> None:
@@ -683,6 +773,38 @@ async def test_skip_update_uses_account_id_expected_by_stable_protocol() -> None
     delivered = next(PacketReader(realtime.delivered[0][1], packet_enum=ServerPacket))
     assert delivered.packet_type is ServerPacket.MATCH_PLAYER_SKIPPED
     assert delivered.payload.read_i32() == 10
+
+
+@pytest.mark.asyncio
+async def test_load_complete_and_failed_round_signals_fan_out() -> None:
+    multiplayer = FakeMultiplayer(room_state())
+    multiplayer.state = replace(
+        multiplayer.state,
+        in_progress=True,
+        round_id=uuid.uuid7(),
+        round_participant_account_ids=(10, 20),
+        slots=(
+            replace(multiplayer.state.slots[0], status=SlotStatus.PLAYING),
+            RoomSlot(1, SlotStatus.PLAYING, 20, loaded=True),
+            *multiplayer.state.slots[2:],
+        ),
+    )
+    realtime = RoomRealtime(20)
+    stable_services = services(multiplayer, realtime=realtime)
+
+    loaded = await dispatch_packets(client_packet(ClientPacket.MATCH_LOAD_COMPLETE), context(), stable_services)
+    failed = await dispatch_packets(client_packet(ClientPacket.MATCH_FAILED), context(), stable_services)
+
+    assert [packet.packet_type for packet in PacketReader(loaded, packet_enum=ServerPacket)] == [
+        ServerPacket.MATCH_ALL_PLAYERS_LOADED
+    ]
+    failed_packet = next(PacketReader(failed, packet_enum=ServerPacket))
+    assert failed_packet.packet_type is ServerPacket.MATCH_PLAYER_FAILED
+    assert failed_packet.payload.read_i32() == 0
+    assert [next(PacketReader(payload, packet_enum=ServerPacket)).packet_type for _, payload in realtime.delivered] == [
+        ServerPacket.MATCH_ALL_PLAYERS_LOADED,
+        ServerPacket.MATCH_PLAYER_FAILED,
+    ]
 
 
 @pytest.mark.asyncio

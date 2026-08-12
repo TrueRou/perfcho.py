@@ -39,16 +39,16 @@ from perfcho.modules.account import AccountService, RegisterAccount
 from perfcho.modules.common import ClientContext, CommandMeta
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.identity import (
+    AuthenticateClientSession,
+    ClientSessionResult,
     CredentialSnapshot,
     IdentityService,
     InvalidCredentials,
-    InvalidStableSession,
-    ResolvedStableSession,
-    StableLogin,
-    StableSessionAlreadyActive,
-    StableSessionResult,
+    InvalidSession,
+    ResolvedClientSession,
+    SessionAlreadyActive,
 )
-from perfcho.modules.identity.models import OpenStableSession
+from perfcho.modules.identity.models import OpenClientSession
 
 INSTANT = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 POLICY = Argon2Policy(1, 8, 1)
@@ -105,9 +105,9 @@ class FakeIdentityRepository:
         self.calls = calls
         self.snapshot = snapshot
         self.current = snapshot
-        self.open_session: OpenStableSession | None = None
-        self.web_candidate: tuple[CredentialSnapshot, OpenStableSession] | None = None
-        self.resolved: ResolvedStableSession | None = None
+        self.open_session: OpenClientSession | None = None
+        self.web_candidate: tuple[CredentialSnapshot, OpenClientSession] | None = None
+        self.resolved: ResolvedClientSession | None = None
         self.session_account_id: int | None = snapshot.account_id if snapshot is not None else None
         self.attempts: list[dict[str, object]] = []
         self.device_write: dict[str, object] | None = None
@@ -129,20 +129,20 @@ class FakeIdentityRepository:
         self.credential_upgrade = dict(kwargs)
         return self.upgrade_succeeds
 
-    async def acquire_stable_session_lock(self, account_id: int) -> None:
+    async def acquire_session_lock(self, account_id: int) -> None:
         self.calls.append(f"lock:{account_id}")
 
-    async def find_open_stable_session(self, account_id: int) -> OpenStableSession | None:
+    async def find_open_client_session(self, account_id: int) -> OpenClientSession | None:
         self.calls.append(f"open:{account_id}")
         return self.open_session
 
-    async def find_stable_web_candidate(
+    async def find_online_credential_candidate(
         self,
         identifier_kind: str,
         identifier_key: str,
         *,
         at: datetime,
-    ) -> tuple[CredentialSnapshot, OpenStableSession] | None:
+    ) -> tuple[CredentialSnapshot, OpenClientSession] | None:
         self.calls.append(f"web-candidate:{identifier_kind}:{identifier_key}")
         return self.web_candidate
 
@@ -151,7 +151,7 @@ class FakeIdentityRepository:
         self.device_write = dict(kwargs)
         return cast(uuid.UUID, kwargs["proposed_device_id"])
 
-    async def create_stable_session(self, **kwargs: object) -> None:
+    async def create_client_session(self, **kwargs: object) -> None:
         self.calls.append("create")
         self.session_write = dict(kwargs)
 
@@ -159,25 +159,25 @@ class FakeIdentityRepository:
         self.calls.append(f"attempt:{kwargs['result']}")
         self.attempts.append(dict(kwargs))
 
-    async def resolve_stable_session(self, token_digest: bytes, *, at: datetime) -> ResolvedStableSession | None:
+    async def resolve_client_session(self, token_digest: bytes, *, at: datetime) -> ResolvedClientSession | None:
         self.calls.append("resolve")
         return self.resolved
 
-    async def touch_stable_session(
+    async def touch_client_session(
         self,
         token_digest: bytes,
         *,
         at: datetime,
         minimum_interval: timedelta,
-    ) -> tuple[ResolvedStableSession, bool] | None:
+    ) -> tuple[ResolvedClientSession, bool] | None:
         self.calls.append("touch")
         return (replace(self.resolved, last_activity_at=at), True) if self.resolved is not None else None
 
-    async def get_stable_session_account_id(self, session_id: uuid.UUID) -> int | None:
+    async def get_client_session_account_id(self, session_id: uuid.UUID) -> int | None:
         self.calls.append("session-account")
         return self.session_account_id
 
-    async def close_stable_session(
+    async def close_client_session(
         self,
         session_id: uuid.UUID,
         *,
@@ -246,11 +246,11 @@ def _meta(value: bytes = b"identity-login") -> CommandMeta:
     )
 
 
-def _login(*, identifier: str = "Ａlice", password_token: str = "a" * 32) -> StableLogin:
-    return StableLogin(
+def _login(*, identifier: str = "Ａlice", password_preverification: str = "a" * 32) -> AuthenticateClientSession:
+    return AuthenticateClientSession(
         meta=_meta(),
         identifier=identifier,
-        password_token=password_token,
+        password_preverification=password_preverification,
         client_version="b20260729",
         client_variant="cuttingedge",
         ip_address="127.0.0.1",
@@ -283,8 +283,8 @@ def _service(
             device_hmac_key=DEVICE_KEY,
             clock=FixedClock(),
             id_generator=SequenceIds(),
-            stable_session_stale_grace=timedelta(minutes=2),
-            stable_web_verification_cache=cache,
+            client_session_stale_grace=timedelta(minutes=2),
+            online_credential_verification_cache=cache,
             token_factory=lambda: "raw-stable-token-secret",
         ),
         units,
@@ -293,7 +293,7 @@ def _service(
 
 def test_identity_values_are_frozen_slotted_and_hide_secrets() -> None:
     command = _login()
-    result = StableSessionResult(42, "Alice", uuid.uuid7(), uuid.uuid7(), "secret", INSTANT)
+    result = ClientSessionResult(42, "Alice", uuid.uuid7(), uuid.uuid7(), "secret", INSTANT)
 
     assert command.__slots__
     assert result.__slots__
@@ -324,7 +324,7 @@ async def test_login_verifies_outside_transactions_rechecks_and_persists_only_hm
         return PasswordVerification(PasswordVerificationStatus.MATCH)
 
     monkeypatch.setattr("perfcho.modules.identity.services.verify_password", verify_outside_transaction)
-    result = await service.login_stable(_login())
+    result = await service.authenticate_client_session(_login())
 
     assert result.raw_token == "raw-stable-token-secret"
     assert calls == [
@@ -360,7 +360,7 @@ async def test_login_verifies_outside_transactions_rechecks_and_persists_only_hm
     assert repository.attempts[0]["failure_reason"] is None
     assert outbox.events[0].payload["session_id"] == str(result.session_id)
     assert "raw-stable-token-secret" not in repr(outbox.events[0])
-    assert logged[0][:2] == ("INFO", "identity.stable_session.opened")
+    assert logged[0][:2] == ("INFO", "identity.client_session.opened")
     assert logged[0][2]["credential_upgraded"] is False
     assert not {"token", "password", "ip_address", "user_agent"} & logged[0][2].keys()
 
@@ -396,7 +396,7 @@ async def test_successful_legacy_login_upgrades_after_recheck_in_the_session_tra
     )
     monkeypatch.setattr("perfcho.modules.identity.services.hash_password", hash_argon_outside_transaction)
 
-    await service.login_stable(_login())
+    await service.authenticate_client_session(_login())
 
     assert calls.index("verify-legacy") < calls.index("hash-argon2") < calls.index("lock:42")
     assert calls.index("recheck:42") < calls.index("upgrade") < calls.index("create") < calls.index("commit")
@@ -432,7 +432,7 @@ async def test_concurrent_argon_credential_wins_over_a_verified_legacy_snapshot(
     )
 
     with pytest.raises(InvalidCredentials):
-        await service.login_stable(_login())
+        await service.authenticate_client_session(_login())
 
     assert repository.credential_upgrade is None
     assert repository.session_write is None
@@ -460,7 +460,7 @@ async def test_failed_legacy_compare_and_replace_does_not_create_a_session(
     )
 
     with pytest.raises(InvalidCredentials):
-        await service.login_stable(_login())
+        await service.authenticate_client_session(_login())
 
     assert repository.credential_upgrade is not None
     assert repository.session_write is None
@@ -490,7 +490,7 @@ async def test_missing_identifier_and_wrong_password_are_indistinguishable_and_a
         ),
     )
     with pytest.raises(InvalidCredentials) as raised:
-        await service.login_stable(_login(identifier="Unknown"))
+        await service.authenticate_client_session(_login(identifier="Unknown"))
 
     assert raised.value.code == "invalid_credentials"
     assert str(raised.value) == "invalid credentials"
@@ -502,6 +502,7 @@ async def test_missing_identifier_and_wrong_password_are_indistinguishable_and_a
             "identifier_hmac": repository.attempts[0]["identifier_hmac"],
             "ip_address": "127.0.0.1",
             "client_version": "b20260729",
+            "client_family": "stable",
             "result": "failure",
             "failure_reason": "invalid_credentials",
             "context": {"client_variant": "cuttingedge", "user_agent": "osu!"},
@@ -526,7 +527,7 @@ async def test_changed_credential_is_rejected_and_audited_in_second_uow(monkeypa
     )
 
     with pytest.raises(InvalidCredentials):
-        await service.login_stable(_login())
+        await service.authenticate_client_session(_login())
 
     assert units[1].committed
     assert repository.attempts[0]["failure_reason"] == "invalid_credentials"
@@ -535,10 +536,10 @@ async def test_changed_credential_is_rejected_and_audited_in_second_uow(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_login_enforces_one_active_normal_stable_session(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_login_enforces_one_active_client_session(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     repository = FakeIdentityRepository(calls, _snapshot())
-    repository.open_session = OpenStableSession(
+    repository.open_session = OpenClientSession(
         uuid.uuid7(),
         INSTANT - timedelta(hours=1),
         INSTANT - timedelta(seconds=1),
@@ -551,8 +552,8 @@ async def test_login_enforces_one_active_normal_stable_session(monkeypatch: pyte
         lambda *args, **kwargs: PasswordVerification(PasswordVerificationStatus.MATCH),
     )
 
-    with pytest.raises(StableSessionAlreadyActive):
-        await service.login_stable(_login())
+    with pytest.raises(SessionAlreadyActive):
+        await service.authenticate_client_session(_login())
 
     assert units[1].committed
     assert repository.attempts[0]["failure_reason"] == "active_session"
@@ -564,7 +565,7 @@ async def test_expired_open_session_is_closed_before_replacement(monkeypatch: py
     calls: list[str] = []
     repository = FakeIdentityRepository(calls, _snapshot())
     expired_id = uuid.uuid7()
-    repository.open_session = OpenStableSession(
+    repository.open_session = OpenClientSession(
         expired_id,
         INSTANT - timedelta(hours=2),
         INSTANT - timedelta(hours=1),
@@ -577,7 +578,7 @@ async def test_expired_open_session_is_closed_before_replacement(monkeypatch: py
         lambda *args, **kwargs: PasswordVerification(PasswordVerificationStatus.MATCH),
     )
 
-    await service.login_stable(_login())
+    await service.authenticate_client_session(_login())
 
     assert repository.closed == [(expired_id, False, "expired")]
     assert [event.event_type for event in outbox.events] == [
@@ -591,7 +592,7 @@ async def test_stale_open_session_is_atomically_closed_before_replacement(monkey
     calls: list[str] = []
     repository = FakeIdentityRepository(calls, _snapshot())
     stale_id = uuid.uuid7()
-    repository.open_session = OpenStableSession(
+    repository.open_session = OpenClientSession(
         stale_id,
         INSTANT - timedelta(hours=1),
         INSTANT - timedelta(minutes=2),
@@ -604,7 +605,7 @@ async def test_stale_open_session_is_atomically_closed_before_replacement(monkey
         lambda *args, **kwargs: PasswordVerification(PasswordVerificationStatus.MATCH),
     )
 
-    await service.login_stable(_login())
+    await service.authenticate_client_session(_login())
 
     assert repository.closed == [(stale_id, False, "stale")]
     assert calls.index("lock:42") < calls.index("open:42") < calls.index("close:False") < calls.index("create")
@@ -617,7 +618,7 @@ async def test_resolve_close_and_revoke_use_digest_and_emit_closed_events() -> N
     calls: list[str] = []
     repository = FakeIdentityRepository(calls, _snapshot())
     session_id = uuid.uuid7()
-    repository.resolved = ResolvedStableSession(
+    repository.resolved = ResolvedClientSession(
         account_id=42,
         current_name="Alice",
         auth_version=1,
@@ -632,10 +633,10 @@ async def test_resolve_close_and_revoke_use_digest_and_emit_closed_events() -> N
     outbox = FakeOutboxWriter(calls)
     service, units = _service(repository, outbox, calls)
 
-    assert await service.resolve_stable_session("bearer") == repository.resolved
-    touched = await service.touch_stable_session("bearer")
-    await service.close_stable_session("bearer", reason="login_bootstrap_failed")
-    await service.revoke_stable_session(session_id, reason="credential_reset")
+    assert await service.resolve_client_session("bearer") == repository.resolved
+    touched = await service.touch_client_session("bearer")
+    await service.close_client_session("bearer", reason="login_bootstrap_failed")
+    await service.revoke_client_session(session_id, reason="credential_reset")
 
     assert touched.opened_at == INSTANT - timedelta(minutes=5)
     assert touched.last_activity_at == INSTANT
@@ -657,7 +658,7 @@ async def test_web_verification_checks_session_before_password_and_rechecks_afte
 ) -> None:
     calls: list[str] = []
     snapshot = _snapshot()
-    session = OpenStableSession(
+    session = OpenClientSession(
         uuid.uuid7(),
         INSTANT - timedelta(minutes=5),
         INSTANT - timedelta(seconds=5),
@@ -675,7 +676,7 @@ async def test_web_verification_checks_session_before_password_and_rechecks_afte
 
     monkeypatch.setattr("perfcho.modules.identity.services.verify_password", verify)
 
-    principal = await service.verify_stable_web("Alice", "a" * 32)
+    principal = await service.verify_online_credentials("Alice", "a" * 32)
 
     assert principal.session_id == session.session_id
     assert calls.index("web-candidate:name:alice") < calls.index("verify-web") < calls.index("recheck:42")
@@ -687,7 +688,7 @@ async def test_web_verification_cache_hit_skips_password_kdf_and_credential_rech
 ) -> None:
     calls: list[str] = []
     snapshot = _snapshot()
-    session = OpenStableSession(
+    session = OpenClientSession(
         uuid.uuid7(),
         INSTANT - timedelta(minutes=5),
         INSTANT - timedelta(seconds=5),
@@ -702,7 +703,7 @@ async def test_web_verification_cache_hit_skips_password_kdf_and_credential_rech
         lambda *args, **kwargs: pytest.fail("a valid cached proof must skip Argon2"),
     )
 
-    principal = await service.verify_stable_web("Alice", "a" * 32)
+    principal = await service.verify_online_credentials("Alice", "a" * 32)
 
     assert principal.session_id == session.session_id
     assert len(cache.matches_calls) == 1
@@ -730,7 +731,7 @@ async def test_web_verification_uses_dummy_kdf_without_an_online_candidate(
     )
 
     with pytest.raises(InvalidCredentials):
-        await service.verify_stable_web("Unknown", "a" * 32)
+        await service.verify_online_credentials("Unknown", "a" * 32)
 
     assert calls == ["uow", "enter", "web-candidate:name:unknown", "exit", "dummy-kdf"]
 
@@ -741,7 +742,7 @@ async def test_web_verification_uses_dummy_kdf_for_malformed_password_shape(
 ) -> None:
     calls: list[str] = []
     snapshot = _snapshot()
-    session = OpenStableSession(
+    session = OpenClientSession(
         uuid.uuid7(),
         INSTANT - timedelta(minutes=5),
         INSTANT - timedelta(seconds=5),
@@ -761,7 +762,7 @@ async def test_web_verification_uses_dummy_kdf_for_malformed_password_shape(
     )
 
     with pytest.raises(InvalidCredentials):
-        await service.verify_stable_web("Alice", "z" * 32)
+        await service.verify_online_credentials("Alice", "z" * 32)
 
 
 @pytest.mark.asyncio
@@ -771,8 +772,8 @@ async def test_unresolvable_token_raises_domain_error_without_writes() -> None:
     outbox = FakeOutboxWriter(calls)
     service, units = _service(repository, outbox, calls)
 
-    with pytest.raises(InvalidStableSession):
-        await service.resolve_stable_session("missing")
+    with pytest.raises(InvalidSession):
+        await service.resolve_client_session("missing")
 
     assert not units[0].committed
     assert outbox.events == []
@@ -789,11 +790,12 @@ async def test_sqlalchemy_repository_creates_digest_only_session_models() -> Non
     token_jti = uuid.uuid7()
     token_digest = hashlib.sha256(b"persisted-digest").digest()
 
-    await repository.create_stable_session(
+    await repository.create_client_session(
         session_id=session_id,
         token_id=token_id,
         token_jti=token_jti,
         account_id=42,
+        client_family="stable",
         device_id=uuid.uuid7(),
         client_version="b20260729",
         client_variant="cuttingedge",
@@ -811,7 +813,7 @@ async def test_sqlalchemy_repository_creates_digest_only_session_models() -> Non
     assert auth_session.client_family is ClientFamily.STABLE
     assert auth_session.session_class == "normal"
     assert auth_session.last_activity_at == INSTANT
-    assert token.kind is TokenKind.STABLE_SESSION
+    assert token.kind is TokenKind.CLIENT_SESSION
     assert token.digest == token_digest
     assert token.prefix == "safe-prefix"
     assert token.jti == token_jti
@@ -840,7 +842,7 @@ async def test_sqlalchemy_repository_touches_session_monotonically_under_row_loc
     session.execute = AsyncMock(side_effect=(query_result, MagicMock()))
     repository = SqlAlchemyIdentityRepository(session)
 
-    resolved = await repository.touch_stable_session(
+    resolved = await repository.touch_client_session(
         hashlib.sha256(b"token").digest(),
         at=INSTANT,
         minimum_interval=timedelta(seconds=5),
@@ -880,7 +882,7 @@ async def test_sqlalchemy_repository_skips_heartbeat_write_before_interval() -> 
     session.execute = AsyncMock(return_value=query_result)
     repository = SqlAlchemyIdentityRepository(session)
 
-    result = await repository.touch_stable_session(
+    result = await repository.touch_client_session(
         hashlib.sha256(b"token").digest(),
         at=INSTANT,
         minimum_interval=timedelta(seconds=30),
@@ -943,13 +945,14 @@ async def test_sqlalchemy_repository_appends_attempt_and_revoke_advances_auth_ve
         identifier_hmac=identifier_hmac,
         ip_address="127.0.0.1",
         client_version="b20260729",
+        client_family="stable",
         result="failure",
         failure_reason="invalid_credentials",
         context={},
         now=INSTANT,
     )
     assert (
-        await repository.close_stable_session(
+        await repository.close_client_session(
             auth_session.id,
             now=INSTANT,
             reason="credential_reset",
@@ -1007,27 +1010,27 @@ async def test_postgres_stable_identity_lifecycle_is_digest_only_and_audited(pos
             device_hmac_key=DEVICE_KEY,
             clock=identity_clock,
             id_generator=Uuid7Generator(),
-            stable_session_stale_grace=timedelta(minutes=2),
+            client_session_stale_grace=timedelta(minutes=2),
             token_factory=lambda: next(stable_tokens),
         )
 
-        created = await identity.login_stable(_login(identifier="alice@example.com"))
-        resolved = await identity.resolve_stable_session(created.raw_token)
+        created = await identity.authenticate_client_session(_login(identifier="alice@example.com"))
+        resolved = await identity.resolve_client_session(created.raw_token)
         assert resolved.account_id == account.account_id
         assert resolved.session_id == created.session_id
         assert resolved.opened_at == INSTANT
         assert resolved.last_activity_at == INSTANT
         identity_clock.instant = INSTANT + timedelta(seconds=30)
-        touched = await identity.touch_stable_session(created.raw_token)
+        touched = await identity.touch_client_session(created.raw_token)
         assert touched.last_activity_at == identity_clock.instant
-        with pytest.raises(StableSessionAlreadyActive):
-            await identity.login_stable(_login(identifier=str(account.account_id)))
+        with pytest.raises(SessionAlreadyActive):
+            await identity.authenticate_client_session(_login(identifier=str(account.account_id)))
 
         async with session_factory() as session:
             token = await session.scalar(select(AuthToken).where(AuthToken.session_id == created.session_id))
             assert token is not None
             assert token.digest == digest_opaque_token(created.raw_token, key=TOKEN_KEY)
-            assert token.kind is TokenKind.STABLE_SESSION
+            assert token.kind is TokenKind.CLIENT_SESSION
             assert await session.scalar(select(func.count()).select_from(Device)) == 1
             assert await session.scalar(select(func.count()).select_from(DeviceIdentifier)) == 2
             assert await session.scalar(select(func.count()).select_from(AccountDevice)) == 1
@@ -1035,16 +1038,16 @@ async def test_postgres_stable_identity_lifecycle_is_digest_only_and_audited(pos
             event_types = set(await session.scalars(select(OutboxEvent.event_type)))
             assert "identity.session-opened.v1" in event_types
 
-        await identity.close_stable_session(created.raw_token, reason="login_bootstrap_failed")
-        with pytest.raises(InvalidStableSession):
-            await identity.resolve_stable_session(created.raw_token)
+        await identity.close_client_session(created.raw_token, reason="login_bootstrap_failed")
+        with pytest.raises(InvalidSession):
+            await identity.resolve_client_session(created.raw_token)
 
-        second = await identity.login_stable(_login(identifier="Alice"))
+        second = await identity.authenticate_client_session(_login(identifier="Alice"))
         identity_clock.instant += timedelta(seconds=121)
-        replacement = await identity.login_stable(_login(identifier="Alice"))
-        with pytest.raises(InvalidStableSession):
-            await identity.resolve_stable_session(second.raw_token)
-        await identity.revoke_stable_session(replacement.session_id, reason="credential_reset")
+        replacement = await identity.authenticate_client_session(_login(identifier="Alice"))
+        with pytest.raises(InvalidSession):
+            await identity.resolve_client_session(second.raw_token)
+        await identity.revoke_client_session(replacement.session_id, reason="credential_reset")
         async with session_factory() as session:
             account_row = await session.get(Account, account.account_id)
             assert account_row is not None

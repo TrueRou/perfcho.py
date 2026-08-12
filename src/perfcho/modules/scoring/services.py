@@ -1,4 +1,4 @@
-"""Accept canonical Stable and Lazer scores in one explicit transaction."""
+"""Accept canonical score facts in one explicit transaction."""
 
 import hashlib
 import time
@@ -26,7 +26,7 @@ from perfcho.modules.scoring.models import (
     AcceptScore,
     AccountStatsView,
     BeatmapGradeView,
-    ClientFamily,
+    CanonicalMod,
     IssueSoloScoreToken,
     LeaderboardPage,
     LeaderboardScope,
@@ -98,12 +98,10 @@ class ScoringService:
         self._solo_token_lifetime = solo_token_lifetime
 
     async def issue_solo_token(self, command: IssueSoloScoreToken) -> SoloScoreToken:
-        """Authorize one Lazer solo play after binding account, map revision, and ruleset."""
+        """Authorize one solo play after binding account, map revision, and ruleset."""
         actor = command.meta.actor
         if actor is None:
             raise ScoreRejected("solo score token requires an authenticated actor")
-        if command.meta.client.family != ClientFamily.LAZER.value:
-            raise ScoreRejected("solo score tokens are only available to Lazer clients")
         now = self._clock.now()
         async with self._uow_factory() as uow:
             repository = self._repository_factory(uow.session)
@@ -129,12 +127,9 @@ class ScoringService:
         actor = command.meta.actor
         if actor is None:
             raise ScoreRejected("score submission requires an authenticated actor")
-        try:
-            protocol = ClientFamily(command.meta.client.family)
-        except ValueError as error:
-            raise ScoreRejected("unsupported score submission client family") from error
-        if command.attestation.client_family is not protocol:
-            raise ScoreRejected("attestation client family does not match the command client")
+        source = command.meta.client.family
+        if command.attestation.source != source:
+            raise ScoreRejected("attestation source does not match the command client")
         if (
             command.meta.client.version is not None
             and command.attestation.client_version != command.meta.client.version
@@ -223,7 +218,7 @@ class ScoringService:
                 score,
                 revision,
                 command.variant,
-                lazer_grading=protocol is ClientFamily.LAZER,
+                uses_threshold_grading=command.uses_threshold_grading,
             )
 
             attempt_claim = await repository.claim_attempt(
@@ -234,7 +229,7 @@ class ScoringService:
                     beatmap_revision_id=revision.revision_id,
                     scoreboard_id=scoreboard.scoreboard_id,
                     mod_set_id=mod_set.mod_set_id,
-                    protocol=protocol,
+                    source=source,
                     submission=command.attempt,
                     outcome=score.outcome,
                 )
@@ -356,7 +351,7 @@ class ScoringService:
 
 
 def _judged_hits(ruleset: Ruleset, score: object) -> int:
-    """Count ruleset object judgements for Lazer attempt progress."""
+    """Count ruleset object judgements for token progress."""
     from perfcho.modules.scoring.models import ScoreSubmission
 
     if not isinstance(score, ScoreSubmission):
@@ -453,7 +448,7 @@ class ReplayService:
 
 
 class RankingQueryService:
-    """Read bounded Stable leaderboard projections through canonical dimensions."""
+    """Read bounded leaderboard projections through canonical dimensions."""
 
     def __init__(
         self,
@@ -744,7 +739,7 @@ def _leaderboard_score_from_mapping(value: object) -> LeaderboardScoreView:
         nkatu=int(value["nkatu"]),
         ngeki=int(value["ngeki"]),
         perfect=bool(value["perfect"]),
-        legacy_mod_bits=int(value["legacy_mod_bits"]),
+        mods=_mods_from_cache(value["mods"]),
         rank=int(value["rank"]),
         ended_at=_datetime_cache_value(value["ended_at"]),
         has_replay=bool(value["has_replay"]),
@@ -769,6 +764,20 @@ def _account_stats_from_cache(raw: bytes) -> AccountStatsView:
         replay_views=int(value.get("replay_views", 0)),
         grade_counts=cast(dict[str, int], value.get("grade_counts", {})),
     )
+
+
+def _mods_from_cache(value: object) -> tuple[CanonicalMod, ...]:
+    if not isinstance(value, list):
+        raise ValueError("invalid cached leaderboard mods")
+    mods: list[CanonicalMod] = []
+    for item in value:
+        if not isinstance(item, dict) or "acronym" not in item:
+            raise ValueError("invalid cached leaderboard mod")
+        settings = item.get("settings", {})
+        if not isinstance(settings, dict):
+            raise ValueError("invalid cached leaderboard mod settings")
+        mods.append(CanonicalMod(str(item["acronym"]), settings))
+    return tuple(mods)
 
 
 def _decimal_cache_value(value: object) -> Decimal:

@@ -3,7 +3,11 @@
 import hashlib
 from dataclasses import dataclass, replace
 
-from perfcho.api.cho.dispatcher.models import MultiplayerRuntimeContext
+from perfcho.api.stable.canonize.scoring import parse_legacy_mods
+from perfcho.api.stable.channels import parse_stable_channel_selector
+from perfcho.api.stable.dispatcher.models import MultiplayerRuntimeContext
+from perfcho.api.stable.realtime.codec import Packet, ProtocolError
+from perfcho.api.stable.realtime.models import ClientPacket, MultiplayerMatch
 from perfcho.infra.compose import StableServices
 from perfcho.infra.logging import log_event, rate_limit, sampled
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
@@ -28,48 +32,28 @@ from perfcho.modules.multiplayer import (
     UpdateRoomSettings,
     WinCondition,
 )
-from perfcho.modules.realtime import MailboxOverflow
-from perfcho.modules.realtime.stable.builders import (
-    channel_join,
-    channel_kick,
-    dispose_match,
-    match_abort,
-    match_all_players_loaded,
-    match_complete,
-    match_invite,
-    match_join_fail,
-    match_join_success,
-    match_player_failed,
-    match_player_skipped,
-    match_score_update,
-    match_skip,
-    match_start,
-    match_transfer_host,
-    new_match,
-    notification,
-    update_match,
+from perfcho.modules.realtime import (
+    MultiplayerInvitationState,
+    MultiplayerRoomAction,
+    MultiplayerRoomBubble,
+    MultiplayerScoreState,
+    MultiplayerSignalBubble,
+    MultiplayerSignalKind,
+    NotificationBubble,
+    RealtimeBubble,
+    multiplayer_room_snapshot,
 )
-from perfcho.modules.realtime.stable.codec import Packet, ProtocolError
-from perfcho.modules.realtime.stable.models import ClientPacket, Message, MultiplayerMatch
-from perfcho.modules.scoring import CanonicalMod, Ruleset, ScoreboardVariant
-from perfcho.modules.scoring.mods import normalize_mods, parse_legacy_mods
+from perfcho.modules.scoring import Ruleset
+from perfcho.modules.scoring.mods import normalize_mods
 
 _RULESETS = (Ruleset.OSU, Ruleset.TAIKO, Ruleset.FRUITS, Ruleset.MANIA)
 _TEAM_MODES = (TeamMode.HEAD_TO_HEAD, TeamMode.TAG_COOP, TeamMode.TEAM_VS, TeamMode.TAG_TEAM_VS)
 _WIN_CONDITIONS = (WinCondition.SCORE, WinCondition.ACCURACY, WinCondition.COMBO, WinCondition.SCORE_V2)
 _TEAM_MODE_IDS = {value: index for index, value in enumerate(_TEAM_MODES)}
 _WIN_CONDITION_IDS = {value: index for index, value in enumerate(_WIN_CONDITIONS)}
-_RULESET_IDS = {value: index for index, value in enumerate(_RULESETS)}
-_SLOT_STATUS_TO_WIRE = {
-    SlotStatus.OPEN: 1,
-    SlotStatus.LOCKED: 2,
-    SlotStatus.NOT_READY: 4,
-    SlotStatus.READY: 8,
-    SlotStatus.NO_BEATMAP: 16,
-    SlotStatus.PLAYING: 32,
-    SlotStatus.COMPLETE: 64,
-}
 _SPEED_MODS = frozenset({"DT", "NC", "HT"})
+_STABLE_ROOM_CAPACITY = 16
+_STABLE_PUBLIC_ID_LIMIT = 32767
 
 MULTIPLAYER_PACKETS = frozenset(
     {
@@ -109,7 +93,8 @@ async def dispatch_multiplayer_packet(
     multiplayer = services.multiplayer
     packet_type = packet.packet_type
     if multiplayer is None or not isinstance(packet_type, ClientPacket):
-        return match_join_fail()
+        context.local_bubbles.append(MultiplayerSignalBubble(MultiplayerSignalKind.JOIN_FAILED, None))
+        return b""
     dispatch = _MultiplayerPacketContext(
         packet=packet,
         packet_type=packet_type,
@@ -132,8 +117,9 @@ async def dispatch_multiplayer_packet(
             error_type=type(error).__name__,
         )
         if packet_type in {ClientPacket.CREATE_MATCH, ClientPacket.JOIN_MATCH}:
-            return match_join_fail() + notification(_failure_message(error))
-        return notification(_failure_message(error))
+            context.local_bubbles.append(MultiplayerSignalBubble(MultiplayerSignalKind.JOIN_FAILED, None))
+        context.local_bubbles.append(NotificationBubble(_failure_message(error)))
+        return b""
     except ProtocolError:
         raise
     except ValueError as error:
@@ -148,8 +134,9 @@ async def dispatch_multiplayer_packet(
             error_type=type(error).__name__,
         )
         if packet_type in {ClientPacket.CREATE_MATCH, ClientPacket.JOIN_MATCH}:
-            return match_join_fail() + notification("The multiplayer request is invalid.")
-        return notification("The multiplayer request is invalid.")
+            context.local_bubbles.append(MultiplayerSignalBubble(MultiplayerSignalKind.JOIN_FAILED, None))
+        context.local_bubbles.append(NotificationBubble("The multiplayer request is invalid."))
+        return b""
     return b""
 
 
@@ -157,18 +144,26 @@ async def dispatch_multiplayer_mutation(
     mutation: MultiplayerMutationResult,
     caller_account_id: int,
     services: StableServices,
+    local_bubbles: list[RealtimeBubble],
 ) -> bytes:
-    """Map one canonical multiplayer mutation to Stable responses and fanout."""
+    """Map one canonical multiplayer mutation to local and remote Bubbles."""
     if mutation.replayed:
         return b""
     state = mutation.state
     kind = mutation.kind
     if kind in {MultiplayerMutationKind.SETTINGS_UPDATED, MultiplayerMutationKind.PASSWORD_CHANGED}:
-        return await _state_response(state, caller_account_id, services)
+        return await _state_response(state, caller_account_id, services, local_bubbles)
     if kind is MultiplayerMutationKind.ROUND_STARTED:
-        wire = match_start(_wire_match(state))
-        failed = set(await _broadcast_playing(wire, state, caller_account_id, services))
-        failed.update(await _broadcast_lobby(update_match(_wire_match(state), send_password=False), None, services))
+        started = MultiplayerRoomBubble(MultiplayerRoomAction.ROUND_STARTED, multiplayer_room_snapshot(state))
+        local_bubbles.append(started)
+        failed = set(await _broadcast_playing(started, state, caller_account_id, services))
+        failed.update(
+            await _broadcast_lobby(
+                MultiplayerRoomBubble(MultiplayerRoomAction.UPDATED, multiplayer_room_snapshot(state)),
+                None,
+                services,
+            )
+        )
         log_event(
             "INFO",
             "stable.multiplayer.round_started",
@@ -178,12 +173,19 @@ async def dispatch_multiplayer_mutation(
             participant_count=len(mutation.round_participant_account_ids),
             delivery_failure_count=len(failed),
         )
-        return wire + _delivery_warning(failed)
+        _append_delivery_warning(local_bubbles, failed)
+        return b""
     if kind in {MultiplayerMutationKind.ROUND_COMPLETED, MultiplayerMutationKind.ROUND_ABORTED}:
-        wire = match_abort() if kind is MultiplayerMutationKind.ROUND_ABORTED else match_complete()
-        state_wire = update_match(_wire_match(state), send_password=False)
+        action = (
+            MultiplayerRoomAction.ROUND_ABORTED
+            if kind is MultiplayerMutationKind.ROUND_ABORTED
+            else MultiplayerRoomAction.ROUND_COMPLETED
+        )
+        lifecycle = MultiplayerRoomBubble(action, multiplayer_room_snapshot(state))
+        updated = MultiplayerRoomBubble(MultiplayerRoomAction.UPDATED, multiplayer_room_snapshot(state))
+        local_bubbles.extend((lifecycle, updated))
         round_accounts = frozenset(mutation.round_participant_account_ids)
-        failed = set(await _broadcast_accounts(wire, state, round_accounts, caller_account_id, services))
+        failed = set(await _broadcast_accounts(lifecycle, state, round_accounts, caller_account_id, services))
         failed.update(await _broadcast_state(state, caller_account_id, services))
         log_event(
             "INFO",
@@ -196,24 +198,32 @@ async def dispatch_multiplayer_mutation(
             participant_count=len(round_accounts),
             delivery_failure_count=len(failed),
         )
-        return wire + state_wire + _delivery_warning(failed)
+        _append_delivery_warning(local_bubbles, failed)
+        return b""
     if kind is MultiplayerMutationKind.HOST_CHANGED:
         host_target = mutation.target_account_id or state.room.host_account_id
-        delivered = await _enqueue(host_target, match_transfer_host(), state, services)
-        response = await _state_response(state, caller_account_id, services)
-        return response + _delivery_warning(() if delivered else (host_target,))
+        signal = MultiplayerSignalBubble(
+            MultiplayerSignalKind.HOST_TRANSFERRED,
+            state.room.public_id,
+            actor_account_id=host_target,
+        )
+        delivered = await _publish(host_target, signal, state, services)
+        await _state_response(state, caller_account_id, services, local_bubbles)
+        _append_delivery_warning(local_bubbles, () if delivered else (host_target,))
+        return b""
     if kind is MultiplayerMutationKind.PARTICIPANT_KICKED:
         target = mutation.target_account_id
         if target is None:
             raise ValueError("participant-kicked mutation requires a target account")
-        delivered = await _enqueue(
+        delivered = await _publish(
             target,
-            channel_kick("#multiplayer") + match_join_fail(),
+            MultiplayerRoomBubble(MultiplayerRoomAction.KICKED, multiplayer_room_snapshot(state)),
             state,
             services,
         )
-        response = await _state_response(state, caller_account_id, services)
-        return response + _delivery_warning(() if delivered else (target,))
+        await _state_response(state, caller_account_id, services, local_bubbles)
+        _append_delivery_warning(local_bubbles, () if delivered else (target,))
+        return b""
     raise ValueError(f"unsupported multiplayer mutation kind: {kind}")
 
 
@@ -252,7 +262,12 @@ async def _dispatch_lobby_packet(dispatch: _MultiplayerPacketContext) -> bytes:
         packet.payload.require_exhausted()
         await _set_lobby_membership(context, services, joining=True)
         states = await dispatch.multiplayer.list_public_rooms(limit=services.settings.stable_lobby_match_limit)
-        return b"".join(new_match(_wire_match(state)) for state in states if _stable_visible(state))
+        context.local_bubbles.extend(
+            MultiplayerRoomBubble(MultiplayerRoomAction.CREATED, multiplayer_room_snapshot(state))
+            for state in states
+            if _stable_visible(state)
+        )
+        return b""
     if dispatch.packet_type is ClientPacket.PART_LOBBY:
         packet.payload.require_exhausted()
         await _set_lobby_membership(context, services, joining=False)
@@ -269,13 +284,15 @@ async def _create_match(dispatch: _MultiplayerPacketContext) -> bytes:
     incoming = packet.payload.read_multiplayer_match()
     packet.payload.require_exhausted()
     if incoming.host_id != context.identity.account_id:
-        return match_join_fail()
+        context.local_bubbles.append(MultiplayerSignalBubble(MultiplayerSignalKind.JOIN_FAILED, None))
+        return b""
     state = await dispatch.multiplayer.create_room(
         CreateRoom(
-            _meta("create", dispatch.packet_type, dispatch.raw_payload, context, services),
-            _settings_from_wire(incoming),
-            incoming.password,
-            16,
+            meta=_meta("create", dispatch.packet_type, dispatch.raw_payload, context, services),
+            settings=_settings_from_wire(incoming),
+            capacity=_STABLE_ROOM_CAPACITY,
+            password=incoming.password,
+            public_id_limit=_STABLE_PUBLIC_ID_LIMIT,
         )
     )
     if not _stable_visible(state):
@@ -293,9 +310,15 @@ async def _create_match(dispatch: _MultiplayerPacketContext) -> bytes:
             room_id=state.room.public_id,
             participant_count=_participant_count(state),
         )
-        return match_join_fail()
+        context.local_bubbles.append(MultiplayerSignalBubble(MultiplayerSignalKind.JOIN_FAILED, None))
+        return b""
     await _leave_lobby_after_join(context, state, services)
-    failed = await _broadcast_lobby(new_match(_wire_match(state)), context.identity.account_id, services)
+    snapshot = multiplayer_room_snapshot(state)
+    failed = await _broadcast_lobby(
+        MultiplayerRoomBubble(MultiplayerRoomAction.CREATED, snapshot),
+        context.identity.account_id,
+        services,
+    )
     log_event(
         "INFO",
         "stable.multiplayer.room_lifecycle",
@@ -306,11 +329,15 @@ async def _create_match(dispatch: _MultiplayerPacketContext) -> bytes:
         participant_count=_participant_count(state),
         delivery_failure_count=len(failed),
     )
-    return (
-        channel_kick("#lobby")
-        + channel_join("#multiplayer")
-        + match_join_success(_wire_match(state, password=incoming.password))
+    context.local_bubbles.append(
+        MultiplayerRoomBubble(
+            MultiplayerRoomAction.JOINED,
+            snapshot,
+            local_admission_credential=incoming.password,
+        )
     )
+    _append_delivery_warning(context.local_bubbles, failed)
+    return b""
 
 
 async def _join_match(dispatch: _MultiplayerPacketContext) -> bytes:
@@ -335,12 +362,15 @@ async def _join_match(dispatch: _MultiplayerPacketContext) -> bytes:
         participant_count=_participant_count(state),
         delivery_failure_count=len(failed),
     )
-    return (
-        channel_kick("#lobby")
-        + channel_join("#multiplayer")
-        + match_join_success(_wire_match(state, password=password))
-        + _delivery_warning(failed)
+    context.local_bubbles.append(
+        MultiplayerRoomBubble(
+            MultiplayerRoomAction.JOINED,
+            multiplayer_room_snapshot(state),
+            local_admission_credential=password,
+        )
     )
+    _append_delivery_warning(context.local_bubbles, failed)
+    return b""
 
 
 async def _dispatch_score_update(dispatch: _MultiplayerPacketContext) -> bytes:
@@ -353,9 +383,35 @@ async def _dispatch_score_update(dispatch: _MultiplayerPacketContext) -> bytes:
     slot = cached.slot_for(account_id)
     if slot is None or account_id not in cached.round_participant_account_ids:
         return b""
-    wire = match_score_update(replace(frame, frame_id=slot.position))
+    score = MultiplayerScoreState(
+        account_id,
+        frame.time,
+        slot.position,
+        frame.count_300,
+        frame.count_100,
+        frame.count_50,
+        frame.count_geki,
+        frame.count_katu,
+        frame.count_miss,
+        frame.total_score,
+        frame.max_combo,
+        frame.current_combo,
+        frame.perfect,
+        frame.current_hp,
+        frame.tag_byte,
+        frame.score_v2,
+        frame.combo_portion,
+        frame.bonus_portion,
+    )
+    bubble = MultiplayerSignalBubble(
+        MultiplayerSignalKind.SCORE_UPDATED,
+        cached.room.public_id,
+        actor_account_id=account_id,
+        score=score,
+    )
+    dispatch.context.local_bubbles.append(bubble)
     failed = await _broadcast_accounts(
-        wire,
+        bubble,
         cached,
         frozenset(cached.round_participant_account_ids),
         account_id,
@@ -364,7 +420,7 @@ async def _dispatch_score_update(dispatch: _MultiplayerPacketContext) -> bytes:
     _log_ephemeral_state(
         dispatch.packet_type, cached, dispatch.context, dispatch.services, delivery_failure_count=len(failed)
     )
-    return wire
+    return b""
 
 
 async def _dispatch_room_packet(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -416,16 +472,26 @@ async def _part_match(dispatch: _MultiplayerPacketContext, current: RoomState) -
         )
     )
     if state is None:
-        failed = set(await _broadcast_lobby(dispose_match(public_id), account_id, dispatch.services))
+        failed = set(
+            await _broadcast_lobby(
+                MultiplayerRoomBubble(MultiplayerRoomAction.DISPOSED, multiplayer_room_snapshot(current)),
+                account_id,
+                dispatch.services,
+            )
+        )
         action = "closed"
         participant_count = 0
     else:
         failed = set(await _broadcast_state(state, account_id, dispatch.services))
         action = "left"
         participant_count = _participant_count(state)
-        if current.room.host_account_id == account_id and not await _enqueue(
+        if current.room.host_account_id == account_id and not await _publish(
             state.room.host_account_id,
-            match_transfer_host(),
+            MultiplayerSignalBubble(
+                MultiplayerSignalKind.HOST_TRANSFERRED,
+                state.room.public_id,
+                actor_account_id=state.room.host_account_id,
+            ),
             state,
             dispatch.services,
         ):
@@ -440,7 +506,11 @@ async def _part_match(dispatch: _MultiplayerPacketContext, current: RoomState) -
         participant_count=participant_count,
         delivery_failure_count=len(failed),
     )
-    return channel_kick("#multiplayer") + _delivery_warning(failed)
+    dispatch.context.local_bubbles.append(
+        MultiplayerRoomBubble(MultiplayerRoomAction.LEFT, multiplayer_room_snapshot(current))
+    )
+    _append_delivery_warning(dispatch.context.local_bubbles, failed)
+    return b""
 
 
 async def _dispatch_room_settings(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -450,14 +520,16 @@ async def _dispatch_room_settings(dispatch: _MultiplayerPacketContext, current: 
     if dispatch.packet_type is ClientPacket.MATCH_CHANGE_SLOT:
         target = packet.payload.read_i32()
         packet.payload.require_exhausted()
+        if not 0 <= target < _STABLE_ROOM_CAPACITY:
+            raise ValueError("Stable slot is outside the supported range")
         state = await dispatch.multiplayer.move_slot(public_id, account_id, target)
         _log_ephemeral_state(dispatch.packet_type, state, dispatch.context, dispatch.services)
-        return await _state_response(state, account_id, dispatch.services)
+        return await _state_response(state, account_id, dispatch.services, dispatch.context.local_bubbles)
     if dispatch.packet_type is ClientPacket.MATCH_READY:
         packet.payload.require_exhausted()
         state = await dispatch.multiplayer.set_slot_status(public_id, account_id, SlotStatus.READY)
         _log_ephemeral_state(dispatch.packet_type, state, dispatch.context, dispatch.services)
-        return await _state_response(state, account_id, dispatch.services, lobby=False)
+        return await _state_response(state, account_id, dispatch.services, dispatch.context.local_bubbles, lobby=False)
     if dispatch.packet_type is ClientPacket.MATCH_LOCK:
         return await _lock_slot(dispatch, current)
     if dispatch.packet_type is ClientPacket.MATCH_CHANGE_SETTINGS:
@@ -472,7 +544,7 @@ async def _dispatch_room_settings(dispatch: _MultiplayerPacketContext, current: 
         return b""
     state = await dispatch.multiplayer.set_slot_team(public_id, account_id, 1 if slot.team == 2 else 2)
     _log_ephemeral_state(dispatch.packet_type, state, dispatch.context, dispatch.services)
-    return await _state_response(state, account_id, dispatch.services, lobby=False)
+    return await _state_response(state, account_id, dispatch.services, dispatch.context.local_bubbles, lobby=False)
 
 
 async def _lock_slot(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -498,15 +570,15 @@ async def _lock_slot(dispatch: _MultiplayerPacketContext, current: RoomState) ->
                 target_account_id,
             )
         )
-        await _enqueue(
+        await _publish(
             target_account_id,
-            channel_kick("#multiplayer") + match_join_fail(),
+            MultiplayerRoomBubble(MultiplayerRoomAction.KICKED, multiplayer_room_snapshot(current)),
             current,
             dispatch.services,
         )
     state = await dispatch.multiplayer.lock_slot(current.room.public_id, account_id, target)
     _log_ephemeral_state(dispatch.packet_type, state, dispatch.context, dispatch.services)
-    return await _state_response(state, account_id, dispatch.services)
+    return await _state_response(state, account_id, dispatch.services, dispatch.context.local_bubbles)
 
 
 async def _change_settings(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -530,7 +602,7 @@ async def _change_settings(dispatch: _MultiplayerPacketContext, current: RoomSta
             _settings_from_wire(incoming),
         )
     )
-    return await dispatch_multiplayer_mutation(mutation, account_id, dispatch.services)
+    return await dispatch_multiplayer_mutation(mutation, account_id, dispatch.services, dispatch.context.local_bubbles)
 
 
 async def _change_password(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -554,7 +626,7 @@ async def _change_password(dispatch: _MultiplayerPacketContext, current: RoomSta
             incoming.password,
         )
     )
-    return await dispatch_multiplayer_mutation(mutation, account_id, dispatch.services)
+    return await dispatch_multiplayer_mutation(mutation, account_id, dispatch.services, dispatch.context.local_bubbles)
 
 
 async def _change_mods(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -605,7 +677,7 @@ async def _change_mods(dispatch: _MultiplayerPacketContext, current: RoomState) 
     else:
         return b""
     _log_ephemeral_state(dispatch.packet_type, state, dispatch.context, dispatch.services)
-    return await _state_response(state, account_id, dispatch.services)
+    return await _state_response(state, account_id, dispatch.services, dispatch.context.local_bubbles)
 
 
 async def _dispatch_room_round(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -620,12 +692,13 @@ async def _dispatch_room_round(dispatch: _MultiplayerPacketContext, current: Roo
         packet.payload.require_exhausted()
         state = await dispatch.multiplayer.mark_loaded(public_id, account_id)
         if all(slot.loaded for slot in state.slots if slot.status is SlotStatus.PLAYING):
-            wire = match_all_players_loaded()
-            failed = await _broadcast_match(wire, state, account_id, dispatch.services)
+            bubble = MultiplayerSignalBubble(MultiplayerSignalKind.PARTICIPANT_LOADING_COMPLETED, public_id)
+            dispatch.context.local_bubbles.append(bubble)
+            failed = await _broadcast_match(bubble, state, account_id, dispatch.services)
             _log_ephemeral_state(
                 dispatch.packet_type, state, dispatch.context, dispatch.services, delivery_failure_count=len(failed)
             )
-            return wire
+            return b""
         _log_ephemeral_state(dispatch.packet_type, state, dispatch.context, dispatch.services)
         return b""
     if dispatch.packet_type is ClientPacket.MATCH_NO_BEATMAP:
@@ -639,7 +712,7 @@ async def _dispatch_room_round(dispatch: _MultiplayerPacketContext, current: Roo
     packet.payload.require_exhausted()
     state = await dispatch.multiplayer.set_slot_status(public_id, account_id, status)
     _log_ephemeral_state(dispatch.packet_type, state, dispatch.context, dispatch.services)
-    return await _state_response(state, account_id, dispatch.services, lobby=False)
+    return await _state_response(state, account_id, dispatch.services, dispatch.context.local_bubbles, lobby=False)
 
 
 async def _start_round(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -662,6 +735,7 @@ async def _start_round(dispatch: _MultiplayerPacketContext, current: RoomState) 
         mutation,
         dispatch.context.identity.account_id,
         dispatch.services,
+        dispatch.context.local_bubbles,
     )
 
 
@@ -685,7 +759,7 @@ async def _complete_round(dispatch: _MultiplayerPacketContext, current: RoomStat
             state.room.version,
         )
     )
-    return await dispatch_multiplayer_mutation(mutation, account_id, dispatch.services)
+    return await dispatch_multiplayer_mutation(mutation, account_id, dispatch.services, dispatch.context.local_bubbles)
 
 
 async def _fail_round(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -695,31 +769,43 @@ async def _fail_round(dispatch: _MultiplayerPacketContext, current: RoomState) -
     slot = state.slot_for(account_id)
     if slot is None:
         return b""
-    wire = match_player_failed(slot.position)
-    failed = await _broadcast_match(wire, state, account_id, dispatch.services)
+    bubble = MultiplayerSignalBubble(
+        MultiplayerSignalKind.FAILED,
+        state.room.public_id,
+        actor_account_id=account_id,
+        slot_position=slot.position,
+    )
+    dispatch.context.local_bubbles.append(bubble)
+    failed = await _broadcast_match(bubble, state, account_id, dispatch.services)
     _log_ephemeral_state(
         dispatch.packet_type, state, dispatch.context, dispatch.services, delivery_failure_count=len(failed)
     )
-    return wire
+    return b""
 
 
 async def _skip_round(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
     dispatch.packet.payload.require_exhausted()
     account_id = dispatch.context.identity.account_id
     state = await dispatch.multiplayer.mark_skipped(current.room.public_id, account_id)
-    player_wire = match_player_skipped(account_id)
-    failed = set(await _broadcast_match(player_wire, state, account_id, dispatch.services))
+    player = MultiplayerSignalBubble(
+        MultiplayerSignalKind.SKIPPED,
+        state.room.public_id,
+        actor_account_id=account_id,
+    )
+    dispatch.context.local_bubbles.append(player)
+    failed = set(await _broadcast_match(player, state, account_id, dispatch.services))
     if all(slot.skipped for slot in state.slots if slot.status is SlotStatus.PLAYING):
-        skip_wire = match_skip()
-        failed.update(await _broadcast_match(skip_wire, state, account_id, dispatch.services))
+        skipped = MultiplayerSignalBubble(MultiplayerSignalKind.ALL_PLAYERS_SKIPPED, state.room.public_id)
+        dispatch.context.local_bubbles.append(skipped)
+        failed.update(await _broadcast_match(skipped, state, account_id, dispatch.services))
         _log_ephemeral_state(
             dispatch.packet_type, state, dispatch.context, dispatch.services, delivery_failure_count=len(failed)
         )
-        return player_wire + skip_wire
+        return b""
     _log_ephemeral_state(
         dispatch.packet_type, state, dispatch.context, dispatch.services, delivery_failure_count=len(failed)
     )
-    return player_wire
+    return b""
 
 
 async def _dispatch_room_host(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
@@ -731,7 +817,7 @@ async def _dispatch_room_host(dispatch: _MultiplayerPacketContext, current: Room
 async def _transfer_host(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
     position = dispatch.packet.payload.read_i32()
     dispatch.packet.payload.require_exhausted()
-    if not 0 <= position < len(current.slots):
+    if not 0 <= position < min(len(current.slots), _STABLE_ROOM_CAPACITY):
         return b""
     target = current.slots[position].account_id
     if target is None:
@@ -755,6 +841,7 @@ async def _transfer_host(dispatch: _MultiplayerPacketContext, current: RoomState
         mutation,
         dispatch.context.identity.account_id,
         dispatch.services,
+        dispatch.context.local_bubbles,
     )
 
 
@@ -766,23 +853,32 @@ async def _invite_player(dispatch: _MultiplayerPacketContext, current: RoomState
         return b""
     target_presence = await dispatch.services.realtime.get_presence(target_account_id, at=dispatch.services.clock.now())
     if target_presence is None:
-        return notification("The invited player is offline.")
-    target_name = _presence_name(target_presence.payload, target_account_id)
+        dispatch.context.local_bubbles.append(NotificationBubble("The invited player is offline."))
+        return b""
+    target_name = target_presence.identity.display_name
     admission = await dispatch.multiplayer.issue_admission_token(
         current.room.public_id,
         inviter_account_id=account_id,
         recipient_account_id=target_account_id,
     )
-    wire = match_invite(
-        Message(
-            dispatch.context.identity.current_name,
-            f"Come join my game: [osump://{current.room.public_id}/{admission} {current.room.settings.name}].",
-            target_name,
+    bubble = MultiplayerSignalBubble(
+        MultiplayerSignalKind.INVITED,
+        current.room.public_id,
+        actor_account_id=account_id,
+        invitation=MultiplayerInvitationState(
             account_id,
-        )
+            dispatch.context.identity.current_name,
+            target_name,
+            current.room.settings.name,
+            admission,
+        ),
     )
-    delivered = await _enqueue(target_account_id, wire, current, dispatch.services)
-    return b"" if delivered else notification("The invite could not be delivered; the room is still available.")
+    delivered = await _publish(target_account_id, bubble, current, dispatch.services)
+    if not delivered:
+        dispatch.context.local_bubbles.append(
+            NotificationBubble("The invite could not be delivered; the room is still available.")
+        )
+    return b""
 
 
 def _settings_from_wire(match: MultiplayerMatch) -> RoomSettings:
@@ -809,37 +905,6 @@ def _settings_from_wire(match: MultiplayerMatch) -> RoomSettings:
     )
     normalize_mods(settings.ruleset, settings.variant, settings.mods)
     return settings
-
-
-def _wire_match(state: RoomState, *, password: str | None = None) -> MultiplayerMatch:
-    settings = state.room.settings
-    legacy_bits = normalize_mods(settings.ruleset, settings.variant, settings.mods).legacy_bits
-    statuses = tuple(_SLOT_STATUS_TO_WIRE[slot.status] for slot in state.slots)
-    teams = tuple(slot.team for slot in state.slots)
-    users = tuple(slot.account_id for slot in state.slots)
-    slot_mods = (
-        tuple(_slot_legacy_bits(settings.ruleset, slot.mods) for slot in state.slots) if settings.free_mods else ()
-    )
-    return MultiplayerMatch(
-        match_id=state.room.public_id,
-        in_progress=state.in_progress,
-        mods=legacy_bits,
-        name=settings.name,
-        password=password if password is not None else "*" if state.room.password_protected else "",
-        beatmap_name=settings.beatmap_name,
-        beatmap_id=settings.external_beatmap_id,
-        beatmap_md5=settings.beatmap_md5.hex() if settings.beatmap_md5 is not None else "",
-        slot_statuses=statuses,
-        slot_teams=teams,
-        slot_user_ids=users,
-        host_id=state.room.host_account_id,
-        mode=_RULESET_IDS[settings.ruleset],
-        win_condition=_WIN_CONDITION_IDS[settings.win_condition],
-        team_type=_TEAM_MODE_IDS[settings.team_mode],
-        freemods=settings.free_mods,
-        slot_mods=slot_mods,
-        seed=settings.seed,
-    )
 
 
 def _participant_count(state: RoomState) -> int:
@@ -879,14 +944,17 @@ async def _state_response(
     state: RoomState,
     caller_account_id: int,
     services: StableServices,
+    local_bubbles: list[RealtimeBubble],
     *,
     lobby: bool = True,
 ) -> bytes:
-    wire = update_match(_wire_match(state), send_password=False)
-    failed = set(await _broadcast_match(wire, state, caller_account_id, services))
+    bubble = MultiplayerRoomBubble(MultiplayerRoomAction.UPDATED, multiplayer_room_snapshot(state))
+    local_bubbles.append(bubble)
+    failed = set(await _broadcast_match(bubble, state, caller_account_id, services))
     if lobby:
-        failed.update(await _broadcast_lobby(wire, caller_account_id, services))
-    return wire + _delivery_warning(failed)
+        failed.update(await _broadcast_lobby(bubble, caller_account_id, services))
+    _append_delivery_warning(local_bubbles, failed)
+    return b""
 
 
 async def _broadcast_state(
@@ -894,14 +962,14 @@ async def _broadcast_state(
     caller_account_id: int | None,
     services: StableServices,
 ) -> frozenset[int]:
-    wire = update_match(_wire_match(state), send_password=False)
-    failed = set(await _broadcast_match(wire, state, caller_account_id, services))
-    failed.update(await _broadcast_lobby(wire, caller_account_id, services))
+    bubble = MultiplayerRoomBubble(MultiplayerRoomAction.UPDATED, multiplayer_room_snapshot(state))
+    failed = set(await _broadcast_match(bubble, state, caller_account_id, services))
+    failed.update(await _broadcast_lobby(bubble, caller_account_id, services))
     return frozenset(failed)
 
 
 async def _broadcast_match(
-    payload: bytes,
+    bubble: RealtimeBubble,
     state: RoomState,
     excluded_account_id: int | None,
     services: StableServices,
@@ -909,13 +977,13 @@ async def _broadcast_match(
     failed: dict[int, BaseException] = {}
     for account_id in {slot.account_id for slot in state.slots if slot.account_id is not None}:
         if account_id != excluded_account_id:
-            await _enqueue(account_id, payload, state, services, failure_errors=failed)
+            await _publish(account_id, bubble, state, services, failure_errors=failed)
     _log_broadcast_failures("match", failed, room_id=state.room.public_id)
     return frozenset(failed)
 
 
 async def _broadcast_accounts(
-    payload: bytes,
+    bubble: RealtimeBubble,
     state: RoomState,
     account_ids: frozenset[int],
     excluded_account_id: int | None,
@@ -924,13 +992,13 @@ async def _broadcast_accounts(
     failed: dict[int, BaseException] = {}
     for account_id in account_ids:
         if account_id != excluded_account_id:
-            await _enqueue(account_id, payload, state, services, failure_errors=failed)
+            await _publish(account_id, bubble, state, services, failure_errors=failed)
     _log_broadcast_failures("round_accounts", failed, room_id=state.room.public_id)
     return frozenset(failed)
 
 
 async def _broadcast_playing(
-    payload: bytes,
+    bubble: RealtimeBubble,
     state: RoomState,
     excluded_account_id: int | None,
     services: StableServices,
@@ -938,21 +1006,26 @@ async def _broadcast_playing(
     failed: dict[int, BaseException] = {}
     for slot in state.slots:
         if slot.status is SlotStatus.PLAYING and slot.account_id is not None and slot.account_id != excluded_account_id:
-            await _enqueue(slot.account_id, payload, state, services, failure_errors=failed)
+            await _publish(slot.account_id, bubble, state, services, failure_errors=failed)
     _log_broadcast_failures("playing", failed, room_id=state.room.public_id)
     return frozenset(failed)
 
 
 async def _broadcast_lobby(
-    payload: bytes,
+    bubble: RealtimeBubble,
     excluded_account_id: int | None,
     services: StableServices,
 ) -> frozenset[int]:
-    if services.community is None:
+    if isinstance(bubble, MultiplayerRoomBubble) and not _stable_visible(bubble):
+        return frozenset()
+    if services.community is None or services.bubbles is None:
         return frozenset()
     lookup_account_id = excluded_account_id or 1
     try:
-        lobby = await services.community.get_public_channel_by_stable_name(lookup_account_id, "#lobby")
+        lobby = await services.community.get_public_channel(
+            lookup_account_id,
+            parse_stable_channel_selector("#lobby"),
+        )
     except ApplicationError as error:
         log_event(
             "WARNING",
@@ -972,37 +1045,31 @@ async def _broadcast_lobby(
         if presence is None:
             continue
         try:
-            await services.realtime.enqueue_mailbox(
-                account_id,
-                payload,
-                recipient_fence=presence.fence,
-                expires_at=presence.expires_at,
-            )
-        except MailboxOverflow as error:
+            await services.bubbles.publish(presence.fence, bubble)
+        except Exception as error:
             failed[account_id] = error
     _log_broadcast_failures("lobby", failed)
     return frozenset(failed)
 
 
-async def _enqueue(
+async def _publish(
     account_id: int,
-    payload: bytes,
+    bubble: RealtimeBubble,
     state: RoomState,
     services: StableServices,
     *,
     failure_errors: dict[int, BaseException] | None = None,
 ) -> bool:
+    if isinstance(bubble, MultiplayerRoomBubble) and bubble.local_admission_credential is not None:
+        raise ValueError("local multiplayer admission credentials cannot be published")
     presence = await services.realtime.get_presence(account_id, at=services.clock.now())
     if presence is None:
         return True
+    if services.bubbles is None:
+        return False
     try:
-        await services.realtime.enqueue_mailbox(
-            account_id,
-            payload,
-            recipient_fence=presence.fence,
-            expires_at=presence.expires_at,
-        )
-    except MailboxOverflow as error:
+        await services.bubbles.publish(presence.fence, bubble)
+    except Exception as error:
         if failure_errors is not None:
             failure_errors[account_id] = error
         elif rate_limit("stable-multiplayer-delivery-failed", interval_seconds=5):
@@ -1026,7 +1093,10 @@ async def _set_lobby_membership(
 ) -> None:
     if services.community is None:
         return
-    lobby = await services.community.get_public_channel_by_stable_name(context.identity.account_id, "#lobby")
+    lobby = await services.community.get_public_channel(
+        context.identity.account_id,
+        parse_stable_channel_selector("#lobby"),
+    )
     if joining:
         await services.realtime.join_channel(
             lobby.channel_id,
@@ -1091,32 +1161,10 @@ def _meta(
     )
 
 
-def _stable_visible(state: RoomState) -> bool:
-    return state.room.capacity == 16 and 0 < state.room.public_id <= 32767
-
-
-def _slot_legacy_bits(ruleset: Ruleset, mods: tuple[CanonicalMod, ...]) -> int:
-    acronyms = {mod.acronym for mod in mods}
-    variant = (
-        ScoreboardVariant.AUTOPILOT
-        if "AP" in acronyms
-        else ScoreboardVariant.RELAX
-        if "RX" in acronyms
-        else ScoreboardVariant.VANILLA
-    )
-    return normalize_mods(ruleset, variant, mods).legacy_bits
-
-
-def _presence_name(payload: bytes, account_id: int) -> str:
-    from perfcho.modules.realtime.stable.codec import PacketReader
-    from perfcho.modules.realtime.stable.models import ServerPacket
-
-    for packet in PacketReader(payload, packet_enum=ServerPacket):
-        if packet.packet_type is ServerPacket.USER_PRESENCE:
-            presence = packet.payload.read_user_presence()
-            if presence.user_id == account_id:
-                return presence.username
-    raise ValueError("invited player has no valid presence")
+def _stable_visible(state: RoomState | MultiplayerRoomBubble) -> bool:
+    capacity = state.room.capacity
+    public_id = state.room.room_public_id if isinstance(state, MultiplayerRoomBubble) else state.room.public_id
+    return capacity == _STABLE_ROOM_CAPACITY and 0 < public_id <= _STABLE_PUBLIC_ID_LIMIT
 
 
 def _failure_message(error: MultiplayerError) -> str:
@@ -1133,10 +1181,11 @@ def _failure_message(error: MultiplayerError) -> str:
     return messages.get(error.code, "The multiplayer action could not be completed.")
 
 
-def _delivery_warning(failed_account_ids: object) -> bytes:
-    if not failed_account_ids:
-        return b""
-    return notification("A multiplayer update was deferred; affected players will recover the current room state.")
+def _append_delivery_warning(local_bubbles: list[RealtimeBubble], failed_account_ids: object) -> None:
+    if failed_account_ids:
+        local_bubbles.append(
+            NotificationBubble("A multiplayer update was lost; affected players can recover the current room state.")
+        )
 
 
 def _log_broadcast_failures(

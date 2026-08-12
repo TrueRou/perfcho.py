@@ -21,8 +21,8 @@ from perfcho.infra.security import (
     hmac_sha256_digest,
     normalize_email,
     normalize_name,
-    preverify_lazer_password,
-    validate_stable_password_token,
+    preverify_password,
+    validate_password_preverification,
     verify_dummy_password,
     verify_hmac_sha256_digest,
     verify_legacy_bcrypt_md5,
@@ -70,21 +70,21 @@ def test_email_normalization_rejects_malformed_addresses(email: str) -> None:
         normalize_email(email)
 
 
-def test_stable_password_token_requires_lowercase_md5_shape() -> None:
+def test_password_preverification_requires_lowercase_md5_shape() -> None:
     token = "0123456789abcdef0123456789abcdef"
-    assert validate_stable_password_token(token) == token
+    assert validate_password_preverification(token) == token
 
     for malformed in (token.upper(), token[:-1], f"{token}0", "g" * 32, f" {token}"):
         with pytest.raises(ValueError):
-            validate_stable_password_token(malformed)
+            validate_password_preverification(malformed)
 
 
 def test_lazer_password_uses_stable_preverification_representation() -> None:
-    assert preverify_lazer_password("password") == "5f4dcc3b5aa765d61d8327deb882cf99"
+    assert preverify_password("password") == "5f4dcc3b5aa765d61d8327deb882cf99"
 
 
 def test_argon2id_password_hash_uses_appended_versioned_pepper() -> None:
-    token = preverify_lazer_password("correct horse battery staple")
+    token = preverify_password("correct horse battery staple")
     pepper = PasswordPepper(version=7, secret=b"test-password-pepper")
     password_hash = hash_password(token, pepper=pepper, policy=TEST_POLICY)
 
@@ -97,12 +97,12 @@ def test_argon2id_password_hash_uses_appended_versioned_pepper() -> None:
 
 
 def test_legacy_bcrypt_verifies_the_stable_md5_token_and_treats_malformed_hashes_as_mismatch() -> None:
-    token = preverify_lazer_password("password")
+    token = preverify_password("password")
     verifier = bcrypt.hashpw(token.encode("ascii"), bcrypt.gensalt(rounds=4)).decode("ascii")
 
     assert verify_legacy_bcrypt_md5(token, verifier).verified
     for candidate_token, candidate_verifier in (
-        (preverify_lazer_password("wrong"), verifier),
+        (preverify_password("wrong"), verifier),
         (token.upper(), verifier),
         (token, "not-a-bcrypt-hash"),
         (token, "\N{SNOWMAN}"),
@@ -113,12 +113,12 @@ def test_legacy_bcrypt_verifies_the_stable_md5_token_and_treats_malformed_hashes
 
 
 def test_password_verification_rejects_wrong_input_pepper_version_and_malformed_hash() -> None:
-    token = preverify_lazer_password("password")
+    token = preverify_password("password")
     pepper = PasswordPepper(version=2, secret=b"current-pepper")
     password_hash = hash_password(token, pepper=pepper, policy=TEST_POLICY)
 
     wrong_password = verify_password(
-        preverify_lazer_password("not-password"),
+        preverify_password("not-password"),
         password_hash,
         pepper=pepper,
         policy=TEST_POLICY,
@@ -149,7 +149,7 @@ def test_password_verification_rejects_wrong_input_pepper_version_and_malformed_
 
 
 def test_password_verification_reports_policy_rehash_and_results_are_frozen() -> None:
-    token = preverify_lazer_password("password")
+    token = preverify_password("password")
     pepper = PasswordPepper(version=1, secret=b"pepper")
     password_hash = hash_password(token, pepper=pepper, policy=TEST_POLICY)
     stronger_policy = Argon2Policy(time_cost=2, memory_cost_kib=32, parallelism=1)

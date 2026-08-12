@@ -1,15 +1,23 @@
-"""Resolve authenticated osu! API v2 request context."""
+"""Resolve Canonical API services and authenticated request context."""
 
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 
-from perfcho.api.cho.dependencies import StableServicesDependency
+from perfcho.infra.compose import StableServices
 from perfcho.modules.identity import AuthenticatedAccount, InvalidAccessToken
 
 
-async def authenticate_v2_account(
-    services: StableServicesDependency,
+async def get_canonical_services(request: Request) -> StableServices:
+    """Return the process-owned services used by the Canonical adapter."""
+    return request.state.stable_services
+
+
+CanonicalServicesDependency = Annotated[StableServices, Depends(get_canonical_services)]
+
+
+async def authenticate_canonical_account(
+    services: CanonicalServicesDependency,
     authorization: Annotated[str | None, Header()] = None,
 ) -> AuthenticatedAccount:
     """Authenticate a Lazer access token with the required client scope."""
@@ -33,4 +41,4 @@ async def authenticate_v2_account(
     return account
 
 
-V2AccountDependency = Annotated[AuthenticatedAccount, Depends(authenticate_v2_account)]
+CanonicalAccountDependency = Annotated[AuthenticatedAccount, Depends(authenticate_canonical_account)]

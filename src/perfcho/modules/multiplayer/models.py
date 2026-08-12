@@ -9,7 +9,7 @@ from perfcho.modules.common.models import CommandMeta
 from perfcho.modules.scoring.models import CanonicalMod, Ruleset, ScoreboardVariant
 
 MAX_ROOM_CAPACITY = 1024
-MAX_STABLE_PUBLIC_ID = 32767
+MAX_ROOM_PUBLIC_ID = 2_147_483_647
 
 
 class TeamMode(StrEnum):
@@ -246,10 +246,10 @@ class RoundParticipantSelection:
     mods: tuple[CanonicalMod, ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate the account, Stable slot, team, and immutable mods."""
+        """Validate the account, slot, team, and immutable mods."""
         _positive("account_id", self.account_id)
-        if not 0 <= self.slot_position < 16:
-            raise ValueError("round participant slot must be between zero and fifteen")
+        if not 0 <= self.slot_position < MAX_ROOM_CAPACITY:
+            raise ValueError("round participant slot is outside the room capacity bound")
         if self.team not in {0, 1, 2}:
             raise ValueError("round participant team is invalid")
         object.__setattr__(self, "mods", tuple(self.mods))
@@ -284,8 +284,9 @@ class CreateRoom:
 
     meta: CommandMeta
     settings: RoomSettings
+    capacity: int
     password: str = field(default="", repr=False)
-    capacity: int = 16
+    public_id_limit: int = MAX_ROOM_PUBLIC_ID
 
     def __post_init__(self) -> None:
         """Require an authenticated actor and bounded password/capacity."""
@@ -293,6 +294,8 @@ class CreateRoom:
             raise ValueError("create room requires an authenticated actor")
         if not 1 <= self.capacity <= MAX_ROOM_CAPACITY:
             raise ValueError("capacity is outside the supported range")
+        if not 1 <= self.public_id_limit <= MAX_ROOM_PUBLIC_ID:
+            raise ValueError("public_id_limit is outside the supported range")
         if len(self.password) > 64:
             raise ValueError("room password must contain at most 64 characters")
 

@@ -12,7 +12,7 @@ class BotIdentity:
     """Describe the account used to send bot replies."""
 
     account_id: int = 1
-    name: str = "BanchoBot"
+    name: str = "Bot"
 
     def __post_init__(self) -> None:
         """Validate the configured bot identity."""
@@ -24,7 +24,7 @@ class BotIdentity:
 class BotCommandService:
     """Execute commands from a registry assembled by the application root."""
 
-    def __init__(self, *, prefix: str = "!", bot_account_id: int = 1, bot_name: str = "BanchoBot") -> None:
+    def __init__(self, *, prefix: str = "!", bot_account_id: int = 1, bot_name: str = "Bot") -> None:
         """Create an empty registry and bind the reply identity."""
         self.registry = CommandRegistry(prefix)
         self.identity = BotIdentity(bot_account_id, bot_name)

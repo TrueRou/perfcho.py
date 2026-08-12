@@ -1,4 +1,4 @@
-"""Project durable community events without duplicating Stable mailbox delivery."""
+"""Project durable community events without duplicating realtime delivery."""
 
 from datetime import UTC, datetime
 

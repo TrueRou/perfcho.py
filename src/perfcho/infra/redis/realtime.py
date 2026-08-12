@@ -2,43 +2,47 @@
 
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
 
+from perfcho.infra.redis.bubbles import decode_bubble, encode_bubble
 from perfcho.infra.redis.scripts import RealtimeScripts
 from perfcho.infra.redis.state import (
     RealtimeKeys,
     datetime_from_milliseconds,
     datetime_to_milliseconds,
     decode_ordered_frame,
-    decode_ordered_payload,
+    decode_presence,
     duration_to_milliseconds,
+    encode_presence,
     sequence_token,
 )
 from perfcho.modules.realtime import (
-    MAX_FRAME_SEQUENCE,
     MAX_REVISION,
     MAX_SEQUENCE,
     InvalidFrame,
-    MailboxBatch,
-    MailboxOverflow,
-    MailboxPacket,
-    PollLeaseConflict,
     PresenceCapacityReached,
     PresenceSnapshot,
-    RealtimeRepository,
+    PresenceSubscription,
     RealtimeSession,
     RealtimeSessionFenced,
     RealtimeSessionNotFound,
+    RealtimeStateRepository,
     SessionFence,
     SpectatorAttachment,
+    SpectatorFrame,
+    SpectatorFrameBubble,
     SpectatorFramePublish,
     SpectatorFrameWindow,
     SpectatorHostOffline,
+    SpectatorRecipient,
     SpectatorRelation,
 )
+
+_MAX_STREAM_SEQUENCE = 2**16 - 1
 
 
 def _positive_integer(name: str, value: int) -> int:
@@ -102,7 +106,7 @@ def _mapping_text(values: Mapping[bytes | str, bytes | str], field: str) -> str:
     return _text(value)
 
 
-class RedisRealtimeRepository(RealtimeRepository):
+class RedisRealtimeStateRepository(RealtimeStateRepository):
     """Coordinate expiring realtime state through registered atomic scripts."""
 
     def __init__(
@@ -112,9 +116,6 @@ class RedisRealtimeRepository(RealtimeRepository):
         prefix: str,
         session_ttl: timedelta | int | float,
         presence_ttl: timedelta | int | float,
-        mailbox_ttl: timedelta | int | float,
-        max_packet_count: int,
-        max_packet_bytes: int,
         max_frame_count: int,
         max_frame_bytes: int,
         max_channels_per_session: int = 256,
@@ -127,9 +128,6 @@ class RedisRealtimeRepository(RealtimeRepository):
         self._keys = RealtimeKeys(prefix)
         self._session_ttl_ms = duration_to_milliseconds(session_ttl, name="session_ttl")
         self._presence_ttl_ms = duration_to_milliseconds(presence_ttl, name="presence_ttl")
-        self._mailbox_ttl_ms = duration_to_milliseconds(mailbox_ttl, name="mailbox_ttl")
-        self._max_packet_count = _positive_integer("max_packet_count", max_packet_count)
-        self._max_packet_bytes = _positive_integer("max_packet_bytes", max_packet_bytes)
         self._max_frame_count = _positive_integer("max_frame_count", max_frame_count)
         self._max_frame_bytes = _positive_integer("max_frame_bytes", max_frame_bytes)
         self._max_channels_per_session = _positive_integer(
@@ -184,10 +182,6 @@ class RedisRealtimeRepository(RealtimeRepository):
             self._keys.presence_index,
             self._keys.preference(account_id),
             self._keys.session_channels(session_id),
-            self._keys.mailbox_packets(account_id),
-            self._keys.mailbox_bytes(account_id),
-            self._keys.mailbox_sequence(account_id),
-            self._keys.mailbox_lease(account_id),
             self._keys.spectator_relation(account_id),
             self._keys.spectator_relation_revision(account_id),
             self._keys.spectator_viewers(account_id),
@@ -225,7 +219,6 @@ class RedisRealtimeRepository(RealtimeRepository):
                 f"{self._keys.base}:channel:",
                 f"{self._keys.base}:spectator:viewer:",
                 f"{self._keys.base}:spectator:host:",
-                f"{self._keys.base}:mailbox:",
             ],
         )
         self._raise_session_status(_text(result[0]))
@@ -313,7 +306,6 @@ class RedisRealtimeRepository(RealtimeRepository):
                 f"{self._keys.base}:channel:",
                 f"{self._keys.base}:spectator:viewer:",
                 f"{self._keys.base}:spectator:host:",
-                f"{self._keys.base}:mailbox:",
             ],
         )
         self._raise_session_status(_text(result[0]))
@@ -333,7 +325,7 @@ class RedisRealtimeRepository(RealtimeRepository):
             _positive_integer("capacity", capacity)
             if capacity > 8192:
                 raise ValueError("presence capacity exceeds 8192")
-        if snapshot.session_id is not None and snapshot.session_id != session_id:
+        if snapshot.session_id != session_id:
             raise RealtimeSessionFenced("presence owner does not match session_id")
         result = await self._run(
             self._scripts.set_presence,
@@ -349,7 +341,7 @@ class RedisRealtimeRepository(RealtimeRepository):
                 snapshot.revision,
                 datetime_to_milliseconds(snapshot.expires_at),
                 self._presence_ttl_ms,
-                snapshot.payload,
+                encode_presence(snapshot),
                 capacity or 0,
             ],
         )
@@ -376,14 +368,19 @@ class RedisRealtimeRepository(RealtimeRepository):
             revision = int(_mapping_text(values, "revision"))
             expires_at = datetime_from_milliseconds(int(_mapping_text(values, "expires_at")))
             session_id = uuid.UUID(_mapping_text(values, "session_id"))
-            payload = _binary(values[b"payload"])
+            snapshot = decode_presence(_binary(values[b"state"]))
         except (KeyError, ValueError) as error:
             raise RuntimeError("stored presence is invalid") from error
-        if stored_account != account_id:
-            raise RuntimeError("stored presence account does not match its Redis key")
+        if (
+            stored_account != account_id
+            or snapshot.account_id != account_id
+            or snapshot.revision != revision
+            or snapshot.session_id != session_id
+        ):
+            raise RuntimeError("stored presence metadata does not match its Redis key")
         if expires_at <= at:
             return None
-        return PresenceSnapshot(account_id, revision, payload, expires_at, session_id)
+        return replace(snapshot, expires_at=expires_at)
 
     async def list_presences(self, *, at: datetime, limit: int) -> tuple[PresenceSnapshot, ...]:
         """Read a bounded online index and prune missing presence members."""
@@ -430,29 +427,35 @@ class RedisRealtimeRepository(RealtimeRepository):
             raise RuntimeError(f"unexpected clear presence script status: {status}")
         return status == "OK"
 
-    async def set_presence_filter(
+    async def set_presence_subscription(
         self,
         account_id: int,
         *,
         session_id: uuid.UUID,
         expected_revision: int,
-        value: int,
+        subscription: PresenceSubscription,
     ) -> None:
-        """Store a Stable presence filter under an exact current epoch."""
-        if value not in {0, 1, 2}:
-            raise ValueError("presence filter must be zero, one, or two")
-        await self._set_preference(account_id, session_id, expected_revision, "presence_filter", str(value))
+        """Store a canonical presence subscription under an exact current epoch."""
+        if not isinstance(subscription, PresenceSubscription):
+            raise TypeError("subscription must be a PresenceSubscription")
+        await self._set_preference(
+            account_id,
+            session_id,
+            expected_revision,
+            "presence_subscription",
+            subscription.value,
+        )
 
-    async def get_presence_filter(self, account_id: int) -> int:
-        """Return the current Stable presence filter or zero when absent."""
+    async def get_presence_subscription(self, account_id: int) -> PresenceSubscription:
+        """Return the current presence subscription or none when absent."""
         _positive_integer("account_id", account_id)
-        value = await self._redis.hget(self._keys.preference(account_id), "presence_filter")
+        value = await self._redis.hget(self._keys.preference(account_id), "presence_subscription")
         if value is None:
-            return 0
-        result = int(_text(value))
-        if result not in {0, 1, 2}:
-            raise RuntimeError("stored presence filter is invalid")
-        return result
+            return PresenceSubscription.NONE
+        try:
+            return PresenceSubscription(_text(value))
+        except ValueError as error:
+            raise RuntimeError("stored presence subscription is invalid") from error
 
     async def set_away_message(
         self,
@@ -573,176 +576,6 @@ class RedisRealtimeRepository(RealtimeRepository):
         """Return the current fenced Redis channel membership count."""
         del at
         return len(await self.list_channel_members(channel_id))
-
-    async def enqueue_mailbox(
-        self,
-        account_id: int,
-        payload: bytes,
-        *,
-        recipient_fence: SessionFence,
-        expires_at: datetime,
-    ) -> MailboxPacket:
-        """Append only to the mailbox owned by the explicit recipient epoch."""
-        _positive_integer("account_id", account_id)
-        fence = _fence("recipient_fence", recipient_fence)
-        frozen_payload = _bytes(payload)
-        result = await self._run(
-            self._scripts.enqueue_mailbox,
-            keys=[
-                self._keys.session(fence.session_id),
-                self._keys.account_session(account_id),
-                self._keys.mailbox_packets(account_id),
-                self._keys.mailbox_bytes(account_id),
-                self._keys.mailbox_sequence(account_id),
-                self._keys.mailbox_signal(account_id, fence),
-            ],
-            args=[
-                account_id,
-                str(fence.session_id),
-                fence.revision,
-                frozen_payload,
-                datetime_to_milliseconds(expires_at),
-                self._mailbox_ttl_ms,
-                self._max_packet_count,
-                self._max_packet_bytes,
-                MAX_SEQUENCE,
-            ],
-        )
-        status = _text(result[0])
-        if status == "OVERFLOW":
-            raise MailboxOverflow("mailbox packet or byte bound reached")
-        if status == "SEQUENCE_OVERFLOW":
-            raise MailboxOverflow("mailbox sequence is exhausted")
-        self._raise_session_status(status)
-        return MailboxPacket(int(_text(result[1])), frozen_payload)
-
-    async def lease_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        lease_id: uuid.UUID,
-        limit: int,
-        expires_at: datetime,
-    ) -> MailboxBatch:
-        """Lease packets only from the explicit recipient epoch's mailbox."""
-        _positive_integer("account_id", account_id)
-        fence = _fence("recipient_fence", recipient_fence)
-        _uuid("lease_id", lease_id)
-        _positive_integer("limit", limit)
-        if limit > self._max_packet_count:
-            raise ValueError("limit exceeds max_packet_count")
-        result = await self._run(
-            self._scripts.lease_mailbox,
-            keys=[
-                self._keys.session(fence.session_id),
-                self._keys.account_session(account_id),
-                self._keys.mailbox_packets(account_id),
-                self._keys.mailbox_bytes(account_id),
-                self._keys.mailbox_lease(account_id),
-                self._keys.mailbox_signal(account_id, fence),
-            ],
-            args=[
-                account_id,
-                str(fence.session_id),
-                fence.revision,
-                str(lease_id),
-                limit,
-                datetime_to_milliseconds(expires_at),
-                self._mailbox_ttl_ms,
-                self._max_packet_count,
-            ],
-        )
-        status = _text(result[0])
-        if status == "CONFLICT":
-            raise PollLeaseConflict("mailbox already has an active poll lease")
-        self._raise_session_status(status)
-        packets = tuple(
-            MailboxPacket(decoded.sequence, decoded.payload)
-            for decoded in (decode_ordered_payload(_binary(packet)) for packet in result[1:])
-        )
-        return MailboxBatch(lease_id, packets, expires_at)
-
-    async def wait_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        timeout: float,
-    ) -> bool:
-        """Block one Redis connection briefly until the fenced mailbox is signalled."""
-        _positive_integer("account_id", account_id)
-        fence = _fence("recipient_fence", recipient_fence)
-        timeout_seconds = duration_to_milliseconds(timeout, name="timeout") / 1_000
-        result = await self._redis.blpop(
-            self._keys.mailbox_signal(account_id, fence),
-            timeout=timeout_seconds,
-        )
-        return result is not None
-
-    async def ack_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        lease_id: uuid.UUID,
-        through_sequence: int,
-    ) -> None:
-        """Acknowledge only a lease owned by the explicit recipient epoch."""
-        _positive_integer("account_id", account_id)
-        fence = _fence("recipient_fence", recipient_fence)
-        _uuid("lease_id", lease_id)
-        _bounded_integer("through_sequence", through_sequence, MAX_SEQUENCE)
-        result = await self._run(
-            self._scripts.ack_mailbox,
-            keys=[
-                self._keys.session(fence.session_id),
-                self._keys.account_session(account_id),
-                self._keys.mailbox_packets(account_id),
-                self._keys.mailbox_bytes(account_id),
-                self._keys.mailbox_lease(account_id),
-                self._keys.mailbox_signal(account_id, fence),
-            ],
-            args=[
-                account_id,
-                str(fence.session_id),
-                fence.revision,
-                str(lease_id),
-                sequence_token(through_sequence),
-                self._max_packet_count,
-            ],
-        )
-        status = _text(result[0])
-        if status == "CONFLICT":
-            raise PollLeaseConflict("mailbox poll lease is absent or owned by another epoch")
-        if status == "INVALID_ACK":
-            raise ValueError("through_sequence exceeds the leased packet range")
-        self._raise_session_status(status)
-
-    async def release_mailbox(
-        self,
-        account_id: int,
-        *,
-        recipient_fence: SessionFence,
-        lease_id: uuid.UUID,
-    ) -> None:
-        """Release only a lease owned by the explicit recipient epoch."""
-        _positive_integer("account_id", account_id)
-        fence = _fence("recipient_fence", recipient_fence)
-        _uuid("lease_id", lease_id)
-        result = await self._run(
-            self._scripts.release_mailbox,
-            keys=[
-                self._keys.session(fence.session_id),
-                self._keys.account_session(account_id),
-                self._keys.mailbox_lease(account_id),
-            ],
-            args=[account_id, str(fence.session_id), fence.revision, str(lease_id)],
-        )
-        status = _text(result[0])
-        if status == "CONFLICT":
-            raise PollLeaseConflict("mailbox poll lease is owned by another epoch")
-        self._raise_session_status(status)
 
     async def attach_spectator(
         self,
@@ -949,18 +782,19 @@ class RedisRealtimeRepository(RealtimeRepository):
         host_account_id: int,
         *,
         host_fence: SessionFence,
-        sequence: int,
-        reset_sequence: bool,
-        payload: bytes,
+        frame: SpectatorFrameBubble,
+        reset_history: bool,
         expires_at: datetime,
     ) -> SpectatorFramePublish:
-        """Roll per-play history and queue live delivery in one host-epoch-fenced transition."""
+        """Roll canonical history and return state-validated spectator targets."""
         _positive_integer("host_account_id", host_account_id)
         host = _fence("host_fence", host_fence)
-        _bounded_integer("sequence", sequence, MAX_FRAME_SEQUENCE)
-        if not isinstance(reset_sequence, bool):
-            raise TypeError("reset_sequence must be a boolean")
-        frozen_payload = _bytes(payload)
+        if not isinstance(frame, SpectatorFrameBubble) or frame.host_account_id != host_account_id:
+            raise ValueError("frame must be a SpectatorFrameBubble for host_account_id")
+        _bounded_integer("sequence", frame.sequence, _MAX_STREAM_SEQUENCE)
+        if not isinstance(reset_history, bool):
+            raise TypeError("reset_history must be a boolean")
+        encoded_frame = encode_bubble(frame)
         result = await self._run(
             self._scripts.publish_frame,
             keys=[
@@ -976,23 +810,19 @@ class RedisRealtimeRepository(RealtimeRepository):
                 host_account_id,
                 str(host.session_id),
                 host.revision,
-                sequence,
-                frozen_payload,
+                frame.sequence,
+                encoded_frame,
                 datetime_to_milliseconds(expires_at),
                 self._presence_ttl_ms,
-                MAX_FRAME_SEQUENCE,
+                _MAX_STREAM_SEQUENCE,
                 self._max_frame_count,
                 self._max_frame_bytes,
                 MAX_SEQUENCE,
-                self._mailbox_ttl_ms,
-                self._max_packet_count,
-                self._max_packet_bytes,
                 self._max_spectators_per_host,
                 f"{self._keys.base}:account:",
                 self._keys.session_prefix,
                 f"{self._keys.base}:spectator:viewer:",
-                f"{self._keys.base}:mailbox:",
-                int(reset_sequence),
+                int(reset_history),
             ],
         )
         status = _text(result[0])
@@ -1001,11 +831,27 @@ class RedisRealtimeRepository(RealtimeRepository):
         if status in {"INVALID_EXPIRY", "FRAME_TOO_LARGE", "NON_MONOTONIC", "SEQUENCE_OVERFLOW"}:
             raise InvalidFrame(f"spectator frame was rejected: {status.lower()}")
         self._raise_session_status(status)
-        frame = decode_ordered_frame(
-            f"{sequence_token(int(_text(result[1])))}:{datetime_to_milliseconds(expires_at)}:{sequence:05d}:".encode()
-            + frozen_payload
-        ).frame
-        return SpectatorFramePublish(frame, tuple(int(_text(value)) for value in result[2:]))
+        stored_frame = SpectatorFrame(
+            int(_text(result[1])),
+            frame.host_account_id,
+            frame.sequence,
+            frame.action,
+            frame.frames,
+            frame.score,
+            frame.extra,
+        )
+        values = result[2:]
+        if len(values) % 4:
+            raise RuntimeError("Redis returned malformed spectator recipients")
+        recipients = tuple(
+            SpectatorRecipient(
+                int(_text(values[index])),
+                SessionFence(uuid.UUID(_text(values[index + 1])), int(_text(values[index + 2]))),
+                datetime_from_milliseconds(int(_text(values[index + 3]))),
+            )
+            for index in range(0, len(values), 4)
+        )
+        return SpectatorFramePublish(stored_frame, recipients)
 
     async def read_spectator_frames(
         self,
@@ -1052,10 +898,26 @@ class RedisRealtimeRepository(RealtimeRepository):
         oldest = _text(values[0])
         latest = _text(values[1])
         truncated = _text(values[2]) == "1"
-        frames = tuple(decode_ordered_frame(_binary(value)).frame for value in values[3:])
+        frames = tuple(RedisRealtimeStateRepository._decode_stored_frame(_binary(value)) for value in values[3:])
         return SpectatorFrameWindow(
             frames,
             int(oldest) if oldest else None,
             int(latest) if latest else None,
             truncated,
+        )
+
+    @staticmethod
+    def _decode_stored_frame(value: bytes) -> SpectatorFrame:
+        ordered = decode_ordered_frame(value)
+        bubble = decode_bubble(ordered.payload)
+        if not isinstance(bubble, SpectatorFrameBubble) or bubble.sequence != ordered.sequence:
+            raise ValueError("stored spectator frame does not contain canonical frame state")
+        return SpectatorFrame(
+            ordered.cursor,
+            bubble.host_account_id,
+            bubble.sequence,
+            bubble.action,
+            bubble.frames,
+            bubble.score,
+            bubble.extra,
         )

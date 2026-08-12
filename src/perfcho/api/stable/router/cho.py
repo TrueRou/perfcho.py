@@ -2,33 +2,20 @@
 
 import asyncio
 import hashlib
-import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from time import monotonic_ns
 
 from fastapi import APIRouter, Header, Request, Response
 
-from perfcho.api.cho.canonize.ipaddr import resolve_client_ip
-from perfcho.api.cho.canonize.login import StableLoginParseError, parse_stable_login
-from perfcho.api.cho.dependencies import StableServicesDependency
-from perfcho.api.cho.dispatcher import StableRuntimeContext, account_stats, dispatch_packets, realtime_expiry
-from perfcho.infra.compose import StableServices
-from perfcho.infra.logging import duration_ms, log_event, rate_limit, sampled
-from perfcho.modules.common import ClientContext, CommandMeta
-from perfcho.modules.community import StableChannel
-from perfcho.modules.identity import InvalidCredentials, InvalidStableSession, StableLogin, StableSessionAlreadyActive
-from perfcho.modules.realtime import (
-    MailboxOverflow,
-    MailboxPacket,
-    PollLeaseConflict,
-    PresenceCapacityReached,
-    PresenceSnapshot,
-    RealtimeSession,
-    RealtimeSessionFenced,
-    RealtimeSessionNotFound,
-)
-from perfcho.modules.realtime.stable import (
+from perfcho.api.stable.authorization import project_stable_privileges
+from perfcho.api.stable.bubbles import StableBubbleRenderer, canonicalize_presence, stable_presence_models
+from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
+from perfcho.api.stable.canonize.login import StableLoginParseError, parse_stable_login
+from perfcho.api.stable.channels import stable_channel_name
+from perfcho.api.stable.dependencies import StableServicesDependency
+from perfcho.api.stable.dispatcher import StableRuntimeContext, account_stats, dispatch_packets, realtime_expiry
+from perfcho.api.stable.realtime import (
     Channel,
     ClientPacket,
     LoginFailureReason,
@@ -44,21 +31,39 @@ from perfcho.modules.realtime.stable import (
     friends_list,
     login_reply,
     notification,
-    pong,
     privileges,
     protocol_version,
     restart,
     send_message,
     silence_end,
-    user_presence,
-    user_stats,
 )
-from perfcho.modules.realtime.stable.countries import stable_country_id
+from perfcho.api.stable.realtime.countries import stable_country_id
+from perfcho.infra.compose import StableServices
+from perfcho.infra.logging import duration_ms, log_event, rate_limit, sampled
+from perfcho.modules.common import ClientContext, CommandMeta
+from perfcho.modules.community import ChannelView
+from perfcho.modules.identity import (
+    AuthenticateClientSession,
+    InvalidCredentials,
+    InvalidSession,
+    SessionAlreadyActive,
+)
+from perfcho.modules.realtime import (
+    PresenceCapacityReached,
+    PresenceSnapshot,
+    RealtimeBubble,
+    RealtimeBubbleSubscription,
+    RealtimeSession,
+    RealtimeSessionFenced,
+    RealtimeSessionNotFound,
+    presence_updated_bubble,
+)
 from perfcho.modules.social import FollowView
 
 router = APIRouter()
 
 _BINARY_MEDIA_TYPE = "application/octet-stream"
+_BUBBLE_RENDERER = StableBubbleRenderer()
 
 
 @router.post("/", response_class=Response)
@@ -124,7 +129,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
 
     now = services.clock.now()
     request_id = services.id_generator.new()
-    command = StableLogin(
+    command = AuthenticateClientSession(
         meta=CommandMeta(
             request_id=request_id,
             idempotency_key=f"stable-login:{request_id}",
@@ -140,7 +145,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             received_at=now,
         ),
         identifier=parsed.identifier,
-        password_token=parsed.password_token,
+        password_preverification=parsed.password_token,
         client_version=parsed.client_version,
         client_variant=None,
         ip_address=resolve_client_ip(request, services.settings.trusted_proxy_cidrs),
@@ -149,7 +154,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         session_lifetime=timedelta(seconds=services.settings.stable_session_lifetime_seconds),
     )
     try:
-        result = await services.identity.login_stable(command)
+        result = await services.identity.authenticate_client_session(command)
     except InvalidCredentials as error:
         if rate_limit("stable-login-invalid-credentials", interval_seconds=5):
             log_event(
@@ -166,7 +171,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             notification("Authentication failed.") + login_reply(LoginFailureReason.AUTHENTICATION_FAILED),
             token="invalid-credentials",
         )
-    except StableSessionAlreadyActive as error:
+    except SessionAlreadyActive as error:
         log_event(
             "INFO",
             "stable.login.rejected",
@@ -191,10 +196,11 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         if len(online_presences) >= services.settings.stable_presence_batch_size:
             raise PresenceCapacityReached
 
-        stable_privileges, social_friends = await asyncio.gather(
-            services.authorization.get_stable_privileges(result.account_id),
+        authorization, social_friends = await asyncio.gather(
+            services.authorization.get_effective(result.account_id),
             services.social.list_friends(result.account_id) if services.social is not None else _empty_friends(),
         )
+        stable_privileges = project_stable_privileges(authorization)
         friend_ids = tuple(dict.fromkeys((1, *(friend.account_id for friend in social_friends))))
         if services.community is not None:
             channels, offline_messages, silence_seconds, _ = await asyncio.gather(
@@ -223,10 +229,10 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         community = services.community
         if community is not None:
             auto_join_channels = tuple(
-                channel for channel in channels if channel.auto_join and channel.name != "#lobby"
+                channel for channel in channels if channel.auto_join and stable_channel_name(channel) != "#lobby"
             )
 
-            async def initialize_channel(channel: StableChannel) -> bytes:
+            async def initialize_channel(channel: ChannelView) -> bytes:
                 await services.realtime.join_channel(
                     channel.channel_id,
                     session_id=result.session_id,
@@ -237,7 +243,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
                     channel.channel_id,
                     already_authorized=True,
                 )
-                return channel_info(Channel(channel.name, channel.topic, member_count))
+                return channel_info(Channel(stable_channel_name(channel), channel.topic, member_count))
 
             channel_packets = await _bounded_gather(
                 auto_join_channels,
@@ -257,17 +263,28 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             global_rank=0,
         )
         stats = await account_stats(_empty_stats(result.account_id), services)
-        presence_packet = user_presence(presence)
-        stats_packet = user_stats(stats)
-        own_presence_payload = presence_packet + stats_packet
-        await services.realtime.set_presence(
-            PresenceSnapshot(
-                account_id=result.account_id,
-                revision=realtime.revision,
-                payload=own_presence_payload,
-                expires_at=realtime.expires_at,
-                session_id=result.session_id,
+        identity_state, activity, statistics = canonicalize_presence(
+            presence,
+            stats,
+            country_code=result.country_code,
+            privilege_codes=frozenset(
+                authorization.permission_codes | authorization.role_codes | authorization.entitlement_codes
             ),
+        )
+        own_snapshot = PresenceSnapshot(
+            account_id=result.account_id,
+            revision=realtime.revision,
+            identity=identity_state,
+            activity=activity,
+            statistics=statistics,
+            expires_at=realtime.expires_at,
+            session_id=result.session_id,
+        )
+        own_bubble = presence_updated_bubble(own_snapshot)
+        presence_packet = _BUBBLE_RENDERER.render_presence(own_bubble, include_statistics=False)
+        stats_packet = _BUBBLE_RENDERER.render_presence(own_bubble, include_identity=False)
+        await services.realtime.set_presence(
+            own_snapshot,
             session_id=result.session_id,
             capacity=services.settings.stable_presence_batch_size,
         )
@@ -280,15 +297,12 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             if snapshot.account_id != result.account_id
         )
 
-        async def enqueue_presence(snapshot: PresenceSnapshot) -> BaseException | None:
+        async def publish_presence(snapshot: PresenceSnapshot) -> BaseException | None:
+            if services.bubbles is None:
+                return RuntimeError("realtime Bubble bus is unavailable")
             try:
-                await services.realtime.enqueue_mailbox(
-                    snapshot.account_id,
-                    own_presence_payload,
-                    recipient_fence=snapshot.fence,
-                    expires_at=snapshot.expires_at,
-                )
-            except (MailboxOverflow, RealtimeSessionFenced, RealtimeSessionNotFound) as error:
+                await services.bubbles.publish(snapshot.fence, own_bubble)
+            except Exception as error:
                 return error
             return None
 
@@ -296,7 +310,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             error
             for error in await _bounded_gather(
                 online_presences,
-                enqueue_presence,
+                publish_presence,
                 limit=services.settings.stable_presence_fanout_concurrency,
             )
             if error is not None
@@ -304,7 +318,9 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
         presence_broadcast_failure_count = len(broadcast_errors)
         presence_broadcast_error = broadcast_errors[0] if broadcast_errors else None
 
-        online_packets = tuple(_presence_projection(snapshot) for snapshot in online_presences)
+        online_packets = tuple(
+            _BUBBLE_RENDERER.render(presence_updated_bubble(snapshot)) for snapshot in online_presences
+        )
         offline_packets = tuple(
             send_message(
                 Message(
@@ -383,8 +399,8 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
     now = services.clock.now()
     idle_ping = _is_idle_ping(body)
     try:
-        identity = await services.identity.touch_stable_session(raw_token)
-    except InvalidStableSession as error:
+        identity = await services.identity.touch_client_session(raw_token)
+    except InvalidSession as error:
         _log_invalid_poll_session("touch_identity", error)
         return _binary_response(notification("Session expired. Please reconnect.") + restart(0))
 
@@ -432,24 +448,40 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
 
     try:
         stored_presence = await services.realtime.get_presence(identity.account_id, at=now)
-        presence, stats = _presence_and_stats(
-            identity.account_id,
-            identity.current_name,
-            stable_country_id(identity.country_code),
-            stored_presence,
-        )
         if stored_presence is None:
+            presence = UserPresence(
+                identity.account_id,
+                identity.current_name,
+                0,
+                stable_country_id(identity.country_code),
+                1,
+                0,
+                0.0,
+                0.0,
+                0,
+            )
+            stats = _empty_stats(identity.account_id)
+            identity_state, activity, statistics = canonicalize_presence(
+                presence,
+                stats,
+                country_code=identity.country_code,
+            )
+            stored_presence = PresenceSnapshot(
+                account_id=identity.account_id,
+                revision=realtime.revision,
+                identity=identity_state,
+                activity=activity,
+                statistics=statistics,
+                expires_at=expiry,
+                session_id=identity.session_id,
+            )
             await services.realtime.set_presence(
-                PresenceSnapshot(
-                    account_id=identity.account_id,
-                    revision=realtime.revision,
-                    payload=user_presence(presence) + user_stats(stats),
-                    expires_at=expiry,
-                    session_id=identity.session_id,
-                ),
+                stored_presence,
                 session_id=identity.session_id,
                 capacity=services.settings.stable_presence_batch_size,
             )
+        else:
+            presence, stats = stable_presence_models(presence_updated_bubble(stored_presence))
     except (RealtimeSessionNotFound, RealtimeSessionFenced, PresenceCapacityReached) as error:
         return await _realtime_lost(
             raw_token,
@@ -457,47 +489,6 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
             account_id=identity.account_id,
             stage="presence",
             error=error,
-        )
-
-    lease_id = services.id_generator.new()
-    try:
-        batch = await services.realtime.lease_mailbox(
-            identity.account_id,
-            recipient_fence=realtime.fence,
-            lease_id=lease_id,
-            limit=services.settings.stable_mailbox_batch_size,
-            expires_at=now + timedelta(seconds=services.settings.stable_mailbox_lease_seconds),
-        )
-    except PollLeaseConflict as error:
-        if rate_limit("stable.poll.mailbox_lease_conflict", interval_seconds=5.0):
-            log_event(
-                "INFO",
-                "stable.poll.mailbox_lease_conflict",
-                exception=error,
-                stage="lease",
-                outcome="conflict",
-                account_id=identity.account_id,
-                error_code=error.code,
-                error_type=type(error).__name__,
-            )
-        return _binary_response(b"")
-    except (RealtimeSessionNotFound, RealtimeSessionFenced) as error:
-        return await _realtime_lost(
-            raw_token,
-            services,
-            account_id=identity.account_id,
-            stage="mailbox_lease",
-            error=error,
-        )
-
-    if sampled((started_ns, "mailbox_lease"), services.settings.log_hot_path_sample_rate):
-        log_event(
-            "DEBUG",
-            "stable.poll.mailbox_stage",
-            stage="leased",
-            outcome="success",
-            account_id=identity.account_id,
-            packet_count=len(batch.packets),
         )
 
     context = StableRuntimeContext(
@@ -514,149 +505,178 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
         ),
         raw_token=raw_token,
     )
+    if services.bubbles is None or services.poll_gate is None:
+        raise RuntimeError("Stable Poll requires the Bubble bus and PollGate")
+
+    gate_id = services.id_generator.new()
     try:
-        local_output = await dispatch_packets(body, context, services)
-    except (ProtocolError, ValueError) as error:
-        await _release_mailbox(identity.account_id, realtime, lease_id, services)
-        log_event(
-            "INFO",
-            "stable.poll.protocol_rejected",
-            exception=error,
-            stage="dispatch",
-            outcome="malformed",
-            account_id=identity.account_id,
-            error_type=type(error).__name__,
-            input_bytes=len(body),
-            leased_packet_count=len(batch.packets),
-            duration_ms=duration_ms(started_ns),
+        acquired = await services.poll_gate.acquire(
+            identity.account_id,
+            realtime.fence,
+            gate_id,
+            expires_at=now + timedelta(seconds=services.settings.stable_poll_gate_seconds),
         )
-        return _protocol_failure("Malformed Bancho packet.")
-    except BaseException:
-        await _release_mailbox(identity.account_id, realtime, lease_id, services)
-        raise
-    if context.session_closed:
-        # Logout fences the realtime session and removes its mailbox lease.
-        # There is nothing left for this Poll to acknowledge or release.
-        return _binary_response(local_output)
-
-    mailbox_waited = False
-    mailbox_signaled = False
-    lease_active = True
-    if idle_ping and not local_output and not batch.packets:
-        mailbox_waited = True
-        try:
-            mailbox_signaled = await services.realtime.wait_mailbox(
-                identity.account_id,
-                recipient_fence=realtime.fence,
-                timeout=services.settings.stable_mailbox_wait_seconds,
+    except Exception as error:
+        if rate_limit("stable.poll.gate_failed", interval_seconds=5.0):
+            log_event(
+                "WARNING",
+                "stable.poll.gate_failed",
+                exception=error,
+                outcome="failed",
+                account_id=identity.account_id,
             )
-        except BaseException:
-            await _release_mailbox(identity.account_id, realtime, lease_id, services)
-            raise
-
-        lease_active = not await _release_mailbox(identity.account_id, realtime, lease_id, services)
-        if mailbox_signaled and not lease_active:
-            lease_id = services.id_generator.new()
-            lease_now = services.clock.now()
-            try:
-                batch = await services.realtime.lease_mailbox(
-                    identity.account_id,
-                    recipient_fence=realtime.fence,
-                    lease_id=lease_id,
-                    limit=services.settings.stable_mailbox_batch_size,
-                    expires_at=lease_now + timedelta(seconds=services.settings.stable_mailbox_lease_seconds),
-                )
-                lease_active = True
-            except PollLeaseConflict as error:
-                if rate_limit("stable.poll.mailbox_lease_conflict", interval_seconds=5.0):
-                    log_event(
-                        "INFO",
-                        "stable.poll.mailbox_lease_conflict",
-                        exception=error,
-                        stage="reacquire_after_wait",
-                        outcome="conflict",
-                        account_id=identity.account_id,
-                        error_code=error.code,
-                        error_type=type(error).__name__,
-                    )
-                return _binary_response(b"")
-            except (RealtimeSessionNotFound, RealtimeSessionFenced) as error:
-                return await _realtime_lost(
-                    raw_token,
-                    services,
-                    account_id=identity.account_id,
-                    stage="mailbox_reacquire_after_wait",
-                    error=error,
-                )
-
-    mailbox_packets = _mailbox_packets_within_budget(
-        batch.packets,
-        services.settings.stable_max_response_bytes - len(local_output),
-    )
-    mailbox_output = b"".join(packet.payload for packet in mailbox_packets)
-    continuation = pong() if mailbox_packets else b""
-    if len(local_output) + len(mailbox_output) + len(continuation) > services.settings.stable_max_response_bytes:
-        continuation = b""
-    mailbox_stage = "acked" if mailbox_packets else "released"
-    if mailbox_waited and not mailbox_signaled:
-        mailbox_stage = "wait_timeout"
-    try:
-        if mailbox_packets:
-            await services.realtime.ack_mailbox(
-                identity.account_id,
-                recipient_fence=realtime.fence,
-                lease_id=lease_id,
-                through_sequence=mailbox_packets[-1].sequence,
-            )
-        elif lease_active:
-            await services.realtime.release_mailbox(
-                identity.account_id,
-                recipient_fence=realtime.fence,
-                lease_id=lease_id,
-            )
-    except PollLeaseConflict as error:
-        log_event(
-            "INFO",
-            "stable.poll.mailbox_lease_conflict",
-            exception=error,
-            stage=mailbox_stage,
-            outcome="conflict",
-            account_id=identity.account_id,
-            error_code=error.code,
-            error_type=type(error).__name__,
-        )
         return _binary_response(b"")
-    except (RealtimeSessionNotFound, RealtimeSessionFenced) as error:
-        return await _realtime_lost(
-            raw_token,
-            services,
-            account_id=identity.account_id,
-            stage=f"mailbox_{mailbox_stage}",
-            error=error,
-        )
-    except BaseException:
-        await _release_mailbox(identity.account_id, realtime, lease_id, services)
-        raise
-    output = local_output + mailbox_output + continuation
+    if not acquired:
+        return _binary_response(b"")
+
+    try:
+        try:
+            async with services.bubbles.subscribe(realtime.fence) as subscription:
+                return await _poll_subscribed(
+                    body,
+                    context,
+                    services,
+                    subscription,
+                    idle_ping=idle_ping,
+                    started_ns=started_ns,
+                )
+        except (ProtocolError, ValueError) as error:
+            log_event(
+                "INFO",
+                "stable.poll.protocol_rejected",
+                exception=error,
+                stage="dispatch",
+                outcome="malformed",
+                account_id=identity.account_id,
+                error_type=type(error).__name__,
+                input_bytes=len(body),
+                duration_ms=duration_ms(started_ns),
+            )
+            return _protocol_failure("Malformed Bancho packet.")
+        except (RealtimeSessionNotFound, RealtimeSessionFenced) as error:
+            return await _realtime_lost(
+                raw_token,
+                services,
+                account_id=identity.account_id,
+                stage="bubble_poll",
+                error=error,
+            )
+        except Exception as error:
+            if rate_limit("stable.poll.subscription_failed", interval_seconds=5.0):
+                log_event(
+                    "WARNING",
+                    "stable.poll.subscription_failed",
+                    exception=error,
+                    outcome="local_only",
+                    account_id=identity.account_id,
+                )
+            return _binary_response(_render_local_response(context, services))
+    finally:
+        try:
+            await services.poll_gate.release(identity.account_id, realtime.fence, gate_id)
+        except Exception as error:
+            if rate_limit("stable.poll.gate_release_failed", interval_seconds=5.0):
+                log_event(
+                    "WARNING",
+                    "stable.poll.gate_release_failed",
+                    exception=error,
+                    outcome="ttl_cleanup",
+                    account_id=identity.account_id,
+                )
+
+
+async def _poll_subscribed(
+    body: bytes,
+    context: StableRuntimeContext,
+    services: StableServices,
+    subscription: RealtimeBubbleSubscription,
+    *,
+    idle_ping: bool,
+    started_ns: int,
+) -> Response:
+    local_bubbles = await dispatch_packets(body, context, services)
+    if context.session_closed:
+        return _binary_response(_render_local_response(context, services, local_bubbles))
+
+    remote_bubbles: tuple[RealtimeBubble, ...]
+    try:
+        remote_bubbles = await subscription.drain(limit=services.settings.stable_bubble_batch_size)
+    except Exception as error:
+        _log_subscription_error(error, context.identity.account_id, stage="drain")
+        remote_bubbles = ()
+
+    waited = False
+    if idle_ping and not local_bubbles and not context.stable_output and not remote_bubbles:
+        waited = True
+        try:
+            first = await subscription.receive(timeout=services.settings.stable_bubble_wait_seconds)
+            if first is not None:
+                remaining = services.settings.stable_bubble_batch_size - 1
+                additional = await subscription.drain(limit=remaining) if remaining else ()
+                remote_bubbles = (first, *additional)
+        except Exception as error:
+            _log_subscription_error(error, context.identity.account_id, stage="wait")
+
+    output = bytearray(_render_local_response(context, services, local_bubbles))
+    remote_output = _BUBBLE_RENDERER.render_many(
+        remote_bubbles,
+        max_bytes=max(0, services.settings.stable_max_response_bytes - len(output)),
+    )
+    output.extend(remote_output)
     if sampled((started_ns, "poll_summary"), services.settings.log_hot_path_sample_rate):
         log_event(
             "INFO",
             "stable.poll.completed",
             outcome="success",
-            account_id=identity.account_id,
-            mailbox_stage=mailbox_stage,
+            account_id=context.identity.account_id,
             input_bytes=len(body),
-            local_output_bytes=len(local_output),
-            leased_packet_count=len(batch.packets),
-            returned_mailbox_packet_count=len(mailbox_packets),
-            deferred_mailbox_packet_count=len(batch.packets) - len(mailbox_packets),
-            mailbox_waited=mailbox_waited,
-            mailbox_signaled=mailbox_signaled,
-            continuation_sent=bool(continuation),
+            local_output_bytes=len(context.stable_output),
+            local_bubble_count=len(local_bubbles),
+            remote_bubble_count=len(remote_bubbles),
+            bubble_waited=waited,
             response_bytes=len(output),
             duration_ms=duration_ms(started_ns),
         )
-    return _binary_response(output)
+    return _binary_response(bytes(output))
+
+
+def _render_local_response(
+    context: StableRuntimeContext,
+    services: StableServices,
+    bubbles: Sequence[RealtimeBubble] | None = None,
+) -> bytes:
+    output = bytearray(
+        _BUBBLE_RENDERER.render_many(
+            context.local_bubbles if bubbles is None else bubbles,
+            max_bytes=services.settings.stable_max_response_bytes,
+        )
+    )
+    _extend_stable_output(
+        output,
+        bytes(context.stable_output),
+        services.settings.stable_max_response_bytes,
+    )
+    return bytes(output)
+
+
+def _extend_stable_output(output: bytearray, payload: bytes, maximum: int) -> None:
+    for packet in PacketReader(payload, packet_enum=ServerPacket):
+        wire = build_packet(packet.packet_id, packet.payload_view)
+        if len(output) + len(wire) > maximum:
+            break
+        output.extend(wire)
+
+
+def _log_subscription_error(error: Exception, account_id: int, *, stage: str) -> None:
+    if rate_limit(f"stable.poll.subscription_failed:{stage}", interval_seconds=5.0):
+        log_event(
+            "WARNING",
+            "stable.poll.subscription_failed",
+            exception=error,
+            stage=stage,
+            outcome="local_only",
+            account_id=account_id,
+        )
 
 
 async def _read_limited_body(request: Request, maximum: int) -> bytes:
@@ -691,54 +711,9 @@ async def _bounded_gather[T, R](
     return tuple(await asyncio.gather(*(run(value) for value in values)))
 
 
-def _presence_and_stats(
-    account_id: int,
-    current_name: str,
-    country_code: int,
-    snapshot: PresenceSnapshot | None,
-) -> tuple[UserPresence, UserStats]:
-    if snapshot is not None:
-        parsed_presence: UserPresence | None = None
-        parsed_stats: UserStats | None = None
-
-        for packet in PacketReader(snapshot.payload, packet_enum=ServerPacket):
-            if packet.packet_type is ServerPacket.USER_PRESENCE:
-                parsed_presence = packet.payload.read_user_presence()
-            elif packet.packet_type is ServerPacket.USER_STATS:
-                parsed_stats = packet.payload.read_user_stats()
-        if parsed_presence is not None and parsed_stats is not None:
-            return parsed_presence, parsed_stats
-    return (
-        UserPresence(account_id, current_name, 0, country_code, 1, 0, 0.0, 0.0, 0),
-        _empty_stats(account_id),
-    )
-
-
-def _presence_projection(snapshot: PresenceSnapshot) -> bytes:
-    output = bytearray()
-    for packet in PacketReader(snapshot.payload, packet_enum=ServerPacket):
-        if packet.packet_type in {ServerPacket.USER_PRESENCE, ServerPacket.USER_STATS}:
-            output.extend(build_packet(packet.packet_id, packet.payload_view))
-    return bytes(output)
-
-
 def _offline_message_text(created_at: datetime, content: str) -> str:
     timestamp = created_at.astimezone(UTC)
     return f"[{timestamp:%a %b %d @ %H:%M%p}] {content}"
-
-
-def _mailbox_packets_within_budget(
-    packets: tuple[MailboxPacket, ...],
-    remaining_bytes: int,
-) -> tuple[MailboxPacket, ...]:
-    selected: list[MailboxPacket] = []
-    used = 0
-    for packet in packets:
-        if used + len(packet.payload) > remaining_bytes:
-            break
-        selected.append(packet)
-        used += len(packet.payload)
-    return tuple(selected)
 
 
 def _is_idle_ping(body: bytes) -> bool:
@@ -778,7 +753,7 @@ async def _compensate_failed_login(
                 error_type=type(error).__name__,
             )
     try:
-        await services.identity.close_stable_session(raw_token, reason="bootstrap_failed")
+        await services.identity.close_client_session(raw_token, reason="bootstrap_failed")
     except Exception as error:
         log_event(
             "ERROR",
@@ -808,7 +783,7 @@ async def _realtime_lost(
         error_type=type(error).__name__ if error is not None else "SessionFenceMismatch",
     )
     try:
-        await services.identity.close_stable_session(raw_token, reason="realtime_state_lost")
+        await services.identity.close_client_session(raw_token, reason="realtime_state_lost")
     except Exception as cleanup_error:
         log_event(
             "ERROR",
@@ -822,33 +797,7 @@ async def _realtime_lost(
     return _binary_response(notification("Session state was lost. Please reconnect.") + restart(0))
 
 
-async def _release_mailbox(
-    account_id: int,
-    realtime: RealtimeSession,
-    lease_id: uuid.UUID,
-    services: StableServices,
-) -> bool:
-    try:
-        await services.realtime.release_mailbox(
-            account_id,
-            recipient_fence=realtime.fence,
-            lease_id=lease_id,
-        )
-        return True
-    except Exception as error:
-        log_event(
-            "WARNING",
-            "stable.poll.cleanup_failed",
-            exception=error,
-            operation="release_mailbox",
-            account_id=account_id,
-            error_code=getattr(error, "code", "cleanup_failed"),
-            error_type=type(error).__name__,
-        )
-        return False
-
-
-def _log_invalid_poll_session(stage: str, error: InvalidStableSession) -> None:
+def _log_invalid_poll_session(stage: str, error: InvalidSession) -> None:
     if not rate_limit(f"stable.poll.invalid_session:{stage}", interval_seconds=5.0):
         return
     log_event(

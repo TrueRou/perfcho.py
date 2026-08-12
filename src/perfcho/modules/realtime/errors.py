@@ -15,18 +15,6 @@ class RealtimeSessionFenced(ResourceConflict):
     code = "realtime_session_fenced"
 
 
-class PollLeaseConflict(ResourceConflict):
-    """Reject a concurrent poll while another mailbox lease is active."""
-
-    code = "poll_lease_conflict"
-
-
-class MailboxOverflow(ResourceConflict):
-    """Indicate that an account mailbox reached its configured packet bound."""
-
-    code = "mailbox_overflow"
-
-
 class PresenceCapacityReached(ResourceConflict):
     """Reject a presence claim when the bounded online index is full."""
 

@@ -123,6 +123,8 @@ class MultiplayerService:
                     connection_session_id=_actor_session_id(command.meta),
                     settings=_normalized_settings(command.settings),
                     capacity=command.capacity,
+                    public_id_limit=command.public_id_limit,
+                    protocol=command.meta.client.family,
                     password_salt=salt,
                     password_verifier=verifier,
                     now=now,
@@ -811,7 +813,7 @@ class MultiplayerService:
         started_at: datetime,
         ended_at: datetime,
     ) -> MultiplayerSubmissionContext | None:
-        """Resolve an authoritative Stable multiplayer attempt when one exists."""
+        """Resolve an authoritative multiplayer attempt when one exists."""
         if account_id < 1 or beatmap_revision_id < 1:
             raise ValueError("submission context identifiers must be positive")
         if started_at.tzinfo is None or started_at.utcoffset() is None:

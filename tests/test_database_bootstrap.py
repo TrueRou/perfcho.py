@@ -179,7 +179,7 @@ async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_databa
             assert all(mod_set.legacy_bits == 0 for mod_set in no_mod_sets)
 
             channels = (await session.scalars(select(Channel).order_by(Channel.slug))).all()
-            assert {channel.name for channel in channels} == {"#osu", "#announce", "#help", "#lobby"}
+            assert {channel.name for channel in channels} == {"osu", "announce", "help", "lobby"}
             assert all(channel.kind is ChannelKind.PUBLIC for channel in channels)
 
             policies = (await session.scalars(select(RankingPolicy))).all()

@@ -294,14 +294,13 @@ class ReplayFrame:
 
 @dataclass(frozen=True, slots=True)
 class ReplayFrameBundle:
-    """Parsed spectator frame bundle and its exact zero-copy wire slice."""
+    """Parsed Stable spectator frame bundle."""
 
     frames: tuple[ReplayFrame, ...]
     score_frame: ScoreFrame
     action: ReplayAction
     extra: int
-    sequence: int | None
-    raw_data: memoryview
+    sequence: int
 
     def __post_init__(self) -> None:
         """Normalize and validate the bounded spectator action inventory."""

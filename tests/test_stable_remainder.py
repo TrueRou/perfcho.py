@@ -7,32 +7,12 @@ from typing import cast
 
 import pytest
 
-from perfcho.api.cho.dispatcher import StableRuntimeContext, dispatch_packets
-from perfcho.infra.compose import StableServices
-from perfcho.infra.settings import Settings
-from perfcho.modules.authorization import AuthorizationQueryService
-from perfcho.modules.bot import BotCommandService, BotInvocation, CommandResult
-from perfcho.modules.common import Clock, IdGenerator
-from perfcho.modules.community import (
-    ChannelMembershipRequired,
-    CommunityInputRejected,
-    CommunityService,
-    DirectMessageBlocked,
-    MessageResult,
-    StableChannel,
-    TargetAccountSilenced,
-)
-from perfcho.modules.identity import IdentityService, ResolvedStableSession
-from perfcho.modules.multiplayer import CleanupPresence, MultiplayerService
-from perfcho.modules.realtime import (
-    MailboxOverflow,
-    MailboxPacket,
-    PresenceSnapshot,
-    RealtimeRepository,
-    RealtimeSession,
-    SessionFence,
-)
-from perfcho.modules.realtime.stable import (
+from perfcho.api.stable.bubbles import StableBubbleRenderer, canonicalize_presence
+from perfcho.api.stable.canonize.scoring import LEGACY_MOD_BITS
+from perfcho.api.stable.channels import parse_stable_channel_selector, stable_channel_name
+from perfcho.api.stable.dispatcher import StableRuntimeContext
+from perfcho.api.stable.dispatcher import dispatch_packets as dispatch_bubbles
+from perfcho.api.stable.realtime import (
     ClientPacket,
     ClientStatus,
     Message,
@@ -42,16 +22,53 @@ from perfcho.modules.realtime.stable import (
     UserPresence,
     UserStats,
     build_packet,
-    user_presence,
     user_stats,
 )
-from perfcho.modules.realtime.stable.countries import stable_country_id
+from perfcho.api.stable.realtime.countries import stable_country_id
+from perfcho.infra.compose import StableServices
+from perfcho.infra.settings import Settings
+from perfcho.modules.authorization import AuthorizationQueryService
+from perfcho.modules.bot import BotCommandService, BotInvocation, CommandResult
+from perfcho.modules.common import Clock, IdGenerator
+from perfcho.modules.community import (
+    ChannelMembershipRequired,
+    ChannelSelector,
+    ChannelView,
+    CommunityInputRejected,
+    CommunityService,
+    DirectMessageBlocked,
+    MessageResult,
+    TargetAccountSilenced,
+)
+from perfcho.modules.identity import IdentityService, ResolvedClientSession
+from perfcho.modules.multiplayer import CleanupPresence, MultiplayerService
+from perfcho.modules.realtime import (
+    PresenceSnapshot,
+    PresenceSubscription,
+    RealtimeBubble,
+    RealtimeBubbleBus,
+    RealtimeSession,
+    RealtimeStateRepository,
+    SessionFence,
+)
 from perfcho.modules.scoring import AccountStatsView, RankingQueryService
-from perfcho.modules.scoring.mods import LEGACY_MOD_BITS
 from perfcho.modules.social import AccountIdentityView, SocialInteractionBlocked, SocialService
 
 NOW = datetime(2026, 7, 29, 12, tzinfo=UTC)
+
+
+async def dispatch_packets(body: bytes, context: StableRuntimeContext, services: StableServices) -> bytes:
+    bubbles = await dispatch_bubbles(body, context, services)
+    rendered = StableBubbleRenderer().render_many(bubbles, max_bytes=services.settings.stable_max_response_bytes)
+    return rendered + bytes(context.stable_output)
+
+
 EXPIRY = NOW + timedelta(minutes=5)
+
+
+def test_stable_channel_names_are_parsed_and_rendered_at_the_adapter_boundary() -> None:
+    assert parse_stable_channel_selector(" #OsU ") == ChannelSelector(name="osu")
+    assert stable_channel_name(ChannelView(7, "osu", "general", False, 256, True, False)) == "#osu"
 
 
 def test_stable_country_ids_match_legacy_table() -> None:
@@ -75,7 +92,7 @@ class FakeIdentity:
     def __init__(self) -> None:
         self.closed: tuple[str, str] | None = None
 
-    async def close_stable_session(self, raw_token: str, *, reason: str) -> None:
+    async def close_client_session(self, raw_token: str, *, reason: str) -> None:
         self.closed = (raw_token, reason)
 
 
@@ -148,7 +165,7 @@ class FakeCommunity:
         self.sent: tuple[int, int, str] | None = None
         self.client_message_ids: list[uuid.UUID] = []
         self.public_client_message_ids: list[uuid.UUID] = []
-        self.channel = StableChannel(7, "#osu", "general", False, 256, True, False)
+        self.channel = ChannelView(7, "osu", "general", False, 256, True, False)
         self.member_count = 0
 
     async def send_direct_message(
@@ -177,12 +194,10 @@ class FakeCommunity:
             created,
         )
 
-    async def get_public_channel_by_stable_name(self, account_id: int, name: str) -> StableChannel:
+    async def get_public_channel(self, account_id: int, selector: ChannelSelector) -> ChannelView:
         assert account_id == 10
-        assert name.casefold() in {
-            self.channel.name.casefold(),
-            self.channel.name.removeprefix("#").casefold(),
-        }
+        assert selector.name is not None
+        assert selector.name.casefold() == self.channel.name.casefold()
         return self.channel
 
     async def get_channel_member_count(
@@ -199,11 +214,11 @@ class FakeCommunity:
     async def send_public_message(
         self,
         sender_account_id: int,
-        channel_name: str,
+        channel_selector: ChannelSelector,
         client_message_id: uuid.UUID,
         content: str,
     ) -> MessageResult:
-        assert sender_account_id == 10 and channel_name == "#osu"
+        assert sender_account_id == 10 and channel_selector == ChannelSelector(name="osu")
         if self.error is not None:
             raise self.error
         created = client_message_id not in self.public_client_message_ids
@@ -239,12 +254,12 @@ class FakeRankingQuery:
 class FakeRealtime:
     def __init__(self, presences: tuple[PresenceSnapshot, ...]) -> None:
         self.presences = {snapshot.account_id: snapshot for snapshot in presences}
-        self.enqueued: list[tuple[int, bytes]] = []
-        self.filter_value: int | None = None
+        self.published: list[tuple[int, RealtimeBubble]] = []
+        self.filter_value: PresenceSubscription | None = None
         self.fenced: tuple[uuid.UUID, int] | None = None
         self.away = "Away for lunch"
         self.get_presence_calls: list[int] = []
-        self.overflow_accounts: frozenset[int] = frozenset()
+        self.failed_publish_accounts: frozenset[int] = frozenset()
         self.channel_members: set[int] = set()
         self.stored_presence: PresenceSnapshot | None = None
 
@@ -256,21 +271,6 @@ class FakeRealtime:
     async def list_presences(self, *, at: datetime, limit: int) -> tuple[PresenceSnapshot, ...]:
         del at
         return tuple(self.presences.values())[:limit]
-
-    async def enqueue_mailbox(
-        self,
-        account_id: int,
-        payload: bytes,
-        *,
-        recipient_fence: SessionFence,
-        expires_at: datetime,
-    ) -> MailboxPacket:
-        assert expires_at == self.presences[account_id].expires_at
-        assert recipient_fence == self.presences[account_id].fence
-        if account_id in self.overflow_accounts:
-            raise MailboxOverflow()
-        self.enqueued.append((account_id, payload))
-        return MailboxPacket(len(self.enqueued), payload)
 
     async def set_presence(
         self,
@@ -310,19 +310,19 @@ class FakeRealtime:
         assert channel_id == 7
         return frozenset(self.channel_members)
 
-    async def set_presence_filter(
+    async def set_presence_subscription(
         self,
         account_id: int,
         *,
         session_id: uuid.UUID,
         expected_revision: int,
-        value: int,
+        subscription: PresenceSubscription,
     ) -> None:
         del account_id, session_id, expected_revision
-        self.filter_value = value
+        self.filter_value = subscription
 
-    async def get_presence_filter(self, account_id: int) -> int:
-        return 2 if account_id == 20 else 0
+    async def get_presence_subscription(self, account_id: int) -> PresenceSubscription:
+        return PresenceSubscription.FOLLOWED if account_id == 20 else PresenceSubscription.NONE
 
     async def get_away_message(self, account_id: int) -> str:
         assert account_id == 20
@@ -343,16 +343,31 @@ class FakeRealtime:
         self.fenced = (session_id, expected_revision)
 
 
+class FakeBubbleBus:
+    def __init__(self, realtime: FakeRealtime) -> None:
+        self.realtime = realtime
+
+    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
+        account_id = next(
+            account_id for account_id, presence in self.realtime.presences.items() if presence.fence == recipient_fence
+        )
+        if account_id in self.realtime.failed_publish_accounts:
+            raise RuntimeError("publish failed")
+        self.realtime.published.append((account_id, bubble))
+        return 1
+
+
 def snapshot(account_id: int, name: str, *, action: int = 0) -> PresenceSnapshot:
-    payload = user_presence(UserPresence(account_id, name, 0, 0, 1, 0, 0.0, 0.0, 0))
-    payload += user_stats(UserStats(account_id, action, "", "", 0, 0, 0, 0, 0.0, 0, 0, 0, 0))
-    return PresenceSnapshot(account_id, 1, payload, EXPIRY, uuid.uuid7())
+    presence = UserPresence(account_id, name, 0, 0, 1, 0, 0.0, 0.0, 0)
+    stats = UserStats(account_id, action, "", "", 0, 0, 0, 0, 0.0, 0, 0, 0, 0)
+    identity, activity, statistics = canonicalize_presence(presence, stats, country_code=None)
+    return PresenceSnapshot(account_id, 1, identity, activity, statistics, EXPIRY, uuid.uuid7())
 
 
 def context(realtime: FakeRealtime, *, opened_at: datetime | None = None) -> StableRuntimeContext:
     fence = realtime.presences[10].fence
     return StableRuntimeContext(
-        ResolvedStableSession(
+        ResolvedClientSession(
             10,
             "sender",
             1,
@@ -384,10 +399,11 @@ def services(
     return StableServices(
         identity=cast(IdentityService, identity or FakeIdentity()),
         authorization=cast(AuthorizationQueryService, object()),
-        realtime=cast(RealtimeRepository, realtime),
+        realtime=cast(RealtimeStateRepository, realtime),
         clock=cast(Clock, FixedClock()),
         id_generator=cast(IdGenerator, FakeIds()),
         settings=settings or Settings(),
+        bubbles=cast(RealtimeBubbleBus, FakeBubbleBus(realtime)),
         social=cast(SocialService, social or FakeSocial()),
         community=cast(CommunityService, community or FakeCommunity()),
         multiplayer=cast(MultiplayerService, multiplayer),
@@ -418,10 +434,10 @@ def id_request_packet(packet_type: ClientPacket, account_ids: tuple[int, ...]) -
 
 
 @pytest.mark.asyncio
-async def test_private_message_is_persisted_enqueued_and_returns_away_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_private_message_is_persisted_published_and_returns_away_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
-    dispatcher_module = importlib.import_module("perfcho.api.cho.dispatcher.packets")
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
     events: list[tuple[str, dict[str, object]]] = []
 
     def capture(level: str, event: str, **fields: object) -> None:
@@ -440,8 +456,8 @@ async def test_private_message_is_persisted_enqueued_and_returns_away_reply(monk
     )
 
     assert community.sent == (10, 20, "hello")
-    assert realtime.enqueued[0][0] == 20
-    delivered = next(PacketReader(realtime.enqueued[0][1], packet_enum=ServerPacket))
+    assert realtime.published[0][0] == 20
+    delivered = next(PacketReader(StableBubbleRenderer().render(realtime.published[0][1]), packet_enum=ServerPacket))
     assert delivered.payload.read_message() == Message("sender", "hello", "target", 10)
     away = next(PacketReader(response, packet_enum=ServerPacket))
     assert away.payload.read_message().text == "Away for lunch"
@@ -477,8 +493,8 @@ async def test_public_bot_command_returns_bot_message_and_fans_out_to_channel_me
     assert packet.packet_type is ServerPacket.SEND_MESSAGE
     assert packet.payload.read_message() == Message("BanchoBot", "pong", "#osu", 1)
     assert bot.invocations[0].sender_name == "sender"
-    assert [account_id for account_id, _ in realtime.enqueued] == [20, 20]
-    delivered = next(PacketReader(realtime.enqueued[-1][1], packet_enum=ServerPacket))
+    assert [account_id for account_id, _ in realtime.published] == [20, 20]
+    delivered = next(PacketReader(StableBubbleRenderer().render(realtime.published[-1][1]), packet_enum=ServerPacket))
     assert delivered.payload.read_message() == Message("BanchoBot", "pong", "#osu", 1)
 
 
@@ -513,7 +529,7 @@ async def test_blocked_private_message_maps_to_stable_packet() -> None:
 
     packet = next(PacketReader(response, packet_enum=ServerPacket))
     assert packet.packet_type is ServerPacket.USER_DM_BLOCKED
-    assert not realtime.enqueued
+    assert not realtime.published
 
 
 @pytest.mark.asyncio
@@ -526,7 +542,7 @@ async def test_presence_all_and_filter_use_bounded_realtime_state() -> None:
 
     packets = list(PacketReader(response, packet_enum=ServerPacket))
     assert [packet.packet_type for packet in packets] == [ServerPacket.USER_PRESENCE, ServerPacket.USER_PRESENCE]
-    assert realtime.filter_value == 2
+    assert realtime.filter_value is PresenceSubscription.FOLLOWED
 
 
 @pytest.mark.asyncio
@@ -549,7 +565,7 @@ async def test_logout_closes_identity_fences_session_and_broadcasts() -> None:
     cleanup = multiplayer.cleanup_commands[0]
     assert isinstance(cleanup, CleanupPresence)
     assert cleanup.connection_session_id == current.identity.session_id
-    packet = next(PacketReader(realtime.enqueued[0][1], packet_enum=ServerPacket))
+    packet = next(PacketReader(StableBubbleRenderer().render(realtime.published[0][1]), packet_enum=ServerPacket))
     assert packet.packet_type is ServerPacket.USER_LOGOUT
 
 
@@ -590,7 +606,7 @@ async def test_dispatcher_logs_expected_application_code_and_propagates_unexpect
 ) -> None:
     import importlib
 
-    dispatcher_module = importlib.import_module("perfcho.api.cho.dispatcher.packets")
+    dispatcher_module = importlib.import_module("perfcho.api.stable.dispatcher.packets")
     realtime = FakeRealtime((snapshot(10, "sender"),))
     current = context(realtime)
     stable_services = services(realtime)
@@ -648,12 +664,10 @@ async def test_change_action_normalizes_assistance_and_stores_consistent_presenc
     assert response_stats.mods & (LEGACY_MOD_BITS["AP"] | LEGACY_MOD_BITS["RX"]) == 0
     assert realtime.stored_presence is not None
     assert realtime.stored_presence.session_id == realtime.presences[10].session_id
-    stored_packets = list(PacketReader(realtime.stored_presence.payload, packet_enum=ServerPacket))
-    stored_presence = stored_packets[0].payload.read_user_presence()
-    stored_stats = stored_packets[1].payload.read_user_stats()
-    assert (stored_presence.mode, stored_presence.global_rank) == (stored_stats.mode, stored_stats.global_rank)
+    assert realtime.stored_presence.activity.ruleset == "mania"
+    assert realtime.stored_presence.statistics.global_rank is None
     assert social.incoming_follower_queries == [(10, (20,))]
-    assert [recipient_account_id for recipient_account_id, _ in realtime.enqueued] == [20]
+    assert [recipient_account_id for recipient_account_id, _ in realtime.published] == [20]
 
 
 @pytest.mark.asyncio
@@ -670,7 +684,7 @@ async def test_presence_broadcast_bounds_follower_candidates_to_online_snapshot_
     )
 
     assert social.incoming_follower_queries == [(10, (20,))]
-    assert [recipient_account_id for recipient_account_id, _ in realtime.enqueued] == [20]
+    assert [recipient_account_id for recipient_account_id, _ in realtime.published] == [20]
 
 
 @pytest.mark.asyncio
@@ -701,18 +715,20 @@ async def test_status_request_refreshes_mode_specific_authoritative_stats() -> N
     stats = next(PacketReader(response, packet_enum=ServerPacket)).payload.read_user_stats()
     assert (stats.mode, stats.play_count, stats.total_score, stats.performance) == (3, 12, 2_000_000, 321)
     assert realtime.stored_presence is not None
-    stored_packets = list(PacketReader(realtime.stored_presence.payload, packet_enum=ServerPacket))
-    stored_stats = stored_packets[1].payload.read_user_stats()
-    assert (stored_stats.mode, stored_stats.play_count, stored_stats.performance) == (3, 12, 321)
+    assert realtime.stored_presence.activity.ruleset == "mania"
+    assert (
+        realtime.stored_presence.statistics.play_count,
+        realtime.stored_presence.statistics.performance,
+    ) == (12, 321)
 
 
 @pytest.mark.asyncio
-async def test_public_message_replay_block_filter_and_overflow_are_recipient_isolated() -> None:
+async def test_public_message_replay_block_filter_and_publish_failure_are_recipient_isolated() -> None:
     realtime = FakeRealtime(
         (snapshot(10, "sender"), snapshot(20, "full"), snapshot(30, "blocked"), snapshot(40, "delivered"))
     )
     realtime.channel_members.update((10, 20, 30, 40))
-    realtime.overflow_accounts = frozenset({20})
+    realtime.failed_publish_accounts = frozenset({20})
     community = FakeCommunity()
     social = FakeSocial()
     social.blocked_recipients = frozenset({30})
@@ -725,7 +741,7 @@ async def test_public_message_replay_block_filter_and_overflow_are_recipient_iso
 
     assert first == replay == b""
     assert social.filtered == (20, 30, 40)
-    assert [account_id for account_id, _ in realtime.enqueued] == [40]
+    assert [account_id for account_id, _ in realtime.published] == [40]
     assert len(community.public_client_message_ids) == 1
 
 
@@ -749,7 +765,7 @@ async def test_public_message_without_active_membership_returns_actionable_notif
 
 
 @pytest.mark.asyncio
-async def test_direct_message_replay_does_not_enqueue_twice() -> None:
+async def test_direct_message_replay_does_not_publish_twice() -> None:
     realtime = FakeRealtime((snapshot(10, "sender"), snapshot(20, "target")))
     community = FakeCommunity()
     packet = message_packet(ClientPacket.SEND_PRIVATE_MESSAGE, Message("", "hello", "target", 0))
@@ -761,7 +777,7 @@ async def test_direct_message_replay_does_not_enqueue_twice() -> None:
 
     assert replay == b""
     assert len(community.client_message_ids) == 1
-    assert [account_id for account_id, _ in realtime.enqueued] == [20]
+    assert [account_id for account_id, _ in realtime.published] == [20]
 
 
 @pytest.mark.asyncio
@@ -795,7 +811,7 @@ async def test_target_silence_and_other_dm_application_errors_map_to_stable_pack
 async def test_lobby_channel_join_requires_lobby_membership_and_confirms_client_sequence() -> None:
     realtime = FakeRealtime((snapshot(10, "sender"),))
     community = FakeCommunity()
-    community.channel = StableChannel(7, "#lobby", "Lobby", False, 2000, True, False)
+    community.channel = ChannelView(7, "lobby", "Lobby", False, 2000, True, False)
     community.member_count = 1
     stable_services = services(realtime, community=community, multiplayer=FakeMultiplayer())
 
@@ -840,7 +856,7 @@ async def test_channel_join_broadcasts_authoritative_counts() -> None:
         ServerPacket.CHANNEL_INFO,
     ]
     assert joined_packets[1].payload.read_channel().player_count == 2
-    broadcast = next(PacketReader(realtime.enqueued[0][1], packet_enum=ServerPacket))
+    broadcast = next(PacketReader(StableBubbleRenderer().render(realtime.published[0][1]), packet_enum=ServerPacket))
     assert broadcast.payload.read_channel().player_count == 2
 
 
@@ -877,4 +893,4 @@ async def test_logout_during_first_second_is_ignored_without_cleanup_or_fencing(
     assert identity.closed is None
     assert not multiplayer.cleanup_commands
     assert realtime.fenced is None
-    assert not realtime.enqueued
+    assert not realtime.published

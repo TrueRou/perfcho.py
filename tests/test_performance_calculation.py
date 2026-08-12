@@ -10,7 +10,6 @@ from perfcho.modules.performance.models import (
     PerformanceCalculationInput,
 )
 from perfcho.modules.scoring.models import (
-    ClientFamily,
     HitStatistic,
     Ruleset,
     ScoreboardInfo,
@@ -90,7 +89,7 @@ def _calculation() -> PerformanceCalculationInput:
         scoreboard=ScoreboardInfo(1, "osu", Ruleset.OSU, ScoreboardVariant.VANILLA),
         mod_set_id=1,
         mods=(),
-        client_family=ClientFamily.LAZER,
+        source="lazer",
         score=ScoreSubmission(
             total_score=1_000_000,
             classic_score=1_000_000,

@@ -63,6 +63,7 @@ from perfcho.infra.db.models.scoring import (
     UserPlayStat,
     UserRankedStat,
 )
+from perfcho.infra.db.mods import project_legacy_mod_bits
 from perfcho.modules.common import AccountUnavailable
 from perfcho.modules.scoring.errors import AttemptIdempotencyConflict, MultiplayerContextRejected, ScoreRejected
 from perfcho.modules.scoring.models import (
@@ -181,13 +182,22 @@ class SqlAlchemyScoringRepository:
 
     async def get_or_create_mod_set(self, scoreboard_id: int, normalized: NormalizedModSet) -> ModSetInfo:
         """Upsert a deterministic canonical mod set for one scoreboard."""
+        scoreboard_variant = await self._session.scalar(
+            select(Scoreboard.variant).where(Scoreboard.id == scoreboard_id)
+        )
+        if scoreboard_variant is None:
+            raise RuntimeError("canonical scoreboard does not exist")
+        compatibility_bits = project_legacy_mod_bits(
+            normalized.mods,
+            ScoreboardVariant(scoreboard_variant.value),
+        )
         mod_set_id = await self._session.scalar(
             insert(ModSet)
             .values(
                 scoreboard_id=scoreboard_id,
                 canonical=list(normalized.canonical),
                 canonical_digest=normalized.canonical_digest,
-                legacy_bits=normalized.legacy_bits,
+                legacy_bits=compatibility_bits,
             )
             .on_conflict_do_nothing(index_elements=(ModSet.scoreboard_id, ModSet.canonical_digest))
             .returning(ModSet.id)
@@ -206,7 +216,6 @@ class SqlAlchemyScoringRepository:
             scoreboard_id=scoreboard_id,
             canonical=normalized.canonical,
             canonical_digest=normalized.canonical_digest,
-            legacy_bits=normalized.legacy_bits,
         )
 
     async def claim_attempt(self, record: PlayAttemptRecord) -> AttemptClaim:
@@ -220,7 +229,7 @@ class SqlAlchemyScoringRepository:
                 beatmap_revision_id=record.beatmap_revision_id,
                 scoreboard_id=record.scoreboard_id,
                 mod_set_id=record.mod_set_id,
-                protocol=DbClientFamily(record.protocol.value),
+                protocol=DbClientFamily(record.source),
                 idempotency_key=record.submission.idempotency_key,
                 status=AttemptStatus.SUBMITTED,
                 started_at=record.submission.started_at,
@@ -242,7 +251,7 @@ class SqlAlchemyScoringRepository:
                 select(PlayAttempt)
                 .where(
                     PlayAttempt.account_id == record.account_id,
-                    PlayAttempt.protocol == DbClientFamily(record.protocol.value),
+                    PlayAttempt.protocol == DbClientFamily(record.source),
                     PlayAttempt.idempotency_key == record.submission.idempotency_key,
                 )
                 .with_for_update()
@@ -327,7 +336,7 @@ class SqlAlchemyScoringRepository:
         self._session.add(
             ScoreAttestation(
                 score_id=score_id,
-                client_family=DbClientFamily(record.attestation.client_family.value),
+                client_family=DbClientFamily(record.attestation.source),
                 client_version=record.attestation.client_version,
                 client_flags=record.attestation.client_flags,
                 checksum=record.attestation.checksum,
@@ -405,7 +414,7 @@ class SqlAlchemyScoringRepository:
         ruleset: Ruleset,
         at: datetime,
     ) -> SoloScoreToken:
-        """Lock and return one matching unexpired Lazer solo token."""
+        """Lock and return one matching unexpired solo token."""
         row = (
             await self._session.execute(
                 select(PlayAttemptToken).where(PlayAttemptToken.id == token_id).with_for_update()
@@ -1364,7 +1373,7 @@ def _leaderboard_row_statement() -> Select:
             Score.perfect,
             Score.ended_at,
             AccountName.display_name,
-            ModSet.legacy_bits,
+            ModSet.canonical,
             Replay.score_id.label("replay_score_id"),
         )
         .join(Score, Score.id == LeaderboardEntry.score_id)
@@ -1383,7 +1392,7 @@ def _mod_acronyms_expression(canonical: object) -> object:
 
 
 def _leaderboard_view(
-    row: tuple[int, int, Decimal, int, int, bool, datetime, str, int, int | None, int],
+    row: tuple[int, int, Decimal, int, int, bool, datetime, str, object, int | None, int],
     *,
     ruleset: Ruleset,
     hits: dict[str, int],
@@ -1397,7 +1406,7 @@ def _leaderboard_view(
         perfect,
         ended_at,
         display_name,
-        legacy_mod_bits,
+        canonical_mods,
         replay_score_id,
         rank,
     ) = row
@@ -1429,11 +1438,25 @@ def _leaderboard_view(
         nkatu=nkatu,
         ngeki=ngeki,
         perfect=perfect,
-        legacy_mod_bits=legacy_mod_bits,
+        mods=_canonical_mods(canonical_mods),
         rank=rank,
         ended_at=ended_at,
         has_replay=replay_score_id is not None,
     )
+
+
+def _canonical_mods(value: object) -> tuple[CanonicalMod, ...]:
+    if not isinstance(value, list):
+        raise RuntimeError("persisted canonical mods must be a list")
+    mods: list[CanonicalMod] = []
+    for item in value:
+        if not isinstance(item, dict) or "acronym" not in item:
+            raise RuntimeError("persisted canonical mod is invalid")
+        settings = item.get("settings", {})
+        if not isinstance(settings, dict):
+            raise RuntimeError("persisted canonical mod settings are invalid")
+        mods.append(CanonicalMod(str(item["acronym"]), settings))
+    return tuple(mods)
 
 
 def _result_from_receipt(claim: ReceiptClaim) -> AcceptedScoreResult:

@@ -567,7 +567,6 @@ class PacketReader(Iterator[Packet]):
 
     def read_replay_frame_bundle(self) -> ReplayFrameBundle:
         """Read and bound a Stable spectator replay-frame bundle."""
-        start = self._position
         extra = self.read_i32()
         frame_count = self.read_u16()
         if frame_count > self.limits.max_frame_count:
@@ -581,18 +580,14 @@ class PacketReader(Iterator[Packet]):
         except ValueError as error:
             raise InvalidStructureError(f"invalid replay action {action_value}") from error
         score_frame = self.read_score_frame()
-        # Older virtual clients omit the sequence that newer Stable builds append.
-        # Only accept the exact legacy boundary; every other truncation failed above.
-        sequence = self.read_u16() if self.remaining == 2 else None
-        if self.remaining:
-            raise TrailingDataError(f"{self.remaining} trailing replay bundle bytes remain")
+        sequence = self.read_u16()
+        self.require_exhausted()
         return ReplayFrameBundle(
             frames=frames,
             score_frame=score_frame,
             action=action,
             extra=extra,
             sequence=sequence,
-            raw_data=self._view[start : self._position],
         )
 
 
@@ -1001,8 +996,7 @@ class PacketWriter:
             self.write_replay_frame(frame)
         self.write_u8(bundle.action)
         self.write_score_frame(bundle.score_frame)
-        if bundle.sequence is not None:
-            self.write_u16(bundle.sequence)
+        self.write_u16(bundle.sequence)
 
 
 def build_packet(

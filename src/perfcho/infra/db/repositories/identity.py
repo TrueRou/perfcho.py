@@ -1,4 +1,4 @@
-"""Persist the Stable identity lifecycle in caller-owned transactions."""
+"""Persist the identity lifecycle in caller-owned transactions."""
 
 import uuid
 from datetime import datetime, timedelta
@@ -28,17 +28,17 @@ from perfcho.infra.db.models.iam import (
     PasswordCredential,
     Scope,
 )
-from perfcho.modules.identity.errors import StableSessionAlreadyActive
+from perfcho.modules.identity.errors import SessionAlreadyActive
 from perfcho.modules.identity.models import (
     AuthenticatedAccount,
     CredentialSnapshot,
     OAuthClientSnapshot,
-    OpenStableSession,
+    OpenClientSession,
     RefreshTokenSnapshot,
-    ResolvedStableSession,
+    ResolvedClientSession,
 )
 
-_ACTIVE_STABLE_SESSION_CONSTRAINT = "uq_auth_sessions_active_normal_stable_account"
+_ACTIVE_CLIENT_SESSION_CONSTRAINT = "uq_auth_sessions_active_client_account"
 
 
 class _ResolvedSessionRow(Protocol):
@@ -163,12 +163,12 @@ class SqlAlchemyIdentityRepository:
         )
         return upgraded_account_id is not None
 
-    async def acquire_stable_session_lock(self, account_id: int) -> None:
-        """Acquire the account's transaction-scoped Stable session lock."""
-        await acquire_transaction_lock(self._session, "identity-stable-session", account_id)
+    async def acquire_session_lock(self, account_id: int) -> None:
+        """Acquire the account's transaction-scoped client session lock."""
+        await acquire_transaction_lock(self._session, "identity-client-session", account_id)
 
-    async def find_open_stable_session(self, account_id: int) -> OpenStableSession | None:
-        """Return the one unclosed normal Stable session, even when it has expired."""
+    async def find_open_client_session(self, account_id: int) -> OpenClientSession | None:
+        """Return the unclosed direct client session, even when it has expired."""
         row = (
             await self._session.execute(
                 select(
@@ -179,7 +179,7 @@ class SqlAlchemyIdentityRepository:
                 )
                 .where(
                     AuthSession.account_id == account_id,
-                    AuthSession.client_family == ClientFamily.STABLE,
+                    AuthSession.oauth_client_id.is_(None),
                     AuthSession.session_class == "normal",
                     AuthSession.closed_at.is_(None),
                     AuthSession.revoked_at.is_(None),
@@ -189,17 +189,17 @@ class SqlAlchemyIdentityRepository:
             )
         ).one_or_none()
         return (
-            OpenStableSession(row.id, row.created_at, row.last_activity_at, row.expires_at) if row is not None else None
+            OpenClientSession(row.id, row.created_at, row.last_activity_at, row.expires_at) if row is not None else None
         )
 
-    async def find_stable_web_candidate(
+    async def find_online_credential_candidate(
         self,
         identifier_kind: str,
         identifier_key: str,
         *,
         at: datetime,
-    ) -> tuple[CredentialSnapshot, OpenStableSession] | None:
-        """Load credentials only for an active account with an open Stable session."""
+    ) -> tuple[CredentialSnapshot, OpenClientSession] | None:
+        """Load credentials only for an active account with an open client session."""
         current_name = aliased(AccountName)
         statement = (
             select(
@@ -226,7 +226,7 @@ class SqlAlchemyIdentityRepository:
                 Account.deleted_at.is_(None),
                 current_name.ended_at.is_(None),
                 PasswordCredential.must_change.is_(False),
-                AuthSession.client_family == ClientFamily.STABLE,
+                AuthSession.oauth_client_id.is_(None),
                 AuthSession.session_class == "normal",
                 AuthSession.closed_at.is_(None),
                 AuthSession.revoked_at.is_(None),
@@ -250,8 +250,8 @@ class SqlAlchemyIdentityRepository:
             return None
         snapshot = _credential_snapshot(row[:10])
         if snapshot is None:
-            raise RuntimeError("Stable web candidate did not contain credentials")
-        return snapshot, OpenStableSession(row.session_id, row.opened_at, row.last_activity_at, row.expires_at)
+            raise RuntimeError("online credential candidate did not contain credentials")
+        return snapshot, OpenClientSession(row.session_id, row.opened_at, row.last_activity_at, row.expires_at)
 
     async def get_or_create_device(
         self,
@@ -324,13 +324,14 @@ class SqlAlchemyIdentityRepository:
         )
         return device_id
 
-    async def create_stable_session(
+    async def create_client_session(
         self,
         *,
         session_id: uuid.UUID,
         token_id: uuid.UUID,
         token_jti: uuid.UUID,
         account_id: int,
+        client_family: str,
         device_id: uuid.UUID,
         client_version: str,
         client_variant: str | None,
@@ -341,12 +342,12 @@ class SqlAlchemyIdentityRepository:
         now: datetime,
         expires_at: datetime,
     ) -> None:
-        """Insert the normal Stable session and its HMAC-only token record."""
+        """Insert a direct client session and its HMAC-only token record."""
         await self._session.execute(
             update(Account)
             .where(Account.id == account_id)
             .values(
-                first_stable_login_at=func.coalesce(Account.first_stable_login_at, now),
+                first_client_login_at=func.coalesce(Account.first_client_login_at, now),
                 last_seen_at=now,
             )
         )
@@ -356,7 +357,7 @@ class SqlAlchemyIdentityRepository:
                     id=session_id,
                     account_id=account_id,
                     device_id=device_id,
-                    client_family=ClientFamily.STABLE,
+                    client_family=ClientFamily(client_family),
                     client_variant=client_variant,
                     session_class="normal",
                     client_version=client_version,
@@ -370,7 +371,7 @@ class SqlAlchemyIdentityRepository:
                     id=token_id,
                     session_id=session_id,
                     account_id=account_id,
-                    kind=TokenKind.STABLE_SESSION,
+                    kind=TokenKind.CLIENT_SESSION,
                     digest=token_digest,
                     prefix=token_prefix,
                     jti=token_jti,
@@ -382,10 +383,10 @@ class SqlAlchemyIdentityRepository:
         try:
             await self._session.flush()
         except IntegrityError as error:
-            if _integrity_constraint_name(error) == _ACTIVE_STABLE_SESSION_CONSTRAINT or (
-                _ACTIVE_STABLE_SESSION_CONSTRAINT in str(error).lower()
+            if _integrity_constraint_name(error) == _ACTIVE_CLIENT_SESSION_CONSTRAINT or (
+                _ACTIVE_CLIENT_SESSION_CONSTRAINT in str(error).lower()
             ):
-                raise StableSessionAlreadyActive("a normal Stable session is already active") from error
+                raise SessionAlreadyActive("a client session is already active") from error
             raise
 
     async def create_oauth_session(
@@ -399,6 +400,7 @@ class SqlAlchemyIdentityRepository:
         refresh_token_jti: uuid.UUID,
         account_id: int,
         client_id: uuid.UUID,
+        client_family: str,
         client_version: str | None,
         ip_address: str,
         user_agent: str | None,
@@ -418,7 +420,7 @@ class SqlAlchemyIdentityRepository:
             id=session_id,
             account_id=account_id,
             oauth_client_id=client_id,
-            client_family=ClientFamily.LAZER,
+            client_family=ClientFamily(client_family),
             session_class="normal",
             client_version=client_version,
             ip_address=ip_address,
@@ -713,28 +715,28 @@ class SqlAlchemyIdentityRepository:
             )
         )
 
-    async def resolve_stable_session(self, token_digest: bytes, *, at: datetime) -> ResolvedStableSession | None:
-        """Resolve only a fully active Stable token, session, account, and current name."""
-        row = (await self._session.execute(_active_stable_session_statement(token_digest, at=at))).one_or_none()
-        return _resolved_stable_session(row)
+    async def resolve_client_session(self, token_digest: bytes, *, at: datetime) -> ResolvedClientSession | None:
+        """Resolve a fully active client token, session, account, and current name."""
+        row = (await self._session.execute(_active_client_session_statement(token_digest, at=at))).one_or_none()
+        return _resolved_client_session(row)
 
-    async def touch_stable_session(
+    async def touch_client_session(
         self,
         token_digest: bytes,
         *,
         at: datetime,
         minimum_interval: timedelta,
-    ) -> tuple[ResolvedStableSession, bool] | None:
+    ) -> tuple[ResolvedClientSession, bool] | None:
         """Resolve an active session and persist its heartbeat only when the interval elapsed."""
         if minimum_interval <= timedelta(0):
             raise ValueError("minimum_interval must be positive")
-        statement = _active_stable_session_statement(token_digest, at=at)
+        statement = _active_client_session_statement(token_digest, at=at)
         row = (await self._session.execute(statement)).one_or_none()
         if row is None:
             return None
 
         if at - row.last_activity_at < minimum_interval:
-            resolved = _resolved_stable_session(row)
+            resolved = _resolved_client_session(row)
             return (resolved, False) if resolved is not None else None
         await self._session.execute(
             update(AuthSession)
@@ -746,20 +748,20 @@ class SqlAlchemyIdentityRepository:
             )
             .values(last_activity_at=func.greatest(AuthSession.last_activity_at, at))
         )
-        resolved = _resolved_stable_session(row, last_activity_at=at)
+        resolved = _resolved_client_session(row, last_activity_at=at)
         return (resolved, True) if resolved is not None else None
 
-    async def get_stable_session_account_id(self, session_id: uuid.UUID) -> int | None:
-        """Return the owning account ID for a normal Stable session."""
+    async def get_client_session_account_id(self, session_id: uuid.UUID) -> int | None:
+        """Return the owning account ID for a direct client session."""
         return await self._session.scalar(
             select(AuthSession.account_id).where(
                 AuthSession.id == session_id,
-                AuthSession.client_family == ClientFamily.STABLE,
+                AuthSession.oauth_client_id.is_(None),
                 AuthSession.session_class == "normal",
             )
         )
 
-    async def close_stable_session(
+    async def close_client_session(
         self,
         session_id: uuid.UUID,
         *,
@@ -767,12 +769,12 @@ class SqlAlchemyIdentityRepository:
         reason: str,
         revoke: bool,
     ) -> int | None:
-        """Close or revoke one open Stable session and invalidate all bearer tokens."""
+        """Close or revoke one open client session and invalidate all bearer tokens."""
         auth_session = await self._session.scalar(
             select(AuthSession)
             .where(
                 AuthSession.id == session_id,
-                AuthSession.client_family == ClientFamily.STABLE,
+                AuthSession.oauth_client_id.is_(None),
                 AuthSession.session_class == "normal",
             )
             .with_for_update()
@@ -829,7 +831,7 @@ def _credential_snapshot(row: object | None) -> CredentialSnapshot | None:
     )
 
 
-def _active_stable_session_statement(token_digest: bytes, *, at: datetime) -> Select:
+def _active_client_session_statement(token_digest: bytes, *, at: datetime) -> Select:
     current_name = aliased(AccountName)
     return (
         select(
@@ -851,11 +853,11 @@ def _active_stable_session_statement(token_digest: bytes, *, at: datetime) -> Se
         .join(current_name, current_name.account_id == Account.id)
         .where(
             AuthToken.digest == token_digest,
-            AuthToken.kind == TokenKind.STABLE_SESSION,
+            AuthToken.kind == TokenKind.CLIENT_SESSION,
             AuthToken.consumed_at.is_(None),
             AuthToken.revoked_at.is_(None),
             AuthToken.expires_at > at,
-            AuthSession.client_family == ClientFamily.STABLE,
+            AuthSession.oauth_client_id.is_(None),
             AuthSession.session_class == "normal",
             AuthSession.closed_at.is_(None),
             AuthSession.revoked_at.is_(None),
@@ -868,15 +870,15 @@ def _active_stable_session_statement(token_digest: bytes, *, at: datetime) -> Se
     )
 
 
-def _resolved_stable_session(
+def _resolved_client_session(
     row: object | None,
     *,
     last_activity_at: datetime | None = None,
-) -> ResolvedStableSession | None:
+) -> ResolvedClientSession | None:
     if row is None:
         return None
     resolved_row = cast(_ResolvedSessionRow, row)
-    return ResolvedStableSession(
+    return ResolvedClientSession(
         account_id=resolved_row.account_id,
         current_name=resolved_row.current_name,
         auth_version=resolved_row.auth_version,

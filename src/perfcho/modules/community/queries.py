@@ -6,7 +6,12 @@ from perfcho.modules.authorization.models import EffectiveAuthorization
 from perfcho.modules.authorization.services import AuthorizationQueryService
 from perfcho.modules.common.ports import Clock
 from perfcho.modules.community.errors import ChannelAccessDenied, ChannelNotFound, CommunityInputRejected
-from perfcho.modules.community.models import OfflineDirectMessage, OfflineDirectMessagePage, StableChannel
+from perfcho.modules.community.models import (
+    ChannelSelector,
+    ChannelView,
+    OfflineDirectMessage,
+    OfflineDirectMessagePage,
+)
 from perfcho.modules.community.ports import (
     ActiveChannelMembershipQuery,
     ActiveSilencePolicyFactory,
@@ -14,10 +19,11 @@ from perfcho.modules.community.ports import (
     CommunityUnitOfWork,
 )
 from perfcho.modules.community.services import (
+    _channel_view,
     _evaluate_permissions,
-    _normalize_stable_channel_name,
+    _load_public_channel,
+    _normalize_channel_selector,
     _remaining_seconds,
-    _stable_channel,
     _validate_account_id,
 )
 
@@ -43,30 +49,28 @@ class CommunityQueryService:
 
     async def list_public_channels(
         self, account_id: int, *, authorization: EffectiveAuthorization | None = None
-    ) -> tuple[StableChannel, ...]:
+    ) -> tuple[ChannelView, ...]:
         _validate_account_id(account_id)
         effective = authorization or await self._authorization.get_effective(account_id)
         async with self._uow_factory() as uow:
             channels = await self._repository_factory(uow.session).list_public_channels(account_id)
         return tuple(
-            _stable_channel(channel, permissions)
+            _channel_view(channel, permissions)
             for channel in channels
             if (permissions := _evaluate_permissions(channel, account_id, effective)).can_read
         )
 
-    async def get_public_channel_by_stable_name(self, account_id: int, stable_name: str) -> StableChannel:
+    async def get_public_channel(self, account_id: int, selector: ChannelSelector) -> ChannelView:
         _validate_account_id(account_id)
-        normalized = _normalize_stable_channel_name(stable_name)
+        selector = _normalize_channel_selector(selector)
         async with self._uow_factory() as uow:
-            channel = await self._repository_factory(uow.session).get_public_channel_by_stable_name(
-                normalized, account_id
-            )
+            channel = await _load_public_channel(self._repository_factory(uow.session), account_id, selector)
         if channel is None:
             raise ChannelNotFound("public channel does not exist")
         permissions = _evaluate_permissions(channel, account_id, await self._authorization.get_effective(account_id))
         if not permissions.can_read:
             raise ChannelNotFound("public channel does not exist")
-        return _stable_channel(channel, permissions)
+        return _channel_view(channel, permissions)
 
     async def list_unread_offline_direct_messages(
         self, account_id: int, *, limit: int = 100

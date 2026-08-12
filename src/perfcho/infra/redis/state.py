@@ -4,11 +4,23 @@ import struct
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
-from perfcho.modules.realtime import MAX_SEQUENCE, PresenceSnapshot, SessionFence, SpectatorFrame
+import msgpack
+
+from perfcho.modules.realtime import (
+    MAX_SEQUENCE,
+    PlayerActivity,
+    PlayerStatistics,
+    PresenceIdentity,
+    PresenceSnapshot,
+)
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-_PRESENCE_HEADER = struct.Struct(">QQQ16s")
+_PRESENCE_VERSION = 1
+_PRESENCE_FIELDS = frozenset(
+    {"v", "account_id", "revision", "session_id", "expires_at", "identity", "activity", "statistics"}
+)
 _SEQUENCE_WIDTH = len(str(MAX_SEQUENCE))
 _FRAME_SEQUENCE_WIDTH = 5
 
@@ -40,31 +52,104 @@ def duration_to_milliseconds(value: timedelta | int | float, *, name: str) -> in
     return milliseconds
 
 
-def encode_presence(snapshot: PresenceSnapshot, *, session_id: uuid.UUID | None = None) -> bytes:
-    """Pack presence metadata ahead of an arbitrary binary payload."""
-    expires_ms = datetime_to_milliseconds(snapshot.expires_at)
-    owner = session_id or snapshot.session_id
-    if owner is None:
-        raise ValueError("presence session_id is required for Redis storage")
-    try:
-        header = _PRESENCE_HEADER.pack(snapshot.account_id, snapshot.revision, expires_ms, owner.bytes)
-    except struct.error as error:
-        raise ValueError("presence metadata exceeds the Redis encoding range") from error
-    return header + snapshot.payload
+def encode_presence(snapshot: PresenceSnapshot) -> bytes:
+    """Encode one canonical presence snapshot as explicit versioned MessagePack."""
+    if not isinstance(snapshot, PresenceSnapshot):
+        raise TypeError("snapshot must be a PresenceSnapshot")
+    identity = snapshot.identity
+    activity = snapshot.activity
+    statistics = snapshot.statistics
+    return msgpack.packb(
+        {
+            "v": _PRESENCE_VERSION,
+            "account_id": snapshot.account_id,
+            "revision": snapshot.revision,
+            "session_id": snapshot.session_id.bytes,
+            "expires_at": datetime_to_milliseconds(snapshot.expires_at),
+            "identity": {
+                "display_name": identity.display_name,
+                "country_code": identity.country_code,
+                "utc_offset": identity.utc_offset,
+                "privileges": sorted(identity.privileges),
+                "longitude": identity.longitude,
+                "latitude": identity.latitude,
+            },
+            "activity": {
+                "action": activity.action,
+                "info": activity.info,
+                "beatmap_id": activity.beatmap_id,
+                "beatmap_checksum": activity.beatmap_checksum,
+                "ruleset": activity.ruleset,
+                "mods": list(activity.mods),
+            },
+            "statistics": {
+                "ranked_score": statistics.ranked_score,
+                "accuracy": statistics.accuracy,
+                "play_count": statistics.play_count,
+                "total_score": statistics.total_score,
+                "global_rank": statistics.global_rank,
+                "performance": statistics.performance,
+            },
+        },
+        use_bin_type=True,
+    )
+
+
+def _presence_map(value: object, fields: frozenset[str], *, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != fields or any(not isinstance(key, str) for key in value):
+        raise ValueError(f"stored presence {name} has invalid fields")
+    return cast(dict[str, Any], value)
 
 
 def decode_presence(value: bytes) -> PresenceSnapshot:
-    """Decode a packed presence snapshot without interpreting its payload."""
-    if len(value) < _PRESENCE_HEADER.size:
-        raise ValueError("stored presence is truncated")
-    account_id, revision, expires_ms, session_bytes = _PRESENCE_HEADER.unpack_from(value)
-    return PresenceSnapshot(
-        account_id=account_id,
-        revision=revision,
-        payload=value[_PRESENCE_HEADER.size :],
-        expires_at=datetime_from_milliseconds(expires_ms),
-        session_id=uuid.UUID(bytes=session_bytes),
-    )
+    """Strictly decode a versioned canonical presence snapshot."""
+    if not isinstance(value, bytes | bytearray | memoryview):
+        raise TypeError("stored presence must be bytes-like")
+    if len(value) > 64 * 1024:
+        raise ValueError("stored presence exceeds the maximum encoded size")
+    try:
+        unpacked = msgpack.unpackb(bytes(value), raw=False, strict_map_key=True)
+        body = _presence_map(unpacked, _PRESENCE_FIELDS, name="envelope")
+        if isinstance(body["v"], bool) or body["v"] != _PRESENCE_VERSION:
+            raise ValueError("stored presence version is unsupported")
+        for field in ("account_id", "revision", "expires_at"):
+            if isinstance(body[field], bool) or not isinstance(body[field], int):
+                raise ValueError(f"stored presence {field} is invalid")
+        identity = _presence_map(
+            body["identity"],
+            frozenset({"display_name", "country_code", "utc_offset", "privileges", "longitude", "latitude"}),
+            name="identity",
+        )
+        activity = _presence_map(
+            body["activity"],
+            frozenset({"action", "info", "beatmap_id", "beatmap_checksum", "ruleset", "mods"}),
+            name="activity",
+        )
+        statistics = _presence_map(
+            body["statistics"],
+            frozenset({"ranked_score", "accuracy", "play_count", "total_score", "global_rank", "performance"}),
+            name="statistics",
+        )
+        session_bytes = body["session_id"]
+        if not isinstance(session_bytes, bytes) or len(session_bytes) != 16:
+            raise ValueError("stored presence session_id is invalid")
+        privileges = identity["privileges"]
+        mods = activity["mods"]
+        if not isinstance(privileges, list) or not isinstance(mods, list):
+            raise ValueError("stored presence collections are invalid")
+        return PresenceSnapshot(
+            account_id=body["account_id"],
+            revision=body["revision"],
+            identity=PresenceIdentity(**identity | {"privileges": frozenset(privileges)}),
+            activity=PlayerActivity(**activity | {"mods": tuple(mods)}),
+            statistics=PlayerStatistics(**statistics),
+            expires_at=datetime_from_milliseconds(body["expires_at"]),
+            session_id=uuid.UUID(bytes=session_bytes),
+        )
+    except (KeyError, OverflowError, TypeError, ValueError, msgpack.UnpackException) as error:
+        if isinstance(error, ValueError) and str(error).startswith("stored presence"):
+            raise
+        raise ValueError("stored presence is invalid") from error
 
 
 def sequence_token(sequence: int) -> str:
@@ -83,37 +168,17 @@ def revision_bytes(revision: int) -> bytes:
 
 
 @dataclass(frozen=True, slots=True)
-class OrderedPayload:
-    """Represent one decoded expiring packet or spectator frame."""
-
-    sequence: int
-    expires_ms: int
-    payload: bytes
-
-
-def decode_ordered_payload(value: bytes) -> OrderedPayload:
-    """Decode a sequence and expiry header while preserving binary payload bytes."""
-    try:
-        raw_sequence, raw_expiry, payload = value.split(b":", 2)
-        sequence = int(raw_sequence)
-        expires_ms = int(raw_expiry)
-    except (ValueError, TypeError) as error:
-        raise ValueError("stored ordered payload has an invalid header") from error
-    if raw_sequence.decode("ascii") != sequence_token(sequence) or expires_ms < 0:
-        raise ValueError("stored ordered payload has an invalid header")
-    return OrderedPayload(sequence=sequence, expires_ms=expires_ms, payload=payload)
-
-
-@dataclass(frozen=True, slots=True)
 class OrderedFrame:
-    """Represent one decoded cursor-ordered spectator frame."""
+    """Represent one decoded cursor-ordered canonical frame value."""
 
-    frame: SpectatorFrame
+    cursor: int
+    sequence: int
+    payload: bytes
     expires_ms: int
 
 
 def decode_ordered_frame(value: bytes) -> OrderedFrame:
-    """Decode an internal cursor, expiry, Stable u16 sequence, and payload."""
+    """Decode an internal cursor, expiry, stream sequence, and encoded state."""
     try:
         raw_cursor, raw_expiry, raw_sequence, payload = value.split(b":", 3)
         cursor = int(raw_cursor)
@@ -129,7 +194,7 @@ def decode_ordered_frame(value: bytes) -> OrderedFrame:
         or expires_ms < 0
     ):
         raise ValueError("stored spectator frame has an invalid header")
-    return OrderedFrame(SpectatorFrame(cursor, sequence, payload), expires_ms)
+    return OrderedFrame(cursor, sequence, payload, expires_ms)
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,26 +255,6 @@ class RealtimeKeys:
     def channel_epochs(self, channel_id: int) -> str:
         """Return a channel's account-to-session fence key."""
         return f"{self.base}:channel:{channel_id}:epochs"
-
-    def mailbox_packets(self, account_id: int) -> str:
-        """Return an account's ordered mailbox packet key."""
-        return f"{self.base}:mailbox:{account_id}:packets"
-
-    def mailbox_bytes(self, account_id: int) -> str:
-        """Return an account's mailbox byte counter key."""
-        return f"{self.base}:mailbox:{account_id}:bytes"
-
-    def mailbox_sequence(self, account_id: int) -> str:
-        """Return an account's monotonic mailbox sequence key."""
-        return f"{self.base}:mailbox:{account_id}:sequence"
-
-    def mailbox_lease(self, account_id: int) -> str:
-        """Return an account's exclusive mailbox lease key."""
-        return f"{self.base}:mailbox:{account_id}:lease"
-
-    def mailbox_signal(self, account_id: int, fence: SessionFence) -> str:
-        """Return the short-wait signal key for one exact mailbox epoch."""
-        return f"{self.base}:mailbox:{account_id}:signal:{fence.session_id}:{fence.revision}"
 
     def spectator_relation_revision(self, spectator_account_id: int) -> str:
         """Return a session-lifetime monotonic relation revision counter."""

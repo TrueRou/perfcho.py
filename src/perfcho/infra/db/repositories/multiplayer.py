@@ -37,6 +37,7 @@ from perfcho.infra.db.models.multiplayer import (
     SessionPresence,
 )
 from perfcho.infra.db.models.scoring import ModSet, RankingPolicy, Scoreboard
+from perfcho.infra.db.mods import project_legacy_mod_bits
 from perfcho.infra.db.repositories.authorization import SqlAlchemyAuthorizationRepository
 from perfcho.modules.multiplayer import (
     DurableRoomSnapshot,
@@ -103,6 +104,8 @@ class SqlAlchemyMultiplayerRepository:
         connection_session_id: uuid.UUID,
         settings: RoomSettings,
         capacity: int,
+        public_id_limit: int,
+        protocol: str,
         password_salt: str | None,
         password_verifier: str | None,
         now: datetime,
@@ -114,7 +117,7 @@ class SqlAlchemyMultiplayerRepository:
         if await self.find_room_for_account(actor_account_id) is not None:
             raise MatchAlreadyJoined("account already has an active multiplayer presence")
 
-        await acquire_transaction_lock(self._session, "stable-multiplayer-public-id")
+        await acquire_transaction_lock(self._session, "multiplayer-public-id")
         replay = await self.find_command_room(command_id)
         if replay is not None:
             return replay
@@ -125,9 +128,14 @@ class SqlAlchemyMultiplayerRepository:
                 )
             ).all()
         )
-        public_id = next((identifier for identifier in range(1, 32768) if identifier not in active_ids), None)
-        if public_id is None:
-            raise MatchFull("no Stable multiplayer identifiers are available")
+        public_id = 1
+        for active_id in sorted(identifier for identifier in active_ids if identifier <= public_id_limit):
+            if active_id == public_id:
+                public_id += 1
+            elif active_id > public_id:
+                break
+        if public_id > public_id_limit:
+            raise MatchFull("no multiplayer room identifiers are available")
 
         room = Room(
             id=uuid.uuid7(),
@@ -152,7 +160,7 @@ class SqlAlchemyMultiplayerRepository:
             room_id=room.id,
             ordinal=1,
             host_account_id=actor_account_id,
-            protocol="stable",
+            protocol=protocol,
             team_mode=settings.team_mode.value,
             scoring_mode=settings.win_condition.value,
             status=SessionStatus.ACTIVE,
@@ -237,7 +245,7 @@ class SqlAlchemyMultiplayerRepository:
         return _record(row[0], row[1]) if row is not None else None
 
     async def list_active_rooms(self, *, limit: int) -> tuple[RoomRecord, ...]:
-        """List active rooms in stable public-ID order for lobby recovery."""
+        """List active rooms in public-ID order for recovery."""
         rows = (
             await self._session.execute(
                 select(Room, MultiplayerSession)
@@ -663,7 +671,7 @@ class SqlAlchemyMultiplayerRepository:
         aborted: bool,
         now: datetime,
     ) -> RoomRecord:
-        """Append completion for the current Stable round."""
+        """Append completion for the current multiplayer round."""
         db_room, session = await self._entities(room.public_id)
         if await self._command_applied(command_id):
             return _record(db_room, session)
@@ -741,17 +749,18 @@ class SqlAlchemyMultiplayerRepository:
         if scoreboard is None:
             raise MatchStateRejected("room ruleset has no active scoreboard")
         normalized = normalize_mods(settings.ruleset, settings.variant, settings.mods)
+        compatibility_bits = project_legacy_mod_bits(normalized.mods, settings.variant)
         mod_statement = (
             insert(ModSet)
             .values(
                 scoreboard_id=scoreboard.id,
                 canonical=list(normalized.canonical),
                 canonical_digest=normalized.canonical_digest,
-                legacy_bits=normalized.legacy_bits,
+                legacy_bits=compatibility_bits,
             )
             .on_conflict_do_update(
                 index_elements=(ModSet.scoreboard_id, ModSet.canonical_digest),
-                set_={"legacy_bits": normalized.legacy_bits},
+                set_={"legacy_bits": compatibility_bits},
             )
             .returning(ModSet.id)
         )
@@ -876,17 +885,18 @@ class SqlAlchemyMultiplayerRepository:
                 by_acronym = {mod.acronym: mod for mod in (*settings.mods, *participant.mods)}
                 participant_mods = tuple(by_acronym.values())
             participant_normalized = normalize_mods(settings.ruleset, settings.variant, participant_mods)
+            participant_compatibility_bits = project_legacy_mod_bits(participant_normalized.mods, settings.variant)
             participant_mod_statement = (
                 insert(ModSet)
                 .values(
                     scoreboard_id=scoreboard.id,
                     canonical=list(participant_normalized.canonical),
                     canonical_digest=participant_normalized.canonical_digest,
-                    legacy_bits=participant_normalized.legacy_bits,
+                    legacy_bits=participant_compatibility_bits,
                 )
                 .on_conflict_do_update(
                     index_elements=(ModSet.scoreboard_id, ModSet.canonical_digest),
-                    set_={"legacy_bits": participant_normalized.legacy_bits},
+                    set_={"legacy_bits": participant_compatibility_bits},
                 )
                 .returning(ModSet.id)
             )

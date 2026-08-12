@@ -1,4 +1,4 @@
-"""Cache short-lived Stable Web password verification proofs in Redis."""
+"""Cache short-lived online credential verification proofs in Redis."""
 
 import hmac
 import uuid
@@ -6,7 +6,7 @@ import uuid
 from redis.asyncio import Redis
 
 
-class RedisStableWebVerificationCache:
+class RedisOnlineCredentialVerificationCache:
     """Store no password material, only session-bound HMAC digests with a short TTL."""
 
     _VALUE_SIZE = 16 + 32 + 32
@@ -16,7 +16,7 @@ class RedisStableWebVerificationCache:
         if not isinstance(redis, Redis):
             raise TypeError("redis must be a redis.asyncio.Redis instance")
         if isinstance(ttl_seconds, bool) or not 1 <= ttl_seconds <= 300:
-            raise ValueError("Stable Web verification cache TTL must be between 1 and 300 seconds")
+            raise ValueError("online credential verification cache TTL must be between 1 and 300 seconds")
         self._redis = redis
         self._prefix = prefix.rstrip(":")
         self._ttl_seconds = ttl_seconds
@@ -54,7 +54,7 @@ class RedisStableWebVerificationCache:
     ) -> None:
         """Store one fixed-width proof under the configured short TTL."""
         if len(password_proof) != 32 or len(credential_fingerprint) != 32:
-            raise ValueError("Stable Web verification digests must be 32 bytes")
+            raise ValueError("online credential verification digests must be 32 bytes")
         await self._redis.set(
             self._key(account_id),
             session_id.bytes + password_proof + credential_fingerprint,

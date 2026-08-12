@@ -31,7 +31,7 @@ class AccountRepository(Protocol):
         ...
 
     async def acquire_identifier_locks(self, name_key: str, email_key: str) -> None:
-        """Serialize claims for the normalized name and email in stable order."""
+        """Serialize claims for the normalized name and email in deterministic order."""
         ...
 
     async def name_exists(self, name_key: str) -> bool:

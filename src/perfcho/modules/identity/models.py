@@ -9,12 +9,12 @@ from perfcho.modules.common.models import CommandMeta
 
 
 @dataclass(frozen=True, slots=True)
-class StableLogin:
-    """Request one normal Stable client authentication session."""
+class AuthenticateClientSession:
+    """Request one direct client authentication session."""
 
     meta: CommandMeta
     identifier: str
-    password_token: str = field(repr=False)
+    password_preverification: str = field(repr=False)
     client_version: str
     client_variant: str | None
     ip_address: str
@@ -24,8 +24,8 @@ class StableLogin:
 
     def __post_init__(self) -> None:
         """Validate bounded client evidence while leaving credentials opaque."""
-        if self.meta.client.family != "stable":
-            raise ValueError("Stable login commands require a stable client context")
+        if not self.meta.client.family:
+            raise ValueError("client session commands require a client family")
         if not self.identifier:
             raise ValueError("identifier must not be empty")
         if not self.client_version or len(self.client_version) > 64:
@@ -63,10 +63,11 @@ class PasswordGrant:
     """Request a password-authenticated OAuth session."""
 
     identifier: str
-    password_token: str = field(repr=False)
+    password_preverification: str = field(repr=False)
     client_key: str
     client_secret: str = field(repr=False)
     requested_scope: str
+    client_family: str
     client_version: str | None
     ip_address: str
     user_agent: str | None
@@ -76,7 +77,7 @@ class PasswordGrant:
 
     def __post_init__(self) -> None:
         """Validate bounded transport evidence while leaving proofs opaque."""
-        if not self.identifier or not self.client_key or not self.client_secret:
+        if not self.identifier or not self.client_key or not self.client_secret or not self.client_family:
             raise ValueError("password grants require identifier and client credentials")
         if self.requested_scope != "*":
             raise ValueError("password grants currently require wildcard scope")
@@ -207,8 +208,8 @@ class CredentialSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class StableSessionResult:
-    """Return a newly created Stable session and its one-time bearer value."""
+class ClientSessionResult:
+    """Return a newly created client session and its one-time bearer value."""
 
     account_id: int
     current_name: str
@@ -221,14 +222,14 @@ class StableSessionResult:
     def __post_init__(self) -> None:
         """Require a usable creation result."""
         if self.account_id < 1 or not self.raw_token:
-            raise ValueError("Stable session results require an account and raw token")
+            raise ValueError("client session results require an account and raw token")
         if self.expires_at.tzinfo is None or self.expires_at.utcoffset() is None:
             raise ValueError("expires_at must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvedStableSession:
-    """Describe an active Stable bearer session without returning its token."""
+class ResolvedClientSession:
+    """Describe an active client bearer session without returning its token."""
 
     account_id: int
     current_name: str
@@ -262,8 +263,8 @@ class ResolvedStableSession:
 
 
 @dataclass(frozen=True, slots=True)
-class OpenStableSession:
-    """Identify the one unclosed normal Stable session for an account."""
+class OpenClientSession:
+    """Identify an unclosed direct client session for an account."""
 
     session_id: uuid.UUID
     opened_at: datetime
@@ -284,8 +285,8 @@ class OpenStableSession:
 
 
 @dataclass(frozen=True, slots=True)
-class StableWebPrincipal:
-    """Identify credentials proven for an already-online Stable account."""
+class OnlineCredentialPrincipal:
+    """Identify credentials proven for an account with an online session."""
 
     account_id: int
     current_name: str
