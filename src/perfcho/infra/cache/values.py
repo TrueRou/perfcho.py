@@ -1,5 +1,6 @@
 """Small explicit codecs for cacheable immutable domain values."""
 
+from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -30,7 +31,7 @@ def _encode(value: Any) -> Any:
         return {"__type__": "decimal", "value": str(value)}
     if isinstance(value, bytes):
         return {"__type__": "bytes", "value": value.hex()}
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _encode(item) for key, item in value.items()}
     return value
 
