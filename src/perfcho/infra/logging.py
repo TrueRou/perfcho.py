@@ -28,7 +28,7 @@ _HUMAN_FORMAT = (
     "<level>{level: <8}</level> | "
     "<cyan>{extra[process_role]}[{extra[pid]}]</cyan> | "
     "<magenta>{extra[trace_id]}</magenta> | "
-    "<level>{message}</level>{extra[human_suffix]}\n{exception}"
+    "<level>{message}</level>{extra[human_suffix]}"
 )
 _LOKI_METADATA_KEYS = (
     "trace_id",

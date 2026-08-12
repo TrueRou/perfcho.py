@@ -51,6 +51,7 @@ def test_console_is_human_with_trace_and_without_structured_fields(monkeypatch: 
         _restore_logger()
 
     output = stream.getvalue()
+    assert "\n\n" not in output
     assert "| test[" in output
     assert "0123456789abcdef0123456789abcdef | test.event" in output
     assert output.rstrip().endswith("test.event | duration=12.5ms")
