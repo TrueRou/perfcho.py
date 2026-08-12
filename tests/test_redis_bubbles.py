@@ -4,15 +4,15 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
-import msgpack
 import pytest
 from redis.asyncio import Redis
+from redis.exceptions import ResponseError
 
 from perfcho.infra.redis.bubbles import (
     RedisBubbleSubscription,
     RedisRealtimeBubbleBus,
     RedisRealtimePollGate,
-    bubble_channel,
+    encode_bubble,
 )
 from perfcho.modules.realtime import (
     NotificationBubble,
@@ -34,38 +34,42 @@ def test_redis_adapters_implement_realtime_ports() -> None:
         asyncio.run(redis.aclose())
 
 
-async def test_subscribe_closes_pubsub_when_ack_fails() -> None:
-    pubsub = MagicMock()
-    pubsub.subscribe = AsyncMock()
-    pubsub.get_message = AsyncMock(side_effect=RuntimeError("ack failed"))
-    pubsub.aclose = AsyncMock()
+async def test_subscribe_propagates_group_creation_failure() -> None:
     redis = MagicMock()
-    redis.pubsub.return_value = pubsub
+    redis.xgroup_create = AsyncMock(side_effect=ResponseError("failure"))
     bus = RedisRealtimeBubbleBus(redis, prefix="tests:bubbles")
 
-    with pytest.raises(RuntimeError, match="ack failed"):
+    with pytest.raises(ResponseError, match="failure"):
         async with bus.subscribe(SessionFence(uuid.uuid7(), 1)):
             pass
 
-    pubsub.aclose.assert_awaited_once()
 
+async def test_subscription_reads_pending_then_new_entries_and_acknowledges_returned_entries() -> None:
+    redis = MagicMock()
+    pending = NotificationBubble("pending")
+    new = NotificationBubble("new")
+    redis.xreadgroup = AsyncMock(
+        side_effect=[
+            [[b"stream", [(b"0-0", {b"payload": encode_bubble(pending)})]]],
+            [[b"stream", []]],
+            [[b"stream", [(b"1-0", {b"payload": encode_bubble(new)})]]],
+        ]
+    )
+    redis.xack = AsyncMock()
+    subscription = RedisBubbleSubscription(redis, "stream", "group", "consumer")
 
-async def test_subscription_closes_pubsub_when_unsubscribe_fails_and_is_idempotent() -> None:
-    pubsub = MagicMock()
-    pubsub.unsubscribe = AsyncMock(side_effect=RuntimeError("unsubscribe failed"))
-    pubsub.aclose = AsyncMock()
-    subscription = RedisBubbleSubscription(pubsub)
+    assert await subscription.receive(timeout=0) == pending
+    assert await subscription.receive(timeout=0) == new
+    await subscription.acknowledge()
 
-    with pytest.raises(RuntimeError, match="unsubscribe failed"):
-        await subscription.aclose()
-    await subscription.aclose()
-
-    pubsub.unsubscribe.assert_awaited_once()
-    pubsub.aclose.assert_awaited_once()
+    assert redis.xreadgroup.await_args_list[0].args[2] == {"stream": "0"}
+    assert redis.xreadgroup.await_args_list[1].args[2] == {"stream": "0"}
+    assert redis.xreadgroup.await_args_list[2].args[2] == {"stream": ">"}
+    redis.xack.assert_awaited_once_with("stream", "group", b"0-0", b"1-0")
 
 
 @pytest.mark.skipif(not os.getenv("TEST_REDIS_URL"), reason="TEST_REDIS_URL is not configured")
-async def test_real_redis_pubsub_is_fenced_ordered_and_drops_malformed() -> None:
+async def test_real_redis_stream_is_fenced_ordered_durable_and_acknowledged() -> None:
     prefix = f"tests:bubbles:{uuid.uuid7()}"
     subscriber_redis = Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=False)
     publisher_redis = Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=False)
@@ -74,15 +78,17 @@ async def test_real_redis_pubsub_is_fenced_ordered_and_drops_malformed() -> None
     subscriber = RedisRealtimeBubbleBus(subscriber_redis, prefix=prefix)
     publisher = RedisRealtimeBubbleBus(publisher_redis, prefix=prefix)
     try:
-        assert await publisher.publish(fence, NotificationBubble("lost")) == 0
+        assert await publisher.publish(fence, NotificationBubble("queued")) == 1
         async with subscriber.subscribe(fence) as subscription:
             assert isinstance(subscription, RealtimeBubbleSubscription)
-            assert await publisher.publish(other_revision, NotificationBubble("isolated")) == 0
-            await publisher_redis.publish(bubble_channel(prefix, fence), msgpack.packb({"v": 999}))
+            assert await subscription.receive(timeout=1) == NotificationBubble("queued")
+            await subscription.acknowledge()
+            assert await publisher.publish(other_revision, NotificationBubble("isolated")) == 1
             await publisher.publish(fence, NotificationBubble("one"))
             await publisher.publish(fence, NotificationBubble("two"))
             assert await subscription.receive(timeout=1) == NotificationBubble("one")
             assert await subscription.receive(timeout=1) == NotificationBubble("two")
+            await subscription.acknowledge()
             assert await subscription.receive(timeout=0.01) is None
             second_fence = SessionFence(uuid.uuid7(), 1)
             async with subscriber.subscribe(second_fence) as second_subscription:
@@ -90,7 +96,12 @@ async def test_real_redis_pubsub_is_fenced_ordered_and_drops_malformed() -> None
                 assert await publisher.publish_many((fence, second_fence), bubble) == 2
                 assert await subscription.receive(timeout=1) == bubble
                 assert await second_subscription.receive(timeout=1) == bubble
-        assert await publisher.publish(fence, NotificationBubble("after-close")) == 0
+                await subscription.acknowledge()
+                await second_subscription.acknowledge()
+        assert await publisher.publish(fence, NotificationBubble("after-close")) == 1
+        async with subscriber.subscribe(fence) as resumed:
+            assert await resumed.receive(timeout=1) == NotificationBubble("after-close")
+            await resumed.acknowledge()
     finally:
         await subscriber_redis.aclose()
         await publisher_redis.aclose()

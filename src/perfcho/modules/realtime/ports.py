@@ -202,7 +202,7 @@ class RealtimeStateRepository(Protocol):
 
 @runtime_checkable
 class RealtimeBubbleSubscription(Protocol):
-    """Consume best-effort Bubbles for one session fence."""
+    """Consume and acknowledge Bubbles for one session fence."""
 
     async def receive(self, *, timeout: float) -> RealtimeBubble | None:
         """Wait for one valid Bubble or return None at timeout."""
@@ -212,6 +212,10 @@ class RealtimeBubbleSubscription(Protocol):
         """Return up to limit currently buffered valid Bubbles."""
         ...
 
+    async def acknowledge(self) -> None:
+        """Acknowledge every Bubble returned by this subscription."""
+        ...
+
     async def aclose(self) -> None:
         """Release the dedicated subscription connection."""
         ...
@@ -219,14 +223,14 @@ class RealtimeBubbleSubscription(Protocol):
 
 @runtime_checkable
 class RealtimeBubbleBus(Protocol):
-    """Publish and subscribe to ephemeral session-scoped Bubbles."""
+    """Publish and consume bounded session-scoped Bubbles."""
 
     async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
-        """Publish one Bubble and return the subscriber count."""
+        """Publish one Bubble and return the number of streams written."""
         ...
 
     async def publish_many(self, recipient_fences: Sequence[SessionFence], bubble: RealtimeBubble) -> int:
-        """Publish one Bubble to many exact session epochs and return total subscribers."""
+        """Publish one Bubble to many exact session epochs and return streams written."""
         ...
 
     def subscribe(self, recipient_fence: SessionFence) -> AbstractAsyncContextManager[RealtimeBubbleSubscription]:

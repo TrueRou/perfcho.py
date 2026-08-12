@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     redis_state_prefix: str = Field(default="perfcho:state")
     redis_bubble_url: str | None = Field(default=None)
     redis_bubble_max_connections: int = Field(default=256, ge=1)
+    redis_bubble_max_entries: int = Field(default=4096, ge=1, le=65536)
+    redis_bubble_ttl_seconds: int = Field(default=360, ge=60, le=24 * 60 * 60)
     redis_socket_timeout: float = Field(default=5.0, gt=0)
     redis_cache_url: str = Field(default="redis://127.0.0.1:56379/0")
     redis_cache_prefix: str = Field(default="perfcho:cache")

@@ -623,6 +623,10 @@ async def _poll_subscribed(
         max_bytes=max(0, services.settings.stable_max_response_bytes - len(output)),
     )
     output.extend(remote_output)
+    try:
+        await subscription.acknowledge()
+    except Exception as error:
+        _log_subscription_error(error, context.identity.account_id, stage="acknowledge")
     if sampled((started_ns, "poll_summary"), services.settings.log_hot_path_sample_rate):
         log_event(
             "INFO",

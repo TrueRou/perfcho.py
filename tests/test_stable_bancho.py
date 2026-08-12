@@ -105,6 +105,11 @@ class FakeBubbleSubscription:
         del self.bus.pending[:limit]
         return drained
 
+    async def acknowledge(self) -> None:
+        self.bus.acknowledge_calls += 1
+        if self.bus.acknowledge_error is not None:
+            raise self.bus.acknowledge_error
+
     async def aclose(self) -> None:
         self.bus.subscribed = False
 
@@ -118,6 +123,8 @@ class FakeBubbleBus:
         self.receive_calls = 0
         self.drain_calls = 0
         self.drain_error: Exception | None = None
+        self.acknowledge_calls = 0
+        self.acknowledge_error: Exception | None = None
         self.subscribe_calls: list[SessionFence] = []
 
     async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:

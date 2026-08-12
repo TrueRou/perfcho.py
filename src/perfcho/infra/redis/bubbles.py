@@ -1,7 +1,7 @@
-"""MessagePack codec, Redis Pub/Sub bus, and fenced poll gate."""
+"""MessagePack codec, Redis Stream bus, and fenced poll gate."""
 
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from time import monotonic
@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import msgpack  # type: ignore[import-untyped]
 from redis.asyncio import Redis
-from redis.asyncio.client import PubSub
+from redis.exceptions import ResponseError
 
 from perfcho.infra.db.mods import project_scoreboard_variant
 from perfcho.infra.logging import log_event
@@ -467,30 +467,70 @@ def decode_bubble(payload: bytes) -> RealtimeBubble | None:
 
 
 def bubble_channel(prefix: str, fence: SessionFence) -> str:
-    """Return the channel isolated to one exact session epoch."""
+    """Return the stream isolated to one exact session epoch."""
     return f"{prefix.rstrip(':')}:events:v1:session:{fence.session_id}:{fence.revision}"
 
 
 class RedisBubbleSubscription:
-    """Consume valid Bubbles from one Redis Pub/Sub subscription."""
+    """Consume valid Bubbles from one Redis Stream consumer group."""
 
-    def __init__(self, pubsub: PubSub) -> None:
-        """Wrap one subscribed PubSub connection."""
-        self._pubsub = pubsub
+    def __init__(self, redis: Redis, stream: str, group: str, consumer: str) -> None:
+        """Bind one logical consumer to a session stream."""
+        self._redis = redis
+        self._stream = stream
+        self._group = group
+        self._consumer = consumer
+        self._pending = True
+        self._delivered_ids: list[bytes | str] = []
         self._closed = False
+
+    async def _read(self, *, timeout: float) -> tuple[bytes | str, bytes] | None:
+        result: Any = None
+        if self._pending:
+            result = await self._redis.xreadgroup(
+                self._group,
+                self._consumer,
+                {self._stream: "0"},
+                count=1,
+            )
+            if not result or not cast(Any, result[0])[1]:
+                self._pending = False
+        if not self._pending:
+            result = await self._redis.xreadgroup(
+                self._group,
+                self._consumer,
+                {self._stream: ">"},
+                count=1,
+                block=None if timeout <= 0 else max(1, int(timeout * 1000)),
+            )
+        if not result:
+            return None
+        _, entries = cast(Any, result[0])
+        entry_id, fields = cast(Any, entries[0])
+        if not isinstance(fields, Mapping):
+            await self._redis.xack(self._stream, self._group, entry_id)
+            return None
+        payload = fields.get(b"payload", fields.get("payload"))
+        if not isinstance(payload, bytes):
+            await self._redis.xack(self._stream, self._group, entry_id)
+            return None
+        return entry_id, payload
 
     async def receive(self, *, timeout: float) -> RealtimeBubble | None:
         """Return the next valid Bubble before timeout."""
         deadline = monotonic() + max(timeout, 0)
         while not self._closed:
-            message = await self._pubsub.get_message(
-                ignore_subscribe_messages=True, timeout=max(0, deadline - monotonic())
-            )
-            if message is None:
+            entry = await self._read(timeout=max(0, deadline - monotonic()))
+            if entry is None:
+                if self._pending:
+                    continue
                 return None
-            bubble = decode_bubble(message["data"])
+            entry_id, payload = entry
+            bubble = decode_bubble(payload)
             if bubble is not None:
+                self._delivered_ids.append(entry_id)
                 return bubble
+            await self._redis.xack(self._stream, self._group, entry_id)
             if monotonic() >= deadline:
                 return None
         return None
@@ -507,58 +547,68 @@ class RedisBubbleSubscription:
             bubbles.append(bubble)
         return tuple(bubbles)
 
+    async def acknowledge(self) -> None:
+        """Acknowledge all entries successfully returned to the adapter."""
+        if self._delivered_ids:
+            await self._redis.xack(self._stream, self._group, *self._delivered_ids)
+            self._delivered_ids.clear()
+
     async def aclose(self) -> None:
-        """Close the dedicated Pub/Sub connection once."""
-        if not self._closed:
-            self._closed = True
-            try:
-                await self._pubsub.unsubscribe()
-                await self._pubsub.get_message(ignore_subscribe_messages=False, timeout=5.0)
-            finally:
-                await self._pubsub.aclose()
+        """Stop this request-scoped consumer once."""
+        self._closed = True
 
 
 class RedisRealtimeBubbleBus:
-    """Publish typed Bubbles over session-fenced Redis channels."""
+    """Publish typed Bubbles over bounded session-fenced Redis Streams."""
 
-    def __init__(self, redis: Redis, *, prefix: str) -> None:
-        """Bind the bus to an isolated Redis client and deployment prefix."""
+    def __init__(self, redis: Redis, *, prefix: str, max_entries: int = 4096, ttl_seconds: int = 360) -> None:
+        """Bind the bus to an isolated Redis client and bounded retention."""
+        if max_entries < 1 or ttl_seconds < 1:
+            raise ValueError("Bubble Stream limits must be positive")
         self._redis = redis
         self._prefix = prefix
+        self._max_entries = max_entries
+        self._ttl_seconds = ttl_seconds
+        self._group = "delivery-v1"
+        self._consumer = "session"
 
     async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
-        """Publish one encoded Bubble and return Redis' subscriber count."""
-        return int(await self._redis.publish(bubble_channel(self._prefix, recipient_fence), encode_bubble(bubble)))
+        """Append one encoded Bubble to a bounded session stream."""
+        stream = bubble_channel(self._prefix, recipient_fence)
+        async with self._redis.pipeline(transaction=False) as pipeline:
+            pipeline.xadd(stream, {"payload": encode_bubble(bubble)}, maxlen=self._max_entries)
+            pipeline.expire(stream, self._ttl_seconds)
+            await pipeline.execute()
+        return 1
 
     async def publish_many(self, recipient_fences: Sequence[SessionFence], bubble: RealtimeBubble) -> int:
-        """Publish one encoding to many fenced channels in one Redis pipeline."""
+        """Append one encoding to many fenced streams in one Redis pipeline."""
         if not recipient_fences:
             return 0
         payload = encode_bubble(bubble)
         async with self._redis.pipeline(transaction=False) as pipeline:
             for fence in recipient_fences:
-                pipeline.publish(bubble_channel(self._prefix, fence), payload)
-            results = await pipeline.execute()
-        return sum(int(result) for result in results)
+                stream = bubble_channel(self._prefix, fence)
+                pipeline.xadd(stream, {"payload": payload}, maxlen=self._max_entries)
+                pipeline.expire(stream, self._ttl_seconds)
+            await pipeline.execute()
+        return len(recipient_fences)
 
     @asynccontextmanager
     async def subscribe(self, recipient_fence: SessionFence) -> AsyncIterator[RedisBubbleSubscription]:
-        """Confirm subscription before yielding its typed consumer."""
-        pubsub = self._redis.pubsub()
-        channel = bubble_channel(self._prefix, recipient_fence)
-        subscription: RedisBubbleSubscription | None = None
+        """Ensure the consumer group exists before yielding its typed consumer."""
+        stream = bubble_channel(self._prefix, recipient_fence)
         try:
-            await pubsub.subscribe(channel)
-            confirmation = await pubsub.get_message(ignore_subscribe_messages=False, timeout=5.0)
-            if confirmation is None or confirmation["type"] not in {"subscribe", b"subscribe"}:
-                raise RuntimeError("Redis bubble subscription was not confirmed")
-            subscription = RedisBubbleSubscription(pubsub)
+            await self._redis.xgroup_create(stream, self._group, id="0", mkstream=True)
+        except ResponseError as error:
+            if "BUSYGROUP" not in str(error):
+                raise
+        await self._redis.expire(stream, self._ttl_seconds)
+        subscription = RedisBubbleSubscription(self._redis, stream, self._group, self._consumer)
+        try:
             yield subscription
         finally:
-            if subscription is None:
-                await pubsub.aclose()
-            else:
-                await subscription.aclose()
+            await subscription.aclose()
 
 
 _ACQUIRE_POLL_GATE = """-- perfcho:acquire-poll-gate:v1

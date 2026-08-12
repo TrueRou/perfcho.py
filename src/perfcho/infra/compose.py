@@ -361,7 +361,12 @@ async def compose_stable_services(
         max_spectators_per_host=core.config.redis_spectator_max_viewers,
     )
     bubble_redis = core.bubble_redis or core.state_redis
-    bubbles = RedisRealtimeBubbleBus(bubble_redis, prefix=core.config.redis_state_prefix)
+    bubbles = RedisRealtimeBubbleBus(
+        bubble_redis,
+        prefix=core.config.redis_state_prefix,
+        max_entries=core.config.redis_bubble_max_entries,
+        ttl_seconds=core.config.redis_bubble_ttl_seconds,
+    )
     poll_gate = RedisRealtimePollGate(
         bubble_redis,
         prefix=core.config.redis_state_prefix,
