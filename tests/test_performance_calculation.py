@@ -12,8 +12,6 @@ from perfcho.modules.performance.models import (
 from perfcho.modules.scoring.models import (
     HitStatistic,
     Ruleset,
-    ScoreboardInfo,
-    ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
     ScoreSubmission,
@@ -86,8 +84,8 @@ def _calculation() -> PerformanceCalculationInput:
         beatmap_revision_id=1,
         beatmap_sha256=b"b" * 32,
         beatmap_storage_key="beatmaps/test.osu",
-        scoreboard=ScoreboardInfo(1, "osu", Ruleset.OSU, ScoreboardVariant.VANILLA),
-        mod_set_id=1,
+        ruleset=Ruleset.OSU,
+        mods_digest=b"m" * 32,
         mods=(),
         source="lazer",
         score=ScoreSubmission(

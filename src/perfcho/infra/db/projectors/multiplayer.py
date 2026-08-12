@@ -29,6 +29,7 @@ from perfcho.infra.db.projectors.common import (
     advance_checkpoint,
     payload_boolean,
     payload_integer,
+    payload_string,
     payload_uuid,
     require_event_context,
 )
@@ -81,25 +82,25 @@ async def project_multiplayer_results(session: AsyncSession, event: OutboxEvent,
     elif event.event_type == "score.accepted.v1":
         score_id = payload_integer(event.payload, "score_id")
         account_id = payload_integer(event.payload, "account_id")
-        scoreboard_id = payload_integer(event.payload, "scoreboard_id")
+        ruleset = payload_string(event.payload, "ruleset")
         require_event_context(
             event,
             partition_key,
             aggregate_type="score",
             aggregate_id=str(score_id),
-            expected_partition_key=f"account:{account_id}:scoreboard:{scoreboard_id}",
+            expected_partition_key=f"account:{account_id}:ruleset:{ruleset}",
         )
         dimensions = (
             await session.execute(
-                select(Score.account_id, Score.scoreboard_id, MultiplayerAttempt.round_id)
+                select(Score.account_id, Score.ruleset, MultiplayerAttempt.round_id)
                 .outerjoin(MultiplayerAttempt, MultiplayerAttempt.score_id == Score.id)
                 .where(Score.id == score_id)
             )
         ).one_or_none()
         if dimensions is None:
             raise RuntimeError("accepted score event does not match the authoritative score")
-        authoritative_account_id, authoritative_scoreboard_id, round_id = dimensions._tuple()
-        if authoritative_scoreboard_id != scoreboard_id or authoritative_account_id != account_id:
+        authoritative_account_id, authoritative_ruleset, round_id = dimensions._tuple()
+        if authoritative_ruleset.value != ruleset or authoritative_account_id != account_id:
             raise RuntimeError("accepted score event does not match the authoritative score")
     else:
         raise RuntimeError(f"unsupported multiplayer results event: {event.event_type}")

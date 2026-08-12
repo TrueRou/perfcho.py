@@ -6,7 +6,12 @@ import orjson
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.models.events import OutboxEvent
-from perfcho.infra.db.projectors.common import advance_checkpoint, payload_integer, require_event_context
+from perfcho.infra.db.projectors.common import (
+    advance_checkpoint,
+    payload_integer,
+    payload_string,
+    require_event_context,
+)
 from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
 from perfcho.infra.db.repositories.performance.projection import SqlAlchemyPerformanceProjectionRepository
 from perfcho.modules.common.models import PendingEvent
@@ -40,17 +45,19 @@ class PerformanceProjector:
         """Calculate and persist all Performance releases for one accepted score."""
         score_id = payload_integer(event.payload, "score_id")
         account_id = payload_integer(event.payload, "account_id")
-        scoreboard_id = payload_integer(event.payload, "scoreboard_id")
+        ruleset = payload_string(event.payload, "ruleset")
         require_event_context(
             event,
             partition_key,
             aggregate_type="score",
             aggregate_id=str(score_id),
-            expected_partition_key=f"account:{account_id}:scoreboard:{scoreboard_id}",
+            expected_partition_key=f"account:{account_id}:ruleset:{ruleset}",
         )
         repository = SqlAlchemyPerformanceProjectionRepository(session)
         writer = SqlAlchemyOutboxWriter(session)
         for calculation in await repository.materialize(score_id):
+            if calculation.ruleset.value != ruleset:
+                raise RuntimeError("score event ruleset does not match the authoritative score")
             beatmap_url = await self._object_url_provider.presign_read(
                 calculation.beatmap_storage_key,
                 expires_in_seconds=self._beatmap_url_expiry_seconds,
@@ -70,7 +77,7 @@ class PerformanceProjector:
                     payload={
                         "score_id": completion.score_id,
                         "account_id": completion.account_id,
-                        "scoreboard_id": completion.scoreboard_id,
+                        "ruleset": completion.ruleset.value,
                         "formula_id": str(completion.formula_id),
                         "formula_code": completion.formula_code,
                         "release_id": str(completion.release_id),

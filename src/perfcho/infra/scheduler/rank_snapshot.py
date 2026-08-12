@@ -84,8 +84,9 @@ class RankSnapshotTask:
 
 
 async def _write_rank_snapshots(session: AsyncSession, snapshot_date: date) -> None:
+    metric = RankingPolicy.configuration["metric"].as_string()
     ranking_value = case(
-        (RankingPolicy.metric == "pp", UserRankedStat.performance),
+        (metric == "pp", UserRankedStat.performance),
         else_=cast(UserRankedStat.ranked_score, Numeric(20, 5)),
     ).label("value")
     active_stats = (

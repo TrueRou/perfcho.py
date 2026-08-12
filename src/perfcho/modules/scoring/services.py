@@ -18,7 +18,6 @@ from perfcho.modules.common.ports import Clock, IdGenerator, OutboxWriterFactory
 from perfcho.modules.scoring.errors import (
     BeatmapRevisionNotFound,
     ReplayNotFound,
-    ScoreboardUnavailable,
     ScoreRejected,
 )
 from perfcho.modules.scoring.models import (
@@ -30,18 +29,20 @@ from perfcho.modules.scoring.models import (
     IssueSoloScoreToken,
     LeaderboardPage,
     LeaderboardScope,
-    LeaderboardScopeKind,
     LeaderboardScoreView,
+    NormalizedModSet,
     PlayAttemptRecord,
+    PopulationFilter,
     ReplayReference,
     Ruleset,
     ScoreAcceptanceRecord,
     ScoreboardVariant,
     ScoreDetailView,
+    ScoreDimension,
     ScoreOutcome,
     SoloScoreToken,
 )
-from perfcho.modules.scoring.mods import normalize_mods
+from perfcho.modules.scoring.mods import canonical_json_digest
 from perfcho.modules.scoring.ports import (
     AccountStatisticsRepositoryFactory,
     AccountSubmissionValidatorFactory,
@@ -62,6 +63,12 @@ _RANKING_CONSUMER = "ranking-projector.v1"
 _STATS_CONSUMER = "scoring-stats-projector.v1"
 _MULTIPLAYER_RESULTS_CONSUMER = "multiplayer-results-projector.v1"
 _PERFORMANCE_CONSUMER = "performance-projector.v1"
+_KEY_MODS = frozenset({"1K", "2K", "3K", "4K", "5K", "6K", "7K", "8K", "9K", "CO"})
+_INCOMPATIBLE_MOD_GROUPS = (
+    frozenset({"EZ", "HR"}),
+    frozenset({"HT", "DT", "NC"}),
+    frozenset({"NF", "SD", "PF"}),
+)
 
 
 class ScoringService:
@@ -135,7 +142,8 @@ class ScoringService:
             and command.attestation.client_version != command.meta.client.version
         ):
             raise ScoreRejected("attestation client version does not match the command client")
-        normalized_mods = normalize_mods(command.ruleset, command.variant, command.mods)
+        normalized_mods = _normalize_mods(command.ruleset, command.mods)
+        variant = _legacy_variant(command.ruleset, normalized_mods.mods)
         now = self._clock.now()
         if command.attempt.ended_at > now + timedelta(minutes=5):
             raise ScoreRejected("score end time is unreasonably far in the future")
@@ -195,10 +203,6 @@ class ScoringService:
                 command = replace(command, attempt=replace(command.attempt, progress=progress))
             if revision.ruleset is not command.ruleset and revision.ruleset.value != "osu":
                 raise ScoreRejected("native beatmap ruleset cannot be converted to the submitted ruleset")
-            scoreboard = await repository.get_scoreboard(command.ruleset, command.variant)
-            if scoreboard is None:
-                raise ScoreboardUnavailable("canonical scoreboard is not active")
-            mod_set = await repository.get_or_create_mod_set(scoreboard.scoreboard_id, normalized_mods)
             score = replace(
                 command.score,
                 perfect=(
@@ -217,7 +221,7 @@ class ScoringService:
                 command.attempt,
                 score,
                 revision,
-                command.variant,
+                variant,
                 uses_threshold_grading=command.uses_threshold_grading,
             )
 
@@ -227,8 +231,9 @@ class ScoringService:
                     account_id=account_context.account_id,
                     beatmap_id=revision.beatmap_id,
                     beatmap_revision_id=revision.revision_id,
-                    scoreboard_id=scoreboard.scoreboard_id,
-                    mod_set_id=mod_set.mod_set_id,
+                    ruleset=command.ruleset,
+                    mods=normalized_mods.mods,
+                    mods_digest=normalized_mods.digest,
                     source=source,
                     submission=command.attempt,
                     outcome=score.outcome,
@@ -252,8 +257,9 @@ class ScoringService:
                     command.multiplayer,
                     account_id=account_context.account_id,
                     revision=revision,
-                    scoreboard=scoreboard,
-                    mod_set=mod_set,
+                    ruleset=command.ruleset,
+                    mods=normalized_mods.mods,
+                    mods_digest=normalized_mods.digest,
                     attempt=command.attempt,
                     at=now,
                 )
@@ -263,8 +269,9 @@ class ScoringService:
                     attempt_id=attempt_claim.attempt_id,
                     account_id=account_context.account_id,
                     revision=revision,
-                    scoreboard=scoreboard,
-                    mod_set=mod_set,
+                    ruleset=command.ruleset,
+                    mods=normalized_mods.mods,
+                    mods_digest=normalized_mods.digest,
                     attempt=command.attempt,
                     score=score,
                     replay=command.replay,
@@ -280,7 +287,7 @@ class ScoringService:
                     beatmap_id=result.beatmap_id,
                     beatmap_revision_id=result.beatmap_revision_id,
                     ruleset=command.ruleset.value,
-                    variant=command.variant.value,
+                    variant=variant.value,
                     beatmap_status=revision.status,
                     outcome=result.outcome.value,
                     grade=score.grade.value,
@@ -323,8 +330,8 @@ class ScoringService:
                         "beatmap_id": revision.beatmap_id,
                         "beatmap_revision_id": revision.revision_id,
                         "beatmap_status": revision.status,
-                        "scoreboard_id": scoreboard.scoreboard_id,
-                        "mod_set_id": mod_set.mod_set_id,
+                        "ruleset": command.ruleset.value,
+                        "mods_digest": normalized_mods.digest.hex(),
                         "outcome": result.outcome.value,
                         "grade": score.grade.value,
                         "total_hits": validated.total_hits,
@@ -335,7 +342,7 @@ class ScoringService:
                         "request_id": str(command.meta.request_id),
                     },
                     consumers=consumers,
-                    partition_key=f"account:{account_context.account_id}:scoreboard:{scoreboard.scoreboard_id}",
+                    partition_key=f"account:{account_context.account_id}:ruleset:{command.ruleset.value}",
                 )
             )
             await repository.complete_acceptance(command.meta.idempotency_key, result)
@@ -437,11 +444,12 @@ class ReplayService:
                         payload={
                             "score_id": replay.score_id,
                             "account_id": replay.owner_account_id,
-                            "scoreboard_id": replay.scoreboard_id,
+                            "ruleset": replay.ruleset.value,
+                            "mods_digest": replay.mods_digest.hex(),
                             "request_id": str(request_id),
                         },
                         consumers=(_STATS_CONSUMER,),
-                        partition_key=f"account:{replay.owner_account_id}:scoreboard:{replay.scoreboard_id}",
+                        partition_key=f"account:{replay.owner_account_id}:ruleset:{replay.ruleset.value}",
                     )
                 )
             await uow.commit()
@@ -467,7 +475,8 @@ class RankingQueryService:
         decode=lambda raw: _leaderboard_scores_from_cache(raw),
         ttl_seconds=120,
         enabled=lambda _self, **kwargs: (
-            kwargs["scope"].kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}
+            kwargs["scope"].dimension in {ScoreDimension.OVERALL, ScoreDimension.EXACT_MODS}
+            and kwargs["scope"].population is PopulationFilter.PUBLIC
         ),
     )
     async def get_public_leaderboard(
@@ -475,7 +484,6 @@ class RankingQueryService:
         *,
         beatmap_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
         scope: LeaderboardScope,
         limit: int = 50,
     ) -> tuple[LeaderboardScoreView, ...]:
@@ -487,7 +495,6 @@ class RankingQueryService:
             result = await self._repository_factory(uow.session).get_public_leaderboard(
                 beatmap_id=beatmap_id,
                 ruleset=ruleset,
-                variant=variant,
                 scope=scope,
                 limit=limit,
             )
@@ -499,7 +506,8 @@ class RankingQueryService:
         decode=lambda raw: _personal_score_from_cache(raw),
         ttl_seconds=120,
         enabled=lambda _self, **kwargs: (
-            kwargs["scope"].kind in {LeaderboardScopeKind.OVERALL, LeaderboardScopeKind.EXACT_MODS}
+            kwargs["scope"].dimension in {ScoreDimension.OVERALL, ScoreDimension.EXACT_MODS}
+            and kwargs["scope"].population is PopulationFilter.PUBLIC
         ),
         cache_none=True,
     )
@@ -508,7 +516,6 @@ class RankingQueryService:
         *,
         beatmap_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
         scope: LeaderboardScope,
         account_id: int,
     ) -> LeaderboardScoreView | None:
@@ -519,7 +526,6 @@ class RankingQueryService:
             result = await self._repository_factory(uow.session).get_personal_leaderboard(
                 beatmap_id=beatmap_id,
                 ruleset=ruleset,
-                variant=variant,
                 scope=scope,
                 account_id=account_id,
             )
@@ -530,19 +536,15 @@ class RankingQueryService:
         *,
         beatmap_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
         scope: LeaderboardScope,
         requester_account_id: int,
         limit: int = 50,
     ) -> LeaderboardPage:
         """Compose public rows and the requester's personal row."""
-        public = await self.get_public_leaderboard(
-            beatmap_id=beatmap_id, ruleset=ruleset, variant=variant, scope=scope, limit=limit
-        )
+        public = await self.get_public_leaderboard(beatmap_id=beatmap_id, ruleset=ruleset, scope=scope, limit=limit)
         personal = await self.get_personal_leaderboard(
             beatmap_id=beatmap_id,
             ruleset=ruleset,
-            variant=variant,
             scope=scope,
             account_id=requester_account_id,
         )
@@ -550,7 +552,6 @@ class RankingQueryService:
             total_count = await self._repository_factory(uow.session).get_leaderboard_count(
                 beatmap_id=beatmap_id,
                 ruleset=ruleset,
-                variant=variant,
                 scope=scope,
             )
         return LeaderboardPage(public, personal, total_count)
@@ -560,12 +561,11 @@ class RankingQueryService:
         kind: str,
         beatmap_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
         scope: LeaderboardScope,
         tail: int,
         generation: str,
     ) -> str:
-        dimension = scope.kind.value
+        dimension = f"{scope.dimension.value}:{scope.population.value}"
         if scope.mod_acronyms is not None:
             digest = hashlib.sha256(",".join(sorted(scope.mod_acronyms)).encode()).hexdigest()[:16]
             dimension += f":{digest}"
@@ -577,7 +577,7 @@ class RankingQueryService:
         return self._cache.key(
             "scoring",
             f"leaderboard-{kind}",
-            f"{dimension}:{beatmap_id}:{ruleset.value}:{variant.value}:{tail}:{generation}",
+            f"{dimension}:{beatmap_id}:{ruleset.value}:{tail}:{generation}",
         )
 
     async def _public_leaderboard_cache_key(self, **kwargs: object) -> str:
@@ -587,7 +587,6 @@ class RankingQueryService:
             "public",
             beatmap_id,
             cast(Ruleset, kwargs["ruleset"]),
-            cast(ScoreboardVariant, kwargs["variant"]),
             cast(LeaderboardScope, kwargs["scope"]),
             cast(int, kwargs["limit"]),
             generation,
@@ -600,7 +599,6 @@ class RankingQueryService:
             "personal",
             beatmap_id,
             cast(Ruleset, kwargs["ruleset"]),
-            cast(ScoreboardVariant, kwargs["variant"]),
             cast(LeaderboardScope, kwargs["scope"]),
             cast(int, kwargs["account_id"]),
             generation,
@@ -657,14 +655,13 @@ class AccountStatisticsQueryService:
         self,
         account_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant = ScoreboardVariant.VANILLA,
     ) -> AccountStatsView:
         """Read stats authoritatively for score submission before/after values."""
-        return await self._load(account_id, ruleset, variant)
+        return await self._load(account_id, ruleset)
 
     @cached(
-        key_builder=lambda self, account_id, ruleset, variant: self._cache.key(
-            "scoring", "account-stats", f"{account_id}:{ruleset.value}:{variant.value}"
+        key_builder=lambda self, account_id, ruleset: self._cache.key(
+            "scoring", "account-stats", f"{account_id}:{ruleset.value}"
         ),
         encode=encode_json,
         decode=lambda raw: _account_stats_from_cache(raw),
@@ -674,16 +671,15 @@ class AccountStatisticsQueryService:
         self,
         account_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant = ScoreboardVariant.VANILLA,
     ) -> AccountStatsView:
         """Read short-lived stats suitable for online display."""
         _positive_identifier("account_id", account_id)
-        return await self._load(account_id, ruleset, variant)
+        return await self._load(account_id, ruleset)
 
-    async def _load(self, account_id: int, ruleset: Ruleset, variant: ScoreboardVariant) -> AccountStatsView:
+    async def _load(self, account_id: int, ruleset: Ruleset) -> AccountStatsView:
         _positive_identifier("account_id", account_id)
         async with self._uow_factory() as uow:
-            return await self._repository_factory(uow.session).get_account_stats(account_id, ruleset, variant)
+            return await self._repository_factory(uow.session).get_account_stats(account_id, ruleset)
 
 
 class BeatmapScoresQueryService:
@@ -815,7 +811,47 @@ def _log_acceptance(
         attempt_id=str(result.attempt_id),
         beatmap_id=result.beatmap_id,
         beatmap_revision_id=result.beatmap_revision_id,
-        scoreboard_id=result.scoreboard_id,
-        mod_set_id=result.mod_set_id,
+        ruleset=result.ruleset.value,
+        mods_digest=result.mods_digest.hex(),
         duration_ms=duration_ms(started_ns),
     )
+
+
+def _normalize_mods(ruleset: Ruleset, mods: tuple[CanonicalMod, ...]) -> NormalizedModSet:
+    """Validate and deterministically identify canonical mods without variant identity."""
+    by_acronym: dict[str, CanonicalMod] = {}
+    for mod in mods:
+        if mod.acronym in by_acronym:
+            raise ScoreRejected(f"duplicate mod acronym: {mod.acronym}")
+        by_acronym[mod.acronym] = mod
+    if {"RX", "AP"} <= by_acronym.keys():
+        raise ScoreRejected("relax and autopilot cannot be combined")
+    if "RX" in by_acronym and ruleset is Ruleset.MANIA:
+        raise ScoreRejected("mania does not support relax")
+    if "AP" in by_acronym and ruleset is not Ruleset.OSU:
+        raise ScoreRejected("autopilot is only supported by osu")
+    if {"AT", "CN"} & by_acronym.keys():
+        raise ScoreRejected("automatic play mods cannot submit scores")
+    acronyms = frozenset(by_acronym)
+    for group in _INCOMPATIBLE_MOD_GROUPS:
+        selected = group & acronyms
+        if len(selected) > 1:
+            raise ScoreRejected(f"incompatible mods: {', '.join(sorted(selected))}")
+    selected_keys = _KEY_MODS & acronyms
+    if ruleset is not Ruleset.MANIA and selected_keys:
+        raise ScoreRejected("key-count mods are only valid for mania")
+    if len(selected_keys) > 1:
+        raise ScoreRejected("multiple key-count mods cannot be combined")
+    canonical_mods = tuple(sorted(by_acronym.values(), key=lambda mod: mod.acronym))
+    canonical = tuple(mod.as_json() for mod in canonical_mods)
+    return NormalizedModSet(canonical, frozenset(by_acronym), canonical_json_digest(canonical))
+
+
+def _legacy_variant(ruleset: Ruleset, mods: tuple[CanonicalMod, ...]) -> ScoreboardVariant:
+    """Derive the temporary validation/achievement compatibility view."""
+    acronyms = {mod.acronym for mod in mods}
+    if "AP" in acronyms:
+        return ScoreboardVariant.AUTOPILOT
+    if "RX" in acronyms:
+        return ScoreboardVariant.RELAX
+    return ScoreboardVariant.VANILLA

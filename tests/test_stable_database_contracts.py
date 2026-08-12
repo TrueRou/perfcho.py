@@ -8,7 +8,6 @@ from sqlalchemy import (
     Column,
     ForeignKeyConstraint,
     Index,
-    Numeric,
     Table,
     UniqueConstraint,
 )
@@ -60,7 +59,7 @@ def test_metadata_preserves_the_reviewed_table_inventory() -> None:
         "iam": 18,
         "moderation": 8,
         "multiplayer": 29,
-        "scoring": 25,
+        "scoring": 20,
         "social": 8,
         "system": 2,
     }
@@ -149,11 +148,35 @@ def test_content_and_scoring_dimensions_are_unambiguous() -> None:
     ) == ("md5",)
 
     attempts = _table("scoring.play_attempts")
-    assert "beatmap_id" in attempts.c
+    assert {"beatmap_id", "ruleset", "mods_details", "mods_acronyms", "mods_digest"} <= set(attempts.c.keys())
+    assert "scoreboard_id" not in attempts.c
+    assert "mod_set_id" not in attempts.c
     revision_fk = _constraint("scoring.play_attempts", "fk_play_attempts_revision_beatmap", ForeignKeyConstraint)
-    mods_fk = _constraint("scoring.play_attempts", "fk_play_attempts_mod_set_scoreboard", ForeignKeyConstraint)
     assert _column_names(revision_fk.columns) == ("beatmap_revision_id", "beatmap_id")
-    assert _column_names(mods_fk.columns) == ("mod_set_id", "scoreboard_id")
+
+    scores = _table("scoring.scores")
+    assert {"ruleset", "mods_details", "mods_acronyms", "mods_digest"} <= set(scores.c.keys())
+    assert "scoreboard_id" not in scores.c
+    assert "mod_set_id" not in scores.c
+    score_attempt_fk = _constraint("scoring.scores", "fk_scores_attempt_dimensions", ForeignKeyConstraint)
+    assert _column_names(score_attempt_fk.columns) == (
+        "attempt_id",
+        "account_id",
+        "beatmap_id",
+        "beatmap_revision_id",
+        "ruleset",
+        "mods_details",
+        "mods_acronyms",
+        "mods_digest",
+    )
+
+    difficulty = _table("scoring.beatmap_difficulty_attributes")
+    assert {"ruleset", "mods_digest"} <= set(difficulty.c.keys())
+    assert "scoreboard_id" not in difficulty.c
+    assert "mod_set_id" not in difficulty.c
+
+    ranking_policy = _table("scoring.ranking_policies")
+    assert set(ranking_policy.c.keys()) == {"id", "code", "ruleset", "active", "configuration"}
 
     attestation = _table("scoring.score_attestations")
     assert "client_integrity_digest" in attestation.c
@@ -163,12 +186,6 @@ def test_content_and_scoring_dimensions_are_unambiguous() -> None:
     assert "beatmap_id" in ratings.c
     assert "beatmap_revision_id" not in ratings.c
     assert _index("content.rating_votes", "uq_rating_votes_beatmap_account").unique
-
-    leaderboard = _table("scoring.leaderboard_entries")
-    assert isinstance(leaderboard.c.metric_value.type, Numeric)
-    assert isinstance(leaderboard.c.tie_break_value.type, Numeric)
-    assert leaderboard.c.metric_value.type.precision == 30
-    assert leaderboard.c.tie_break_value.type.precision == 30
 
     replays = _table("scoring.replays")
     unique_columns = {
@@ -189,11 +206,24 @@ def test_stable_read_paths_have_ordered_indexes() -> None:
         "account_id",
     )
 
-    leaderboard_index = _index("scoring.leaderboard_entries", "ix_leaderboard_entries_rank")
-    leaderboard_sql = str(CreateIndex(leaderboard_index).compile(dialect=postgresql.dialect()))
-    assert "metric_value DESC" in leaderboard_sql
-    assert "tie_break_value DESC" in leaderboard_sql
-    assert _index("scoring.leaderboard_entries", "ix_leaderboard_entries_country_rank")
+    assert _column_names(_index("scoring.play_attempts", "ix_play_attempts_ruleset_mods").columns) == (
+        "ruleset",
+        "mods_digest",
+    )
+    assert _column_names(_index("scoring.scores", "ix_scores_revision_ruleset").columns) == (
+        "beatmap_revision_id",
+        "ruleset",
+        "id",
+    )
+    assert _column_names(_index("scoring.scores", "ix_scores_beatmap_ruleset_mods").columns) == (
+        "beatmap_id",
+        "ruleset",
+        "mods_digest",
+        "id",
+    )
+    assert _column_names(
+        _index("scoring.beatmap_difficulty_attributes", "ix_difficulty_attributes_release").columns
+    ) == ("release_id", "ruleset", "mods_digest")
 
 
 def test_replies_multiplayer_events_and_outbox_positions_have_integrity() -> None:

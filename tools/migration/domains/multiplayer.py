@@ -12,7 +12,6 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.models.multiplayer import TournamentPool, TournamentPoolItem, TournamentPoolRevision
-from perfcho.infra.db.models.scoring import ModSet
 from tools.migration.domains.common import run_batched_phase
 from tools.migration.models import DiagnosticSeverity, MigrationRuntime, SourceRow
 from tools.migration.transforms import aware_datetime, mod_set
@@ -197,34 +196,19 @@ async def _migrate_pick(
     revision_target_id = runtime.mappings.revisions_by_md5.get(md5)
     if revision_target_id is None:
         raise ValueError(f"pool map revision {md5} was not migrated")
-    scoreboard_id, canonical, digest, bits = mod_set(source_map.get("mode"), row.get("mods"))
-    mod_set_id = await session.scalar(
-        insert(ModSet)
-        .values(
-            scoreboard_id=scoreboard_id,
-            canonical=canonical,
-            canonical_digest=digest,
-            legacy_bits=bits,
-        )
-        .on_conflict_do_nothing(index_elements=(ModSet.scoreboard_id, ModSet.canonical_digest))
-        .returning(ModSet.id)
-    )
-    if mod_set_id is None:
-        mod_set_id = await session.scalar(
-            select(ModSet.id).where(ModSet.scoreboard_id == scoreboard_id, ModSet.canonical_digest == digest)
-        )
-    if mod_set_id is None:
-        raise RuntimeError("pool mod set merge failed")
+    ruleset, canonical, acronyms, digest = mod_set(source_map.get("mode"), row.get("mods"))
     slot = _positive(row.get("slot"), "pool slot")
     bucket = _mod_bucket(canonical)
     await session.execute(
         insert(TournamentPoolItem)
         .values(
-            id=runtime.ids.make("tournament-pool-item", f"{source_pool_id}:{source_map_id}:{bits}:{slot}"),
+            id=runtime.ids.make("tournament-pool-item", f"{source_pool_id}:{source_map_id}:{digest.hex()}:{slot}"),
             revision_id=revision_id,
             beatmap_revision_id=revision_target_id,
-            scoreboard_id=scoreboard_id,
-            mod_set_id=mod_set_id,
+            ruleset=ruleset,
+            mods_details=canonical,
+            mods_acronyms=acronyms,
+            mods_digest=digest,
             mod_bucket=bucket,
             slot_number=slot,
         )

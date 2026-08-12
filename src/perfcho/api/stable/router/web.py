@@ -75,12 +75,12 @@ from perfcho.modules.scoring import (
     LeaderboardPage,
     LeaderboardScope,
     LeaderboardScoreView,
+    PopulationFilter,
     RankingQueryService,
     ReplayNotFound,
     ReplayQueryService,
     ReplayService,
     Ruleset,
-    ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
     ScoringService,
@@ -194,15 +194,18 @@ async def _build_leaderboard_scope(
     if leaderboard_type in {0, 1}:
         return LeaderboardScope.overall()
     if leaderboard_type == 2:
-        mods, _ = parse_legacy_mods(legacy_mod_bits)
-        return LeaderboardScope.exact_mods(frozenset(mod.acronym for mod in mods if mod.acronym not in {"RX", "AP"}))
+        mods = parse_legacy_mods(legacy_mod_bits)
+        return LeaderboardScope.exact_mods(frozenset(mod.acronym for mod in mods))
     if leaderboard_type == 3:
         friends = await social.list_friends(requester_account_id)
-        return LeaderboardScope.friends(frozenset(friend.account_id for friend in friends))
+        return LeaderboardScope.overall().with_population(
+            PopulationFilter.FRIENDS,
+            account_ids=frozenset({requester_account_id, *(friend.account_id for friend in friends)}),
+        )
     if leaderboard_type == 4:
         if not country_code:
             raise ValueError("country leaderboard requires a country code")
-        return LeaderboardScope.country(country_code)
+        return LeaderboardScope.overall().with_population(PopulationFilter.COUNTRY, country_code=country_code)
     raise ValueError("leaderboard type is invalid")
 
 
@@ -1032,7 +1035,6 @@ async def submit_score(
         ),
         beatmap=BeatmapReference(md5=parsed.beatmap_md5),
         ruleset=parsed.ruleset,
-        variant=parsed.variant,
         mods=parsed.mods,
         attempt=parsed.attempt,
         score=parsed.score,
@@ -1186,7 +1188,7 @@ async def get_scores(
     if not beatmap.is_current or beatmap.md5_hex != map_md5.lower():
         return Response(b"1|false")
     try:
-        _, variant = parse_legacy_mods(legacy_mod_bits)
+        parse_legacy_mods(legacy_mod_bits)
     except ValueError:
         return Response(b"-1|false")
     ruleset = _GRADE_RULESETS[mode]
@@ -1203,7 +1205,6 @@ async def get_scores(
         else await ranking_query.get_combined_leaderboard(
             beatmap_id=beatmap.beatmap_id,
             ruleset=ruleset,
-            variant=variant,
             scope=scope,
             requester_account_id=principal.account_id,
         )
@@ -1216,9 +1217,9 @@ async def get_scores(
             f"{beatmap.external_beatmapset_id}|{len(page.scores)}|0|"
         ),
         f"0\n{beatmap.artist} - {beatmap.title} [{beatmap.difficulty_name}]\n{average_rating}",
-        _format_leaderboard_score(page.personal_best, variant) if page.personal_best is not None else "",
+        _format_leaderboard_score(page.personal_best) if page.personal_best is not None else "",
     ]
-    lines.extend(_format_leaderboard_score(score, variant) for score in page.scores)
+    lines.extend(_format_leaderboard_score(score) for score in page.scores)
     if not page.scores:
         lines.append("")
     return Response("\n".join(lines))
@@ -1234,13 +1235,13 @@ async def _account_stats(
         return None
     try:
         if services.account_statistics is not None:
-            return await services.account_statistics.get_for_submission(account_id, parsed.ruleset, parsed.variant)
+            return await services.account_statistics.get_for_submission(account_id, parsed.ruleset)
         ranking_query = services.ranking_query
         if ranking_query is None:
             return None
         legacy_stats_name = "get_account_stats"
         legacy_stats = getattr(ranking_query, legacy_stats_name)
-        return await legacy_stats(account_id, parsed.ruleset, parsed.variant)
+        return await legacy_stats(account_id, parsed.ruleset)
     except Exception as error:
         log_event(
             "WARNING",
@@ -1248,7 +1249,6 @@ async def _account_stats(
             exception=error,
             account_id=account_id,
             ruleset=parsed.ruleset.value,
-            variant=parsed.variant.value,
         )
         return None
 
@@ -1324,8 +1324,8 @@ def _chart_accuracy(stats: AccountStatsView | None) -> str:
     return "" if stats is None else format(stats.accuracy * 100, ".2f")
 
 
-def _format_leaderboard_score(score: LeaderboardScoreView, variant: ScoreboardVariant) -> str:
-    legacy_mod_bits = project_legacy_mods(score.mods, variant)
+def _format_leaderboard_score(score: LeaderboardScoreView) -> str:
+    legacy_mod_bits = project_legacy_mods(score.mods)
     return (
         f"{score.score_id}|{score.display_name}|{round(score.metric_value)}|{score.max_combo}|"
         f"{score.n50}|{score.n100}|{score.n300}|{score.nmiss}|{score.nkatu}|{score.ngeki}|"

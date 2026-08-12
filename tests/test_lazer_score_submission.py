@@ -21,7 +21,6 @@ from perfcho.modules.scoring import (
     CanonicalMod,
     IssueSoloScoreToken,
     Ruleset,
-    ScoreboardVariant,
     ScoreDetailView,
     ScoreGrade,
     ScoreOutcome,
@@ -77,8 +76,9 @@ class FakeScoring:
             score_id=900,
             beatmap_id=123,
             beatmap_revision_id=456,
-            scoreboard_id=1,
-            mod_set_id=2,
+            ruleset=command.ruleset,
+            mods=command.mods,
+            mods_digest=b"m" * 32,
             outcome=command.score.outcome,
         )
 
@@ -95,7 +95,6 @@ class FakeScoreQuery:
             country_code="JP",
             beatmap_id=123,
             ruleset=Ruleset.OSU,
-            variant=ScoreboardVariant.VANILLA,
             total_score=987654,
             classic_score=765432,
             accuracy=Decimal("0.95"),
@@ -210,6 +209,8 @@ async def test_submit_solo_score_normalizes_lazer_json_to_canonical_command() ->
     assert command.score.outcome is ScoreOutcome.PASSED
     assert command.score.classic_score == 765432
     assert command.score.accuracy == Decimal("0.95")
+    assert command.ruleset is Ruleset.OSU
+    assert command.mods == (CanonicalMod("HD"), CanonicalMod("DT", {"speed_change": 1.25}))
     assert {hit.hit_result: hit.actual for hit in command.score.hits} == {
         "great": 95,
         "meh": 0,

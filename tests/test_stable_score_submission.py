@@ -13,7 +13,7 @@ from perfcho.api.stable.canonize.scoring import (
     verify_stable_online_checksum,
 )
 from perfcho.infra.security.rijndael import Rijndael256Cbc
-from perfcho.modules.scoring import Ruleset, ScoreboardVariant, ScoreGrade, ScoreOutcome
+from perfcho.modules.scoring import Ruleset, ScoreGrade, ScoreOutcome
 
 OSU_VERSION = "20260711"
 SUPPORTED_BUILD = "b20260711.1"
@@ -85,7 +85,7 @@ def test_stable_score_decryption_normalizes_identity_hits_and_timing() -> None:
     assert result.username == "player"
     assert result.beatmap_md5 == b"\xaa" * 16
     assert result.ruleset is Ruleset.OSU
-    assert result.variant is ScoreboardVariant.VANILLA
+    assert result.mods == ()
     assert result.score.grade is ScoreGrade.X
     assert result.score.outcome is ScoreOutcome.PASSED
     assert result.score.accuracy == Decimal(1)
@@ -102,7 +102,6 @@ def test_stable_score_decryption_maps_assistance_and_composite_mod_bits() -> Non
     bits = LEGACY_MOD_BITS["RX"] | LEGACY_MOD_BITS["NC"] | LEGACY_MOD_BITS["DT"]
     result = decrypt(score_fields(mods=bits))
 
-    assert result.variant is ScoreboardVariant.RELAX
     assert {mod.acronym for mod in result.mods} == {"RX", "NC"}
 
 

@@ -14,18 +14,15 @@ from perfcho.modules.scoring.models import (
     BeatmapGradeView,
     BeatmapReference,
     BeatmapRevisionInfo,
+    CanonicalMod,
     LeaderboardScope,
     LeaderboardScoreView,
-    ModSetInfo,
     MultiplayerSubmissionContext,
-    NormalizedModSet,
     PlayAttemptRecord,
     PlayAttemptSubmission,
     ReplayReference,
     Ruleset,
     ScoreAcceptanceRecord,
-    ScoreboardInfo,
-    ScoreboardVariant,
     ScoreDetailView,
     SoloScoreToken,
 )
@@ -56,14 +53,6 @@ class ScoringAcceptanceRepository(Protocol):
 
     async def resolve_current_revision(self, reference: BeatmapReference) -> BeatmapRevisionInfo | None:
         """Resolve only a current immutable beatmap revision."""
-        ...
-
-    async def get_scoreboard(self, ruleset: Ruleset, variant: ScoreboardVariant) -> ScoreboardInfo | None:
-        """Return the active scoreboard for canonical gameplay dimensions."""
-        ...
-
-    async def get_or_create_mod_set(self, scoreboard_id: int, normalized: NormalizedModSet) -> ModSetInfo:
-        """Resolve canonical mod JSON by its deterministic digest."""
         ...
 
     async def claim_attempt(self, record: PlayAttemptRecord) -> AttemptClaim:
@@ -142,7 +131,6 @@ class RankingRepository(Protocol):
         *,
         beatmap_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
         scope: LeaderboardScope,
         limit: int,
     ) -> tuple[LeaderboardScoreView, ...]:
@@ -154,7 +142,6 @@ class RankingRepository(Protocol):
         *,
         beatmap_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
         scope: LeaderboardScope,
         account_id: int,
     ) -> LeaderboardScoreView | None:
@@ -166,7 +153,6 @@ class RankingRepository(Protocol):
         *,
         beatmap_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
         scope: LeaderboardScope,
     ) -> int:
         """Return the complete number of accounts in one scope."""
@@ -188,7 +174,6 @@ class AccountStatisticsRepository(Protocol):
         self,
         account_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
     ) -> AccountStatsView:
         """Aggregate account statistics without calculating PP."""
         ...
@@ -223,8 +208,9 @@ class MultiplayerSubmissionValidator(Protocol):
         *,
         account_id: int,
         revision: BeatmapRevisionInfo,
-        scoreboard: ScoreboardInfo,
-        mod_set: ModSetInfo,
+        ruleset: Ruleset,
+        mods: tuple[CanonicalMod, ...],
+        mods_digest: bytes,
         attempt: PlayAttemptSubmission,
         at: datetime,
     ) -> None:

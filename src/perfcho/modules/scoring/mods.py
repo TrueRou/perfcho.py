@@ -71,7 +71,11 @@ def normalize_mods(
 
     ordered = tuple(sorted(by_acronym.values(), key=lambda mod: (mod.acronym, _settings_sort_key(mod))))
     canonical = tuple(mod.as_json() for mod in ordered)
-    return NormalizedModSet(ordered, canonical, canonical_json_digest(canonical))
+    return NormalizedModSet(
+        canonical=canonical,
+        mods_acronyms=frozenset(by_acronym),
+        digest=canonical_json_digest(canonical),
+    )
 
 
 def _settings_sort_key(mod: CanonicalMod) -> str:

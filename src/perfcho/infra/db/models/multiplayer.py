@@ -5,6 +5,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    ARRAY,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -19,6 +20,7 @@ from sqlalchemy import (
     Numeric,
     SmallInteger,
     String,
+    Text,
     UniqueConstraint,
     text,
 )
@@ -29,6 +31,7 @@ from perfcho.infra.db.base import DbBase
 from perfcho.infra.db.enums import (
     AttemptStatus,
     RoomStatus,
+    Ruleset,
     SessionStatus,
     enum_type,
 )
@@ -230,13 +233,13 @@ class PlaylistRevision(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     beatmap_revision_id: Mapped[int] = mapped_column(
         ForeignKey("content.beatmap_revisions.id", ondelete="RESTRICT"), nullable=False
     )
-    scoreboard_id: Mapped[int] = mapped_column(
-        ForeignKey("scoring.scoreboards.id", ondelete="RESTRICT"), nullable=False
+    ruleset: Mapped[Ruleset] = mapped_column(enum_type(Ruleset, "playlist_revision_ruleset", 16), nullable=False)
+    ranking_policy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("scoring.ranking_policies.id", ondelete="RESTRICT"), nullable=False
     )
-    mod_policy_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("scoring.mod_policies.id", ondelete="RESTRICT"), nullable=False
-    )
-    required_mod_set_id: Mapped[int | None] = mapped_column(ForeignKey("scoring.mod_sets.id", ondelete="RESTRICT"))
+    required_mods_details: Mapped[list[dict[str, object]]] = mapped_column(JSONB, nullable=False)
+    required_mods_acronyms: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    required_mods_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
     scoring_mode: Mapped[str] = mapped_column(String(32), nullable=False)
     configuration: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
     configuration_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
@@ -302,7 +305,7 @@ class TournamentPoolItem(Uuid7PrimaryKeyMixin, DbBase):
         UniqueConstraint(
             "revision_id",
             "beatmap_revision_id",
-            "mod_set_id",
+            "mods_digest",
             name="uq_tournament_pool_items_revision_map_mods",
         ),
         Index("ix_tournament_pool_items_beatmap", "beatmap_revision_id"),
@@ -315,10 +318,10 @@ class TournamentPoolItem(Uuid7PrimaryKeyMixin, DbBase):
     beatmap_revision_id: Mapped[int] = mapped_column(
         ForeignKey("content.beatmap_revisions.id", ondelete="RESTRICT"), nullable=False
     )
-    scoreboard_id: Mapped[int] = mapped_column(
-        ForeignKey("scoring.scoreboards.id", ondelete="RESTRICT"), nullable=False
-    )
-    mod_set_id: Mapped[int] = mapped_column(ForeignKey("scoring.mod_sets.id", ondelete="RESTRICT"), nullable=False)
+    ruleset: Mapped[Ruleset] = mapped_column(enum_type(Ruleset, "tournament_pool_item_ruleset", 16), nullable=False)
+    mods_details: Mapped[list[dict[str, object]]] = mapped_column(JSONB, nullable=False)
+    mods_acronyms: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    mods_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
     mod_bucket: Mapped[str] = mapped_column(String(16), nullable=False)
     slot_number: Mapped[int] = mapped_column(SmallInteger, nullable=False)
 
@@ -390,7 +393,9 @@ class RoundParticipant(DbBase):
     )
     slot_number: Mapped[int | None] = mapped_column(SmallInteger)
     team_number: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default="0")
-    mod_set_id: Mapped[int] = mapped_column(ForeignKey("scoring.mod_sets.id", ondelete="RESTRICT"), nullable=False)
+    mods_details: Mapped[list[dict[str, object]]] = mapped_column(JSONB, nullable=False)
+    mods_acronyms: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    mods_digest: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
 
 
 class MultiplayerAttempt(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
@@ -543,21 +548,19 @@ class SessionPoolBinding(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
 
 
 class MatchmakingQueue(Uuid7PrimaryKeyMixin, TimestampMixin, DbBase):
-    """Defines queue sizes, rating algorithms, scoreboards, and tournament pools."""
+    """Defines queue sizes, rating algorithms, rulesets, and tournament pools."""
 
     __tablename__ = "matchmaking_queues"
     __table_args__ = (
         CheckConstraint("team_size > 0 AND min_group_size > 0 AND max_group_size >= min_group_size", name="size_range"),
-        UniqueConstraint("scoreboard_id", "name_key"),
-        Index("ix_matchmaking_queues_active_board", "active", "scoreboard_id"),
+        UniqueConstraint("ruleset", "name_key"),
+        Index("ix_matchmaking_queues_active_ruleset", "active", "ruleset"),
         {"schema": "multiplayer"},
     )
 
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     name_key: Mapped[str] = mapped_column(String(100), nullable=False)
-    scoreboard_id: Mapped[int] = mapped_column(
-        ForeignKey("scoring.scoreboards.id", ondelete="RESTRICT"), nullable=False
-    )
+    ruleset: Mapped[Ruleset] = mapped_column(enum_type(Ruleset, "matchmaking_queue_ruleset", 16), nullable=False)
     pool_revision_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("multiplayer.tournament_pool_revisions.id", ondelete="SET NULL")
     )
@@ -738,12 +741,12 @@ class MatchmakingRatingChange(BigIntIdentityMixin, CreatedAtMixin, DbBase):
 
 
 class DailyChallenge(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
-    """Defines a dated challenge with its map, scoreboard, and ranking policy."""
+    """Defines a dated challenge with its map, ruleset, and ranking policy."""
 
     __tablename__ = "daily_challenges"
     __table_args__ = (
         CheckConstraint("ends_at > starts_at", name="valid_period"),
-        UniqueConstraint("challenge_date", "scoreboard_id"),
+        UniqueConstraint("challenge_date", "ruleset"),
         UniqueConstraint("room_id"),
         Index("ix_daily_challenges_status_start", "status", "starts_at"),
         {"schema": "multiplayer"},
@@ -754,9 +757,7 @@ class DailyChallenge(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     playlist_revision_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("multiplayer.playlist_revisions.id", ondelete="RESTRICT"), nullable=False
     )
-    scoreboard_id: Mapped[int] = mapped_column(
-        ForeignKey("scoring.scoreboards.id", ondelete="RESTRICT"), nullable=False
-    )
+    ruleset: Mapped[Ruleset] = mapped_column(enum_type(Ruleset, "daily_challenge_ruleset", 16), nullable=False)
     ranking_policy_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("scoring.ranking_policies.id", ondelete="RESTRICT"), nullable=False
     )

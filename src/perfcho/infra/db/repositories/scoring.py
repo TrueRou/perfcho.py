@@ -5,13 +5,11 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import cast
 
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import InstrumentedAttribute, aliased
-from sqlalchemy.sql.selectable import Select
+from sqlalchemy.sql.selectable import CTE
 
 from perfcho.infra.db.enums import (
     AccountStatus,
@@ -24,9 +22,6 @@ from perfcho.infra.db.enums import (
 )
 from perfcho.infra.db.enums import (
     Ruleset as DbRuleset,
-)
-from perfcho.infra.db.enums import (
-    ScoreboardVariant as DbScoreboardVariant,
 )
 from perfcho.infra.db.enums import (
     ScoreGrade as DbScoreGrade,
@@ -47,8 +42,7 @@ from perfcho.infra.db.models.multiplayer import (
     TournamentPoolItem,
 )
 from perfcho.infra.db.models.scoring import (
-    LeaderboardEntry,
-    ModSet,
+    CalculationRelease,
     PlayAttempt,
     PlayAttemptToken,
     RankingPolicy,
@@ -56,14 +50,11 @@ from perfcho.infra.db.models.scoring import (
     ReplayViewEvent,
     Score,
     ScoreAttestation,
-    Scoreboard,
-    ScoreEligibility,
     ScoreHitStatistic,
     ScorePerformance,
     UserPlayStat,
     UserRankedStat,
 )
-from perfcho.infra.db.mods import project_legacy_mod_bits
 from perfcho.modules.common import AccountUnavailable
 from perfcho.modules.scoring.errors import AttemptIdempotencyConflict, MultiplayerContextRejected, ScoreRejected
 from perfcho.modules.scoring.models import (
@@ -76,21 +67,17 @@ from perfcho.modules.scoring.models import (
     BeatmapReference,
     BeatmapRevisionInfo,
     CanonicalMod,
-    LeaderboardPage,
     LeaderboardScope,
-    LeaderboardScopeKind,
     LeaderboardScoreView,
-    ModSetInfo,
     MultiplayerSubmissionContext,
-    NormalizedModSet,
     PlayAttemptRecord,
     PlayAttemptSubmission,
+    PopulationFilter,
     ReplayReference,
     Ruleset,
     ScoreAcceptanceRecord,
-    ScoreboardInfo,
-    ScoreboardVariant,
     ScoreDetailView,
+    ScoreDimension,
     ScoreGrade,
     ScoreOutcome,
     SoloScoreToken,
@@ -158,66 +145,6 @@ class SqlAlchemyScoringRepository:
             max_combo=row.max_combo,
         )
 
-    async def get_scoreboard(self, ruleset: Ruleset, variant: ScoreboardVariant) -> ScoreboardInfo | None:
-        """Resolve one active canonical scoreboard by gameplay dimensions."""
-        row = (
-            await self._session.execute(
-                select(Scoreboard.id, Scoreboard.code, Scoreboard.ruleset, Scoreboard.variant)
-                .where(
-                    Scoreboard.ruleset == DbRuleset(ruleset.value),
-                    Scoreboard.variant == DbScoreboardVariant(variant.value),
-                    Scoreboard.active.is_(True),
-                )
-                .limit(1)
-            )
-        ).one_or_none()
-        if row is None:
-            return None
-        return ScoreboardInfo(
-            scoreboard_id=row.id,
-            code=row.code,
-            ruleset=Ruleset(row.ruleset.value),
-            variant=ScoreboardVariant(row.variant.value),
-        )
-
-    async def get_or_create_mod_set(self, scoreboard_id: int, normalized: NormalizedModSet) -> ModSetInfo:
-        """Upsert a deterministic canonical mod set for one scoreboard."""
-        scoreboard_variant = await self._session.scalar(
-            select(Scoreboard.variant).where(Scoreboard.id == scoreboard_id)
-        )
-        if scoreboard_variant is None:
-            raise RuntimeError("canonical scoreboard does not exist")
-        compatibility_bits = project_legacy_mod_bits(
-            normalized.mods,
-            ScoreboardVariant(scoreboard_variant.value),
-        )
-        mod_set_id = await self._session.scalar(
-            insert(ModSet)
-            .values(
-                scoreboard_id=scoreboard_id,
-                canonical=list(normalized.canonical),
-                canonical_digest=normalized.canonical_digest,
-                legacy_bits=compatibility_bits,
-            )
-            .on_conflict_do_nothing(index_elements=(ModSet.scoreboard_id, ModSet.canonical_digest))
-            .returning(ModSet.id)
-        )
-        if mod_set_id is None:
-            mod_set_id = await self._session.scalar(
-                select(ModSet.id).where(
-                    ModSet.scoreboard_id == scoreboard_id,
-                    ModSet.canonical_digest == normalized.canonical_digest,
-                )
-            )
-        if mod_set_id is None:
-            raise RuntimeError("canonical mod set conflict did not resolve")
-        return ModSetInfo(
-            mod_set_id=mod_set_id,
-            scoreboard_id=scoreboard_id,
-            canonical=normalized.canonical,
-            canonical_digest=normalized.canonical_digest,
-        )
-
     async def claim_attempt(self, record: PlayAttemptRecord) -> AttemptClaim:
         """Claim independent play-attempt idempotency and return an accepted replay."""
         inserted_id = await self._session.scalar(
@@ -227,8 +154,10 @@ class SqlAlchemyScoringRepository:
                 account_id=record.account_id,
                 beatmap_id=record.beatmap_id,
                 beatmap_revision_id=record.beatmap_revision_id,
-                scoreboard_id=record.scoreboard_id,
-                mod_set_id=record.mod_set_id,
+                ruleset=DbRuleset(record.ruleset.value),
+                mods_details=[mod.as_json() for mod in record.mods],
+                mods_acronyms=sorted(mod.acronym for mod in record.mods),
+                mods_digest=record.mods_digest,
                 protocol=DbClientFamily(record.source),
                 idempotency_key=record.submission.idempotency_key,
                 status=AttemptStatus.SUBMITTED,
@@ -260,8 +189,10 @@ class SqlAlchemyScoringRepository:
         expected = (
             record.beatmap_id,
             record.beatmap_revision_id,
-            record.scoreboard_id,
-            record.mod_set_id,
+            record.ruleset.value,
+            [mod.as_json() for mod in record.mods],
+            sorted(mod.acronym for mod in record.mods),
+            record.mods_digest,
             record.submission.started_at,
             record.submission.ended_at,
             record.outcome.value,
@@ -271,8 +202,10 @@ class SqlAlchemyScoringRepository:
         actual = (
             attempt.beatmap_id,
             attempt.beatmap_revision_id,
-            attempt.scoreboard_id,
-            attempt.mod_set_id,
+            attempt.ruleset.value,
+            attempt.mods_details,
+            attempt.mods_acronyms,
+            attempt.mods_digest,
             attempt.started_at,
             attempt.ended_at,
             attempt.outcome.value if attempt.outcome is not None else None,
@@ -291,8 +224,10 @@ class SqlAlchemyScoringRepository:
             account_id=record.account_id,
             beatmap_id=record.revision.beatmap_id,
             beatmap_revision_id=record.revision.revision_id,
-            scoreboard_id=record.scoreboard.scoreboard_id,
-            mod_set_id=record.mod_set.mod_set_id,
+            ruleset=DbRuleset(record.ruleset.value),
+            mods_details=[mod.as_json() for mod in record.mods],
+            mods_acronyms=sorted(mod.acronym for mod in record.mods),
+            mods_digest=record.mods_digest,
             total_score=record.score.total_score,
             classic_score=record.score.classic_score,
             accuracy=record.validated.accuracy,
@@ -358,8 +293,9 @@ class SqlAlchemyScoringRepository:
             score_id=score_id,
             beatmap_id=record.revision.beatmap_id,
             beatmap_revision_id=record.revision.revision_id,
-            scoreboard_id=record.scoreboard.scoreboard_id,
-            mod_set_id=record.mod_set.mod_set_id,
+            ruleset=record.ruleset,
+            mods=record.mods,
+            mods_digest=record.mods_digest,
             outcome=record.score.outcome,
         )
 
@@ -470,8 +406,9 @@ class SqlAlchemyScoringRepository:
                     Score.id,
                     Score.beatmap_id,
                     Score.beatmap_revision_id,
-                    Score.scoreboard_id,
-                    Score.mod_set_id,
+                    Score.ruleset,
+                    Score.mods_details,
+                    Score.mods_digest,
                     Score.outcome,
                 ).where(Score.id == score_id)
             )
@@ -483,8 +420,9 @@ class SqlAlchemyScoringRepository:
             score_id=row.id,
             beatmap_id=row.beatmap_id,
             beatmap_revision_id=row.beatmap_revision_id,
-            scoreboard_id=row.scoreboard_id,
-            mod_set_id=row.mod_set_id,
+            ruleset=Ruleset(row.ruleset.value),
+            mods=_canonical_mods(row.mods_details),
+            mods_digest=row.mods_digest,
             outcome=ScoreOutcome(row.outcome.value),
         )
 
@@ -495,14 +433,13 @@ class SqlAlchemyScoringRepository:
                 select(
                     Replay.score_id,
                     Score.account_id,
-                    Score.scoreboard_id,
-                    Scoreboard.ruleset,
+                    Score.ruleset,
+                    Score.mods_digest,
                     Replay.storage_key,
                     Replay.size_bytes,
                     Replay.format,
                 )
                 .join(Score, Score.id == Replay.score_id)
-                .join(Scoreboard, Scoreboard.id == Score.scoreboard_id)
                 .where(Replay.score_id == score_id, Replay.state == "ready")
                 .limit(1)
             )
@@ -512,8 +449,8 @@ class SqlAlchemyScoringRepository:
         return ReplayReference(
             score_id=row.score_id,
             owner_account_id=row.account_id,
-            scoreboard_id=row.scoreboard_id,
             ruleset=Ruleset(row.ruleset.value),
+            mods_digest=row.mods_digest,
             storage_key=row.storage_key,
             size_bytes=row.size_bytes,
             format=row.format,
@@ -541,167 +478,32 @@ class SqlAlchemyScoringRepository:
         )
         return inserted is not None
 
-    async def get_leaderboard(
-        self,
-        *,
-        beatmap_id: int,
-        ruleset: Ruleset,
-        variant: ScoreboardVariant,
-        scope: LeaderboardScope,
-        requester_account_id: int,
-        limit: int,
-    ) -> LeaderboardPage:
-        """Read one Stable page from active ranking-policy projections."""
-        order = (
-            LeaderboardEntry.metric_value.desc(),
-            LeaderboardEntry.tie_break_value.desc(),
-            LeaderboardEntry.score_id.asc(),
-        )
-        db_scope = "exact_mods" if scope.kind is LeaderboardScopeKind.EXACT_MODS else "overall"
-        candidate_statement = (
-            select(
-                LeaderboardEntry.id.label("entry_id"),
-                LeaderboardEntry.account_id,
-                LeaderboardEntry.metric_value,
-                LeaderboardEntry.tie_break_value,
-                LeaderboardEntry.score_id,
-            )
-            .join(RankingPolicy, RankingPolicy.id == LeaderboardEntry.policy_id)
-            .join(Scoreboard, Scoreboard.id == RankingPolicy.scoreboard_id)
-            .where(
-                Scoreboard.ruleset == DbRuleset(ruleset.value),
-                Scoreboard.variant == DbScoreboardVariant(variant.value),
-                Scoreboard.active.is_(True),
-                RankingPolicy.active.is_(True),
-                RankingPolicy.is_default.is_(True),
-                LeaderboardEntry.beatmap_id == beatmap_id,
-                LeaderboardEntry.scope == db_scope,
-            )
-        )
-        if scope.kind is LeaderboardScopeKind.EXACT_MODS:
-            filter_mod_set = aliased(ModSet)
-            candidate_statement = candidate_statement.join(
-                filter_mod_set,
-                (filter_mod_set.id == LeaderboardEntry.filter_mod_set_id)
-                & (filter_mod_set.scoreboard_id == RankingPolicy.scoreboard_id),
-            ).where(_mod_acronyms_expression(filter_mod_set.canonical) == sorted(scope.mod_acronyms or ()))
-        else:
-            candidate_statement = candidate_statement.where(LeaderboardEntry.filter_mod_set_id.is_(None))
-        if scope.kind is LeaderboardScopeKind.FRIENDS:
-            candidate_statement = candidate_statement.where(
-                LeaderboardEntry.account_id.in_(set(scope.account_ids or ()) | {requester_account_id})
-            )
-        elif scope.kind is LeaderboardScopeKind.COUNTRY:
-            candidate_statement = candidate_statement.where(LeaderboardEntry.country_code == scope.country_code)
-
-        if scope.kind is LeaderboardScopeKind.EXACT_MODS:
-            mod_candidates = candidate_statement.add_columns(
-                func.row_number()
-                .over(
-                    partition_by=LeaderboardEntry.account_id,
-                    order_by=order,
-                )
-                .label("account_position")
-            ).cte("stable_mod_leaderboard_candidates")
-            candidates = (
-                select(
-                    mod_candidates.c.entry_id,
-                    mod_candidates.c.account_id,
-                    mod_candidates.c.metric_value,
-                    mod_candidates.c.tie_break_value,
-                    mod_candidates.c.score_id,
-                )
-                .where(mod_candidates.c.account_position == 1)
-                .cte("stable_leaderboard_candidates")
-            )
-        else:
-            candidates = candidate_statement.cte("stable_leaderboard_candidates")
-        ranked_entries = select(
-            candidates.c.entry_id,
-            candidates.c.account_id,
-            func.row_number()
-            .over(
-                order_by=(
-                    candidates.c.metric_value.desc(),
-                    candidates.c.tie_break_value.desc(),
-                    candidates.c.score_id.asc(),
-                )
-            )
-            .label("rank"),
-        ).cte("stable_ranked_leaderboard_entries")
-        rows = (
-            await self._session.execute(
-                _leaderboard_row_statement()
-                .add_columns(ranked_entries.c.rank)
-                .join(ranked_entries, ranked_entries.c.entry_id == LeaderboardEntry.id)
-                .where(
-                    or_(
-                        ranked_entries.c.rank <= limit,
-                        ranked_entries.c.account_id == requester_account_id,
-                    )
-                )
-                .order_by(ranked_entries.c.rank)
-            )
-        ).all()
-        top_rows = tuple(row for row in rows if row.rank <= limit)
-        personal_row = next(
-            (row for row in rows if row.account_id == requester_account_id),
-            None,
-        )
-        score_ids = {row.score_id for row in top_rows}
-        if personal_row is not None:
-            score_ids.add(personal_row.score_id)
-        hits = await self._score_hits(score_ids)
-        scores = tuple(
-            _leaderboard_view(row._tuple(), ruleset=ruleset, hits=hits.get(row.score_id, {})) for row in top_rows
-        )
-        personal_best = None
-        if personal_row is not None:
-            personal_best = _leaderboard_view(
-                personal_row._tuple(),
-                ruleset=ruleset,
-                hits=hits.get(personal_row.score_id, {}),
-            )
-        total_count = int(await self._session.scalar(select(func.count()).select_from(candidates)) or 0)
-        return LeaderboardPage(scores, personal_best, total_count)
-
     async def get_score_detail(self, score_id: int) -> ScoreDetailView | None:
-        """Read immutable score facts and the current default-policy projection."""
+        """Read immutable score facts and its live classic-score position."""
+        pp = (
+            select(ScorePerformance.pp)
+            .join(CalculationRelease, CalculationRelease.id == ScorePerformance.release_id)
+            .where(
+                ScorePerformance.score_id == Score.id,
+                CalculationRelease.ruleset == Score.ruleset,
+                CalculationRelease.active.is_(True),
+            )
+            .order_by(CalculationRelease.version, CalculationRelease.id)
+            .limit(1)
+            .correlate(Score)
+            .scalar_subquery()
+        )
         row = (
             await self._session.execute(
                 select(
                     Score,
-                    Scoreboard.ruleset,
-                    Scoreboard.variant,
-                    ModSet.canonical,
                     AccountName.display_name,
                     Account.country_code,
-                    RankingPolicy.id.label("policy_id"),
-                    RankingPolicy.calculation_release_id,
-                    ScoreEligibility.state.label("eligibility_state"),
-                    ScoreEligibility.reason.label("eligibility_reason"),
-                    ScorePerformance.pp,
+                    pp.label("pp"),
                     Replay.score_id.label("replay_score_id"),
                 )
-                .join(Scoreboard, Scoreboard.id == Score.scoreboard_id)
-                .join(ModSet, ModSet.id == Score.mod_set_id)
                 .join(Account, Account.id == Score.account_id)
                 .join(AccountName, and_(AccountName.account_id == Score.account_id, AccountName.ended_at.is_(None)))
-                .outerjoin(
-                    RankingPolicy,
-                    (RankingPolicy.scoreboard_id == Score.scoreboard_id)
-                    & RankingPolicy.active.is_(True)
-                    & RankingPolicy.is_default.is_(True),
-                )
-                .outerjoin(
-                    ScoreEligibility,
-                    (ScoreEligibility.score_id == Score.id) & (ScoreEligibility.policy_id == RankingPolicy.id),
-                )
-                .outerjoin(
-                    ScorePerformance,
-                    (ScorePerformance.score_id == Score.id)
-                    & (ScorePerformance.release_id == RankingPolicy.calculation_release_id),
-                )
                 .outerjoin(Replay, and_(Replay.score_id == Score.id, Replay.state == "ready"))
                 .where(Score.id == score_id)
             )
@@ -711,88 +513,72 @@ class SqlAlchemyScoringRepository:
         score = row.Score
         hits = await self._score_hits_with_maximum({score_id})
         statistics, maximum_statistics = hits.get(score_id, ({}, {}))
-        policy_eligible = row.eligibility_state == "eligible" or row.eligibility_reason == "performance_pending"
-        position = await self._score_position(score, row.policy_id) if row.policy_id is not None else None
+        position = await self._score_position(score)
         return ScoreDetailView(
             score_id=score.id,
             account_id=score.account_id,
             display_name=row.display_name,
             country_code=row.country_code,
             beatmap_id=score.beatmap_id,
-            ruleset=Ruleset(row.ruleset.value),
-            variant=ScoreboardVariant(row.variant.value),
+            ruleset=Ruleset(score.ruleset.value),
             total_score=score.total_score,
             classic_score=score.classic_score,
             accuracy=score.accuracy,
             max_combo=score.max_combo,
             grade=ScoreGrade(score.grade.value),
             outcome=ScoreOutcome(score.outcome.value),
-            mods=tuple(
-                CanonicalMod(str(value["acronym"]), cast(dict[str, object], value.get("settings", {})))
-                for value in row.canonical
-            ),
+            mods=_canonical_mods(score.mods_details),
             statistics=statistics,
             maximum_statistics=maximum_statistics,
             started_at=score.started_at,
             ended_at=score.ended_at,
             has_replay=row.replay_score_id is not None,
-            ranked=policy_eligible,
+            ranked=score.outcome is DbScoreOutcome.PASSED,
             pp=row.pp,
             position=position,
         )
 
-    async def _score_position(self, score: Score, policy_id: uuid.UUID) -> int | None:
-        entry = await self._session.execute(
-            select(LeaderboardEntry.metric_value, LeaderboardEntry.tie_break_value).where(
-                LeaderboardEntry.policy_id == policy_id,
-                LeaderboardEntry.beatmap_id == score.beatmap_id,
-                LeaderboardEntry.account_id == score.account_id,
-                LeaderboardEntry.scope == "overall",
-                LeaderboardEntry.filter_mod_set_id.is_(None),
-                LeaderboardEntry.score_id == score.id,
-            )
-        )
-        row = entry.one_or_none()
-        if row is None:
+    async def _score_position(self, score: Score) -> int | None:
+        if score.outcome is not DbScoreOutcome.PASSED:
             return None
-        ahead = await self._session.scalar(
+        better_personal = await self._session.scalar(
             select(func.count())
-            .select_from(LeaderboardEntry)
+            .select_from(Score)
             .where(
-                LeaderboardEntry.policy_id == policy_id,
-                LeaderboardEntry.beatmap_id == score.beatmap_id,
-                LeaderboardEntry.scope == "overall",
-                LeaderboardEntry.filter_mod_set_id.is_(None),
+                Score.account_id == score.account_id,
+                Score.beatmap_id == score.beatmap_id,
+                Score.ruleset == score.ruleset,
+                Score.outcome == DbScoreOutcome.PASSED,
                 or_(
-                    LeaderboardEntry.metric_value > row.metric_value,
+                    Score.classic_score > score.classic_score,
                     and_(
-                        LeaderboardEntry.metric_value == row.metric_value,
-                        LeaderboardEntry.tie_break_value > row.tie_break_value,
-                    ),
-                    and_(
-                        LeaderboardEntry.metric_value == row.metric_value,
-                        LeaderboardEntry.tie_break_value == row.tie_break_value,
-                        LeaderboardEntry.score_id < score.id,
+                        Score.classic_score == score.classic_score,
+                        or_(
+                            Score.ended_at < score.ended_at, and_(Score.ended_at == score.ended_at, Score.id < score.id)
+                        ),
                     ),
                 ),
             )
         )
-        return int(ahead or 0) + 1
+        if better_personal:
+            return None
+        ranked = self._ranked_scores(score.beatmap_id, Ruleset(score.ruleset.value), LeaderboardScope.overall())
+        return int(await self._session.scalar(select(ranked.c.rank).where(ranked.c.score_id == score.id)) or 0) or None
 
     async def get_public_leaderboard(
-        self, *, beatmap_id: int, ruleset: Ruleset, variant: ScoreboardVariant, scope: LeaderboardScope, limit: int
+        self, *, beatmap_id: int, ruleset: Ruleset, scope: LeaderboardScope, limit: int
     ) -> tuple[LeaderboardScoreView, ...]:
-        """Return public rows using the common leaderboard query."""
+        """Return live passed-score personal bests ranked by classic score."""
         return await self._query_leaderboard_rows(
-            beatmap_id=beatmap_id, ruleset=ruleset, variant=variant, scope=scope, limit=limit, account_id=None
+            beatmap_id=beatmap_id, ruleset=ruleset, scope=scope, limit=limit, account_id=None
         )
 
     async def get_personal_leaderboard(
-        self, *, beatmap_id: int, ruleset: Ruleset, variant: ScoreboardVariant, scope: LeaderboardScope, account_id: int
+        self, *, beatmap_id: int, ruleset: Ruleset, scope: LeaderboardScope, account_id: int
     ) -> LeaderboardScoreView | None:
         """Return the account row using the common leaderboard query."""
         rows = await self._query_leaderboard_rows(
-            beatmap_id=beatmap_id, ruleset=ruleset, variant=variant, scope=scope, limit=1, account_id=account_id
+            beatmap_id=beatmap_id, ruleset=ruleset, scope=scope, limit=1, account_id=account_id
         )
         return rows[0] if rows else None
 
@@ -801,149 +587,111 @@ class SqlAlchemyScoringRepository:
         *,
         beatmap_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
         scope: LeaderboardScope,
         limit: int,
         account_id: int | None,
     ) -> tuple[LeaderboardScoreView, ...]:
-        """Run the bounded leaderboard query for public or one-account rows."""
-        db_scope = "exact_mods" if scope.kind is LeaderboardScopeKind.EXACT_MODS else "overall"
-        statement = (
-            select(
-                LeaderboardEntry.account_id,
-                LeaderboardEntry.metric_value,
-                LeaderboardEntry.tie_break_value,
-                LeaderboardEntry.score_id,
-            )
-            .join(RankingPolicy, RankingPolicy.id == LeaderboardEntry.policy_id)
-            .join(Scoreboard, Scoreboard.id == RankingPolicy.scoreboard_id)
-            .where(
-                Scoreboard.ruleset == DbRuleset(ruleset.value),
-                Scoreboard.variant == DbScoreboardVariant(variant.value),
-                Scoreboard.active.is_(True),
-                RankingPolicy.active.is_(True),
-                RankingPolicy.is_default.is_(True),
-                LeaderboardEntry.beatmap_id == beatmap_id,
-                LeaderboardEntry.scope == db_scope,
-            )
-        )
-        if scope.kind is LeaderboardScopeKind.EXACT_MODS:
-            filter_mod_set = aliased(ModSet)
-            statement = statement.join(
-                filter_mod_set,
-                (filter_mod_set.id == LeaderboardEntry.filter_mod_set_id)
-                & (filter_mod_set.scoreboard_id == RankingPolicy.scoreboard_id),
-            ).where(_mod_acronyms_expression(filter_mod_set.canonical) == sorted(scope.mod_acronyms or ()))
-        else:
-            statement = statement.where(LeaderboardEntry.filter_mod_set_id.is_(None))
-        if scope.kind is LeaderboardScopeKind.FRIENDS:
-            account_ids = set(scope.account_ids or ())
-            if account_id is not None:
-                account_ids.add(account_id)
-            statement = statement.where(LeaderboardEntry.account_id.in_(account_ids))
-        elif scope.kind is LeaderboardScopeKind.COUNTRY:
-            statement = statement.where(LeaderboardEntry.country_code == scope.country_code)
+        """Run the bounded live leaderboard query for public or one-account rows."""
+        ranked = self._ranked_scores(beatmap_id, ruleset, scope)
+        statement = select(ranked)
         if account_id is not None:
-            statement = statement.where(LeaderboardEntry.account_id == account_id)
-        candidates = statement.cte("leaderboard_rows")
-        ranked_order = (
-            candidates.c.metric_value.desc(),
-            candidates.c.tie_break_value.desc(),
-            candidates.c.score_id.asc(),
-        )
-        ranked = (
-            select(
-                candidates,
-                func.row_number().over(order_by=ranked_order).label("rank"),
-            )
-            .order_by(*ranked_order)
-            .limit(limit)
-            .subquery()
-        )
+            statement = statement.where(ranked.c.account_id == account_id)
         rows = (
             await self._session.execute(
-                _leaderboard_row_statement()
-                .add_columns(ranked.c.rank)
-                .join(ranked, ranked.c.score_id == LeaderboardEntry.score_id)
+                statement.join(
+                    AccountName, and_(AccountName.account_id == ranked.c.account_id, AccountName.ended_at.is_(None))
+                )
+                .outerjoin(Replay, and_(Replay.score_id == ranked.c.score_id, Replay.state == "ready"))
+                .add_columns(AccountName.display_name, Replay.score_id.label("replay_score_id"))
+                .order_by(ranked.c.rank)
+                .limit(limit)
             )
         ).all()
         score_ids = {row.score_id for row in rows}
         hits = await self._score_hits(score_ids)
         return tuple(_leaderboard_view(row._tuple(), ruleset=ruleset, hits=hits.get(row.score_id, {})) for row in rows)
 
+    def _ranked_scores(self, beatmap_id: int, ruleset: Ruleset, scope: LeaderboardScope) -> CTE:
+        order = (Score.classic_score.desc(), Score.ended_at.asc(), Score.id.asc())
+        statement = (
+            select(
+                Score.id.label("score_id"),
+                Score.account_id,
+                Score.classic_score.label("metric_value"),
+                Score.max_combo,
+                Score.perfect,
+                Score.ended_at,
+                Score.mods_details,
+                func.row_number().over(partition_by=Score.account_id, order_by=order).label("account_position"),
+            )
+            .join(Account, Account.id == Score.account_id)
+            .where(
+                Score.beatmap_id == beatmap_id,
+                Score.ruleset == DbRuleset(ruleset.value),
+                Score.outcome == DbScoreOutcome.PASSED,
+            )
+        )
+        if scope.dimension is ScoreDimension.EXACT_MODS:
+            statement = statement.where(Score.mods_acronyms == sorted(scope.mod_acronyms or ()))
+        if scope.population is PopulationFilter.FRIENDS:
+            statement = statement.where(Score.account_id.in_(scope.account_ids or ()))
+        elif scope.population is PopulationFilter.COUNTRY:
+            statement = statement.where(Account.country_code == scope.country_code)
+        personal_bests = statement.cte("live_score_personal_bests")
+        return (
+            select(
+                personal_bests.c.score_id,
+                personal_bests.c.account_id,
+                personal_bests.c.metric_value,
+                personal_bests.c.max_combo,
+                personal_bests.c.perfect,
+                personal_bests.c.ended_at,
+                personal_bests.c.mods_details,
+                func.row_number()
+                .over(
+                    order_by=(
+                        personal_bests.c.metric_value.desc(),
+                        personal_bests.c.ended_at.asc(),
+                        personal_bests.c.score_id.asc(),
+                    )
+                )
+                .label("rank"),
+            )
+            .where(personal_bests.c.account_position == 1)
+            .cte("live_ranked_scores")
+        )
+
     async def get_leaderboard_count(
         self,
         *,
         beatmap_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
         scope: LeaderboardScope,
     ) -> int:
         """Return the complete account count after exact-mod setting variants merge."""
         rows = await self._query_leaderboard_rows(
             beatmap_id=beatmap_id,
             ruleset=ruleset,
-            variant=variant,
             scope=scope,
             limit=100,
             account_id=None,
         )
         if len(rows) < 100:
             return len(rows)
-        return await self._leaderboard_count_query(beatmap_id, ruleset, variant, scope)
-
-    async def _leaderboard_count_query(
-        self,
-        beatmap_id: int,
-        ruleset: Ruleset,
-        variant: ScoreboardVariant,
-        scope: LeaderboardScope,
-    ) -> int:
-        statement = (
-            select(LeaderboardEntry.account_id)
-            .join(RankingPolicy, RankingPolicy.id == LeaderboardEntry.policy_id)
-            .join(Scoreboard, Scoreboard.id == RankingPolicy.scoreboard_id)
-            .where(
-                Scoreboard.ruleset == DbRuleset(ruleset.value),
-                Scoreboard.variant == DbScoreboardVariant(variant.value),
-                Scoreboard.active.is_(True),
-                RankingPolicy.active.is_(True),
-                RankingPolicy.is_default.is_(True),
-                LeaderboardEntry.beatmap_id == beatmap_id,
-            )
-        )
-        if scope.kind is LeaderboardScopeKind.EXACT_MODS:
-            filter_mod_set = aliased(ModSet)
-            statement = statement.join(filter_mod_set, filter_mod_set.id == LeaderboardEntry.filter_mod_set_id).where(
-                LeaderboardEntry.scope == "exact_mods",
-                _mod_acronyms_expression(filter_mod_set.canonical) == sorted(scope.mod_acronyms or ()),
-            )
-        else:
-            statement = statement.where(
-                LeaderboardEntry.scope == "overall",
-                LeaderboardEntry.filter_mod_set_id.is_(None),
-            )
-        if scope.kind is LeaderboardScopeKind.FRIENDS:
-            statement = statement.where(LeaderboardEntry.account_id.in_(scope.account_ids or ()))
-        elif scope.kind is LeaderboardScopeKind.COUNTRY:
-            statement = statement.where(LeaderboardEntry.country_code == scope.country_code)
-        return int(
-            await self._session.scalar(select(func.count(func.distinct(statement.subquery().c.account_id)))) or 0
-        )
+        ranked = self._ranked_scores(beatmap_id, ruleset, scope)
+        return int(await self._session.scalar(select(func.count()).select_from(ranked)) or 0)
 
     async def get_account_stats(
         self,
         account_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
     ) -> AccountStatsView:
-        """Compose factual play totals with default-policy ranked statistics."""
+        """Compose factual play totals with the first active ruleset policy."""
         row = (
             await self._session.execute(
                 select(
-                    Scoreboard.id.label("scoreboard_id"),
                     RankingPolicy.id.label("policy_id"),
-                    RankingPolicy.metric,
+                    RankingPolicy.configuration,
                     UserPlayStat.play_count,
                     UserPlayStat.total_score,
                     UserPlayStat.play_time_ms,
@@ -956,61 +704,56 @@ class SqlAlchemyScoringRepository:
                     UserRankedStat.grade_counts,
                     Account.country_code,
                 )
-                .select_from(Scoreboard)
-                .outerjoin(
-                    UserPlayStat,
-                    (UserPlayStat.scoreboard_id == Scoreboard.id) & (UserPlayStat.account_id == account_id),
-                )
+                .select_from(UserPlayStat)
                 .outerjoin(
                     RankingPolicy,
-                    (RankingPolicy.scoreboard_id == Scoreboard.id)
-                    & RankingPolicy.active.is_(True)
-                    & RankingPolicy.is_default.is_(True),
+                    (RankingPolicy.ruleset == UserPlayStat.ruleset) & RankingPolicy.active.is_(True),
                 )
                 .outerjoin(
                     UserRankedStat,
                     (UserRankedStat.policy_id == RankingPolicy.id) & (UserRankedStat.account_id == account_id),
                 )
-                .outerjoin(Account, Account.id == account_id)
+                .outerjoin(Account, Account.id == UserPlayStat.account_id)
                 .where(
-                    Scoreboard.ruleset == DbRuleset(ruleset.value),
-                    Scoreboard.variant == DbScoreboardVariant(variant.value),
-                    Scoreboard.active.is_(True),
+                    UserPlayStat.account_id == account_id,
+                    UserPlayStat.ruleset == DbRuleset(ruleset.value),
                 )
+                .order_by(RankingPolicy.code)
                 .limit(1)
             )
         ).one_or_none()
         if row is None:
             return AccountStatsView(0, Decimal(0), 0, 0, 0)
         global_rank = 0
-        country_rank = None
+        country_rank: int | None = None
         if row.policy_id is not None:
-            rank_column: InstrumentedAttribute[Decimal] | InstrumentedAttribute[int]
-            if row.metric == "pp":
-                rank_column = UserRankedStat.performance
-                rank_value = row.performance
-            else:
-                rank_column = UserRankedStat.ranked_score
-                rank_value = row.ranked_score
+            metric = str(row.configuration.get("metric", "classic_score"))
+            rank_value = row.performance if metric == "pp" else row.ranked_score
             if rank_value is not None and rank_value > 0:
+                rank_filter = (
+                    UserRankedStat.performance > rank_value
+                    if metric == "pp"
+                    else UserRankedStat.ranked_score > rank_value
+                )
                 higher = await self._session.scalar(
                     select(func.count())
                     .select_from(UserRankedStat)
                     .where(
                         UserRankedStat.policy_id == row.policy_id,
-                        rank_column > rank_value,
+                        rank_filter,
                     )
                 )
                 global_rank = int(higher or 0) + 1
-                if getattr(row, "country_code", None):
+                country_code = await self._session.scalar(select(Account.country_code).where(Account.id == account_id))
+                if country_code:
                     country_higher = await self._session.scalar(
                         select(func.count())
                         .select_from(UserRankedStat)
                         .join(Account, Account.id == UserRankedStat.account_id)
                         .where(
                             UserRankedStat.policy_id == row.policy_id,
-                            Account.country_code == row.country_code,
-                            rank_column > rank_value,
+                            Account.country_code == country_code,
+                            rank_filter,
                         )
                     )
                     country_rank = int(country_higher or 0) + 1
@@ -1034,23 +777,31 @@ class SqlAlchemyScoringRepository:
         account_id: int,
         beatmap_ids: tuple[int, ...],
     ) -> tuple[BeatmapGradeView, ...]:
-        """Return grades backed by active vanilla overall personal-best projections."""
+        """Return each ruleset's best passed classic-score grade per beatmap."""
+        candidates = (
+            select(
+                Score.beatmap_id,
+                Score.ruleset,
+                Score.grade,
+                func.row_number()
+                .over(
+                    partition_by=(Score.beatmap_id, Score.ruleset),
+                    order_by=(Score.classic_score.desc(), Score.ended_at.asc(), Score.id.asc()),
+                )
+                .label("position"),
+            )
+            .where(
+                Score.account_id == account_id,
+                Score.beatmap_id.in_(set(beatmap_ids)),
+                Score.outcome == DbScoreOutcome.PASSED,
+            )
+            .cte("account_beatmap_grades")
+        )
         rows = (
             await self._session.execute(
-                select(LeaderboardEntry.beatmap_id, Scoreboard.ruleset, Score.grade)
-                .join(RankingPolicy, RankingPolicy.id == LeaderboardEntry.policy_id)
-                .join(Scoreboard, Scoreboard.id == RankingPolicy.scoreboard_id)
-                .join(Score, Score.id == LeaderboardEntry.score_id)
-                .where(
-                    LeaderboardEntry.account_id == account_id,
-                    LeaderboardEntry.beatmap_id.in_(set(beatmap_ids)),
-                    LeaderboardEntry.scope == "overall",
-                    LeaderboardEntry.filter_mod_set_id.is_(None),
-                    RankingPolicy.active.is_(True),
-                    RankingPolicy.is_default.is_(True),
-                    Scoreboard.variant == DbScoreboardVariant.VANILLA,
-                )
-                .order_by(LeaderboardEntry.beatmap_id, Scoreboard.id)
+                select(candidates.c.beatmap_id, candidates.c.ruleset, candidates.c.grade)
+                .where(candidates.c.position == 1)
+                .order_by(candidates.c.beatmap_id, candidates.c.ruleset)
             )
         ).all()
         return tuple(
@@ -1108,8 +859,9 @@ class SqlAlchemyScoringRepository:
                     Score.attempt_id,
                     Score.beatmap_id,
                     Score.beatmap_revision_id,
-                    Score.scoreboard_id,
-                    Score.mod_set_id,
+                    Score.ruleset,
+                    Score.mods_details,
+                    Score.mods_digest,
                     Score.outcome,
                 ).where(Score.attempt_id == attempt_id)
             )
@@ -1121,8 +873,9 @@ class SqlAlchemyScoringRepository:
             score_id=row.id,
             beatmap_id=row.beatmap_id,
             beatmap_revision_id=row.beatmap_revision_id,
-            scoreboard_id=row.scoreboard_id,
-            mod_set_id=row.mod_set_id,
+            ruleset=Ruleset(row.ruleset.value),
+            mods=_canonical_mods(row.mods_details),
+            mods_digest=row.mods_digest,
             outcome=ScoreOutcome(row.outcome.value),
         )
 
@@ -1174,8 +927,9 @@ class SqlAlchemyMultiplayerSubmissionValidator:
         *,
         account_id: int,
         revision: BeatmapRevisionInfo,
-        scoreboard: ScoreboardInfo,
-        mod_set: ModSetInfo,
+        ruleset: Ruleset,
+        mods: tuple[CanonicalMod, ...],
+        mods_digest: bytes,
         attempt: PlayAttemptSubmission,
         at: datetime,
     ) -> None:
@@ -1188,37 +942,38 @@ class SqlAlchemyMultiplayerSubmissionValidator:
             or attempt_row.score_id is not None
         ):
             raise MultiplayerContextRejected("multiplayer attempt is unavailable")
-        lifecycle = (
-            await self._session.execute(
-                select(Round, MultiplayerSession)
-                .join(MultiplayerSession, MultiplayerSession.id == Round.session_id)
-                .where(Round.id == attempt_row.round_id)
-                .with_for_update(of=(Round, MultiplayerSession))
-            )
-        ).one_or_none()
-        if lifecycle is None:
-            raise MultiplayerContextRejected("multiplayer round is unavailable")
-        round_row, session = lifecycle
-        if round_row.status not in {"in_progress", "completed", "aborted"} or session.status not in {
-            SessionStatus.ACTIVE,
-            SessionStatus.COMPLETED,
-            SessionStatus.ABORTED,
-        }:
-            raise MultiplayerContextRejected("multiplayer round or session is not scoreable")
-        if round_row.started_at is None or attempt.started_at < round_row.started_at:
-            raise MultiplayerContextRejected("score started before its multiplayer round")
-        if round_row.ended_at is not None and attempt.ended_at > round_row.ended_at:
-            raise MultiplayerContextRejected("score ended after its multiplayer round")
-        if round_row.ended_at is None and attempt.ended_at > at:
-            raise MultiplayerContextRejected("score ended in the future")
+        if attempt_row.round_id is not None:
+            lifecycle = (
+                await self._session.execute(
+                    select(Round, MultiplayerSession)
+                    .join(MultiplayerSession, MultiplayerSession.id == Round.session_id)
+                    .where(Round.id == attempt_row.round_id)
+                    .with_for_update(of=(Round, MultiplayerSession))
+                )
+            ).one_or_none()
+            if lifecycle is None:
+                raise MultiplayerContextRejected("multiplayer round is unavailable")
+            round_row, session = lifecycle
+            if round_row.status not in {"in_progress", "completed", "aborted"} or session.status not in {
+                SessionStatus.ACTIVE,
+                SessionStatus.COMPLETED,
+                SessionStatus.ABORTED,
+            }:
+                raise MultiplayerContextRejected("multiplayer round or session is not scoreable")
+            if round_row.started_at is None or attempt.started_at < round_row.started_at:
+                raise MultiplayerContextRejected("score started before its multiplayer round")
+            if round_row.ended_at is not None and attempt.ended_at > round_row.ended_at:
+                raise MultiplayerContextRejected("score ended after its multiplayer round")
+            if round_row.ended_at is None and attempt.ended_at > at:
+                raise MultiplayerContextRejected("score ended in the future")
         dimensions = await self._submission_dimensions(attempt_row)
         if dimensions is None:
             raise MultiplayerContextRejected("multiplayer attempt has no frozen scoring dimensions")
-        expected_revision_id, expected_scoreboard_id, required_mod_set_id = dimensions
-        if expected_revision_id != revision.revision_id or expected_scoreboard_id != scoreboard.scoreboard_id:
+        expected_revision_id, expected_ruleset, expected_mods_details, expected_mods_digest = dimensions
+        if expected_revision_id != revision.revision_id or expected_ruleset is not DbRuleset(ruleset.value):
             raise MultiplayerContextRejected("multiplayer attempt dimensions do not match the score")
-        if required_mod_set_id is not None and required_mod_set_id != mod_set.mod_set_id:
-            raise MultiplayerContextRejected("multiplayer attempt mod set does not match the score")
+        if expected_mods_details != [mod.as_json() for mod in mods] or expected_mods_digest != mods_digest:
+            raise MultiplayerContextRejected("multiplayer attempt mods do not match the score")
 
     async def bind_score(
         self,
@@ -1264,14 +1019,17 @@ class SqlAlchemyMultiplayerSubmissionValidator:
             raise MultiplayerContextRejected("multiplayer attempt is unavailable")
         return attempt
 
-    async def _submission_dimensions(self, attempt: MultiplayerAttempt) -> tuple[int, int, int | None] | None:
+    async def _submission_dimensions(
+        self, attempt: MultiplayerAttempt
+    ) -> tuple[int, DbRuleset, list[dict[str, object]], bytes] | None:
         if attempt.playlist_revision_id is not None:
             playlist_row = (
                 await self._session.execute(
                     select(
                         PlaylistRevision.beatmap_revision_id,
-                        PlaylistRevision.scoreboard_id,
-                        PlaylistRevision.required_mod_set_id,
+                        PlaylistRevision.ruleset,
+                        PlaylistRevision.required_mods_details,
+                        PlaylistRevision.required_mods_digest,
                     ).where(PlaylistRevision.id == attempt.playlist_revision_id)
                 )
             ).one_or_none()
@@ -1284,12 +1042,15 @@ class SqlAlchemyMultiplayerSubmissionValidator:
             await self._session.execute(
                 select(
                     PlaylistRevision.beatmap_revision_id,
-                    PlaylistRevision.scoreboard_id,
-                    PlaylistRevision.required_mod_set_id,
-                    RoundParticipant.mod_set_id.label("participant_mod_set_id"),
+                    PlaylistRevision.ruleset,
+                    PlaylistRevision.required_mods_details,
+                    PlaylistRevision.required_mods_digest,
+                    RoundParticipant.mods_details.label("participant_mods_details"),
+                    RoundParticipant.mods_digest.label("participant_mods_digest"),
                     TournamentPoolItem.beatmap_revision_id.label("pool_revision_id"),
-                    TournamentPoolItem.scoreboard_id.label("pool_scoreboard_id"),
-                    TournamentPoolItem.mod_set_id.label("pool_mod_set_id"),
+                    TournamentPoolItem.ruleset.label("pool_ruleset"),
+                    TournamentPoolItem.mods_details.label("pool_mods_details"),
+                    TournamentPoolItem.mods_digest.label("pool_mods_digest"),
                 )
                 .select_from(Round)
                 .outerjoin(PlaylistRevision, PlaylistRevision.id == Round.playlist_revision_id)
@@ -1306,24 +1067,33 @@ class SqlAlchemyMultiplayerSubmissionValidator:
         ).one_or_none()
         if round_row is None:
             return None
-        (
-            beatmap_revision_id,
-            scoreboard_id,
-            required_mod_set_id,
-            participant_mod_set_id,
-            pool_revision_id,
-            pool_scoreboard_id,
-            pool_mod_set_id,
-        ) = round_row._tuple()
+        beatmap_revision_id = round_row.beatmap_revision_id
+        playlist_ruleset = round_row.ruleset
+        required_mods_details = round_row.required_mods_details
+        required_mods_digest = round_row.required_mods_digest
+        participant_mods_details = round_row.participant_mods_details
+        participant_mods_digest = round_row.participant_mods_digest
+        pool_revision_id = round_row.pool_revision_id
+        pool_ruleset = round_row.pool_ruleset
+        pool_mods_details = round_row.pool_mods_details
+        pool_mods_digest = round_row.pool_mods_digest
         if beatmap_revision_id is not None:
+            if playlist_ruleset is None or required_mods_details is None or required_mods_digest is None:
+                return None
             return (
                 beatmap_revision_id,
-                scoreboard_id,
-                participant_mod_set_id or required_mod_set_id,
+                playlist_ruleset,
+                participant_mods_details or required_mods_details,
+                participant_mods_digest or required_mods_digest,
             )
-        if pool_revision_id is None or pool_scoreboard_id is None:
+        if pool_revision_id is None or pool_ruleset is None or pool_mods_details is None or pool_mods_digest is None:
             return None
-        return pool_revision_id, pool_scoreboard_id, participant_mod_set_id or pool_mod_set_id
+        return (
+            pool_revision_id,
+            pool_ruleset,
+            participant_mods_details or pool_mods_details,
+            participant_mods_digest or pool_mods_digest,
+        )
 
 
 class SqlAlchemyScoringAcceptanceRepository(SqlAlchemyScoringRepository):
@@ -1356,43 +1126,15 @@ def _result_snapshot(result: AcceptedScoreResult) -> dict[str, object]:
         "score_id": result.score_id,
         "beatmap_id": result.beatmap_id,
         "beatmap_revision_id": result.beatmap_revision_id,
-        "scoreboard_id": result.scoreboard_id,
-        "mod_set_id": result.mod_set_id,
+        "ruleset": result.ruleset.value,
+        "mods": [mod.as_json() for mod in result.mods],
+        "mods_digest": result.mods_digest.hex(),
         "outcome": result.outcome.value,
     }
 
 
-def _leaderboard_row_statement() -> Select:
-    return (
-        select(
-            LeaderboardEntry.score_id,
-            LeaderboardEntry.account_id,
-            LeaderboardEntry.metric_value,
-            LeaderboardEntry.tie_break_value,
-            Score.max_combo,
-            Score.perfect,
-            Score.ended_at,
-            AccountName.display_name,
-            ModSet.canonical,
-            Replay.score_id.label("replay_score_id"),
-        )
-        .join(Score, Score.id == LeaderboardEntry.score_id)
-        .join(
-            AccountName,
-            and_(AccountName.account_id == LeaderboardEntry.account_id, AccountName.ended_at.is_(None)),
-        )
-        .join(ModSet, ModSet.id == Score.mod_set_id)
-        .outerjoin(Replay, and_(Replay.score_id == Score.id, Replay.state == "ready"))
-    )
-
-
-def _mod_acronyms_expression(canonical: object) -> object:
-    """Extract a sorted acronym JSON array from canonical mod JSON."""
-    return func.jsonb_path_query_array(canonical, "$[*].acronym")
-
-
 def _leaderboard_view(
-    row: tuple[int, int, Decimal, int, int, bool, datetime, str, object, int | None, int],
+    row: tuple[int, int, int, int, bool, datetime, object, int, str, int | None],
     *,
     ruleset: Ruleset,
     hits: dict[str, int],
@@ -1400,16 +1142,16 @@ def _leaderboard_view(
     (
         score_id,
         account_id,
-        metric_value,
-        _tie_break_value,
+        raw_metric_value,
         max_combo,
         perfect,
         ended_at,
-        display_name,
         canonical_mods,
-        replay_score_id,
         rank,
+        display_name,
+        replay_score_id,
     ) = row
+    metric_value = Decimal(raw_metric_value)
     if ruleset is Ruleset.OSU:
         n300, n100, n50 = hits.get("great", 0), hits.get("ok", 0), hits.get("meh", 0)
         ngeki = nkatu = 0
@@ -1467,8 +1209,9 @@ def _result_from_receipt(claim: ReceiptClaim) -> AcceptedScoreResult:
             score_id=_receipt_integer(value["score_id"]),
             beatmap_id=_receipt_integer(value["beatmap_id"]),
             beatmap_revision_id=_receipt_integer(value["beatmap_revision_id"]),
-            scoreboard_id=_receipt_integer(value["scoreboard_id"]),
-            mod_set_id=_receipt_integer(value["mod_set_id"]),
+            ruleset=Ruleset(str(value["ruleset"])),
+            mods=_canonical_mods(value["mods"]),
+            mods_digest=bytes.fromhex(str(value["mods_digest"])),
             outcome=ScoreOutcome(str(value["outcome"])),
         )
     except (KeyError, TypeError, ValueError) as error:

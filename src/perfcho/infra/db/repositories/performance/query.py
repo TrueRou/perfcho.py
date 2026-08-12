@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.infra.db.models.scoring import CalculationFormula, CalculationRelease, ScorePerformance
 from perfcho.modules.performance.models import ScorePerformanceView
+from perfcho.modules.scoring.models import Ruleset
 
 
 class SqlAlchemyPerformanceQueryRepository:
@@ -25,6 +26,7 @@ class SqlAlchemyPerformanceQueryRepository:
                     CalculationFormula.name.label("formula_name"),
                     CalculationFormula.calculator,
                     CalculationRelease.id.label("release_id"),
+                    CalculationRelease.ruleset,
                     CalculationRelease.version.label("release_version"),
                     CalculationRelease.active.label("release_active"),
                     ScorePerformance.pp,
@@ -44,6 +46,7 @@ class SqlAlchemyPerformanceQueryRepository:
                 formula_name=row.formula_name,
                 calculator=row.calculator,
                 release_id=row.release_id,
+                ruleset=Ruleset(row.ruleset.value),
                 release_version=row.release_version,
                 release_active=row.release_active,
                 pp=row.pp,

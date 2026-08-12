@@ -1,12 +1,10 @@
 """Seed the deterministic minimum PostgreSQL runtime catalog."""
 
-import hashlib
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
-import orjson
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +17,6 @@ from perfcho.infra.db.enums import (
     CalculationKind,
     ChannelKind,
     Ruleset,
-    ScoreboardVariant,
 )
 from perfcho.infra.db.locks import acquire_transaction_lock
 from perfcho.infra.db.models.authz import (
@@ -35,12 +32,8 @@ from perfcho.infra.db.models.core import Account, AccountName, UserPreference, U
 from perfcho.infra.db.models.iam import OAuthClient, OAuthClientScope, OAuthClientSecret, Scope
 from perfcho.infra.db.models.scoring import (
     CalculationFormula,
-    CalculationFormulaScoreboard,
     CalculationRelease,
-    ModPolicy,
-    ModSet,
     RankingPolicy,
-    Scoreboard,
 )
 from perfcho.infra.security.tokens import digest_opaque_token
 from perfcho.infra.settings import settings
@@ -124,17 +117,6 @@ ROLE_PERMISSION_CODES = {
     "administrator": _ADMIN_PERMISSION_CODES,
 }
 
-SCOREBOARDS = (
-    (1, "osu", Ruleset.OSU, ScoreboardVariant.VANILLA),
-    (2, "taiko", Ruleset.TAIKO, ScoreboardVariant.VANILLA),
-    (3, "fruits", Ruleset.FRUITS, ScoreboardVariant.VANILLA),
-    (4, "mania", Ruleset.MANIA, ScoreboardVariant.VANILLA),
-    (5, "osu_relax", Ruleset.OSU, ScoreboardVariant.RELAX),
-    (6, "taiko_relax", Ruleset.TAIKO, ScoreboardVariant.RELAX),
-    (7, "fruits_relax", Ruleset.FRUITS, ScoreboardVariant.RELAX),
-    (8, "osu_autopilot", Ruleset.OSU, ScoreboardVariant.AUTOPILOT),
-)
-
 STABLE_CODEC_LIMITS = {
     "max_body_size": 16 * 1024 * 1024,
     "max_packet_size": 2 * 1024 * 1024,
@@ -170,15 +152,6 @@ _ACCOUNT_IDENTITY_SQL = text(
     )
     """
 )
-
-
-def canonical_json_digest(value: object) -> bytes:
-    """Hash canonical compact JSON for persisted policy and mod-set identity."""
-    encoded = orjson.dumps(
-        value,
-        option=orjson.OPT_SORT_KEYS,
-    )
-    return hashlib.sha256(encoded).digest()
 
 
 def _bootstrap_uuid(name: str) -> uuid.UUID:
@@ -218,28 +191,35 @@ async def _table_is_empty(session: AsyncSession, table: FromClause) -> bool:
     return empty_tables[table_name]
 
 
-def _mod_policy_rules(scoreboard_code: str, variant: ScoreboardVariant) -> dict[str, object]:
+def _player_policy_configuration(ruleset: Ruleset) -> dict[str, object]:
     return {
-        "scoreboard": scoreboard_code,
-        "variant": variant.value,
-        "allowed_acronyms": [
-            "NF",
-            "EZ",
-            "TD",
-            "HD",
-            "HR",
-            "SD",
-            "DT",
-            "HT",
-            "NC",
-            "FL",
-            "SO",
-            "PF",
-            "FI",
-            "MR",
-        ],
-        "required_acronyms": [],
-        "forbidden_acronyms": ["AT", "CN", "RX", "AP"],
+        "metric": "pp",
+        "tie_breaker": "ended_at",
+        "calculation_release_id": str(_bootstrap_uuid(f"calculation-release:performance:{ruleset.value}")),
+        "selection": {"best_per_account": True},
+        "eligibility": {
+            "beatmap_statuses": ["ranked", "approved", "qualified", "loved"],
+            "mods": {
+                "allowed_acronyms": [
+                    "NF",
+                    "EZ",
+                    "TD",
+                    "HD",
+                    "HR",
+                    "SD",
+                    "DT",
+                    "HT",
+                    "NC",
+                    "FL",
+                    "SO",
+                    "PF",
+                    "FI",
+                    "MR",
+                ],
+                "required_acronyms": [],
+                "forbidden_acronyms": ["AT", "CN", "RX", "AP"],
+            },
+        },
     }
 
 
@@ -355,11 +335,11 @@ async def _seed_access_catalog(session: AsyncSession) -> None:
         conflict_columns=("id",),
         update_columns=("code", "description"),
     )
-    lazer_client_id = _bootstrap_uuid("oauth-client:lazer")
+    seeded_lazer_client_id = _bootstrap_uuid("oauth-client:lazer")
     lazer_client_id = await session.scalar(
         insert(OAuthClient)
         .values(
-            id=lazer_client_id,
+            id=seeded_lazer_client_id,
             client_key=_LAZER_CLIENT_KEY,
             name="osu!lazer",
             owner_account_id=None,
@@ -486,102 +466,22 @@ async def _seed_access_catalog(session: AsyncSession) -> None:
 
 
 async def _seed_scoring_catalog(session: AsyncSession) -> None:
-    await _upsert_catalog(
-        session,
-        Scoreboard.__table__,
-        tuple(
-            {"id": item_id, "code": code, "ruleset": ruleset, "variant": variant, "active": True}
-            for item_id, code, ruleset, variant in SCOREBOARDS
-        ),
-        conflict_columns=("id",),
-        update_columns=("code", "ruleset", "variant", "active"),
-    )
-
-    no_mods: list[dict[str, object]] = []
-    no_mod_digest = canonical_json_digest(no_mods)
-    await _upsert_catalog(
-        session,
-        ModSet.__table__,
-        tuple(
-            {
-                "scoreboard_id": scoreboard_id,
-                "canonical": no_mods,
-                "canonical_digest": no_mod_digest,
-                "legacy_bits": 0,
-            }
-            for scoreboard_id, *_ in SCOREBOARDS
-        ),
-        conflict_columns=("scoreboard_id", "canonical_digest"),
-        update_columns=("canonical", "legacy_bits"),
-    )
-
-    mod_policy_rows: list[dict[str, object]] = []
-    ranking_policy_rows: list[dict[str, object]] = []
-    for scoreboard_id, scoreboard_code, ruleset, variant in SCOREBOARDS:
-        rules = _mod_policy_rules(scoreboard_code, variant)
-        mod_policy_id = _bootstrap_uuid(f"mod-policy:{scoreboard_code}:v{_BOOTSTRAP_VERSION}")
-        mod_policy_rows.append(
-            {
-                "id": mod_policy_id,
-                "name": f"Stable {scoreboard_code} ranked mods",
-                "schema_version": _BOOTSTRAP_VERSION,
-                "rules": rules,
-                "digest": canonical_json_digest(rules),
-            }
-        )
-        ranking_policy_rows.append(
-            {
-                "id": _bootstrap_uuid(f"ranking-policy:{scoreboard_code}:v{_BOOTSTRAP_VERSION}"),
-                "code": f"stable.{scoreboard_code}.ranked",
-                "version": _BOOTSTRAP_VERSION,
-                "scoreboard_id": scoreboard_id,
-                "metric": "total_score" if variant is ScoreboardVariant.VANILLA else "pp",
-                "tie_breaker": "ended_at",
-                "mod_policy_id": mod_policy_id,
-                "calculation_release_id": (
-                    _bootstrap_uuid(f"calculation-release:performance:{ruleset.value}")
-                    if variant is ScoreboardVariant.VANILLA
-                    else None
-                ),
-                "configuration": {
-                    "best_per_account": True,
-                    "eligible_beatmap_statuses": (
-                        ["ranked", "approved", "qualified", "loved"]
-                        if variant is ScoreboardVariant.VANILLA
-                        else ["ranked", "approved"]
-                    ),
-                    "performance_required": variant is not ScoreboardVariant.VANILLA,
-                },
-                "is_default": True,
-                "active": True,
-            }
-        )
-
-    await _upsert_catalog(
-        session,
-        ModPolicy.__table__,
-        mod_policy_rows,
-        conflict_columns=("id",),
-        update_columns=("name", "schema_version", "rules", "digest"),
-    )
     await _seed_default_calculations(session)
     await _upsert_catalog(
         session,
         RankingPolicy.__table__,
-        ranking_policy_rows,
-        conflict_columns=("id",),
-        update_columns=(
-            "code",
-            "version",
-            "scoreboard_id",
-            "metric",
-            "tie_breaker",
-            "mod_policy_id",
-            "calculation_release_id",
-            "configuration",
-            "is_default",
-            "active",
+        tuple(
+            {
+                "id": _bootstrap_uuid(f"ranking-policy:player:{ruleset.value}"),
+                "code": f"player.{ruleset.value}",
+                "ruleset": ruleset,
+                "active": True,
+                "configuration": _player_policy_configuration(ruleset),
+            }
+            for ruleset in Ruleset
         ),
+        conflict_columns=("id",),
+        update_columns=("code", "ruleset", "active", "configuration"),
     )
 
 
@@ -615,17 +515,6 @@ async def _seed_default_calculations(session: AsyncSession) -> None:
         conflict_columns=("id",),
         update_columns=("code", "name", "kind", "calculator", "description", "enabled"),
     )
-    await _upsert_catalog(
-        session,
-        CalculationFormulaScoreboard.__table__,
-        tuple(
-            {"formula_id": performance_formula_id, "scoreboard_id": scoreboard_id}
-            for scoreboard_id, _, _, variant in SCOREBOARDS
-            if variant is ScoreboardVariant.VANILLA
-        ),
-        conflict_columns=("formula_id", "scoreboard_id"),
-    )
-
     for ruleset in Ruleset:
         difficulty_release_id = _bootstrap_uuid(f"calculation-release:difficulty:{ruleset.value}")
         performance_release_id = _bootstrap_uuid(f"calculation-release:performance:{ruleset.value}")

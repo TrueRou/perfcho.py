@@ -20,6 +20,7 @@ from perfcho.infra.db.models.scoring import (
 from perfcho.infra.db.projectors.common import (
     advance_checkpoint,
     payload_integer,
+    payload_string,
     require_event_context,
 )
 
@@ -43,13 +44,13 @@ async def project_scoring_stats(session: AsyncSession, event: OutboxEvent, parti
 async def _project_score(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     score_id = payload_integer(event.payload, "score_id")
     account_id = payload_integer(event.payload, "account_id")
-    scoreboard_id = payload_integer(event.payload, "scoreboard_id")
+    ruleset = payload_string(event.payload, "ruleset")
     require_event_context(
         event,
         partition_key,
         aggregate_type="score",
         aggregate_id=str(score_id),
-        expected_partition_key=f"account:{account_id}:scoreboard:{scoreboard_id}",
+        expected_partition_key=f"account:{account_id}:ruleset:{ruleset}",
     )
     row = (
         await session.execute(
@@ -61,8 +62,8 @@ async def _project_score(session: AsyncSession, event: OutboxEvent, partition_ke
     if row is None:
         raise RuntimeError("score statistics event references a missing score")
     score, progress = row
-    if score.scoreboard_id != scoreboard_id:
-        raise RuntimeError("score statistics event scoreboard does not match the authoritative score")
+    if score.ruleset.value != ruleset:
+        raise RuntimeError("score statistics event ruleset does not match the authoritative score")
     if score.account_id != account_id:
         raise RuntimeError("score statistics event account does not match the authoritative score")
     total_hits = int(
@@ -76,13 +77,13 @@ async def _project_score(session: AsyncSession, event: OutboxEvent, partition_ke
 
     play_stat = await session.get(
         UserPlayStat,
-        {"account_id": score.account_id, "scoreboard_id": scoreboard_id},
+        {"account_id": score.account_id, "ruleset": score.ruleset},
         with_for_update=True,
     )
     if play_stat is None:
         play_stat = UserPlayStat(
             account_id=score.account_id,
-            scoreboard_id=scoreboard_id,
+            ruleset=score.ruleset,
             play_count=0,
             play_time_ms=0,
             total_score=0,
@@ -101,13 +102,13 @@ async def _project_score(session: AsyncSession, event: OutboxEvent, partition_ke
     month = _month_start(score.ended_at)
     monthly = await session.get(
         UserMonthlyActivity,
-        {"account_id": score.account_id, "scoreboard_id": scoreboard_id, "month": month},
+        {"account_id": score.account_id, "ruleset": score.ruleset, "month": month},
         with_for_update=True,
     )
     if monthly is None:
         monthly = UserMonthlyActivity(
             account_id=score.account_id,
-            scoreboard_id=scoreboard_id,
+            ruleset=score.ruleset,
             month=month,
             play_count=0,
             play_time_ms=0,
@@ -119,14 +120,14 @@ async def _project_score(session: AsyncSession, event: OutboxEvent, partition_ke
 
     user_beatmap = await session.get(
         UserBeatmapActivity,
-        {"account_id": score.account_id, "beatmap_id": score.beatmap_id, "scoreboard_id": scoreboard_id},
+        {"account_id": score.account_id, "beatmap_id": score.beatmap_id, "ruleset": score.ruleset},
         with_for_update=True,
     )
     if user_beatmap is None:
         user_beatmap = UserBeatmapActivity(
             account_id=score.account_id,
             beatmap_id=score.beatmap_id,
-            scoreboard_id=scoreboard_id,
+            ruleset=score.ruleset,
             attempt_count=0,
             pass_count=0,
         )
@@ -137,13 +138,13 @@ async def _project_score(session: AsyncSession, event: OutboxEvent, partition_ke
 
     beatmap = await session.get(
         BeatmapActivity,
-        {"beatmap_id": score.beatmap_id, "scoreboard_id": scoreboard_id},
+        {"beatmap_id": score.beatmap_id, "ruleset": score.ruleset},
         with_for_update=True,
     )
     if beatmap is None:
         beatmap = BeatmapActivity(
             beatmap_id=score.beatmap_id,
-            scoreboard_id=scoreboard_id,
+            ruleset=score.ruleset,
             attempt_count=0,
             pass_count=0,
         )
@@ -154,13 +155,13 @@ async def _project_score(session: AsyncSession, event: OutboxEvent, partition_ke
     if score.outcome in {ScoreOutcome.FAILED, ScoreOutcome.ABANDONED}:
         histogram = await session.get(
             BeatmapFailHistogram,
-            {"beatmap_id": score.beatmap_id, "scoreboard_id": scoreboard_id},
+            {"beatmap_id": score.beatmap_id, "ruleset": score.ruleset},
             with_for_update=True,
         )
         if histogram is None:
             histogram = BeatmapFailHistogram(
                 beatmap_id=score.beatmap_id,
-                scoreboard_id=scoreboard_id,
+                ruleset=score.ruleset,
                 failed=[0] * 100,
                 quit=[0] * 100,
             )
@@ -177,29 +178,29 @@ async def _project_score(session: AsyncSession, event: OutboxEvent, partition_ke
 async def _project_replay_view(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     score_id = payload_integer(event.payload, "score_id")
     account_id = payload_integer(event.payload, "account_id")
-    scoreboard_id = payload_integer(event.payload, "scoreboard_id")
+    ruleset = payload_string(event.payload, "ruleset")
     require_event_context(
         event,
         partition_key,
         aggregate_type="score",
         aggregate_id=str(score_id),
-        expected_partition_key=f"account:{account_id}:scoreboard:{scoreboard_id}",
+        expected_partition_key=f"account:{account_id}:ruleset:{ruleset}",
     )
     dimensions = (
-        await session.execute(select(Score.account_id, Score.scoreboard_id).where(Score.id == score_id))
+        await session.execute(select(Score.account_id, Score.ruleset).where(Score.id == score_id))
     ).one_or_none()
-    if dimensions is None or dimensions.account_id != account_id or dimensions.scoreboard_id != scoreboard_id:
+    if dimensions is None or dimensions.account_id != account_id or dimensions.ruleset.value != ruleset:
         raise RuntimeError("replay-view event does not match the authoritative score")
 
     play_stat = await session.get(
         UserPlayStat,
-        {"account_id": account_id, "scoreboard_id": scoreboard_id},
+        {"account_id": account_id, "ruleset": dimensions.ruleset},
         with_for_update=True,
     )
     if play_stat is None:
         play_stat = UserPlayStat(
             account_id=account_id,
-            scoreboard_id=scoreboard_id,
+            ruleset=dimensions.ruleset,
             play_count=0,
             play_time_ms=0,
             total_score=0,
@@ -214,13 +215,13 @@ async def _project_replay_view(session: AsyncSession, event: OutboxEvent, partit
     month = _month_start(event.created_at)
     monthly = await session.get(
         UserMonthlyActivity,
-        {"account_id": account_id, "scoreboard_id": scoreboard_id, "month": month},
+        {"account_id": account_id, "ruleset": dimensions.ruleset, "month": month},
         with_for_update=True,
     )
     if monthly is None:
         monthly = UserMonthlyActivity(
             account_id=account_id,
-            scoreboard_id=scoreboard_id,
+            ruleset=dimensions.ruleset,
             month=month,
             play_count=0,
             play_time_ms=0,

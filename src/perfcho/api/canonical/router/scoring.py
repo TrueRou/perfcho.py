@@ -4,7 +4,7 @@ import hashlib
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 import orjson
 from fastapi import APIRouter, Body, Form, Header, Query, Request
@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from perfcho.api.canonical.dependencies import CanonicalAccountDependency, CanonicalServicesDependency
 from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
 from perfcho.infra.compose import StableServices
-from perfcho.modules.common import Actor, ClientContext, CommandMeta
+from perfcho.modules.common import Actor, ClientContext, CommandMeta, JsonValue
 from perfcho.modules.common.errors import ApplicationError
 from perfcho.modules.scoring import (
     AcceptScore,
@@ -24,9 +24,9 @@ from perfcho.modules.scoring import (
     IssueSoloScoreToken,
     LeaderboardScope,
     PlayAttemptSubmission,
+    PopulationFilter,
     Ruleset,
     ScoreAttestation,
-    ScoreboardVariant,
     ScoreDetailView,
     ScoreGrade,
     ScoreOutcome,
@@ -186,7 +186,7 @@ async def submit_solo_score(
         hits = _hit_statistics(ruleset, body.statistics, body.maximum_statistics)
         digest_payload = body.model_dump(mode="json")
         request_digest = hashlib.sha256(orjson.dumps(digest_payload, option=orjson.OPT_SORT_KEYS)).digest()
-        mods = tuple(CanonicalMod(mod.acronym, mod.settings) for mod in body.mods)
+        mods = tuple(CanonicalMod(mod.acronym, _json_mapping(mod.settings)) for mod in body.mods)
         command = AcceptScore(
             meta=_command_meta(
                 request,
@@ -200,14 +200,13 @@ async def submit_solo_score(
             ),
             beatmap=BeatmapReference(beatmap_id=beatmap_id),
             ruleset=ruleset,
-            variant=_variant(mods),
             mods=mods,
             attempt=PlayAttemptSubmission(
                 idempotency_key=f"lazer-solo-attempt:{token}",
                 started_at=ended_at,
                 ended_at=ended_at,
                 progress=Decimal(1) if body.passed else Decimal(0),
-                client_metadata={"pauses": body.pauses},
+                client_metadata=_json_mapping({"pauses": body.pauses}),
             ),
             score=ScoreSubmission(
                 total_score=body.total_score,
@@ -271,33 +270,26 @@ async def get_beatmap_scores(
     """Return a Lazer score collection with personal score outside the top limit."""
     if services.ranking_query is None or services.score_query is None:
         return _error(503, "service_unavailable", "Ranking is unavailable.")
-    variant = ScoreboardVariant.VANILLA
     acronyms = frozenset(value.strip().upper() for value in mods or ())
     assistance = acronyms & {"RX", "AP"}
     if len(assistance) > 1:
         return _error(422, "invalid_request", "RX and AP cannot be combined.")
-    if "RX" in assistance:
-        variant = ScoreboardVariant.RELAX
-    elif "AP" in assistance:
-        variant = ScoreboardVariant.AUTOPILOT
-    acronyms -= assistance
-    if mods is not None:
-        scope = LeaderboardScope.exact_mods(acronyms)
-    elif type == "friend":
+    scope = LeaderboardScope.exact_mods(acronyms) if mods is not None else LeaderboardScope.overall()
+    if type == "friend":
         if services.social is None:
             return _error(503, "service_unavailable", "Social service is unavailable.")
         friends = await services.social.list_friends(account.account_id)
-        scope = LeaderboardScope.friends(frozenset({account.account_id, *(friend.account_id for friend in friends)}))
+        scope = scope.with_population(
+            PopulationFilter.FRIENDS,
+            account_ids=frozenset({account.account_id, *(friend.account_id for friend in friends)}),
+        )
     elif type == "country":
         if not account.country_code:
             return {"scores": [], "user_score": None, "score_count": 0}
-        scope = LeaderboardScope.country(account.country_code)
-    else:
-        scope = LeaderboardScope.overall()
+        scope = scope.with_population(PopulationFilter.COUNTRY, country_code=account.country_code)
     page = await services.ranking_query.get_combined_leaderboard(
         beatmap_id=beatmap_id,
         ruleset=mode,
-        variant=variant,
         scope=scope,
         requester_account_id=account.account_id,
         limit=limit,
@@ -306,14 +298,16 @@ async def get_beatmap_scores(
         score.score_id: await services.score_query.get(score.score_id)
         for score in (*page.scores, *((page.personal_best,) if page.personal_best else ()))
     }
-    scores = [
-        _score_response(details[row.score_id]).model_dump(mode="json") for row in page.scores if details[row.score_id]
-    ]
+    scores = []
+    for row in page.scores:
+        detail = details[row.score_id]
+        if detail is not None:
+            scores.append(_score_response(detail).model_dump(mode="json"))
     user_score = None
-    if page.personal_best is not None and details[page.personal_best.score_id] is not None:
+    if page.personal_best is not None and (personal_detail := details[page.personal_best.score_id]) is not None:
         user_score = {
             "position": page.personal_best.rank,
-            "score": _score_response(details[page.personal_best.score_id]).model_dump(mode="json"),
+            "score": _score_response(personal_detail).model_dump(mode="json"),
         }
     return {"scores": scores, "user_score": user_score, "score_count": page.total_count}
 
@@ -394,13 +388,8 @@ def _hit_statistics(
     return tuple(HitStatistic(name, actual.get(name, 0), maximum.get(name)) for name in sorted(names))
 
 
-def _variant(mods: tuple[CanonicalMod, ...]) -> ScoreboardVariant:
-    acronyms = {mod.acronym for mod in mods}
-    if "RX" in acronyms:
-        return ScoreboardVariant.RELAX
-    if "AP" in acronyms:
-        return ScoreboardVariant.AUTOPILOT
-    return ScoreboardVariant.VANILLA
+def _json_mapping(value: dict[str, object]) -> dict[str, JsonValue]:
+    return cast(dict[str, JsonValue], orjson.loads(orjson.dumps(value)))
 
 
 def _error(status_code: int, code: str, message: str) -> JSONResponse:

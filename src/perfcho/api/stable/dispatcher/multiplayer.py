@@ -9,6 +9,7 @@ from perfcho.api.stable.dispatcher.models import MultiplayerRuntimeContext
 from perfcho.api.stable.realtime.codec import Packet, ProtocolError
 from perfcho.api.stable.realtime.models import ClientPacket, MultiplayerMatch
 from perfcho.infra.compose import StableServices
+from perfcho.infra.db.mods import project_scoreboard_variant
 from perfcho.infra.logging import log_event, rate_limit, sampled
 from perfcho.modules.common import Actor, ClientContext, CommandMeta
 from perfcho.modules.common.errors import ApplicationError
@@ -632,7 +633,7 @@ async def _change_password(dispatch: _MultiplayerPacketContext, current: RoomSta
 async def _change_mods(dispatch: _MultiplayerPacketContext, current: RoomState) -> bytes:
     legacy_bits = dispatch.packet.payload.read_i32()
     dispatch.packet.payload.require_exhausted()
-    mods, variant = parse_legacy_mods(legacy_bits)
+    mods = parse_legacy_mods(legacy_bits)
     account_id = dispatch.context.identity.account_id
     public_id = current.room.public_id
     if current.room.settings.free_mods:
@@ -652,7 +653,11 @@ async def _change_mods(dispatch: _MultiplayerPacketContext, current: RoomState) 
                     ),
                     public_id,
                     current.room.version,
-                    replace(current.room.settings, mods=room_mods, variant=variant),
+                    replace(
+                        current.room.settings,
+                        mods=room_mods,
+                        variant=project_scoreboard_variant(room_mods),
+                    ),
                 )
             )
             state = mutation.state
@@ -670,7 +675,7 @@ async def _change_mods(dispatch: _MultiplayerPacketContext, current: RoomState) 
                 ),
                 public_id,
                 current.room.version,
-                replace(current.room.settings, mods=mods, variant=variant),
+                replace(current.room.settings, mods=mods, variant=project_scoreboard_variant(mods)),
             )
         )
         state = mutation.state
@@ -888,7 +893,8 @@ def _settings_from_wire(match: MultiplayerMatch) -> RoomSettings:
         raise ValueError("Stable match team mode is invalid")
     if not 0 <= match.win_condition < len(_WIN_CONDITIONS):
         raise ValueError("Stable match win condition is invalid")
-    mods, variant = parse_legacy_mods(match.mods)
+    mods = parse_legacy_mods(match.mods)
+    variant = project_scoreboard_variant(mods)
     checksum = bytes.fromhex(match.beatmap_md5) if match.beatmap_md5 else None
     settings = RoomSettings(
         name=match.name,

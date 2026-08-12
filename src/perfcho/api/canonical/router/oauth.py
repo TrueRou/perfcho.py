@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from perfcho.api.canonical.dependencies import CanonicalServicesDependency
 from perfcho.api.stable.canonize.ipaddr import resolve_client_ip
+from perfcho.infra.compose import StableServices
 from perfcho.modules.identity import (
     InvalidAccessToken,
     InvalidOAuthClient,
@@ -18,7 +19,7 @@ from perfcho.modules.identity import (
     PasswordGrant,
     RefreshGrant,
 )
-from perfcho.modules.scoring import AccountStatsView, Ruleset, ScoreboardVariant
+from perfcho.modules.scoring import AccountStatsView, Ruleset
 
 router = APIRouter()
 
@@ -180,7 +181,7 @@ async def _statistics_rulesets(
     result: dict[str, dict[str, object]] = {}
     for ruleset in Ruleset:
         view = (
-            await statistics.get_for_display(account_id, ruleset, ScoreboardVariant.VANILLA)
+            await statistics.get_for_display(account_id, ruleset)
             if statistics is not None
             else AccountStatsView(0, Decimal(0), 0, 0, None)
         )
@@ -220,7 +221,7 @@ def _statistics_response(stats: AccountStatsView) -> dict[str, object]:
 
 
 def _user_response(
-    services: object,
+    services: StableServices,
     account_id: int,
     username: str,
     account_type: str,

@@ -7,10 +7,11 @@ from datetime import UTC, datetime
 from time import monotonic
 from typing import Any, cast
 
-import msgpack
+import msgpack  # type: ignore[import-untyped]
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
+from perfcho.infra.db.mods import project_scoreboard_variant
 from perfcho.infra.logging import log_event
 from perfcho.modules.multiplayer import SlotStatus, TeamMode, WinCondition
 from perfcho.modules.realtime.bubbles import (
@@ -39,7 +40,7 @@ from perfcho.modules.realtime.bubbles import (
     UserLogoutBubble,
 )
 from perfcho.modules.realtime.models import PlayerActivity, PlayerStatistics, SessionFence
-from perfcho.modules.scoring import CanonicalMod, Ruleset, ScoreboardVariant
+from perfcho.modules.scoring import CanonicalMod, Ruleset
 
 _VERSION = 1
 
@@ -121,7 +122,7 @@ def _room(value: object) -> MultiplayerRoomSnapshot:
         **body
         | {
             "ruleset": Ruleset(body["ruleset"]),
-            "variant": ScoreboardVariant(body["variant"]),
+            "variant": project_scoreboard_variant(tuple(_mod(mod) for mod in body["mods"])),
             "team_mode": TeamMode(body["team_mode"]),
             "win_condition": WinCondition(body["win_condition"]),
             "mods": tuple(_mod(mod) for mod in body["mods"]),
@@ -283,7 +284,7 @@ def _encode_body(bubble: RealtimeBubble) -> tuple[str, dict[str, Any]]:
                     "external_beatmap_id": room.external_beatmap_id,
                     "beatmap_md5": room.beatmap_md5,
                     "ruleset": room.ruleset.value,
-                    "variant": room.variant.value,
+                    "variant": project_scoreboard_variant(room.mods).value,
                     "team_mode": room.team_mode.value,
                     "win_condition": room.win_condition.value,
                     "mods": [_encoded_mod(mod) for mod in room.mods],

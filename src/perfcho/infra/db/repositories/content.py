@@ -24,7 +24,8 @@ from perfcho.infra.db.models.content import (
     RatingVote,
 )
 from perfcho.infra.db.models.core import MediaAsset
-from perfcho.infra.db.models.scoring import BeatmapDifficultyAttribute, ModSet, Scoreboard
+from perfcho.infra.db.models.scoring import BeatmapDifficultyAttribute
+from perfcho.infra.db.mods import canonical_mods_digest
 from perfcho.modules.content.models import (
     BeatmapRevisionView,
     BeatmapsetView,
@@ -774,16 +775,15 @@ class SqlAlchemyContentRepository:
 
 
 def _revision_statement() -> Select[*_RevisionRow]:
+    no_mod_digest = canonical_mods_digest(())
     no_mod_stars = (
         select(func.max(BeatmapDifficultyAttribute.star_rating))
-        .join(ModSet, ModSet.id == BeatmapDifficultyAttribute.mod_set_id)
-        .join(Scoreboard, Scoreboard.id == BeatmapDifficultyAttribute.scoreboard_id)
         .where(
             BeatmapDifficultyAttribute.beatmap_revision_id == BeatmapRevision.id,
-            ModSet.legacy_bits == 0,
-            Scoreboard.variant == "vanilla",
+            BeatmapDifficultyAttribute.ruleset == Beatmap.ruleset,
+            BeatmapDifficultyAttribute.mods_digest == no_mod_digest,
         )
-        .correlate(BeatmapRevision)
+        .correlate(BeatmapRevision, Beatmap)
         .scalar_subquery()
     )
     return (

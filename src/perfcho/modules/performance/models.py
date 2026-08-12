@@ -8,7 +8,7 @@ from decimal import Decimal
 from types import MappingProxyType
 
 from perfcho.modules.common.models import JsonValue
-from perfcho.modules.scoring.models import CanonicalMod, ScoreboardInfo, ScoreSubmission
+from perfcho.modules.scoring.models import CanonicalMod, Ruleset, ScoreSubmission
 
 _CALCULATION_QUANTUM = Decimal("0.00001")
 
@@ -34,16 +34,16 @@ class PerformanceCalculationInput:
     beatmap_revision_id: int
     beatmap_sha256: bytes
     beatmap_storage_key: str
-    scoreboard: ScoreboardInfo
-    mod_set_id: int
+    ruleset: Ruleset
+    mods_digest: bytes
     mods: tuple[CanonicalMod, ...]
     source: str
     score: ScoreSubmission
 
     def __post_init__(self) -> None:
         """Validate identities, digests, and recursively immutable configuration."""
-        if self.score_id < 1 or self.beatmap_revision_id < 1 or self.mod_set_id < 1:
-            raise ValueError("performance calculation identifiers and attempt count must be positive")
+        if self.score_id < 1 or self.beatmap_revision_id < 1:
+            raise ValueError("performance calculation identifiers must be positive")
         if (
             not self.formula_code
             or not self.calculator
@@ -53,7 +53,7 @@ class PerformanceCalculationInput:
             or not self.beatmap_storage_key
         ):
             raise ValueError("performance calculation release metadata must be non-empty")
-        if len(self.input_digest) != 32 or len(self.beatmap_sha256) != 32:
+        if len(self.input_digest) != 32 or len(self.beatmap_sha256) != 32 or len(self.mods_digest) != 32:
             raise ValueError("performance calculation digests must contain 32 bytes")
         configuration = _freeze_json(dict(self.release_configuration))
         difficulty_configuration = _freeze_json(dict(self.difficulty_release_configuration))
@@ -80,9 +80,8 @@ class PerformanceCalculationInput:
             "difficulty_release_configuration": _thaw_json(self.difficulty_release_configuration),
             "beatmap_revision_id": self.beatmap_revision_id,
             "beatmap_sha256": self.beatmap_sha256.hex(),
-            "ruleset": self.scoreboard.ruleset.value,
-            "variant": self.scoreboard.variant.value,
-            "mod_set_id": self.mod_set_id,
+            "ruleset": self.ruleset.value,
+            "mods_digest": self.mods_digest.hex(),
             "mods": [mod.as_json() for mod in self.mods],
             "client_family": self.source,
             "score": {
@@ -149,7 +148,7 @@ class PerformanceCompletion:
 
     score_id: int
     account_id: int
-    scoreboard_id: int
+    ruleset: Ruleset
     formula_id: uuid.UUID
     formula_code: str
     release_id: uuid.UUID
@@ -167,6 +166,7 @@ class ScorePerformanceView:
     formula_name: str
     calculator: str
     release_id: uuid.UUID
+    ruleset: Ruleset
     release_version: str
     release_active: bool
     pp: Decimal

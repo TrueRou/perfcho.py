@@ -24,7 +24,6 @@ from perfcho.modules.scoring import (
     PlayAttemptSubmission,
     Ruleset,
     ScoreAttestation,
-    ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
     ScoreSubmission,
@@ -101,7 +100,6 @@ class ParsedStableScore:
     beatmap_md5: bytes
     username: str
     ruleset: Ruleset
-    variant: ScoreboardVariant
     mods: tuple[CanonicalMod, ...]
     attempt: PlayAttemptSubmission
     score: ScoreSubmission
@@ -110,45 +108,32 @@ class ParsedStableScore:
     legacy_mod_bits: int
 
 
-def parse_legacy_mods(legacy_bits: int) -> tuple[tuple[CanonicalMod, ...], ScoreboardVariant]:
-    """Convert bounded Stable mod flags into canonical mods and a scoreboard variant."""
+def parse_legacy_mods(legacy_bits: int) -> tuple[CanonicalMod, ...]:
+    """Convert bounded Stable mod flags into canonical mods, including RX/AP."""
     if isinstance(legacy_bits, bool) or not isinstance(legacy_bits, int) or legacy_bits < 0:
         raise ValueError("legacy mod bits must be a non-negative integer")
     if legacy_bits & ~_KNOWN_LEGACY_MOD_MASK:
         raise ValueError("legacy mod bits contain unknown flags")
     if legacy_bits & LEGACY_MOD_BITS["RX"] and legacy_bits & LEGACY_MOD_BITS["AP"]:
         raise ValueError("relax and autopilot cannot be combined")
-    variant = (
-        ScoreboardVariant.AUTOPILOT
-        if legacy_bits & LEGACY_MOD_BITS["AP"]
-        else ScoreboardVariant.RELAX
-        if legacy_bits & LEGACY_MOD_BITS["RX"]
-        else ScoreboardVariant.VANILLA
-    )
     mods: list[CanonicalMod] = []
     for acronym, bit in LEGACY_MOD_BITS.items():
         if not legacy_bits & bit:
             continue
-        if acronym in {"RX", "AP"}:
-            mods.append(CanonicalMod(acronym))
-        elif (acronym == "DT" and legacy_bits & LEGACY_MOD_BITS["NC"]) or (
+        if (acronym == "DT" and legacy_bits & LEGACY_MOD_BITS["NC"]) or (
             acronym == "SD" and legacy_bits & LEGACY_MOD_BITS["PF"]
         ):
             continue
         else:
             mods.append(CanonicalMod(acronym))
-    return tuple(mods), variant
+    return tuple(mods)
 
 
-def project_legacy_mods(mods: Iterable[CanonicalMod], variant: ScoreboardVariant) -> int:
-    """Project canonical mods and assistance into the Stable mod bitset."""
+def project_legacy_mods(mods: Iterable[CanonicalMod]) -> int:
+    """Project canonical mods into the Stable mod bitset."""
     bits = 0
     for mod in mods:
         bits |= LEGACY_MOD_BITS.get(mod.acronym, 0)
-    if variant is ScoreboardVariant.RELAX:
-        bits |= LEGACY_MOD_BITS["RX"]
-    elif variant is ScoreboardVariant.AUTOPILOT:
-        bits |= LEGACY_MOD_BITS["AP"]
     if bits & LEGACY_MOD_BITS["NC"]:
         bits |= LEGACY_MOD_BITS["DT"]
     if bits & LEGACY_MOD_BITS["PF"]:
@@ -318,7 +303,7 @@ def decrypt_stable_score(
     if mode not in _RULESETS:
         raise ValueError("Stable score ruleset is invalid")
     ruleset = _RULESETS[mode]
-    mods, variant = parse_legacy_mods(legacy_mods)
+    mods = parse_legacy_mods(legacy_mods)
     try:
         ended_at = datetime.strptime(fields[16], "%y%m%d%H%M%S").replace(tzinfo=UTC)
     except ValueError as error:
@@ -341,7 +326,6 @@ def decrypt_stable_score(
         beatmap_md5=beatmap_md5,
         username=username,
         ruleset=ruleset,
-        variant=variant,
         mods=mods,
         attempt=PlayAttemptSubmission(
             idempotency_key=f"stable:{online_checksum.hex()}",

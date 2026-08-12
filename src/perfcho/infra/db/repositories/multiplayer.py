@@ -5,7 +5,6 @@ import uuid
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_, select, update
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,9 +16,6 @@ from perfcho.infra.db.enums import (
 )
 from perfcho.infra.db.enums import (
     Ruleset as DbRuleset,
-)
-from perfcho.infra.db.enums import (
-    ScoreboardVariant as DbScoreboardVariant,
 )
 from perfcho.infra.db.locks import acquire_transaction_lock
 from perfcho.infra.db.models.content import Beatmap, BeatmapRevision
@@ -36,8 +32,8 @@ from perfcho.infra.db.models.multiplayer import (
     RoundParticipant,
     SessionPresence,
 )
-from perfcho.infra.db.models.scoring import ModSet, RankingPolicy, Scoreboard
-from perfcho.infra.db.mods import project_legacy_mod_bits
+from perfcho.infra.db.models.scoring import RankingPolicy
+from perfcho.infra.db.mods import canonical_mods_acronyms, canonical_mods_details, canonical_mods_digest
 from perfcho.infra.db.repositories.authorization import SqlAlchemyAuthorizationRepository
 from perfcho.modules.multiplayer import (
     DurableRoomSnapshot,
@@ -54,7 +50,7 @@ from perfcho.modules.multiplayer import (
     WinCondition,
 )
 from perfcho.modules.scoring.models import CanonicalMod, MultiplayerSubmissionContext, Ruleset, ScoreboardVariant
-from perfcho.modules.scoring.mods import canonical_json_digest, normalize_mods
+from perfcho.modules.scoring.mods import canonical_json_digest
 
 _ACTIVE_PRESENCE_CONSTRAINT = "uq_session_presences_account_current"
 _ACTIVE_ROUND_CONSTRAINT = "uq_rounds_session_active"
@@ -278,8 +274,7 @@ class SqlAlchemyMultiplayerRepository:
             return DurableRoomSnapshot(durable, account_ids)
         rows = (
             await self._session.execute(
-                select(RoundParticipant, ModSet.canonical)
-                .join(ModSet, ModSet.id == RoundParticipant.mod_set_id)
+                select(RoundParticipant)
                 .where(
                     RoundParticipant.round_id == active_round.id,
                     RoundParticipant.account_id.in_(account_ids),
@@ -292,9 +287,9 @@ class SqlAlchemyMultiplayerRepository:
                 participant.account_id,
                 participant.slot_number,
                 participant.team_number,
-                _mods_from_json(canonical),
+                _mods_from_json(participant.mods_details),
             )
-            for participant, canonical in rows
+            for participant in rows
             if participant.slot_number is not None
         )
         return DurableRoomSnapshot(durable, account_ids, active_round.id, participants)
@@ -737,34 +732,9 @@ class SqlAlchemyMultiplayerRepository:
         now: datetime,
     ) -> Round:
         settings = _settings(room, session)
-        scoreboard = (
-            await self._session.execute(
-                select(Scoreboard).where(
-                    Scoreboard.ruleset == DbRuleset(settings.ruleset.value),
-                    Scoreboard.variant == DbScoreboardVariant(settings.variant.value),
-                    Scoreboard.active.is_(True),
-                )
-            )
-        ).scalar_one_or_none()
-        if scoreboard is None:
-            raise MatchStateRejected("room ruleset has no active scoreboard")
-        normalized = normalize_mods(settings.ruleset, settings.variant, settings.mods)
-        compatibility_bits = project_legacy_mod_bits(normalized.mods, settings.variant)
-        mod_statement = (
-            insert(ModSet)
-            .values(
-                scoreboard_id=scoreboard.id,
-                canonical=list(normalized.canonical),
-                canonical_digest=normalized.canonical_digest,
-                legacy_bits=compatibility_bits,
-            )
-            .on_conflict_do_update(
-                index_elements=(ModSet.scoreboard_id, ModSet.canonical_digest),
-                set_={"legacy_bits": compatibility_bits},
-            )
-            .returning(ModSet.id)
-        )
-        mod_set_id = (await self._session.execute(mod_statement)).scalar_one()
+        normalized_details = canonical_mods_details(settings.mods)
+        normalized_acronyms = canonical_mods_acronyms(settings.mods)
+        normalized_digest = canonical_mods_digest(settings.mods)
         beatmap_revision: BeatmapRevision | None = None
         if settings.external_beatmap_id > 0:
             revision_statement = (
@@ -782,11 +752,10 @@ class SqlAlchemyMultiplayerRepository:
         if beatmap_revision is not None:
             ranking_policy = (
                 await self._session.execute(
-                    select(RankingPolicy).where(
-                        RankingPolicy.scoreboard_id == scoreboard.id,
-                        RankingPolicy.active.is_(True),
-                        RankingPolicy.is_default.is_(True),
-                    )
+                    select(RankingPolicy)
+                    .where(RankingPolicy.ruleset == DbRuleset(settings.ruleset.value))
+                    .where(RankingPolicy.code == f"player.{settings.ruleset.value}")
+                    .where(RankingPolicy.active.is_(True))
                 )
             ).scalar_one_or_none()
         item = (
@@ -833,9 +802,11 @@ class SqlAlchemyMultiplayerRepository:
                 revision_number=revision_number,
                 owner_account_id=session.host_account_id,
                 beatmap_revision_id=beatmap_revision.id,
-                scoreboard_id=scoreboard.id,
-                mod_policy_id=ranking_policy.mod_policy_id,
-                required_mod_set_id=None if settings.free_mods else mod_set_id,
+                ruleset=DbRuleset(settings.ruleset.value),
+                ranking_policy_id=ranking_policy.id,
+                required_mods_details=[] if settings.free_mods else normalized_details,
+                required_mods_acronyms=[] if settings.free_mods else normalized_acronyms,
+                required_mods_digest=canonical_json_digest([]) if settings.free_mods else normalized_digest,
                 scoring_mode=settings.win_condition.value,
                 configuration=configuration,
                 configuration_digest=digest,
@@ -884,23 +855,9 @@ class SqlAlchemyMultiplayerRepository:
             if settings.free_mods:
                 by_acronym = {mod.acronym: mod for mod in (*settings.mods, *participant.mods)}
                 participant_mods = tuple(by_acronym.values())
-            participant_normalized = normalize_mods(settings.ruleset, settings.variant, participant_mods)
-            participant_compatibility_bits = project_legacy_mod_bits(participant_normalized.mods, settings.variant)
-            participant_mod_statement = (
-                insert(ModSet)
-                .values(
-                    scoreboard_id=scoreboard.id,
-                    canonical=list(participant_normalized.canonical),
-                    canonical_digest=participant_normalized.canonical_digest,
-                    legacy_bits=participant_compatibility_bits,
-                )
-                .on_conflict_do_update(
-                    index_elements=(ModSet.scoreboard_id, ModSet.canonical_digest),
-                    set_={"legacy_bits": participant_compatibility_bits},
-                )
-                .returning(ModSet.id)
-            )
-            participant_mod_set_id = (await self._session.execute(participant_mod_statement)).scalar_one()
+            participant_mods_details = canonical_mods_details(participant_mods)
+            participant_mods_acronyms = canonical_mods_acronyms(participant_mods)
+            participant_mods_digest = canonical_mods_digest(participant_mods)
             self._session.add_all(
                 (
                     RoundParticipant(
@@ -909,7 +866,9 @@ class SqlAlchemyMultiplayerRepository:
                         presence_id=presences.get(participant.account_id),
                         slot_number=participant.slot_position,
                         team_number=participant.team,
-                        mod_set_id=participant_mod_set_id,
+                        mods_details=participant_mods_details,
+                        mods_acronyms=participant_mods_acronyms,
+                        mods_digest=participant_mods_digest,
                     ),
                 )
             )

@@ -9,10 +9,8 @@ from zoneinfo import ZoneInfo
 
 import orjson
 
-from perfcho.api.stable.canonize.scoring import parse_legacy_mods
 from perfcho.infra.db.enums import BeatmapStatus, Ruleset, ScoreboardVariant, ScoreGrade
 
-_SCOREBOARD_IDS = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 8: 8}
 _RULESETS = {0: Ruleset.OSU, 1: Ruleset.TAIKO, 2: Ruleset.FRUITS, 3: Ruleset.MANIA}
 _VARIANTS = {
     0: ScoreboardVariant.VANILLA,
@@ -24,6 +22,40 @@ _VARIANTS = {
     6: ScoreboardVariant.RELAX,
     8: ScoreboardVariant.AUTOPILOT,
 }
+_LEGACY_MOD_BITS = {
+    "NF": 1 << 0,
+    "EZ": 1 << 1,
+    "TD": 1 << 2,
+    "HD": 1 << 3,
+    "HR": 1 << 4,
+    "SD": 1 << 5,
+    "DT": 1 << 6,
+    "RX": 1 << 7,
+    "HT": 1 << 8,
+    "NC": 1 << 9,
+    "FL": 1 << 10,
+    "AT": 1 << 11,
+    "SO": 1 << 12,
+    "AP": 1 << 13,
+    "PF": 1 << 14,
+    "4K": 1 << 15,
+    "5K": 1 << 16,
+    "6K": 1 << 17,
+    "7K": 1 << 18,
+    "8K": 1 << 19,
+    "FI": 1 << 20,
+    "RD": 1 << 21,
+    "CN": 1 << 22,
+    "TP": 1 << 23,
+    "9K": 1 << 24,
+    "CO": 1 << 25,
+    "1K": 1 << 26,
+    "3K": 1 << 27,
+    "2K": 1 << 28,
+    "SV2": 1 << 29,
+    "MR": 1 << 30,
+}
+_KNOWN_LEGACY_MOD_MASK = sum(_LEGACY_MOD_BITS.values())
 _BEATMAP_STATUSES = {
     -1: BeatmapStatus.GRAVEYARD,
     0: BeatmapStatus.PENDING,
@@ -63,11 +95,11 @@ def source_ruleset(mode: object) -> Ruleset:
         raise ValueError(f"unsupported bancho mode: {mode_id}") from error
 
 
-def scoreboard(mode: object) -> tuple[int, Ruleset, ScoreboardVariant]:
-    """Map one valid bancho mode to the deterministic bootstrap scoreboard."""
+def scoreboard(mode: object) -> tuple[Ruleset, ScoreboardVariant]:
+    """Map one valid bancho mode to its ruleset and assistance variant."""
     mode_id = bounded_integer(mode, "mode", minimum=0, maximum=8)
     try:
-        return _SCOREBOARD_IDS[mode_id], source_ruleset(mode_id), _VARIANTS[mode_id]
+        return source_ruleset(mode_id), _VARIANTS[mode_id]
     except KeyError as error:
         raise ValueError(f"unsupported bancho mode: {mode_id}") from error
 
@@ -78,18 +110,33 @@ def beatmap_status(value: object) -> BeatmapStatus:
     return _BEATMAP_STATUSES[status]
 
 
-def mod_set(mode: object, legacy_bits: object) -> tuple[int, list[dict[str, object]], bytes, int]:
-    """Canonicalize legacy bits while requiring their variant to match the score mode."""
-    scoreboard_id, _, expected_variant = scoreboard(mode)
+def mod_set(mode: object, legacy_bits: object) -> tuple[Ruleset, list[dict[str, object]], list[str], bytes]:
+    """Canonicalize legacy bits while requiring assistance mods to match the source mode."""
+    ruleset, expected_variant = scoreboard(mode)
     bits = bounded_integer(legacy_bits, "mods", minimum=0, maximum=2_147_483_647)
-    mods, parsed_variant = parse_legacy_mods(bits)
-    if parsed_variant.value != expected_variant.value:
+    if bits & ~_KNOWN_LEGACY_MOD_MASK:
+        raise ValueError("legacy mod bits contain unknown flags")
+    if bits & _LEGACY_MOD_BITS["RX"] and bits & _LEGACY_MOD_BITS["AP"]:
+        raise ValueError("relax and autopilot cannot be combined")
+    acronyms = {
+        acronym
+        for acronym, bit in _LEGACY_MOD_BITS.items()
+        if bits & bit
+        and not (acronym == "DT" and bits & _LEGACY_MOD_BITS["NC"])
+        and not (acronym == "SD" and bits & _LEGACY_MOD_BITS["PF"])
+    }
+    parsed_variant = (
+        ScoreboardVariant.RELAX
+        if "RX" in acronyms
+        else ScoreboardVariant.AUTOPILOT
+        if "AP" in acronyms
+        else ScoreboardVariant.VANILLA
+    )
+    if parsed_variant is not expected_variant:
         raise ValueError("score mode and assistance mod bits disagree")
-    canonical = [
-        mod.as_json() for mod in sorted(mods, key=lambda item: item.acronym) if mod.acronym not in {"RX", "AP"}
-    ]
+    canonical: list[dict[str, object]] = [{"acronym": acronym} for acronym in sorted(acronyms)]
     digest = canonical_json_digest(canonical)
-    return scoreboard_id, canonical, digest, bits
+    return ruleset, canonical, [str(mod["acronym"]) for mod in canonical], digest
 
 
 def canonical_json_digest(value: object) -> bytes:

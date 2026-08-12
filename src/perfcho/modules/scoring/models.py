@@ -1,5 +1,7 @@
 """Define immutable canonical score commands, facts, and results."""
 
+from __future__ import annotations
+
 import math
 import re
 import uuid
@@ -33,27 +35,34 @@ class ScoreboardVariant(StrEnum):
     AUTOPILOT = "autopilot"
 
 
-class LeaderboardScopeKind(StrEnum):
-    """Identify a protocol-neutral leaderboard population."""
+class ScoreDimension(StrEnum):
+    """Identify the score identity dimension selected by a leaderboard."""
 
     OVERALL = "overall"
     EXACT_MODS = "exact_mods"
+
+
+class PopulationFilter(StrEnum):
+    """Identify an optional account population filter."""
+
+    PUBLIC = "public"
     FRIENDS = "friends"
     COUNTRY = "country"
 
 
 @dataclass(frozen=True, slots=True)
 class LeaderboardScope:
-    """Describe the population and optional dimension used by a leaderboard."""
+    """Compose an orthogonal score dimension and account population filter."""
 
-    kind: LeaderboardScopeKind
+    dimension: ScoreDimension = ScoreDimension.OVERALL
+    population: PopulationFilter = PopulationFilter.PUBLIC
     mod_acronyms: frozenset[str] | None = None
     account_ids: frozenset[int] | None = None
     country_code: str | None = None
 
     def __post_init__(self) -> None:
         """Reject dimensions that do not belong to the selected scope."""
-        if self.kind is LeaderboardScopeKind.EXACT_MODS:
+        if self.dimension is ScoreDimension.EXACT_MODS:
             if self.mod_acronyms is None:
                 raise ValueError("exact-mods scope requires a mod acronym set")
             normalized = frozenset(acronym.strip().upper() for acronym in self.mod_acronyms)
@@ -62,12 +71,12 @@ class LeaderboardScope:
             object.__setattr__(self, "mod_acronyms", normalized)
         elif self.mod_acronyms is not None:
             raise ValueError("mod_acronyms is only valid for exact-mods scope")
-        if self.kind is LeaderboardScopeKind.FRIENDS:
+        if self.population is PopulationFilter.FRIENDS:
             if self.account_ids is None or any(account_id < 1 for account_id in self.account_ids):
                 raise ValueError("friends scope requires positive account IDs")
         elif self.account_ids is not None:
             raise ValueError("account_ids is only valid for friends scope")
-        if self.kind is LeaderboardScopeKind.COUNTRY:
+        if self.population is PopulationFilter.COUNTRY:
             if not self.country_code or self.country_code != self.country_code.strip().upper():
                 raise ValueError("country scope requires an uppercase country code")
         elif self.country_code is not None:
@@ -76,22 +85,32 @@ class LeaderboardScope:
     @classmethod
     def overall(cls) -> LeaderboardScope:
         """Build an unrestricted overall leaderboard scope."""
-        return cls(LeaderboardScopeKind.OVERALL)
+        return cls()
 
     @classmethod
     def exact_mods(cls, mod_acronyms: frozenset[str]) -> LeaderboardScope:
         """Build an exact canonical-mod-acronym leaderboard scope."""
-        return cls(LeaderboardScopeKind.EXACT_MODS, mod_acronyms=mod_acronyms)
+        return cls(ScoreDimension.EXACT_MODS, mod_acronyms=mod_acronyms)
 
     @classmethod
     def friends(cls, account_ids: frozenset[int]) -> LeaderboardScope:
         """Build a friends leaderboard scope from canonical account IDs."""
-        return cls(LeaderboardScopeKind.FRIENDS, account_ids=account_ids)
+        return cls(population=PopulationFilter.FRIENDS, account_ids=account_ids)
 
     @classmethod
     def country(cls, country_code: str) -> LeaderboardScope:
         """Build a country leaderboard scope from a canonical country code."""
-        return cls(LeaderboardScopeKind.COUNTRY, country_code=country_code.strip().upper())
+        return cls(population=PopulationFilter.COUNTRY, country_code=country_code.strip().upper())
+
+    def with_population(
+        self,
+        population: PopulationFilter,
+        *,
+        account_ids: frozenset[int] | None = None,
+        country_code: str | None = None,
+    ) -> LeaderboardScope:
+        """Apply a population filter while retaining the score dimension."""
+        return LeaderboardScope(self.dimension, population, self.mod_acronyms, account_ids, country_code)
 
 
 class ScoreOutcome(StrEnum):
@@ -318,7 +337,6 @@ class AcceptScore:
     meta: CommandMeta
     beatmap: BeatmapReference
     ruleset: Ruleset
-    variant: ScoreboardVariant
     mods: tuple[CanonicalMod, ...]
     attempt: PlayAttemptSubmission
     score: ScoreSubmission
@@ -384,32 +402,28 @@ class BeatmapRevisionInfo:
 
 
 @dataclass(frozen=True, slots=True)
-class ScoreboardInfo:
-    """Return one active canonical scoreboard."""
-
-    scoreboard_id: int
-    code: str
-    ruleset: Ruleset
-    variant: ScoreboardVariant
-
-
-@dataclass(frozen=True, slots=True)
 class NormalizedModSet:
-    """Carry deterministic mod JSON and its persistence identity."""
+    """Carry deterministic canonical mod identity."""
 
-    mods: tuple[CanonicalMod, ...]
     canonical: tuple[dict[str, object], ...]
-    canonical_digest: bytes
+    mods_acronyms: frozenset[str]
+    digest: bytes
 
+    def __post_init__(self) -> None:
+        """Require canonical acronyms and a SHA-256 identity."""
+        if len(self.digest) != 32:
+            raise ValueError("mod digest must contain 32 bytes")
+        if self.mods_acronyms != frozenset(str(mod.get("acronym", "")) for mod in self.canonical):
+            raise ValueError("mod acronyms must match canonical mods")
 
-@dataclass(frozen=True, slots=True)
-class ModSetInfo:
-    """Return a persisted canonical mod-set identity."""
-
-    mod_set_id: int
-    scoreboard_id: int
-    canonical: tuple[dict[str, object], ...]
-    canonical_digest: bytes
+    @property
+    def mods(self) -> tuple[CanonicalMod, ...]:
+        """Materialize immutable mods from their canonical representation."""
+        result: list[CanonicalMod] = []
+        for mod in self.canonical:
+            settings = mod.get("settings", {})
+            result.append(CanonicalMod(str(mod["acronym"]), settings if isinstance(settings, Mapping) else {}))
+        return tuple(result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,8 +451,9 @@ class AcceptedScoreResult:
     score_id: int
     beatmap_id: int
     beatmap_revision_id: int
-    scoreboard_id: int
-    mod_set_id: int
+    ruleset: Ruleset
+    mods: tuple[CanonicalMod, ...]
+    mods_digest: bytes
     outcome: ScoreOutcome
     new_achievement_unlocks: tuple[AchievementUnlockView, ...] = ()
 
@@ -451,8 +466,9 @@ class PlayAttemptRecord:
     account_id: int
     beatmap_id: int
     beatmap_revision_id: int
-    scoreboard_id: int
-    mod_set_id: int
+    ruleset: Ruleset
+    mods: tuple[CanonicalMod, ...]
+    mods_digest: bytes
     source: str
     submission: PlayAttemptSubmission
     outcome: ScoreOutcome
@@ -473,8 +489,9 @@ class ScoreAcceptanceRecord:
     attempt_id: uuid.UUID
     account_id: int
     revision: BeatmapRevisionInfo
-    scoreboard: ScoreboardInfo
-    mod_set: ModSetInfo
+    ruleset: Ruleset
+    mods: tuple[CanonicalMod, ...]
+    mods_digest: bytes
     attempt: PlayAttemptSubmission
     score: ScoreSubmission
     replay: StagedReplayManifest | None
@@ -496,16 +513,18 @@ class ReplayReference:
 
     score_id: int
     owner_account_id: int
-    scoreboard_id: int
     ruleset: Ruleset
+    mods_digest: bytes
     storage_key: str
     size_bytes: int
     format: str
 
     def __post_init__(self) -> None:
         """Require usable score and object identities."""
-        if self.score_id < 1 or self.owner_account_id < 1 or self.scoreboard_id < 1:
+        if self.score_id < 1 or self.owner_account_id < 1:
             raise ValueError("replay reference identifiers must be positive")
+        if len(self.mods_digest) != 32:
+            raise ValueError("replay mod digest must contain 32 bytes")
         if not self.storage_key or self.size_bytes < 0 or not self.format:
             raise ValueError("replay reference object metadata is invalid")
 
@@ -551,7 +570,6 @@ class ScoreDetailView:
     country_code: str | None
     beatmap_id: int
     ruleset: Ruleset
-    variant: ScoreboardVariant
     total_score: int
     classic_score: int
     accuracy: Decimal

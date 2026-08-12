@@ -10,15 +10,13 @@ from perfcho.infra.db.bootstrap import (
     PERMISSIONS,
     ROLE_PERMISSION_CODES,
     ROLES,
-    SCOREBOARDS,
     STABLE_CODEC_LIMITS,
     STABLE_PROTOCOL_VERSION,
     _bootstrap_uuid,
-    _mod_policy_rules,
+    _player_policy_configuration,
     bootstrap_database,
-    canonical_json_digest,
 )
-from perfcho.infra.db.enums import AccountStatus, AccountType, ChannelKind
+from perfcho.infra.db.enums import AccountStatus, AccountType, CalculationKind, ChannelKind, Ruleset
 from perfcho.infra.db.models.authz import AccountRoleGrant, Entitlement, Permission, Role, RolePermission
 from perfcho.infra.db.models.community import Channel
 from perfcho.infra.db.models.content import ContentSource
@@ -26,12 +24,8 @@ from perfcho.infra.db.models.core import Account, AccountName, UserPreference, U
 from perfcho.infra.db.models.iam import OAuthClient, OAuthClientScope, OAuthClientSecret, Scope
 from perfcho.infra.db.models.scoring import (
     CalculationFormula,
-    CalculationFormulaScoreboard,
     CalculationRelease,
-    ModPolicy,
-    ModSet,
     RankingPolicy,
-    Scoreboard,
 )
 from perfcho.infra.security.tokens import digest_opaque_token
 from perfcho.infra.settings import settings
@@ -40,8 +34,6 @@ from perfcho.infra.settings import settings
 def test_bootstrap_catalog_has_stable_ids_and_complete_role_links() -> None:
     assert [item_id for item_id, *_ in OAUTH_SCOPES] == list(range(1, len(OAUTH_SCOPES) + 1))
     assert [item_id for item_id, *_ in PERMISSIONS] == list(range(1, len(PERMISSIONS) + 1))
-    assert [item_id for item_id, *_ in SCOREBOARDS] == list(range(1, 9))
-
     permission_codes = {code for _, code, _ in PERMISSIONS}
     assert {code.split(".", 1)[0] for code in permission_codes} >= {
         "account",
@@ -59,10 +51,7 @@ def test_bootstrap_catalog_has_stable_ids_and_complete_role_links() -> None:
     assert ROLE_PERMISSION_CODES["administrator"] == permission_codes
 
 
-def test_bootstrap_digests_are_canonical_and_uuid_ids_are_uuid5() -> None:
-    assert canonical_json_digest([]).hex() == "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-    assert canonical_json_digest({"b": 1, "a": 2}) == canonical_json_digest({"a": 2, "b": 1})
-
+def test_bootstrap_protocol_policy_and_uuid_contracts() -> None:
     assert STABLE_PROTOCOL_VERSION == 19
     assert STABLE_CODEC_LIMITS == {
         "max_body_size": 16 * 1024 * 1024,
@@ -78,11 +67,37 @@ def test_bootstrap_digests_are_canonical_and_uuid_ids_are_uuid5() -> None:
     assert identifier.version == 5
     assert identifier == _bootstrap_uuid("unit-test")
 
-    for _, scoreboard_code, _, variant in SCOREBOARDS:
-        rules = _mod_policy_rules(scoreboard_code, variant)
-        assert rules["variant"] == variant.value
-        assert rules["required_acronyms"] == []
-        assert rules["forbidden_acronyms"] == ["AT", "CN", "RX", "AP"]
+    for ruleset in Ruleset:
+        configuration = _player_policy_configuration(ruleset)
+        assert configuration["metric"] == "pp"
+        assert configuration["tie_breaker"] == "ended_at"
+        assert configuration["selection"] == {"best_per_account": True}
+        assert configuration["calculation_release_id"] == str(
+            _bootstrap_uuid(f"calculation-release:performance:{ruleset.value}")
+        )
+        assert configuration["eligibility"] == {
+            "beatmap_statuses": ["ranked", "approved", "qualified", "loved"],
+            "mods": {
+                "allowed_acronyms": [
+                    "NF",
+                    "EZ",
+                    "TD",
+                    "HD",
+                    "HR",
+                    "SD",
+                    "DT",
+                    "HT",
+                    "NC",
+                    "FL",
+                    "SO",
+                    "PF",
+                    "FI",
+                    "MR",
+                ],
+                "required_acronyms": [],
+                "forbidden_acronyms": ["AT", "CN", "RX", "AP"],
+            },
+        }
 
 
 def test_bootstrap_models_expose_every_conflict_key() -> None:
@@ -97,8 +112,6 @@ def test_bootstrap_models_expose_every_conflict_key() -> None:
     assert RolePermission.__table__.c.permission_id.primary_key
     assert Entitlement.__table__.c.id.primary_key
     assert ContentSource.__table__.c.id.primary_key
-    assert Scoreboard.__table__.c.id.primary_key
-    assert ModPolicy.__table__.c.id.primary_key
     assert RankingPolicy.__table__.c.id.primary_key
     channel_table = DbBase.metadata.tables["community.channels"]
     assert any(
@@ -159,60 +172,47 @@ async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_databa
             assert await session.scalar(select(func.count()).select_from(Entitlement)) == 1
 
             assert await session.scalar(select(func.count()).select_from(ContentSource)) == 1
-            assert await session.scalar(select(func.count()).select_from(Scoreboard)) == 8
-            assert await session.scalar(select(func.count()).select_from(ModSet)) == 8
-            assert await session.scalar(select(func.count()).select_from(ModPolicy)) == 8
-            assert await session.scalar(select(func.count()).select_from(RankingPolicy)) == 8
+            assert await session.scalar(select(func.count()).select_from(RankingPolicy)) == len(Ruleset)
             assert await session.scalar(select(func.count()).select_from(CalculationFormula)) == 2
-            assert await session.scalar(select(func.count()).select_from(CalculationRelease)) == 8
-            assert await session.scalar(select(func.count()).select_from(CalculationFormulaScoreboard)) == 4
-            assert (
-                await session.scalar(
-                    select(func.count()).select_from(RankingPolicy).where(RankingPolicy.active.is_(True))
-                )
-                == 8
-            )
-
-            no_mod_sets = (await session.scalars(select(ModSet).order_by(ModSet.scoreboard_id))).all()
-            assert all(mod_set.canonical == [] for mod_set in no_mod_sets)
-            assert all(mod_set.canonical_digest == canonical_json_digest([]) for mod_set in no_mod_sets)
-            assert all(mod_set.legacy_bits == 0 for mod_set in no_mod_sets)
+            assert await session.scalar(select(func.count()).select_from(CalculationRelease)) == len(Ruleset) * 2
+            assert await session.scalar(
+                select(func.count()).select_from(RankingPolicy).where(RankingPolicy.active.is_(True))
+            ) == len(Ruleset)
 
             channels = (await session.scalars(select(Channel).order_by(Channel.slug))).all()
             assert {channel.name for channel in channels} == {"osu", "announce", "help", "lobby"}
             assert all(channel.kind is ChannelKind.PUBLIC for channel in channels)
 
             policies = (await session.scalars(select(RankingPolicy))).all()
-            assert all(policy.id.version == 5 and policy.mod_policy_id.version == 5 for policy in policies)
-            vanilla_policies = [policy for policy in policies if policy.scoreboard_id <= 4]
-            assistance_policies = [policy for policy in policies if policy.scoreboard_id > 4]
-            assert all(policy.metric == "total_score" for policy in vanilla_policies)
-            assert all(
-                policy.configuration["eligible_beatmap_statuses"] == ["ranked", "approved", "qualified", "loved"]
-                for policy in vanilla_policies
-            )
-            assert all(policy.metric == "pp" for policy in assistance_policies)
-            assert all(
-                policy.configuration["eligible_beatmap_statuses"] == ["ranked", "approved"]
-                and policy.configuration["performance_required"] is True
-                for policy in assistance_policies
-            )
+            assert {policy.ruleset for policy in policies} == set(Ruleset)
+            assert all(policy.id.version == 5 for policy in policies)
+            assert all(policy.code == f"player.{policy.ruleset.value}" for policy in policies)
+            assert all(policy.configuration == _player_policy_configuration(policy.ruleset) for policy in policies)
             formulas = {formula.code: formula for formula in await session.scalars(select(CalculationFormula))}
+            assert set(formulas) == {"official", "official-difficulty"}
             assert formulas["official"].calculator == "perfcho-pp"
+            assert formulas["official"].kind is CalculationKind.PERFORMANCE
             assert formulas["official"].enabled is True
             assert formulas["official-difficulty"].calculator == "perfcho-pp"
+            assert formulas["official-difficulty"].kind is CalculationKind.DIFFICULTY
             assert formulas["official-difficulty"].enabled is True
 
             releases = (await session.scalars(select(CalculationRelease))).all()
             assert all(release.active for release in releases)
             assert all(release.version == "2026.07.1" for release in releases)
             performance_releases = [release for release in releases if release.formula_id == formulas["official"].id]
-            assert len(performance_releases) == 4
+            difficulty_releases = [
+                release for release in releases if release.formula_id == formulas["official-difficulty"].id
+            ]
+            assert {release.ruleset for release in performance_releases} == set(Ruleset)
+            assert {release.ruleset for release in difficulty_releases} == set(Ruleset)
             assert all(release.difficulty_release_id is not None for release in performance_releases)
-            assert {policy.calculation_release_id for policy in vanilla_policies} == {
-                release.id for release in performance_releases
-            }
-            assert all(policy.calculation_release_id is None for policy in assistance_policies)
+            assert all(release.difficulty_release_id is None for release in difficulty_releases)
+            difficulty_by_ruleset = {release.ruleset: release.id for release in difficulty_releases}
+            assert all(
+                release.difficulty_release_id == difficulty_by_ruleset[release.ruleset]
+                for release in performance_releases
+            )
             assert not await session.scalar(
                 select(func.count())
                 .select_from(AccountRoleGrant)

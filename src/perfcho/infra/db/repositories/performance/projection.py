@@ -18,12 +18,9 @@ from perfcho.infra.db.models.core import MediaAsset
 from perfcho.infra.db.models.scoring import (
     BeatmapDifficultyAttribute,
     CalculationFormula,
-    CalculationFormulaScoreboard,
     CalculationRelease,
-    ModSet,
     PlayAttempt,
     Score,
-    Scoreboard,
     ScoreHitStatistic,
     ScorePerformance,
 )
@@ -38,8 +35,6 @@ from perfcho.modules.scoring.models import (
     CanonicalMod,
     HitStatistic,
     Ruleset,
-    ScoreboardInfo,
-    ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
     ScoreSubmission,
@@ -64,11 +59,9 @@ class SqlAlchemyPerformanceProjectionRepository:
                     PlayAttempt.protocol,
                     BeatmapRevision.sha256,
                     MediaAsset.storage_key,
-                    Scoreboard.id.label("scoreboard_id"),
-                    Scoreboard.code.label("scoreboard_code"),
-                    Scoreboard.ruleset,
-                    Scoreboard.variant,
-                    ModSet.canonical,
+                    Score.ruleset,
+                    Score.mods_digest,
+                    Score.mods_details,
                     CalculationRelease.id.label("release_id"),
                     CalculationRelease.formula_id,
                     CalculationRelease.ruleset.label("release_ruleset"),
@@ -89,11 +82,8 @@ class SqlAlchemyPerformanceProjectionRepository:
                 .join(PlayAttempt, PlayAttempt.id == Score.attempt_id)
                 .join(BeatmapRevision, BeatmapRevision.id == Score.beatmap_revision_id)
                 .join(MediaAsset, MediaAsset.id == BeatmapRevision.file_asset_id)
-                .join(Scoreboard, Scoreboard.id == Score.scoreboard_id)
-                .join(ModSet, ModSet.id == Score.mod_set_id)
-                .join(CalculationFormulaScoreboard, CalculationFormulaScoreboard.scoreboard_id == Score.scoreboard_id)
-                .join(CalculationFormula, CalculationFormula.id == CalculationFormulaScoreboard.formula_id)
-                .join(CalculationRelease, CalculationRelease.formula_id == CalculationFormula.id)
+                .join(CalculationRelease, CalculationRelease.ruleset == Score.ruleset)
+                .join(CalculationFormula, CalculationFormula.id == CalculationRelease.formula_id)
                 .join(difficulty_release, difficulty_release.id == CalculationRelease.difficulty_release_id)
                 .join(difficulty_formula, difficulty_formula.id == difficulty_release.formula_id)
                 .where(
@@ -102,7 +92,7 @@ class SqlAlchemyPerformanceProjectionRepository:
                     CalculationFormula.enabled.is_(True),
                     CalculationRelease.active.is_(True),
                     CalculationRelease.difficulty_release_id.is_not(None),
-                    CalculationRelease.ruleset == Scoreboard.ruleset,
+                    CalculationRelease.ruleset == Score.ruleset,
                 )
                 .order_by(CalculationFormula.code, CalculationRelease.created_at)
             )
@@ -157,14 +147,9 @@ class SqlAlchemyPerformanceProjectionRepository:
                 beatmap_revision_id=score.beatmap_revision_id,
                 beatmap_sha256=row.sha256,
                 beatmap_storage_key=row.storage_key,
-                scoreboard=ScoreboardInfo(
-                    row.scoreboard_id,
-                    row.scoreboard_code,
-                    Ruleset(row.ruleset.value),
-                    ScoreboardVariant(row.variant.value),
-                ),
-                mod_set_id=score.mod_set_id,
-                mods=_canonical_mods(row.canonical),
+                ruleset=Ruleset(row.ruleset.value),
+                mods_digest=row.mods_digest,
+                mods=_canonical_mods(row.mods_details),
                 source=row.protocol.value,
                 score=ScoreSubmission(
                     total_score=score.total_score,
@@ -194,8 +179,8 @@ class SqlAlchemyPerformanceProjectionRepository:
             insert(BeatmapDifficultyAttribute)
             .values(
                 beatmap_revision_id=calculation.beatmap_revision_id,
-                scoreboard_id=calculation.scoreboard.scoreboard_id,
-                mod_set_id=calculation.mod_set_id,
+                ruleset=calculation.ruleset,
+                mods_digest=calculation.mods_digest,
                 release_id=calculation.difficulty_release_id,
                 star_rating=result.difficulty.star_rating,
                 max_combo=result.difficulty.max_combo,
@@ -204,8 +189,8 @@ class SqlAlchemyPerformanceProjectionRepository:
             .on_conflict_do_nothing(
                 index_elements=(
                     BeatmapDifficultyAttribute.beatmap_revision_id,
-                    BeatmapDifficultyAttribute.scoreboard_id,
-                    BeatmapDifficultyAttribute.mod_set_id,
+                    BeatmapDifficultyAttribute.ruleset,
+                    BeatmapDifficultyAttribute.mods_digest,
                     BeatmapDifficultyAttribute.release_id,
                 )
             )
@@ -216,8 +201,8 @@ class SqlAlchemyPerformanceProjectionRepository:
                 await self._session.execute(
                     select(BeatmapDifficultyAttribute).where(
                         BeatmapDifficultyAttribute.beatmap_revision_id == calculation.beatmap_revision_id,
-                        BeatmapDifficultyAttribute.scoreboard_id == calculation.scoreboard.scoreboard_id,
-                        BeatmapDifficultyAttribute.mod_set_id == calculation.mod_set_id,
+                        BeatmapDifficultyAttribute.ruleset == calculation.ruleset,
+                        BeatmapDifficultyAttribute.mods_digest == calculation.mods_digest,
                         BeatmapDifficultyAttribute.release_id == calculation.difficulty_release_id,
                     )
                 )
@@ -266,7 +251,7 @@ class SqlAlchemyPerformanceProjectionRepository:
         return PerformanceCompletion(
             score_id=calculation.score_id,
             account_id=calculation.account_id,
-            scoreboard_id=calculation.scoreboard.scoreboard_id,
+            ruleset=calculation.ruleset,
             formula_id=calculation.formula_id,
             formula_code=calculation.formula_code,
             release_id=calculation.release_id,

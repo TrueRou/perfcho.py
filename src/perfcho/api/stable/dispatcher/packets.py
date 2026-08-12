@@ -9,7 +9,7 @@ from time import monotonic_ns
 from typing import Protocol, runtime_checkable
 
 from perfcho.api.stable.bubbles import StableBubbleRenderer, canonicalize_presence, canonicalize_spectator_frame
-from perfcho.api.stable.canonize.scoring import LEGACY_MOD_BITS, parse_legacy_mods
+from perfcho.api.stable.canonize.scoring import LEGACY_MOD_BITS
 from perfcho.api.stable.channels import parse_stable_channel_selector, stable_channel_name
 from perfcho.api.stable.dispatcher.models import StableRuntimeContext
 from perfcho.api.stable.dispatcher.multiplayer import (
@@ -87,7 +87,7 @@ from perfcho.modules.realtime import (
     multiplayer_room_snapshot,
     presence_updated_bubble,
 )
-from perfcho.modules.scoring import AccountStatsView, Ruleset, ScoreboardVariant
+from perfcho.modules.scoring import AccountStatsView, Ruleset
 from perfcho.modules.social import SocialAccountNotFound, SocialInteractionBlocked, SocialRelationRejected
 
 _MESSAGE_ID_WINDOW_SECONDS = 5
@@ -96,9 +96,7 @@ _BUBBLE_RENDERER = StableBubbleRenderer()
 
 @runtime_checkable
 class _LegacyAccountStatisticsQuery(Protocol):
-    async def get_account_stats(
-        self, account_id: int, ruleset: Ruleset, variant: ScoreboardVariant
-    ) -> AccountStatsView: ...
+    async def get_account_stats(self, account_id: int, ruleset: Ruleset) -> AccountStatsView: ...
 
 
 async def dispatch_packets(
@@ -635,17 +633,13 @@ async def account_stats(stats: UserStats, services: StableServices) -> UserStats
     """Overlay canonical score totals, Performance, and rank for the current mode."""
     if (services.account_statistics is None and services.ranking_query is None) or not 0 <= stats.mode <= 3:
         return stats
-    try:
-        _, variant = parse_legacy_mods(stats.mods)
-    except ValueError:
-        return stats
     if services.account_statistics is not None:
-        view = await services.account_statistics.get_for_display(stats.user_id, tuple(Ruleset)[stats.mode], variant)
+        view = await services.account_statistics.get_for_display(stats.user_id, tuple(Ruleset)[stats.mode])
     else:
         ranking_query = services.ranking_query
         if not isinstance(ranking_query, _LegacyAccountStatisticsQuery):
             return stats
-        view = await ranking_query.get_account_stats(stats.user_id, tuple(Ruleset)[stats.mode], variant)
+        view = await ranking_query.get_account_stats(stats.user_id, tuple(Ruleset)[stats.mode])
     return UserStats(
         stats.user_id,
         stats.action,

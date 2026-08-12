@@ -49,6 +49,7 @@ from perfcho.api.stable.realtime.models import (
     UserPresence,
     UserStats,
 )
+from perfcho.infra.db.mods import project_scoreboard_variant
 from perfcho.infra.logging import log_event, rate_limit
 from perfcho.modules.multiplayer import SlotStatus, TeamMode, WinCondition
 from perfcho.modules.realtime import (
@@ -76,7 +77,7 @@ from perfcho.modules.realtime import (
     SpectatorLifecycleBubble,
     UserLogoutBubble,
 )
-from perfcho.modules.scoring import CanonicalMod, Ruleset, ScoreboardVariant
+from perfcho.modules.scoring import CanonicalMod, Ruleset
 from perfcho.modules.scoring.mods import normalize_mods
 
 _ACTIONS = (
@@ -189,7 +190,7 @@ def canonicalize_presence(
         raise ValueError("Stable presence and statistics rulesets differ")
     if not 0 <= statistics.action < len(_ACTIONS) or not 0 <= statistics.mode < len(_RULESETS):
         raise ValueError("Stable presence contains an unknown activity or ruleset")
-    mods, _ = parse_legacy_mods(statistics.mods)
+    mods = parse_legacy_mods(statistics.mods)
     return (
         PresenceIdentity(
             display_name=presence.username,
@@ -543,8 +544,9 @@ def _stable_multiplayer_match(
     password: str | None = None,
 ) -> MultiplayerMatch:
     """Project a canonical room snapshot into Stable's fixed match structure."""
-    normalized = normalize_mods(snapshot.ruleset, snapshot.variant, snapshot.mods)
-    legacy_bits = project_legacy_mods(normalized.mods, snapshot.variant)
+    variant = project_scoreboard_variant(snapshot.mods)
+    normalized = normalize_mods(snapshot.ruleset, variant, snapshot.mods)
+    legacy_bits = project_legacy_mods(normalized.mods)
     slot_mods = (
         tuple(_stable_slot_mod_bits(snapshot.ruleset, slot.mods) for slot in snapshot.slots)
         if snapshot.free_mods
@@ -573,15 +575,8 @@ def _stable_multiplayer_match(
 
 
 def _stable_slot_mod_bits(ruleset: Ruleset, mods: tuple[CanonicalMod, ...]) -> int:
-    acronyms = {mod.acronym for mod in mods}
-    variant = (
-        ScoreboardVariant.AUTOPILOT
-        if "AP" in acronyms
-        else ScoreboardVariant.RELAX
-        if "RX" in acronyms
-        else ScoreboardVariant.VANILLA
-    )
-    return project_legacy_mods(normalize_mods(ruleset, variant, mods).mods, variant)
+    variant = project_scoreboard_variant(mods)
+    return project_legacy_mods(normalize_mods(ruleset, variant, mods).mods)
 
 
 __all__ = (
