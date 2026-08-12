@@ -249,8 +249,8 @@ async def test_sqlalchemy_recipient_block_filter_uses_one_batch_query() -> None:
     statement = session.scalars.await_args.args[0]
     sql = str(statement)
     parameters = statement.compile().params
-    assert "social.blocks.target_account_id" in sql
-    assert "social.blocks.actor_account_id IN" in sql
+    assert "social.block.target_account_id" in sql
+    assert "social.block.actor_account_id IN" in sql
     assert 20 in parameters.values()
     assert [10, 11, 12] in parameters.values()
 
@@ -267,8 +267,8 @@ async def test_sqlalchemy_incoming_follower_filter_uses_one_bounded_query() -> N
     statement = session.scalars.await_args.args[0]
     sql = str(statement)
     parameters = statement.compile().params
-    assert "social.follows.target_account_id" in sql
-    assert "social.follows.actor_account_id IN" in sql
+    assert "social.follow.target_account_id" in sql
+    assert "social.follow.actor_account_id IN" in sql
     assert 20 in parameters.values()
     assert [10, 11, 12] in parameters.values()
 

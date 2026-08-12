@@ -913,7 +913,7 @@ async def test_sqlalchemy_repository_upgrades_only_the_observed_legacy_credentia
     statement = session.scalar.await_args.args[0]
     parameters = statement.compile().params
     assert upgraded
-    assert str(statement).startswith("UPDATE iam.password_credentials")
+    assert str(statement).startswith("UPDATE iam.password_credential")
     assert {"bcrypt_md5", "$2b$legacy", "$argon2id$replacement", "argon2id"} <= set(parameters.values())
     assert INSTANT in parameters.values()
     session.commit.assert_not_called()

@@ -31,12 +31,12 @@ from perfcho.infra.db.mixins import BigIntIdentityMixin, CreatedAtMixin, Timesta
 class Account(DbBase):
     """Stores the shared Stable and Lazer account identity and lifecycle."""
 
-    __tablename__ = "accounts"
+    __tablename__ = "account"
     __table_args__ = (
         CheckConstraint("id BETWEEN 1 AND 2147483647", name="stable_id_range"),
         CheckConstraint("country_code IS NULL OR country_code ~ '^[A-Z]{2}$'", name="country_code_format"),
-        Index("ix_accounts_status_id", "status", "id"),
-        Index("ix_accounts_country_id", "country_code", "id"),
+        Index("ix_account_status_id", "status", "id"),
+        Index("ix_account_country_id", "country_code", "id"),
         {"schema": "core"},
     )
 
@@ -73,14 +73,14 @@ class Account(DbBase):
 class AccountName(BigIntIdentityMixin, DbBase):
     """Stores display names, normalized keys, and the complete rename history."""
 
-    __tablename__ = "account_names"
+    __tablename__ = "account_name"
     __table_args__ = (
         CheckConstraint("char_length(display_name) BETWEEN 2 AND 15", name="display_name_length"),
         CheckConstraint("char_length(name_key) BETWEEN 2 AND 32", name="name_key_length"),
         CheckConstraint("ended_at IS NULL OR ended_at > started_at", name="valid_period"),
-        Index("uq_account_names_current_key", "name_key", unique=True, postgresql_where=text("ended_at IS NULL")),
+        Index("uq_account_name_current_key", "name_key", unique=True, postgresql_where=text("ended_at IS NULL")),
         Index(
-            "uq_account_names_current_account",
+            "uq_account_name_current_account",
             "account_id",
             unique=True,
             postgresql_where=text("ended_at IS NULL"),
@@ -88,12 +88,12 @@ class AccountName(BigIntIdentityMixin, DbBase):
         {"schema": "core"},
     )
 
-    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="RESTRICT"), nullable=False)
     display_name: Mapped[str] = mapped_column(String(15), nullable=False)
     name_key: Mapped[str] = mapped_column(String(32), nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    changed_by_id: Mapped[int | None] = mapped_column(ForeignKey("core.accounts.id", ondelete="SET NULL"))
+    changed_by_id: Mapped[int | None] = mapped_column(ForeignKey("core.account.id", ondelete="SET NULL"))
 
     account: Mapped[Account] = relationship(back_populates="names", foreign_keys=[account_id], lazy="raise")
 
@@ -101,13 +101,13 @@ class AccountName(BigIntIdentityMixin, DbBase):
 class AccountEmail(Uuid7PrimaryKeyMixin, DbBase):
     """Stores verified email addresses, primary selection, and email change history."""
 
-    __tablename__ = "account_emails"
+    __tablename__ = "account_email"
     __table_args__ = (
         CheckConstraint("position('@' IN email) > 1", name="email_format"),
         CheckConstraint("retired_at IS NULL OR retired_at > added_at", name="valid_period"),
-        Index("uq_account_emails_active_key", "email_key", unique=True, postgresql_where=text("retired_at IS NULL")),
+        Index("uq_account_email_active_key", "email_key", unique=True, postgresql_where=text("retired_at IS NULL")),
         Index(
-            "uq_account_emails_primary_account",
+            "uq_account_email_primary_account",
             "account_id",
             unique=True,
             postgresql_where=text("is_primary AND retired_at IS NULL"),
@@ -115,7 +115,7 @@ class AccountEmail(Uuid7PrimaryKeyMixin, DbBase):
         {"schema": "core"},
     )
 
-    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="RESTRICT"), nullable=False)
     email: Mapped[str] = mapped_column(String(254), nullable=False)
     email_key: Mapped[str] = mapped_column(String(254), nullable=False)
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
@@ -129,7 +129,7 @@ class AccountEmail(Uuid7PrimaryKeyMixin, DbBase):
 class MediaAsset(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     """Stores object-storage metadata for avatars, covers, flags, and other media."""
 
-    __tablename__ = "media_assets"
+    __tablename__ = "media_asset"
     __table_args__ = (
         CheckConstraint("size_bytes >= 0", name="nonnegative_size"),
         CheckConstraint("width IS NULL OR width > 0", name="positive_width"),
@@ -140,7 +140,7 @@ class MediaAsset(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     )
 
     owner_account_id: Mapped[int | None] = mapped_column(
-        ForeignKey("core.accounts.id", ondelete="SET NULL"), index=True
+        ForeignKey("core.account.id", ondelete="SET NULL"), index=True
     )
     storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
     sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
@@ -154,15 +154,15 @@ class MediaAsset(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
 class UserProfile(DbBase):
     """Stores public profile details, media, and the default ruleset for an account."""
 
-    __tablename__ = "user_profiles"
+    __tablename__ = "user_profile"
     __table_args__ = (
         CheckConstraint("accent_color IS NULL OR accent_color ~ '^#[0-9A-Fa-f]{6}$'", name="accent_color_format"),
         {"schema": "core"},
     )
 
-    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="CASCADE"), primary_key=True)
-    avatar_asset_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("core.media_assets.id", ondelete="SET NULL"))
-    cover_asset_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("core.media_assets.id", ondelete="SET NULL"))
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="CASCADE"), primary_key=True)
+    avatar_asset_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("core.media_asset.id", ondelete="SET NULL"))
+    cover_asset_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("core.media_asset.id", ondelete="SET NULL"))
     bio: Mapped[str | None] = mapped_column(Text)
     location: Mapped[str | None] = mapped_column(String(100))
     occupation: Mapped[str | None] = mapped_column(String(100))
@@ -181,7 +181,7 @@ class UserProfile(DbBase):
 class UserPreference(TimestampMixin, DbBase):
     """Stores private client, privacy, and presentation preferences for an account."""
 
-    __tablename__ = "user_preferences"
+    __tablename__ = "user_preference"
     __table_args__ = (
         CheckConstraint("master_volume BETWEEN 0 AND 1", name="master_volume_range"),
         CheckConstraint("music_volume BETWEEN 0 AND 1", name="music_volume_range"),
@@ -189,7 +189,7 @@ class UserPreference(TimestampMixin, DbBase):
         {"schema": "core"},
     )
 
-    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="CASCADE"), primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="CASCADE"), primary_key=True)
     locale: Mapped[str] = mapped_column(String(16), nullable=False, default="en", server_default="en")
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC", server_default="UTC")
     theme: Mapped[str] = mapped_column(String(32), nullable=False, default="system", server_default="system")
@@ -212,29 +212,29 @@ class UserPreference(TimestampMixin, DbBase):
 class Badge(DbBase):
     """Defines honorary badges that can be displayed on account profiles."""
 
-    __tablename__ = "badges"
+    __tablename__ = "badge"
     __table_args__ = (UniqueConstraint("slug"), {"schema": "core"})
 
     id: Mapped[int] = mapped_column(SmallInteger, Identity(always=False), primary_key=True)
     slug: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
-    image_asset_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("core.media_assets.id", ondelete="SET NULL"))
+    image_asset_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("core.media_asset.id", ondelete="SET NULL"))
 
 
 class AccountBadge(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     """Records profile badges awarded to accounts independently of achievements."""
 
-    __tablename__ = "account_badges"
+    __tablename__ = "account_badge"
     __table_args__ = (
         CheckConstraint("expires_at IS NULL OR expires_at > created_at", name="valid_period"),
-        Index("ix_account_badges_account_created", "account_id", "created_at"),
+        Index("ix_account_badge_account_created", "account_id", "created_at"),
         {"schema": "core"},
     )
 
-    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
-    badge_id: Mapped[int] = mapped_column(ForeignKey("core.badges.id", ondelete="RESTRICT"), nullable=False)
-    awarded_by_id: Mapped[int | None] = mapped_column(ForeignKey("core.accounts.id", ondelete="SET NULL"))
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="RESTRICT"), nullable=False)
+    badge_id: Mapped[int] = mapped_column(ForeignKey("core.badge.id", ondelete="RESTRICT"), nullable=False)
+    awarded_by_id: Mapped[int | None] = mapped_column(ForeignKey("core.account.id", ondelete="SET NULL"))
     description: Mapped[str | None] = mapped_column(String(255))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     display_order: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0, server_default="0")

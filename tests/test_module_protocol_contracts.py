@@ -17,7 +17,7 @@ def _module_files() -> tuple[Path, ...]:
 
 
 def _module_paths() -> tuple[Path, ...]:
-    return tuple(sorted(MODULES_ROOT.rglob("*")))
+    return _module_files()
 
 
 def _relative(path: Path) -> str:

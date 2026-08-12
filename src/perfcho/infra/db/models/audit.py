@@ -13,11 +13,11 @@ from perfcho.infra.db.mixins import BigIntIdentityMixin, CreatedAtMixin
 class AuditEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     """Stores immutable audit records for sensitive administrative and security actions."""
 
-    __tablename__ = "audit_events"
+    __tablename__ = "audit_event"
     __table_args__ = (
-        Index("ix_audit_events_actor_created", "actor_account_id", "created_at"),
-        Index("ix_audit_events_target_created", "target_type", "target_id", "created_at"),
-        Index("ix_audit_events_request", "request_id"),
+        Index("ix_audit_event_actor_created", "actor_account_id", "created_at"),
+        Index("ix_audit_event_target_created", "target_type", "target_id", "created_at"),
+        Index("ix_audit_event_request", "request_id"),
         {"schema": "audit"},
     )
 

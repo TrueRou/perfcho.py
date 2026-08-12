@@ -116,8 +116,8 @@ async def _migrate_sources(runtime: MigrationRuntime) -> None:
     async def handler(session: AsyncSession) -> None:
         await session.execute(
             text(
-                "SELECT setval(pg_get_serial_sequence('content.sources', 'id'), "
-                "GREATEST(1, (SELECT COALESCE(MAX(id), 0) FROM content.sources)), true)"
+                "SELECT setval(pg_get_serial_sequence('content.source', 'id'), "
+                "GREATEST(1, (SELECT COALESCE(MAX(id), 0) FROM content.source)), true)"
             )
         )
         statement = insert(ContentSource).values(

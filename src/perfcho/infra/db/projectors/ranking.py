@@ -17,7 +17,7 @@ from perfcho.infra.db.models.scoring import (
     Score,
     ScoreEligibility,
     ScorePerformance,
-    UserRankedStat,
+    UserRanking,
 )
 from perfcho.infra.db.projectors.common import (
     advance_checkpoint,
@@ -69,7 +69,7 @@ async def project_accepted_score(
     )
     for policy in policies:
         await _project_policy(session, score, beatmap_status.value, policy)
-        await _project_user_ranked_stat(session, score.account_id, policy, event.id)
+        await _project_user_ranking(session, score.account_id, policy, event.id)
     await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
     if invalidate is not None:
         await invalidate(score.beatmap_id)
@@ -115,7 +115,7 @@ async def _project_policy(
     )
 
 
-async def _project_user_ranked_stat(
+async def _project_user_ranking(
     session: AsyncSession,
     account_id: int,
     policy: RankingPolicy,
@@ -210,7 +210,7 @@ async def _project_user_ranked_stat(
         .select_from(ordered_performance)
         .cte("ranked_performance_stats")
     )
-    statement = insert(UserRankedStat).from_select(
+    statement = insert(UserRanking).from_select(
         (
             "account_id",
             "policy_id",
@@ -234,7 +234,7 @@ async def _project_user_ranked_stat(
     )
     await session.execute(
         statement.on_conflict_do_update(
-            index_elements=(UserRankedStat.account_id, UserRankedStat.policy_id),
+            index_elements=(UserRanking.account_id, UserRanking.policy_id),
             set_={
                 "ranked_score": statement.excluded.ranked_score,
                 "performance": statement.excluded.performance,

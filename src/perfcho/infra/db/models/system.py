@@ -13,7 +13,7 @@ from perfcho.infra.db.mixins import CreatedAtMixin, TimestampMixin
 class MigrationState(TimestampMixin, DbBase):
     """Store resumable migration checkpoints."""
 
-    __tablename__ = "migration_states"
+    __tablename__ = "migration_state"
     __table_args__ = {"schema": "system"}
 
     task: Mapped[str] = mapped_column(String(100), primary_key=True)
@@ -25,12 +25,12 @@ class MigrationState(TimestampMixin, DbBase):
 class CommandReceipt(CreatedAtMixin, DbBase):
     """Stores bounded command idempotency claims and non-secret result references."""
 
-    __tablename__ = "command_receipts"
+    __tablename__ = "command_receipt"
     __table_args__ = (
         CheckConstraint("octet_length(request_digest) = 32", name="request_digest_length"),
         CheckConstraint("expires_at > created_at", name="valid_period"),
-        Index("ix_command_receipts_expiry", "expires_at"),
-        Index("ix_command_receipts_resource", "resource_type", "resource_id"),
+        Index("ix_command_receipt_expiry", "expires_at"),
+        Index("ix_command_receipt_resource", "resource_type", "resource_id"),
         {"schema": "system"},
     )
 

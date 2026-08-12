@@ -175,9 +175,9 @@ def test_multiplayer_partial_unique_indexes_cover_global_presence_and_active_rou
     assert isinstance(presence_table, Table)
     assert isinstance(round_table, Table)
     presence_index = next(
-        index for index in presence_table.indexes if index.name == "uq_session_presences_account_current"
+        index for index in presence_table.indexes if index.name == "uq_session_presence_account_current"
     )
-    round_index = next(index for index in round_table.indexes if index.name == "uq_rounds_session_active")
+    round_index = next(index for index in round_table.indexes if index.name == "uq_round_session_active")
 
     assert presence_index.unique
     assert str(presence_index.dialect_options["postgresql"]["where"])

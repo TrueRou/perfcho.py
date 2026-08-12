@@ -130,17 +130,17 @@ STABLE_CODEC_LIMITS = {
 _ACCOUNT_IDENTITY_SQL = text(
     """
     SELECT setval(
-        pg_get_serial_sequence('core.accounts', 'id'),
+        pg_get_serial_sequence('core.account', 'id'),
         GREATEST(
             2,
-            (SELECT COALESCE(MAX(id), 0) FROM core.accounts),
+            (SELECT COALESCE(MAX(id), 0) FROM core.account),
             COALESCE(
                 (
                     SELECT last_value
                     FROM pg_sequences
                     WHERE schemaname = 'core'
                       AND sequencename = split_part(
-                          pg_get_serial_sequence('core.accounts', 'id'),
+                          pg_get_serial_sequence('core.account', 'id'),
                           '.',
                           2
                       )

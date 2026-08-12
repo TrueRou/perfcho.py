@@ -19,19 +19,19 @@ from perfcho.infra.logging import duration_ms, log_event
 _TARGET_LOCK_KEY = "perfcho:bancho-migration"
 
 _LEGACY_CREDENTIAL_DDL = (
-    "ALTER TABLE iam.password_credentials DROP CONSTRAINT IF EXISTS ck_password_credentials_argon2id_only",
-    "ALTER TABLE iam.password_credentials DROP CONSTRAINT IF EXISTS ck_password_credentials_positive_pepper_version",
-    "ALTER TABLE iam.password_credentials ALTER COLUMN pepper_version DROP NOT NULL",
+    "ALTER TABLE iam.password_credential DROP CONSTRAINT IF EXISTS ck_password_credential_argon2id_only",
+    "ALTER TABLE iam.password_credential DROP CONSTRAINT IF EXISTS ck_password_credential_positive_pepper_version",
+    "ALTER TABLE iam.password_credential ALTER COLUMN pepper_version DROP NOT NULL",
     """
     DO $$
     BEGIN
         IF NOT EXISTS (
             SELECT 1 FROM pg_constraint
-            WHERE conrelid = 'iam.password_credentials'::regclass
-              AND conname = 'ck_password_credentials_algorithm_pepper_consistency'
+            WHERE conrelid = 'iam.password_credential'::regclass
+              AND conname = 'ck_password_credential_algorithm_pepper_consistency'
         ) THEN
-            ALTER TABLE iam.password_credentials
-            ADD CONSTRAINT ck_password_credentials_algorithm_pepper_consistency CHECK (
+            ALTER TABLE iam.password_credential
+            ADD CONSTRAINT ck_password_credential_algorithm_pepper_consistency CHECK (
                 (algorithm = 'argon2id' AND pepper_version IS NOT NULL AND pepper_version > 0)
                 OR (algorithm = 'bcrypt_md5' AND pepper_version IS NULL)
             );

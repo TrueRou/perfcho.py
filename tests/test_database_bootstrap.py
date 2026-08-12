@@ -113,7 +113,7 @@ def test_bootstrap_models_expose_every_conflict_key() -> None:
     assert Entitlement.__table__.c.id.primary_key
     assert ContentSource.__table__.c.id.primary_key
     assert RankingPolicy.__table__.c.id.primary_key
-    channel_table = DbBase.metadata.tables["community.channels"]
+    channel_table = DbBase.metadata.tables["community.channel"]
     assert any(
         isinstance(constraint, UniqueConstraint) and tuple(constraint.columns.keys()) == ("slug",)
         for constraint in channel_table.constraints
@@ -224,7 +224,7 @@ async def test_bootstrap_is_concurrent_and_repeatably_idempotent(postgres_databa
                 text(
                     "SELECT last_value FROM pg_sequences "
                     "WHERE schemaname = 'core' AND sequencename = "
-                    "split_part(pg_get_serial_sequence('core.accounts', 'id'), '.', 2)"
+                    "split_part(pg_get_serial_sequence('core.account', 'id'), '.', 2)"
                 )
             )
             assert sequence_value is not None and sequence_value >= 2

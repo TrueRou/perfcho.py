@@ -8,19 +8,19 @@ from perfcho.infra.scheduler import configure_scheduler
 
 
 @pytest.mark.asyncio
-async def test_rank_snapshot_schedule_is_coalesced_and_single_instance() -> None:
+async def test_user_ranking_snapshot_schedule_is_coalesced_and_single_instance() -> None:
     async with AsyncScheduler() as scheduler:
         await configure_scheduler(
             scheduler,
             MagicMock(),
-            rank_snapshot_cron="0 4 * * *",
+            user_ranking_snapshot_cron="0 4 * * *",
         )
 
         schedules = await scheduler.get_schedules()
         tasks = await scheduler.get_tasks()
 
-    schedule = next(schedule for schedule in schedules if schedule.id == "rank_snapshot")
-    task = next(task for task in tasks if task.id == "rank_snapshot")
+    schedule = next(schedule for schedule in schedules if schedule.id == "user_ranking_snapshot")
+    task = next(task for task in tasks if task.id == "user_ranking_snapshot")
     assert schedule.coalesce is CoalescePolicy.latest
     assert task.max_running_jobs == 1
     assert isinstance(schedule.trigger, CronTrigger)

@@ -53,7 +53,7 @@ from perfcho.infra.db.models.scoring import (
     ScoreHitStatistic,
     ScorePerformance,
     UserPlayStat,
-    UserRankedStat,
+    UserRanking,
 )
 from perfcho.modules.common import AccountUnavailable
 from perfcho.modules.scoring.errors import AttemptIdempotencyConflict, MultiplayerContextRejected, ScoreRejected
@@ -698,10 +698,10 @@ class SqlAlchemyScoringRepository:
                     UserPlayStat.total_hits,
                     UserPlayStat.max_combo,
                     UserPlayStat.replay_views,
-                    UserRankedStat.ranked_score,
-                    UserRankedStat.accuracy,
-                    UserRankedStat.performance,
-                    UserRankedStat.grade_counts,
+                    UserRanking.ranked_score,
+                    UserRanking.accuracy,
+                    UserRanking.performance,
+                    UserRanking.grade_counts,
                     Account.country_code,
                 )
                 .select_from(UserPlayStat)
@@ -710,8 +710,8 @@ class SqlAlchemyScoringRepository:
                     (RankingPolicy.ruleset == UserPlayStat.ruleset) & RankingPolicy.active.is_(True),
                 )
                 .outerjoin(
-                    UserRankedStat,
-                    (UserRankedStat.policy_id == RankingPolicy.id) & (UserRankedStat.account_id == account_id),
+                    UserRanking,
+                    (UserRanking.policy_id == RankingPolicy.id) & (UserRanking.account_id == account_id),
                 )
                 .outerjoin(Account, Account.id == UserPlayStat.account_id)
                 .where(
@@ -731,15 +731,15 @@ class SqlAlchemyScoringRepository:
             rank_value = row.performance if metric == "pp" else row.ranked_score
             if rank_value is not None and rank_value > 0:
                 rank_filter = (
-                    UserRankedStat.performance > rank_value
+                    UserRanking.performance > rank_value
                     if metric == "pp"
-                    else UserRankedStat.ranked_score > rank_value
+                    else UserRanking.ranked_score > rank_value
                 )
                 higher = await self._session.scalar(
                     select(func.count())
-                    .select_from(UserRankedStat)
+                    .select_from(UserRanking)
                     .where(
-                        UserRankedStat.policy_id == row.policy_id,
+                        UserRanking.policy_id == row.policy_id,
                         rank_filter,
                     )
                 )
@@ -748,10 +748,10 @@ class SqlAlchemyScoringRepository:
                 if country_code:
                     country_higher = await self._session.scalar(
                         select(func.count())
-                        .select_from(UserRankedStat)
-                        .join(Account, Account.id == UserRankedStat.account_id)
+                        .select_from(UserRanking)
+                        .join(Account, Account.id == UserRanking.account_id)
                         .where(
-                            UserRankedStat.policy_id == row.policy_id,
+                            UserRanking.policy_id == row.policy_id,
                             Account.country_code == country_code,
                             rank_filter,
                         )

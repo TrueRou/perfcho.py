@@ -1,4 +1,4 @@
-"""Create daily rank snapshots from the current ranking projection."""
+"""Create daily user ranking snapshots from the current ranking projection."""
 
 from datetime import date
 from time import monotonic_ns
@@ -12,14 +12,14 @@ from perfcho.infra.db.base import DbSessionFactory
 from perfcho.infra.db.enums import OutboxDeliveryStatus
 from perfcho.infra.db.models.core import Account
 from perfcho.infra.db.models.events import OutboxDelivery
-from perfcho.infra.db.models.scoring import RankingPolicy, RankSnapshot, UserRankedStat
+from perfcho.infra.db.models.scoring import RankingPolicy, UserRanking, UserRankingSnapshot
 
 _RANKING_CONSUMER = "ranking-projector.v1"
-_RANK_SNAPSHOT_LOCK_ID = 0x72616E6B736E6170
+_USER_RANKING_SNAPSHOT_LOCK_ID = 0x72616E6B736E6170
 
 
-class RankSnapshotTask:
-    """Materialize one complete rank snapshot after ranking catches up."""
+class UserRankingSnapshotTask:
+    """Materialize one complete user ranking snapshot after ranking catches up."""
 
     def __init__(self, session_factory: DbSessionFactory) -> None:
         """Bind the task to the process-owned database session factory."""
@@ -32,10 +32,10 @@ class RankSnapshotTask:
         try:
             completed = await self._run_once()
         except Exception as error:
-            if logging.rate_limit("scheduler:rank-snapshot:failed"):
+            if logging.rate_limit("scheduler:user-ranking-snapshot:failed"):
                 logging.log_event(
                     "ERROR",
-                    "scheduler.rank_snapshot.failed",
+                    "scheduler.user_ranking_snapshot.failed",
                     exception=error,
                     error_type=type(error).__name__,
                     duration_ms=logging.duration_ms(started_ns),
@@ -44,7 +44,7 @@ class RankSnapshotTask:
         if completed:
             logging.log_event(
                 "INFO",
-                "scheduler.rank_snapshot.completed",
+                "scheduler.user_ranking_snapshot.completed",
                 duration_ms=logging.duration_ms(started_ns),
             )
         return completed
@@ -53,17 +53,19 @@ class RankSnapshotTask:
         async with self._session_factory.begin() as session:
             acquired = await session.scalar(
                 text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
-                {"lock_id": _RANK_SNAPSHOT_LOCK_ID},
+                {"lock_id": _USER_RANKING_SNAPSHOT_LOCK_ID},
             )
             if not acquired:
                 return False
             today = await session.scalar(select(func.current_date()))
             if not isinstance(today, date):
-                raise RuntimeError("PostgreSQL did not return a rank snapshot date")
+                raise RuntimeError("PostgreSQL did not return a user ranking snapshot date")
             if self._completed_date == today:
                 return False
             existing = await session.scalar(
-                select(RankSnapshot.policy_id).where(RankSnapshot.snapshot_date == today).limit(1)
+                select(UserRankingSnapshot.policy_id)
+                .where(UserRankingSnapshot.snapshot_date == today)
+                .limit(1)
             )
             if existing is not None:
                 self._completed_date = today
@@ -78,26 +80,26 @@ class RankSnapshotTask:
             )
             if unfinished:
                 return False
-            await _write_rank_snapshots(session, today)
+            await _write_user_ranking_snapshots(session, today)
         self._completed_date = today
         return True
 
 
-async def _write_rank_snapshots(session: AsyncSession, snapshot_date: date) -> None:
+async def _write_user_ranking_snapshots(session: AsyncSession, snapshot_date: date) -> None:
     metric = RankingPolicy.configuration["metric"].as_string()
     ranking_value = case(
-        (metric == "pp", UserRankedStat.performance),
-        else_=cast(UserRankedStat.ranked_score, Numeric(20, 5)),
+        (metric == "pp", UserRanking.performance),
+        else_=cast(UserRanking.ranked_score, Numeric(20, 5)),
     ).label("value")
     active_stats = (
         select(
-            UserRankedStat.policy_id,
-            UserRankedStat.account_id,
+            UserRanking.policy_id,
+            UserRanking.account_id,
             Account.country_code,
             ranking_value,
         )
-        .join(RankingPolicy, RankingPolicy.id == UserRankedStat.policy_id)
-        .join(Account, Account.id == UserRankedStat.account_id)
+        .join(RankingPolicy, RankingPolicy.id == UserRanking.policy_id)
+        .join(Account, Account.id == UserRanking.account_id)
         .where(RankingPolicy.active.is_(True), ranking_value > 0)
         .subquery()
     )
@@ -120,13 +122,17 @@ async def _write_rank_snapshots(session: AsyncSession, snapshot_date: date) -> N
         ).label("country_rank"),
         cast(active_stats.c.value, Numeric(20, 5)).label("value"),
     )
-    statement = insert(RankSnapshot).from_select(
+    statement = insert(UserRankingSnapshot).from_select(
         ("policy_id", "snapshot_date", "account_id", "global_rank", "country_rank", "value"),
         ranked,
     )
     await session.execute(
         statement.on_conflict_do_update(
-            index_elements=(RankSnapshot.policy_id, RankSnapshot.snapshot_date, RankSnapshot.account_id),
+            index_elements=(
+                UserRankingSnapshot.policy_id,
+                UserRankingSnapshot.snapshot_date,
+                UserRankingSnapshot.account_id,
+            ),
             set_={
                 "global_rank": statement.excluded.global_rank,
                 "country_rank": statement.excluded.country_rank,

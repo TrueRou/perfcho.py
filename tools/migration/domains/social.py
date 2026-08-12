@@ -55,8 +55,8 @@ async def migrate_social(runtime: MigrationRuntime) -> None:
             text(
                 """
                 SELECT setval(
-                    pg_get_serial_sequence('social.teams', 'id'),
-                    GREATEST(1, (SELECT COALESCE(MAX(id), 0) FROM social.teams)),
+                    pg_get_serial_sequence('social.team', 'id'),
+                    GREATEST(1, (SELECT COALESCE(MAX(id), 0) FROM social.team)),
                     true
                 )
                 """

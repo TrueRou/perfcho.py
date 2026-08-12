@@ -266,7 +266,7 @@ async def compose_core_services() -> CoreServices:
         session_factory = infra_db.create_session_factory(postgres)
         scheduler = await start_scheduler(
             session_factory,
-            rank_snapshot_cron=config.rank_snapshot_cron,
+            user_ranking_snapshot_cron=config.user_ranking_snapshot_cron,
         )
     except BaseException as startup_error:
         try:

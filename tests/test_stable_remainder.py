@@ -245,9 +245,9 @@ class FakeBot:
 
 
 class FakeRankingQuery:
-    async def get_account_stats(self, account_id: int, ruleset: object, variant: object) -> AccountStatsView:
+    async def get_account_stats(self, account_id: int, ruleset: object) -> AccountStatsView:
         assert account_id == 10
-        del ruleset, variant
+        del ruleset
         return AccountStatsView(123_456, Decimal("0.987654"), 12, 2_000_000, 4, 321)
 
 

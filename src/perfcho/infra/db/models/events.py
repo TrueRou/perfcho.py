@@ -28,14 +28,14 @@ from perfcho.infra.db.mixins import BigIntIdentityMixin, CreatedAtMixin, Timesta
 class OutboxEvent(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     """Stores domain events committed atomically with business state for reliable publication."""
 
-    __tablename__ = "outbox_events"
+    __tablename__ = "outbox_event"
     __table_args__ = (
         CheckConstraint("schema_version > 0", name="positive_schema_version"),
         UniqueConstraint("position"),
-        UniqueConstraint("id", "position", name="uq_outbox_events_id_position"),
-        Index("ix_outbox_events_aggregate", "aggregate_type", "aggregate_id", "created_at"),
-        Index("ix_outbox_events_trace_id", "trace_id", postgresql_where=text("trace_id IS NOT NULL")),
-        {"schema": "events"},
+        UniqueConstraint("id", "position", name="uq_outbox_event_id_position"),
+        Index("ix_outbox_event_aggregate", "aggregate_type", "aggregate_id", "created_at"),
+        Index("ix_outbox_event_trace_id", "trace_id", postgresql_where=text("trace_id IS NOT NULL")),
+        {"schema": "event"},
     )
 
     position: Mapped[int] = mapped_column(BigInteger, Identity(always=True), nullable=False)
@@ -50,7 +50,7 @@ class OutboxEvent(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
 class OutboxDelivery(TimestampMixin, DbBase):
     """Tracks durable delivery of one outbox event to one versioned consumer."""
 
-    __tablename__ = "outbox_deliveries"
+    __tablename__ = "outbox_delivery"
     __table_args__ = (
         CheckConstraint("attempt_count >= 0 AND enqueue_count >= 0", name="nonnegative_attempt_counts"),
         CheckConstraint(
@@ -68,27 +68,27 @@ class OutboxDelivery(TimestampMixin, DbBase):
         CheckConstraint("status = 'dead' OR dead_lettered_at IS NULL", name="non_dead_letter_forbidden"),
         ForeignKeyConstraint(
             ["event_id", "source_position"],
-            ["events.outbox_events.id", "events.outbox_events.position"],
-            name="fk_outbox_deliveries_event_position",
+            ["event.outbox_event.id", "event.outbox_event.position"],
+            name="fk_outbox_delivery_event_position",
             ondelete="CASCADE",
         ),
         Index(
-            "ix_outbox_deliveries_due",
+            "ix_outbox_delivery_due",
             "available_at",
             "lease_expires_at",
             "source_position",
             postgresql_where=text("status IN ('pending', 'running')"),
         ),
-        Index("ix_outbox_deliveries_broker_task", "broker_task_id"),
+        Index("ix_outbox_delivery_broker_task", "broker_task_id"),
         Index(
-            "ix_outbox_deliveries_partition",
+            "ix_outbox_delivery_partition",
             "consumer",
             "partition_key",
             "source_position",
             postgresql_where=text("status != 'succeeded'"),
         ),
-        Index("ix_outbox_deliveries_consumer_position", "consumer", "source_position"),
-        {"schema": "events"},
+        Index("ix_outbox_delivery_consumer_position", "consumer", "source_position"),
+        {"schema": "event"},
     )
 
     event_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -117,19 +117,19 @@ class OutboxDelivery(TimestampMixin, DbBase):
 class ActivityEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     """Stores user-visible activity projected from authoritative domain events."""
 
-    __tablename__ = "activity_events"
+    __tablename__ = "activity_event"
     __table_args__ = (
         UniqueConstraint("source_event_id"),
-        Index("ix_activity_events_subject_created", "subject_account_id", "created_at"),
-        Index("ix_activity_events_type_created", "event_type", "created_at"),
-        {"schema": "events"},
+        Index("ix_activity_event_subject_created", "subject_account_id", "created_at"),
+        Index("ix_activity_event_type_created", "event_type", "created_at"),
+        {"schema": "event"},
     )
 
     source_event_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("events.outbox_events.id", ondelete="RESTRICT"), nullable=False
+        ForeignKey("event.outbox_event.id", ondelete="RESTRICT"), nullable=False
     )
-    subject_account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="CASCADE"), nullable=False)
-    actor_account_id: Mapped[int | None] = mapped_column(ForeignKey("core.accounts.id", ondelete="SET NULL"))
+    subject_account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="CASCADE"), nullable=False)
+    actor_account_id: Mapped[int | None] = mapped_column(ForeignKey("core.account.id", ondelete="SET NULL"))
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     visibility: Mapped[str] = mapped_column(String(16), nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -139,14 +139,14 @@ class ActivityEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
 class ProjectionCheckpoint(TimestampMixin, DbBase):
     """Tracks the event-processing watermark of each asynchronous projector."""
 
-    __tablename__ = "projection_checkpoints"
-    __table_args__ = ({"schema": "events"},)
+    __tablename__ = "projection_checkpoint"
+    __table_args__ = ({"schema": "event"},)
 
     projector: Mapped[str] = mapped_column(String(100), primary_key=True)
     partition_key: Mapped[str] = mapped_column(
         String(100), primary_key=True, default="default", server_default="default"
     )
     source_event_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("events.outbox_events.id", ondelete="SET NULL")
+        ForeignKey("event.outbox_event.id", ondelete="SET NULL")
     )
     source_position: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")

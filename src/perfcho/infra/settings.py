@@ -140,7 +140,7 @@ class Settings(BaseSettings):
     performance_calculator_urls: dict[str, str] = Field(default_factory=dict)
     performance_http_timeout_seconds: float = Field(default=30.0, gt=0)
     performance_beatmap_url_expiry_seconds: int = Field(default=600, ge=30, le=3600)
-    rank_snapshot_cron: str = Field(default="0 4 * * *")
+    user_ranking_snapshot_cron: str = Field(default="0 4 * * *")
 
     cors_origins: list[str] = Field(default=["http://localhost:3000", "http://localhost:5173"])
 

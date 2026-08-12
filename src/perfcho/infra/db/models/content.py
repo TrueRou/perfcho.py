@@ -31,7 +31,7 @@ from perfcho.infra.db.mixins import BigIntIdentityMixin, CreatedAtMixin, Timesta
 class ContentSource(DbBase):
     """Defines namespaces for official, private, and local beatmap sources."""
 
-    __tablename__ = "sources"
+    __tablename__ = "source"
     __table_args__ = (UniqueConstraint("code"), {"schema": "content"})
 
     id: Mapped[int] = mapped_column(SmallInteger, Identity(always=False), primary_key=True)
@@ -44,18 +44,18 @@ class ContentSource(DbBase):
 class Beatmapset(BigIntIdentityMixin, TimestampMixin, DbBase):
     """Stores beatmapset-level metadata, source identity, and ranking state."""
 
-    __tablename__ = "beatmapsets"
+    __tablename__ = "beatmapset"
     __table_args__ = (
         CheckConstraint("external_id > 0", name="positive_external_id"),
         UniqueConstraint("source_id", "external_id"),
-        Index("ix_beatmapsets_creator", "creator_account_id", "id"),
-        Index("ix_beatmapsets_status_ranked", "status", "ranked_at"),
+        Index("ix_beatmapset_creator", "creator_account_id", "id"),
+        Index("ix_beatmapset_status_ranked", "status", "ranked_at"),
         {"schema": "content"},
     )
 
-    source_id: Mapped[int] = mapped_column(ForeignKey("content.sources.id", ondelete="RESTRICT"), nullable=False)
+    source_id: Mapped[int] = mapped_column(ForeignKey("content.source.id", ondelete="RESTRICT"), nullable=False)
     external_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    creator_account_id: Mapped[int | None] = mapped_column(ForeignKey("core.accounts.id", ondelete="SET NULL"))
+    creator_account_id: Mapped[int | None] = mapped_column(ForeignKey("core.account.id", ondelete="SET NULL"))
     creator_external_id: Mapped[int | None] = mapped_column(BigInteger)
     creator_name: Mapped[str] = mapped_column(String(64), nullable=False)
     artist: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -85,15 +85,15 @@ class Beatmapset(BigIntIdentityMixin, TimestampMixin, DbBase):
 class BeatmapsetAsset(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     """Associates beatmapsets with cover, preview, and related media assets."""
 
-    __tablename__ = "beatmapset_assets"
+    __tablename__ = "beatmapset_asset"
     __table_args__ = (
         UniqueConstraint("beatmapset_id", "kind", "scale"),
-        Index("ix_beatmapset_assets_asset", "asset_id"),
+        Index("ix_beatmapset_asset_asset", "asset_id"),
         {"schema": "content"},
     )
 
-    beatmapset_id: Mapped[int] = mapped_column(ForeignKey("content.beatmapsets.id", ondelete="CASCADE"), nullable=False)
-    asset_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("core.media_assets.id", ondelete="RESTRICT"), nullable=False)
+    beatmapset_id: Mapped[int] = mapped_column(ForeignKey("content.beatmapset.id", ondelete="CASCADE"), nullable=False)
+    asset_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("core.media_asset.id", ondelete="RESTRICT"), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     scale: Mapped[str] = mapped_column(String(16), nullable=False, default="1x", server_default="1x")
 
@@ -101,19 +101,19 @@ class BeatmapsetAsset(BigIntIdentityMixin, CreatedAtMixin, DbBase):
 class Beatmap(BigIntIdentityMixin, TimestampMixin, DbBase):
     """Represents a logical beatmap difficulty independently of its file revisions."""
 
-    __tablename__ = "beatmaps"
+    __tablename__ = "beatmap"
     __table_args__ = (
         CheckConstraint("external_id > 0", name="positive_external_id"),
         UniqueConstraint("source_id", "external_id"),
-        Index("ix_beatmaps_set_id", "beatmapset_id", "id"),
-        Index("ix_beatmaps_status_ruleset", "status", "ruleset"),
+        Index("ix_beatmap_set_id", "beatmapset_id", "id"),
+        Index("ix_beatmap_status_ruleset", "status", "ruleset"),
         {"schema": "content"},
     )
 
     beatmapset_id: Mapped[int] = mapped_column(
-        ForeignKey("content.beatmapsets.id", ondelete="RESTRICT"), nullable=False
+        ForeignKey("content.beatmapset.id", ondelete="RESTRICT"), nullable=False
     )
-    source_id: Mapped[int] = mapped_column(ForeignKey("content.sources.id", ondelete="RESTRICT"), nullable=False)
+    source_id: Mapped[int] = mapped_column(ForeignKey("content.source.id", ondelete="RESTRICT"), nullable=False)
     external_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     ruleset: Mapped[Ruleset] = mapped_column(enum_type(Ruleset, "beatmap_ruleset", 16), nullable=False)
     difficulty_name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -133,18 +133,18 @@ class Beatmap(BigIntIdentityMixin, TimestampMixin, DbBase):
 class BeatmapOwner(DbBase):
     """Associates beatmaps with their creators and collaborating mappers."""
 
-    __tablename__ = "beatmap_owners"
-    __table_args__ = (Index("ix_beatmap_owners_account", "account_id", "beatmap_id"), {"schema": "content"})
+    __tablename__ = "beatmap_owner"
+    __table_args__ = (Index("ix_beatmap_owner_account", "account_id", "beatmap_id"), {"schema": "content"})
 
-    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="CASCADE"), primary_key=True)
-    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), primary_key=True)
+    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmap.id", ondelete="CASCADE"), primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="RESTRICT"), primary_key=True)
     role: Mapped[str] = mapped_column(String(32), primary_key=True)
 
 
 class BeatmapRevision(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     """Stores immutable beatmap file revisions, hashes, and base difficulty attributes."""
 
-    __tablename__ = "beatmap_revisions"
+    __tablename__ = "beatmap_revision"
     __table_args__ = (
         CheckConstraint("total_length_ms >= 0", name="nonnegative_total_length"),
         CheckConstraint("drain_length_ms >= 0", name="nonnegative_drain_length"),
@@ -160,12 +160,12 @@ class BeatmapRevision(BigIntIdentityMixin, CreatedAtMixin, DbBase):
         CheckConstraint("file_name = btrim(file_name)", name="trimmed_file_name"),
         CheckConstraint("file_name_key = lower(file_name)", name="normalized_file_name"),
         CheckConstraint("file_name !~ '[/\\\\]'", name="file_name_is_basename"),
-        UniqueConstraint("id", "beatmap_id", name="uq_beatmap_revisions_id_beatmap"),
+        UniqueConstraint("id", "beatmap_id", name="uq_beatmap_revision_id_beatmap"),
         UniqueConstraint("beatmap_id", "sha256"),
-        UniqueConstraint("md5", name="uq_beatmap_revisions_md5"),
-        Index("ix_beatmap_revisions_file_name_key", "file_name_key", "beatmap_id"),
+        UniqueConstraint("md5", name="uq_beatmap_revision_md5"),
+        Index("ix_beatmap_revision_file_name_key", "file_name_key", "beatmap_id"),
         Index(
-            "uq_beatmap_revisions_current",
+            "uq_beatmap_revision_current",
             "beatmap_id",
             unique=True,
             postgresql_where=text("is_current"),
@@ -173,9 +173,9 @@ class BeatmapRevision(BigIntIdentityMixin, CreatedAtMixin, DbBase):
         {"schema": "content"},
     )
 
-    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="RESTRICT"), nullable=False)
+    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmap.id", ondelete="RESTRICT"), nullable=False)
     file_asset_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("core.media_assets.id", ondelete="RESTRICT"), unique=True
+        ForeignKey("core.media_asset.id", ondelete="RESTRICT"), unique=True
     )
     md5: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
     sha256: Mapped[bytes] = mapped_column(LargeBinary(32), nullable=False)
@@ -204,18 +204,18 @@ class BeatmapRevision(BigIntIdentityMixin, CreatedAtMixin, DbBase):
 class BeatmapStatusEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     """Records every beatmap ranking status transition and its source."""
 
-    __tablename__ = "beatmap_status_events"
+    __tablename__ = "beatmap_status_event"
     __table_args__ = (
-        Index("ix_beatmap_status_events_beatmap_effective", "beatmap_id", "effective_at"),
+        Index("ix_beatmap_status_event_beatmap_effective", "beatmap_id", "effective_at"),
         {"schema": "content"},
     )
 
-    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="RESTRICT"), nullable=False)
+    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmap.id", ondelete="RESTRICT"), nullable=False)
     previous_status: Mapped[BeatmapStatus | None] = mapped_column(
         enum_type(BeatmapStatus, "previous_beatmap_status", 16)
     )
     status: Mapped[BeatmapStatus] = mapped_column(enum_type(BeatmapStatus, "new_beatmap_status", 16), nullable=False)
-    actor_account_id: Mapped[int | None] = mapped_column(ForeignKey("core.accounts.id", ondelete="SET NULL"))
+    actor_account_id: Mapped[int | None] = mapped_column(ForeignKey("core.account.id", ondelete="SET NULL"))
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     reason: Mapped[str | None] = mapped_column(String(255))
     effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -224,15 +224,15 @@ class BeatmapStatusEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
 class ContentSyncState(TimestampMixin, DbBase):
     """Tracks upstream beatmapset synchronization watermarks and retry state."""
 
-    __tablename__ = "sync_states"
+    __tablename__ = "sync_state"
     __table_args__ = (
         CheckConstraint("unchanged_count >= 0 AND error_count >= 0", name="nonnegative_counts"),
-        Index("ix_sync_states_next_check", "next_check_at"),
+        Index("ix_sync_state_next_check", "next_check_at"),
         {"schema": "content"},
     )
 
     beatmapset_id: Mapped[int] = mapped_column(
-        ForeignKey("content.beatmapsets.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("content.beatmapset.id", ondelete="CASCADE"), primary_key=True
     )
     etag: Mapped[str | None] = mapped_column(String(255))
     last_modified: Mapped[str | None] = mapped_column(String(255))
@@ -246,7 +246,7 @@ class ContentSyncState(TimestampMixin, DbBase):
 class BeatmapsetSyncProjection(TimestampMixin, DbBase):
     """Projects the latest completed synchronization result for a beatmapset."""
 
-    __tablename__ = "beatmapset_sync_projections"
+    __tablename__ = "beatmapset_sync_projection"
     __table_args__ = (
         CheckConstraint(
             "created_revision_count >= 0 AND unchanged_revision_count >= 0 AND removed_beatmap_count >= 0",
@@ -254,12 +254,12 @@ class BeatmapsetSyncProjection(TimestampMixin, DbBase):
         ),
         CheckConstraint("source_position > 0", name="positive_source_position"),
         UniqueConstraint("source_event_id"),
-        Index("ix_beatmapset_sync_projections_position", "source_position"),
+        Index("ix_beatmapset_sync_projection_position", "source_position"),
         {"schema": "content"},
     )
 
     beatmapset_id: Mapped[int] = mapped_column(
-        ForeignKey("content.beatmapsets.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("content.beatmapset.id", ondelete="CASCADE"), primary_key=True
     )
     external_beatmapset_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_revision_count: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -267,7 +267,7 @@ class BeatmapsetSyncProjection(TimestampMixin, DbBase):
     removed_beatmap_count: Mapped[int] = mapped_column(Integer, nullable=False)
     source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     source_event_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("events.outbox_events.id", ondelete="RESTRICT"), nullable=False
+        ForeignKey("event.outbox_event.id", ondelete="RESTRICT"), nullable=False
     )
     source_position: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
@@ -275,54 +275,54 @@ class BeatmapsetSyncProjection(TimestampMixin, DbBase):
 class BeatmapsetFavourite(CreatedAtMixin, DbBase):
     """Records beatmapsets favourited by accounts."""
 
-    __tablename__ = "beatmapset_favourites"
+    __tablename__ = "beatmapset_favourite"
     __table_args__ = (
-        Index("ix_beatmapset_favourites_set_created", "beatmapset_id", "created_at"),
+        Index("ix_beatmapset_favourite_set_created", "beatmapset_id", "created_at"),
         {"schema": "content"},
     )
 
-    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="RESTRICT"), primary_key=True)
     beatmapset_id: Mapped[int] = mapped_column(
-        ForeignKey("content.beatmapsets.id", ondelete="RESTRICT"), primary_key=True
+        ForeignKey("content.beatmapset.id", ondelete="RESTRICT"), primary_key=True
     )
 
 
 class RatingVote(BigIntIdentityMixin, TimestampMixin, DbBase):
     """Records account ratings for beatmapsets or logical beatmaps."""
 
-    __tablename__ = "rating_votes"
+    __tablename__ = "rating_vote"
     __table_args__ = (
         CheckConstraint("rating BETWEEN 1 AND 10", name="rating_range"),
         CheckConstraint("num_nonnulls(beatmapset_id, beatmap_id) = 1", name="single_target"),
         Index(
-            "uq_rating_votes_set_account",
+            "uq_rating_vote_set_account",
             "account_id",
             "beatmapset_id",
             unique=True,
             postgresql_where=text("beatmapset_id IS NOT NULL"),
         ),
         Index(
-            "uq_rating_votes_beatmap_account",
+            "uq_rating_vote_beatmap_account",
             "account_id",
             "beatmap_id",
             unique=True,
             postgresql_where=text("beatmap_id IS NOT NULL"),
         ),
-        Index("ix_rating_votes_set_rating", "beatmapset_id", "rating"),
-        Index("ix_rating_votes_beatmap_rating", "beatmap_id", "rating"),
+        Index("ix_rating_vote_set_rating", "beatmapset_id", "rating"),
+        Index("ix_rating_vote_beatmap_rating", "beatmap_id", "rating"),
         {"schema": "content"},
     )
 
-    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
-    beatmapset_id: Mapped[int | None] = mapped_column(ForeignKey("content.beatmapsets.id", ondelete="RESTRICT"))
-    beatmap_id: Mapped[int | None] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="RESTRICT"))
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="RESTRICT"), nullable=False)
+    beatmapset_id: Mapped[int | None] = mapped_column(ForeignKey("content.beatmapset.id", ondelete="RESTRICT"))
+    beatmap_id: Mapped[int | None] = mapped_column(ForeignKey("content.beatmap.id", ondelete="RESTRICT"))
     rating: Mapped[int] = mapped_column(SmallInteger, nullable=False)
 
 
 class TagDefinition(DbBase):
     """Defines tags used to classify and discover beatmaps."""
 
-    __tablename__ = "tag_definitions"
+    __tablename__ = "tag_definition"
     __table_args__ = (UniqueConstraint("slug"), {"schema": "content"})
 
     id: Mapped[int] = mapped_column(Integer, Identity(always=False), primary_key=True)
@@ -335,40 +335,40 @@ class TagDefinition(DbBase):
 class BeatmapTagVote(CreatedAtMixin, DbBase):
     """Records user votes assigning tags to beatmaps."""
 
-    __tablename__ = "beatmap_tag_votes"
-    __table_args__ = (Index("ix_beatmap_tag_votes_count", "beatmap_id", "tag_id"), {"schema": "content"})
+    __tablename__ = "beatmap_tag_vote"
+    __table_args__ = (Index("ix_beatmap_tag_vote_count", "beatmap_id", "tag_id"), {"schema": "content"})
 
-    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="CASCADE"), primary_key=True)
-    tag_id: Mapped[int] = mapped_column(ForeignKey("content.tag_definitions.id", ondelete="CASCADE"), primary_key=True)
-    account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), primary_key=True)
+    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmap.id", ondelete="CASCADE"), primary_key=True)
+    tag_id: Mapped[int] = mapped_column(ForeignKey("content.tag_definition.id", ondelete="CASCADE"), primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="RESTRICT"), primary_key=True)
 
 
 class MapStatusRequest(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
     """Tracks requested beatmap status changes and their resolution workflow."""
 
-    __tablename__ = "map_status_requests"
+    __tablename__ = "map_status_request"
     __table_args__ = (
         Index(
-            "uq_map_status_requests_open",
+            "uq_map_status_request_open",
             "beatmap_id",
             "requester_account_id",
             unique=True,
             postgresql_where=text("status = 'open'"),
         ),
-        Index("ix_map_status_requests_queue", "status", "created_at"),
+        Index("ix_map_status_request_queue", "status", "created_at"),
         {"schema": "content"},
     )
 
-    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="RESTRICT"), nullable=False)
+    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmap.id", ondelete="RESTRICT"), nullable=False)
     requester_account_id: Mapped[int] = mapped_column(
-        ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False
+        ForeignKey("core.account.id", ondelete="RESTRICT"), nullable=False
     )
     requested_status: Mapped[BeatmapStatus] = mapped_column(
         enum_type(BeatmapStatus, "requested_beatmap_status", 16), nullable=False
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", server_default="open")
     reason: Mapped[str | None] = mapped_column(Text)
-    resolved_by_id: Mapped[int | None] = mapped_column(ForeignKey("core.accounts.id", ondelete="SET NULL"))
+    resolved_by_id: Mapped[int | None] = mapped_column(ForeignKey("core.account.id", ondelete="SET NULL"))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolution: Mapped[str | None] = mapped_column(Text)
 
@@ -376,22 +376,22 @@ class MapStatusRequest(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
 class Comment(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     """Stores timeline comments targeting scores, beatmaps, or beatmapsets."""
 
-    __tablename__ = "comments"
+    __tablename__ = "comment"
     __table_args__ = (
         CheckConstraint("num_nonnulls(score_id, beatmap_id, beatmapset_id) = 1", name="single_target"),
         CheckConstraint("position_ms IS NULL OR position_ms >= 0", name="nonnegative_position"),
         CheckConstraint("char_length(body) BETWEEN 1 AND 1000", name="body_length"),
         CheckConstraint("color IS NULL OR color ~ '^#[0-9A-Fa-f]{6}$'", name="color_format"),
-        Index("ix_comments_score_position", "score_id", "position_ms", "id"),
-        Index("ix_comments_beatmap_position", "beatmap_id", "position_ms", "id"),
-        Index("ix_comments_set_position", "beatmapset_id", "position_ms", "id"),
+        Index("ix_comment_score_position", "score_id", "position_ms", "id"),
+        Index("ix_comment_beatmap_position", "beatmap_id", "position_ms", "id"),
+        Index("ix_comment_set_position", "beatmapset_id", "position_ms", "id"),
         {"schema": "content"},
     )
 
-    author_account_id: Mapped[int] = mapped_column(ForeignKey("core.accounts.id", ondelete="RESTRICT"), nullable=False)
-    score_id: Mapped[int | None] = mapped_column(ForeignKey("scoring.scores.id", ondelete="RESTRICT"))
-    beatmap_id: Mapped[int | None] = mapped_column(ForeignKey("content.beatmaps.id", ondelete="RESTRICT"))
-    beatmapset_id: Mapped[int | None] = mapped_column(ForeignKey("content.beatmapsets.id", ondelete="RESTRICT"))
+    author_account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="RESTRICT"), nullable=False)
+    score_id: Mapped[int | None] = mapped_column(ForeignKey("scoring.score.id", ondelete="RESTRICT"))
+    beatmap_id: Mapped[int | None] = mapped_column(ForeignKey("content.beatmap.id", ondelete="RESTRICT"))
+    beatmapset_id: Mapped[int | None] = mapped_column(ForeignKey("content.beatmapset.id", ondelete="RESTRICT"))
     position_ms: Mapped[int | None] = mapped_column(Integer)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     color: Mapped[str | None] = mapped_column(String(7))

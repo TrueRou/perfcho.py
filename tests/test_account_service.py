@@ -342,8 +342,8 @@ class ConstraintViolation(Exception):
 @pytest.mark.parametrize(
     ("constraint_name", "error_type"),
     (
-        ("uq_account_names_current_key", NameUnavailable),
-        ("uq_account_emails_active_key", EmailUnavailable),
+        ("uq_account_name_current_key", NameUnavailable),
+        ("uq_account_email_active_key", EmailUnavailable),
     ),
 )
 async def test_sqlalchemy_repository_maps_identifier_integrity_errors(

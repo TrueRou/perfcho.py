@@ -52,8 +52,8 @@ from perfcho.modules.multiplayer import (
 from perfcho.modules.scoring.models import CanonicalMod, MultiplayerSubmissionContext, Ruleset, ScoreboardVariant
 from perfcho.modules.scoring.mods import canonical_json_digest
 
-_ACTIVE_PRESENCE_CONSTRAINT = "uq_session_presences_account_current"
-_ACTIVE_ROUND_CONSTRAINT = "uq_rounds_session_active"
+_ACTIVE_PRESENCE_CONSTRAINT = "uq_session_presence_account_current"
+_ACTIVE_ROUND_CONSTRAINT = "uq_round_session_active"
 _ROUND_ATTEMPT_LIFETIME = timedelta(hours=2)
 _ROUND_SUBMISSION_GRACE = timedelta(minutes=2)
 

@@ -6,39 +6,39 @@ from apscheduler import AsyncScheduler, CoalescePolicy, ConflictPolicy
 from apscheduler.triggers.cron import CronTrigger
 
 from perfcho.infra.db.base import DbSessionFactory
-from perfcho.infra.scheduler.rank_snapshot import RankSnapshotTask
+from perfcho.infra.scheduler.user_ranking_snapshot import UserRankingSnapshotTask
 
-_RANK_SNAPSHOT_SCHEDULE_ID = "rank_snapshot"
-_RANK_SNAPSHOT_MISFIRE_GRACE_SECONDS = 3600
+_USER_RANKING_SNAPSHOT_SCHEDULE_ID = "user_ranking_snapshot"
+_USER_RANKING_SNAPSHOT_MISFIRE_GRACE_SECONDS = 3600
 
 
 async def configure_scheduler(
     scheduler: AsyncScheduler,
     session_factory: DbSessionFactory,
     *,
-    rank_snapshot_cron: str,
+    user_ranking_snapshot_cron: str,
 ) -> None:
     """Register all application schedules on one caller-owned scheduler."""
-    rank_snapshot = RankSnapshotTask(session_factory)
+    user_ranking_snapshot = UserRankingSnapshotTask(session_factory)
     await scheduler.configure_task(
-        _RANK_SNAPSHOT_SCHEDULE_ID,
-        func=rank_snapshot.run,
+        _USER_RANKING_SNAPSHOT_SCHEDULE_ID,
+        func=user_ranking_snapshot.run,
         max_running_jobs=1,
     )
     await scheduler.add_schedule(
-        _RANK_SNAPSHOT_SCHEDULE_ID,
-        CronTrigger.from_crontab(rank_snapshot_cron),
-        id=_RANK_SNAPSHOT_SCHEDULE_ID,
+        _USER_RANKING_SNAPSHOT_SCHEDULE_ID,
+        CronTrigger.from_crontab(user_ranking_snapshot_cron),
+        id=_USER_RANKING_SNAPSHOT_SCHEDULE_ID,
         coalesce=CoalescePolicy.latest,
         conflict_policy=ConflictPolicy.replace,
-        misfire_grace_time=timedelta(seconds=_RANK_SNAPSHOT_MISFIRE_GRACE_SECONDS),
+        misfire_grace_time=timedelta(seconds=_USER_RANKING_SNAPSHOT_MISFIRE_GRACE_SECONDS),
     )
 
 
 async def start_scheduler(
     session_factory: DbSessionFactory,
     *,
-    rank_snapshot_cron: str,
+    user_ranking_snapshot_cron: str,
 ) -> AsyncScheduler:
     """Create, configure, and start one process-owned scheduler."""
     scheduler = AsyncScheduler()
@@ -47,7 +47,7 @@ async def start_scheduler(
         await configure_scheduler(
             scheduler,
             session_factory,
-            rank_snapshot_cron=rank_snapshot_cron,
+            user_ranking_snapshot_cron=user_ranking_snapshot_cron,
         )
         await scheduler.start_in_background()
     except BaseException:
@@ -61,4 +61,4 @@ async def stop_scheduler(scheduler: AsyncScheduler) -> None:
     await scheduler.__aexit__(None, None, None)
 
 
-__all__ = ["RankSnapshotTask", "configure_scheduler", "start_scheduler", "stop_scheduler"]
+__all__ = ["UserRankingSnapshotTask", "configure_scheduler", "start_scheduler", "stop_scheduler"]

@@ -37,8 +37,8 @@ def test_command_receipt_metadata_contract() -> None:
     assert tuple(column.name for column in table.primary_key.columns) == ("scope", "idempotency_key")
     assert cast(LargeBinary, table.c.request_digest.type).length == 32
     assert {index.name for index in table.indexes} >= {
-        "ix_command_receipts_expiry",
-        "ix_command_receipts_resource",
+        "ix_command_receipt_expiry",
+        "ix_command_receipt_resource",
     }
 
 

@@ -26,18 +26,18 @@ from perfcho.infra.db.models.scoring import (
     BeatmapFailHistogram,
     CalculationFormula,
     CalculationRelease,
-    LeaderboardEntry,
     PlayAttempt,
     RankingPolicy,
     Replay,
     ReplayViewEvent,
     Score,
+    ScoreEligibility,
     ScoreHitStatistic,
     ScorePerformance,
     UserBeatmapActivity,
     UserMonthlyActivity,
     UserPlayStat,
-    UserRankedStat,
+    UserRanking,
 )
 from perfcho.infra.db.models.scoring import (
     ScoreAttestation as DbScoreAttestation,
@@ -68,7 +68,6 @@ from perfcho.modules.scoring import (
     ReplayService,
     Ruleset,
     ScoreAttestation,
-    ScoreboardVariant,
     ScoreGrade,
     ScoreOutcome,
     ScoreRejected,
@@ -82,11 +81,8 @@ from perfcho.modules.scoring.models import (
     AccountSubmissionContext,
     AttemptClaim,
     BeatmapRevisionInfo,
-    ModSetInfo,
-    NormalizedModSet,
     PlayAttemptRecord,
     ScoreAcceptanceRecord,
-    ScoreboardInfo,
 )
 from perfcho.modules.scoring.ports import ScoringRepository
 from perfcho.modules.scoring.validation import validate_score
@@ -153,14 +149,6 @@ class FakeRepository:
         assert reference.md5 == b"m" * 16
         return BeatmapRevisionInfo(10, 20, Ruleset.OSU, "ranked", 10, 10)
 
-    async def get_scoreboard(self, ruleset: Ruleset, variant: ScoreboardVariant) -> ScoreboardInfo:
-        self.calls.append("scoreboard")
-        return ScoreboardInfo(1, "osu", ruleset, variant)
-
-    async def get_or_create_mod_set(self, scoreboard_id: int, normalized: NormalizedModSet) -> ModSetInfo:
-        self.calls.append("mod-set")
-        return ModSetInfo(30, scoreboard_id, normalized.canonical, normalized.canonical_digest)
-
     async def claim_attempt(self, record: PlayAttemptRecord) -> AttemptClaim:
         self.calls.append("attempt")
         return AttemptClaim(self.attempt_id)
@@ -173,8 +161,9 @@ class FakeRepository:
             40,
             record.revision.beatmap_id,
             record.revision.revision_id,
-            record.scoreboard.scoreboard_id,
-            record.mod_set.mod_set_id,
+            record.ruleset,
+            record.mods,
+            record.mods_digest,
             record.score.outcome,
         )
 
@@ -251,7 +240,6 @@ def command() -> AcceptScore:
         ),
         beatmap=BeatmapReference(md5=b"m" * 16),
         ruleset=Ruleset.OSU,
-        variant=ScoreboardVariant.VANILLA,
         mods=(),
         attempt=PlayAttemptSubmission("attempt:test", NOW, NOW, Decimal(1)),
         score=ScoreSubmission(
@@ -319,8 +307,6 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
         "claim-acceptance",
         "account",
         "revision",
-        "scoreboard",
-        "mod-set",
         "attempt",
         "score",
         "achievements",
@@ -405,7 +391,7 @@ async def test_multiplayer_score_routes_results_projector_in_acceptance_transact
 async def test_scoring_replay_logs_only_stable_ids_at_debug(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     repository = FakeRepository(calls)
-    prior = AcceptedScoreResult(repository.attempt_id, 40, 10, 20, 1, 30, ScoreOutcome.PASSED)
+    prior = AcceptedScoreResult(repository.attempt_id, 40, 10, 20, Ruleset.OSU, (), b"m" * 32, ScoreOutcome.PASSED)
     repository.acceptance_claim = AcceptanceClaim(prior)
     logged: list[tuple[str, str, dict[str, object]]] = []
     monkeypatch.setattr(
@@ -492,13 +478,12 @@ def test_threshold_grading_uses_current_score_processor_thresholds() -> None:
 
 
 @pytest.mark.asyncio
-async def test_account_stats_without_ranked_stat_returns_unranked_defaults() -> None:
+async def test_account_stats_without_user_ranking_returns_unranked_defaults() -> None:
     session = AsyncMock(spec=AsyncSession)
     result = MagicMock()
     result.one_or_none.return_value = SimpleNamespace(
-        scoreboard_id=1,
-        policy_id=1,
-        metric="pp",
+        policy_id=None,
+        configuration={},
         play_count=None,
         total_score=None,
         ranked_score=None,
@@ -510,7 +495,6 @@ async def test_account_stats_without_ranked_stat_returns_unranked_defaults() -> 
     stats = await SqlAlchemyScoringRepository(cast(AsyncSession, session)).get_account_stats(
         1,
         Ruleset.OSU,
-        ScoreboardVariant.VANILLA,
     )
 
     assert (
@@ -534,7 +518,6 @@ async def test_public_leaderboard_query_has_no_cartesian_product() -> None:
     await SqlAlchemyScoringRepository(cast(AsyncSession, session)).get_public_leaderboard(
         beatmap_id=1,
         ruleset=Ruleset.OSU,
-        variant=ScoreboardVariant.VANILLA,
         scope=LeaderboardScope.overall(),
         limit=50,
     )
@@ -700,29 +683,31 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 )
             ).all()
             for event in events:
-                await project_accepted_score(session, event, "account:1:scoreboard:1")
-                await project_scoring_stats(session, event, "account:1:scoreboard:1")
+                await project_accepted_score(session, event, "account:1:ruleset:osu")
+                await project_scoring_stats(session, event, "account:1:ruleset:osu")
             scoring_repository = SqlAlchemyScoringRepository(session)
             counting_leaderboard_statements = True
-            exact_mods = await scoring_repository.get_leaderboard(
+            exact_mods = await scoring_repository.get_public_leaderboard(
                 beatmap_id=first.beatmap_id,
                 ruleset=Ruleset.OSU,
-                variant=ScoreboardVariant.VANILLA,
                 scope=LeaderboardScope.exact_mods(frozenset({"HD"})),
-                requester_account_id=1,
                 limit=50,
             )
             counting_leaderboard_statements = False
             assert leaderboard_statement_count == 2
             leaderboard_statement_count = 0
             counting_leaderboard_statements = True
-            friends = await scoring_repository.get_leaderboard(
+            friends = await scoring_repository.get_public_leaderboard(
                 beatmap_id=first.beatmap_id,
                 ruleset=Ruleset.OSU,
-                variant=ScoreboardVariant.VANILLA,
-                scope=LeaderboardScope.friends(frozenset()),
-                requester_account_id=1,
+                scope=LeaderboardScope.friends(frozenset({1})),
                 limit=50,
+            )
+            personal_best = await scoring_repository.get_personal_leaderboard(
+                beatmap_id=first.beatmap_id,
+                ruleset=Ruleset.OSU,
+                scope=LeaderboardScope.friends(frozenset({1})),
+                account_id=1,
             )
             counting_leaderboard_statements = False
             assert leaderboard_statement_count == 2
@@ -753,12 +738,12 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 await session.scalars(select(OutboxEvent).where(OutboxEvent.event_type == "score.replay-viewed.v1"))
             ).all()
             assert len(replay_events) == 1
-            await project_scoring_stats(session, replay_events[0], "account:1:scoreboard:1")
+            await project_scoring_stats(session, replay_events[0], "account:1:ruleset:osu")
 
         assert replayed == replace(first, new_achievement_unlocks=())
-        assert len(exact_mods.scores) == 1
-        assert [score.account_id for score in friends.scores] == [1]
-        assert friends.personal_best is not None and friends.personal_best.account_id == 1
+        assert len(exact_mods) == 1
+        assert [score.account_id for score in friends] == [1]
+        assert personal_best is not None and personal_best.account_id == 1
         async with session_factory() as session:
             assert await session.scalar(select(func.count()).select_from(PlayAttempt)) == 2
             assert await session.scalar(select(func.count()).select_from(Score)) == 2
@@ -766,21 +751,24 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             assert await session.scalar(select(func.count()).select_from(Replay)) == 2
             assert await session.scalar(select(func.count()).select_from(DbScoreAttestation)) == 2
             assert await session.scalar(select(func.count()).select_from(OutboxEvent)) == 4
-            assert await session.scalar(select(func.count()).select_from(LeaderboardEntry)) == 3
-            play_stat = await session.get(UserPlayStat, {"account_id": 1, "scoreboard_id": 1})
+            assert await session.scalar(select(func.count()).select_from(ScoreEligibility)) == 2
+            play_stat = await session.get(UserPlayStat, {"account_id": 1, "ruleset": DbRuleset.OSU})
             policy_id = await session.scalar(
-                select(RankingPolicy.id).where(RankingPolicy.scoreboard_id == 1, RankingPolicy.is_default.is_(True))
+                select(RankingPolicy.id).where(
+                    RankingPolicy.ruleset == DbRuleset.OSU,
+                    RankingPolicy.active.is_(True),
+                )
             )
             assert policy_id is not None
-            ranked_stat = await session.get(UserRankedStat, {"account_id": 1, "policy_id": policy_id})
+            user_ranking = await session.get(UserRanking, {"account_id": 1, "policy_id": policy_id})
             assert play_stat is not None
-            assert ranked_stat is not None
+            assert user_ranking is not None
             assert (play_stat.play_count, play_stat.total_score, play_stat.total_hits) == (2, 2_000_000, 20)
             assert play_stat.replay_views == 1
-            assert ranked_stat.ranked_score == 1_000_000
-            assert ranked_stat.performance == Decimal(0)
-            assert ranked_stat.accuracy == Decimal(1)
-            assert ranked_stat.grade_counts == {"XH": 1, "X": 0, "SH": 0, "S": 0, "A": 0}
+            assert user_ranking.ranked_score == 1_000_000
+            assert user_ranking.performance == Decimal(0)
+            assert user_ranking.accuracy == Decimal(1)
+            assert user_ranking.grade_counts == {"XH": 1, "X": 0, "SH": 0, "S": 0, "A": 0}
             monthly = (
                 await session.scalars(
                     select(UserMonthlyActivity)
@@ -790,7 +778,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             ).all()
             user_beatmap = await session.get(
                 UserBeatmapActivity,
-                {"account_id": 1, "beatmap_id": first.beatmap_id, "scoreboard_id": 1},
+                {"account_id": 1, "beatmap_id": first.beatmap_id, "ruleset": DbRuleset.OSU},
             )
             beatmap_activity = await session.scalar(
                 select(BeatmapActivity).where(BeatmapActivity.beatmap_id == first.beatmap_id)
@@ -808,16 +796,16 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
             assert first_score is not None and shared_score is not None
             first_difficulty = BeatmapDifficultyAttribute(
                 beatmap_revision_id=first_score.beatmap_revision_id,
-                scoreboard_id=first_score.scoreboard_id,
-                mod_set_id=first_score.mod_set_id,
+                ruleset=first_score.ruleset,
+                mods_digest=first_score.mods_digest,
                 release_id=performance_release.id,
                 star_rating=Decimal("1"),
                 max_combo=first_score.max_combo,
             )
             shared_difficulty = BeatmapDifficultyAttribute(
                 beatmap_revision_id=shared_score.beatmap_revision_id,
-                scoreboard_id=shared_score.scoreboard_id,
-                mod_set_id=shared_score.mod_set_id,
+                ruleset=shared_score.ruleset,
+                mods_digest=shared_score.mods_digest,
                 release_id=performance_release.id,
                 star_rating=Decimal("1"),
                 max_combo=shared_score.max_combo,
@@ -853,7 +841,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                     payload={
                         "score_id": shared.score_id,
                         "account_id": 1,
-                        "scoreboard_id": 1,
+                        "ruleset": "osu",
                         "formula_id": str(performance_release.formula_id),
                         "formula_code": "official",
                         "release_id": str(performance_release.id),
@@ -861,7 +849,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                         "output_digest": (b"o" * 32).hex(),
                     },
                     consumers=("ranking-projector.v1",),
-                    partition_key="account:1:scoreboard:1",
+                    partition_key="account:1:ruleset:osu",
                 )
             )
             await session.flush()
@@ -872,15 +860,14 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 )
             )
             assert performance_event is not None
-            await project_accepted_score(session, performance_event, "account:1:scoreboard:1")
-            ranked_stat = await session.get(UserRankedStat, {"account_id": 1, "policy_id": policy_id})
-            assert ranked_stat is not None
-            await session.refresh(ranked_stat)
-            assert ranked_stat.performance == Decimal("200")
+            await project_accepted_score(session, performance_event, "account:1:ruleset:osu")
+            user_ranking = await session.get(UserRanking, {"account_id": 1, "policy_id": policy_id})
+            assert user_ranking is not None
+            await session.refresh(user_ranking)
+            assert user_ranking.performance == Decimal("200")
             account_stats = await SqlAlchemyScoringRepository(session).get_account_stats(
                 1,
                 Ruleset.OSU,
-                ScoreboardVariant.VANILLA,
             )
             assert (account_stats.performance, account_stats.global_rank) == (200, 1)
 
@@ -928,17 +915,17 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 )
             )
             assert failed_event is not None
-            await project_accepted_score(session, failed_event, "account:1:scoreboard:1")
-            await project_scoring_stats(session, failed_event, "account:1:scoreboard:1")
+            await project_accepted_score(session, failed_event, "account:1:ruleset:osu")
+            await project_scoring_stats(session, failed_event, "account:1:ruleset:osu")
         async with session_factory() as session:
             histogram = await session.get(
                 BeatmapFailHistogram,
-                {"beatmap_id": first.beatmap_id, "scoreboard_id": 1},
+                {"beatmap_id": first.beatmap_id, "ruleset": DbRuleset.OSU},
             )
-            play_stat = await session.get(UserPlayStat, {"account_id": 1, "scoreboard_id": 1})
+            play_stat = await session.get(UserPlayStat, {"account_id": 1, "ruleset": DbRuleset.OSU})
             user_beatmap = await session.get(
                 UserBeatmapActivity,
-                {"account_id": 1, "beatmap_id": first.beatmap_id, "scoreboard_id": 1},
+                {"account_id": 1, "beatmap_id": first.beatmap_id, "ruleset": DbRuleset.OSU},
             )
             assert histogram is not None and histogram.failed[42] == 1 and sum(histogram.quit) == 0
             assert play_stat is not None and (play_stat.play_count, play_stat.total_hits) == (3, 25)

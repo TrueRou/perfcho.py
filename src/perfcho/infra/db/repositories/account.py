@@ -19,8 +19,8 @@ from perfcho.modules.account.models import PublicAccountView, RegistrationClaim,
 from perfcho.modules.scoring.models import Ruleset
 
 _RECEIPT_SCOPE = "account.register"
-_NAME_CONSTRAINTS = frozenset({"uq_account_names_current_key"})
-_EMAIL_CONSTRAINTS = frozenset({"uq_account_emails_active_key"})
+_NAME_CONSTRAINTS = frozenset({"uq_account_name_current_key"})
+_EMAIL_CONSTRAINTS = frozenset({"uq_account_email_active_key"})
 
 
 class SqlAlchemyAccountRepository:
@@ -234,9 +234,9 @@ def _registration_result_from_receipt(claim: ReceiptClaim) -> RegistrationResult
 def _map_registration_integrity_error(error: IntegrityError) -> NameUnavailable | EmailUnavailable | None:
     constraint_name = _integrity_constraint_name(error)
     message = str(error).lower()
-    if constraint_name in _NAME_CONSTRAINTS or "uq_account_names_current_key" in message:
+    if constraint_name in _NAME_CONSTRAINTS or "uq_account_name_current_key" in message:
         return NameUnavailable("account name is already in use")
-    if constraint_name in _EMAIL_CONSTRAINTS or "uq_account_emails_active_key" in message:
+    if constraint_name in _EMAIL_CONSTRAINTS or "uq_account_email_active_key" in message:
         return EmailUnavailable("account email is already in use")
     return None
 

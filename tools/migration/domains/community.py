@@ -59,8 +59,8 @@ async def migrate_community(runtime: MigrationRuntime) -> None:
     async def sequence_handler(session: AsyncSession) -> None:
         await session.execute(
             text(
-                "SELECT setval(pg_get_serial_sequence('community.channels', 'id'), "
-                "GREATEST(1, (SELECT COALESCE(MAX(id), 0) FROM community.channels)), true)"
+                "SELECT setval(pg_get_serial_sequence('community.channel', 'id'), "
+                "GREATEST(1, (SELECT COALESCE(MAX(id), 0) FROM community.channel)), true)"
             )
         )
 
@@ -303,7 +303,7 @@ async def _migrate_mail_batch(
         resolved = await session.execute(
             text(
                 """
-                INSERT INTO community.channels
+                INSERT INTO community.channel
                     (id, kind, slug, name, description, owner_account_id, team_id,
                      read_permission_id, write_permission_id, manage_permission_id,
                      auto_join, message_length_limit, archived_at, created_at, updated_at)
@@ -372,7 +372,7 @@ async def _migrate_mail_batch(
 
     message_statement = text(
         """
-        INSERT INTO community.messages
+        INSERT INTO community.message
             (id, channel_id, sender_account_id, client_message_id, reply_to_id,
              content, is_action, edited_at, deleted_at, created_at)
         OVERRIDING SYSTEM VALUE

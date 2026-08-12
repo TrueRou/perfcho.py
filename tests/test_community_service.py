@@ -529,7 +529,7 @@ async def test_sqlalchemy_offline_message_query_uses_keyset_cursor_and_requested
     statement = session.execute.await_args.args[0]
     sql = str(statement)
     parameters = statement.compile().params
-    assert sql.count("community.messages.id >") == 2
+    assert sql.count("community.message.id >") == 2
     assert 100 in parameters.values()
     assert 101 in parameters.values()
 
@@ -562,7 +562,7 @@ async def test_sqlalchemy_direct_read_cursor_batch_upserts_once_and_returns_mono
     )
     assert session.execute.await_count == 2
     upsert = session.execute.await_args_list[0].args[0]
-    assert str(upsert).startswith("INSERT INTO community.channel_user_states")
+    assert str(upsert).startswith("INSERT INTO community.channel_user_state")
     assert "ON CONFLICT" in str(upsert)
 
 

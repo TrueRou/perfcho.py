@@ -232,17 +232,17 @@ def test_schema_contract_requires_core_tables_and_explicitly_excludes_sb() -> No
 
 
 def test_legacy_score_and_content_scalar_transforms_are_explicit() -> None:
-    assert scoreboard(0) == (1, Ruleset.OSU, ScoreboardVariant.VANILLA)
-    assert scoreboard(4) == (5, Ruleset.OSU, ScoreboardVariant.RELAX)
-    assert scoreboard(8) == (8, Ruleset.OSU, ScoreboardVariant.AUTOPILOT)
+    assert scoreboard(0) == (Ruleset.OSU, ScoreboardVariant.VANILLA)
+    assert scoreboard(4) == (Ruleset.OSU, ScoreboardVariant.RELAX)
+    assert scoreboard(8) == (Ruleset.OSU, ScoreboardVariant.AUTOPILOT)
     assert beatmap_status(1) is BeatmapStatus.PENDING
     assert beatmap_status(5) is BeatmapStatus.LOVED
     assert normalized_accuracy("98.765") == Decimal("0.987650000")
-    board_id, canonical, digest, bits = mod_set(4, 1 << 7)
-    assert board_id == 5
-    assert canonical == []
+    ruleset, canonical, acronyms, digest = mod_set(4, 1 << 7)
+    assert ruleset is Ruleset.OSU
+    assert canonical == [{"acronym": "RX"}]
+    assert acronyms == ["RX"]
     assert len(digest) == 32
-    assert bits == 1 << 7
     with pytest.raises(ValueError, match="disagree"):
         mod_set(0, 1 << 7)
 
@@ -699,7 +699,7 @@ async def test_target_preparation_installs_legacy_credential_contract_and_checkp
             constraint = await session.scalar(
                 text(
                     "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                    "WHERE conname = 'ck_password_credentials_algorithm_pepper_consistency'"
+                    "WHERE conname = 'ck_password_credential_algorithm_pepper_consistency'"
                 )
             )
             nullable = await session.scalar(
@@ -1001,21 +1001,21 @@ async def test_complete_fixture_migrates_all_supported_domains(
             counts = {
                 name: await session.scalar(text(f"SELECT count(*) FROM {table}"))
                 for name, table in {
-                    "account": "core.accounts",
-                    "team": "social.teams",
-                    "mail": "community.messages",
-                    "map": "content.beatmaps",
-                    "comment": "content.comments",
-                    "score": "scoring.scores",
-                    "performance": "scoring.score_performances",
-                    "replay": "scoring.replays",
-                    "unlock": "social.achievement_unlocks",
-                    "pool_item": "multiplayer.tournament_pool_items",
+                    "account": "core.account",
+                    "team": "social.team",
+                    "mail": "community.message",
+                    "map": "content.beatmap",
+                    "comment": "content.comment",
+                    "score": "scoring.score",
+                    "performance": "scoring.score_performance",
+                    "replay": "scoring.replay",
+                    "unlock": "social.achievement_unlock",
+                    "pool_item": "multiplayer.tournament_pool_item",
                 }.items()
             }
             credential = (
                 await session.execute(
-                    text("SELECT algorithm, pepper_version FROM iam.password_credentials WHERE account_id = 2")
+                    text("SELECT algorithm, pepper_version FROM iam.password_credential WHERE account_id = 2")
                 )
             ).one()
         assert counts == {

@@ -38,7 +38,7 @@ from perfcho.modules.identity.models import (
     ResolvedClientSession,
 )
 
-_ACTIVE_CLIENT_SESSION_CONSTRAINT = "uq_auth_sessions_active_client_account"
+_ACTIVE_CLIENT_SESSION_CONSTRAINT = "uq_auth_session_active_client_account"
 
 
 class _ResolvedSessionRow(Protocol):

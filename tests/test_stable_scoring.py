@@ -6,19 +6,17 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from types import SimpleNamespace
 from typing import cast
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfcho.api.stable import router
 from perfcho.api.stable.dependencies import get_stable_services
 from perfcho.infra.compose import StableServices
-from perfcho.infra.db.models.scoring import RankingPolicy, Score
-from perfcho.infra.db.projectors.ranking import _metric_value, _tie_break_value
+from perfcho.infra.db.models.scoring import Score, ScorePerformance
+from perfcho.infra.db.projectors.ranking import _calculation_release_id, _metric_expression
 from perfcho.infra.security.rijndael import Rijndael256Cbc
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService
@@ -46,7 +44,6 @@ from perfcho.modules.scoring import (
     ReplayReference,
     ReplayService,
     Ruleset,
-    ScoreboardVariant,
     ScoreOutcome,
     ScoreRejected,
     ScoringService,
@@ -152,8 +149,9 @@ class FakeScoring:
             score_id=40,
             beatmap_id=10,
             beatmap_revision_id=20,
-            scoreboard_id=1,
-            mod_set_id=30,
+            ruleset=command.ruleset,
+            mods=command.mods,
+            mods_digest=b"m" * 32,
             outcome=command.score.outcome,
             new_achievement_unlocks=unlocks,
         )
@@ -192,7 +190,15 @@ class FakeStorage:
 class FakeReplayQuery:
     async def get(self, score_id: int) -> ReplayReference:
         assert score_id == 40
-        return ReplayReference(40, 7, 1, Ruleset.OSU, "replays/stable/3/replay.osr", len(REPLAY_CONTENT), "stable")
+        return ReplayReference(
+            40,
+            7,
+            Ruleset.OSU,
+            b"m" * 32,
+            "replays/stable/3/replay.osr",
+            len(REPLAY_CONTENT),
+            "stable",
+        )
 
 
 class FakeReplayService:
@@ -243,9 +249,8 @@ class FakeRankingQuery:
         self,
         account_id: int,
         ruleset: Ruleset,
-        variant: ScoreboardVariant,
     ) -> AccountStatsView:
-        del account_id, ruleset, variant
+        del account_id, ruleset
         return self.stats.pop(0)
 
 
@@ -685,7 +690,7 @@ async def test_stable_leaderboard_serializes_projection_and_friend_filter() -> N
     assert len(personal_fields) == len(score_fields) == 16
     assert personal_fields[:3] == ["40", "friend", "1000000"]
     assert score_fields[-3:] == ["1", str(int(NOW.timestamp())), "1"]
-    assert cast(LeaderboardScope, ranking.calls[0]["scope"]).kind.value == "friends"
+    assert cast(LeaderboardScope, ranking.calls[0]["scope"]).population.value == "friends"
     assert "friend_account_ids" not in ranking.calls[0]
     assert cast(FakeContentSync, services.content_sync).refreshes == [200]
 
@@ -805,18 +810,14 @@ async def test_stable_leaderboard_does_not_misreport_upstream_failure_as_missing
     assert response.content == b""
 
 
-@pytest.mark.asyncio
-async def test_ranking_uses_exact_microseconds_and_defers_unconfigured_pp() -> None:
-    ended_at = datetime(2026, 7, 29, 12, 30, 0, 123456, tzinfo=UTC)
-    score = cast(Score, SimpleNamespace(ended_at=ended_at))
-    expected = int((ended_at - datetime(1970, 1, 1, tzinfo=UTC)).total_seconds()) * 1_000_000 + 123456
+def test_ranking_metric_uses_policy_configuration() -> None:
+    release_id = uuid.uuid7()
 
-    assert _tie_break_value(score, "ended_at") == Decimal(expected)
-    assert (
-        await _metric_value(
-            cast(AsyncSession, None),
-            score,
-            cast(RankingPolicy, SimpleNamespace(metric="pp", calculation_release_id=None)),
-        )
-        is None
-    )
+    assert _metric_expression("total_score", None) is Score.total_score
+    assert _metric_expression("classic_score", None) is Score.classic_score
+    assert _metric_expression("pp", release_id) is ScorePerformance.pp
+    assert _calculation_release_id({"metric": "total_score"}, "total_score") is None
+    assert _calculation_release_id({"metric": "pp", "calculation_release_id": str(release_id)}, "pp") == release_id
+
+    with pytest.raises(RuntimeError, match="calculation_release_id"):
+        _calculation_release_id({"metric": "pp"}, "pp")

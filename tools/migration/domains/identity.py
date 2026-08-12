@@ -121,8 +121,8 @@ async def migrate_identity(runtime: MigrationRuntime) -> None:
             text(
                 """
                 SELECT setval(
-                    pg_get_serial_sequence('core.accounts', 'id'),
-                    GREATEST(2, (SELECT COALESCE(MAX(id), 0) FROM core.accounts)),
+                    pg_get_serial_sequence('core.account', 'id'),
+                    GREATEST(2, (SELECT COALESCE(MAX(id), 0) FROM core.account)),
                     true
                 )
                 """
@@ -859,7 +859,7 @@ async def _insert_moderation_facts(
         await session.execute(insert(Sanction).values(sanction_rows).on_conflict_do_nothing())
         statement = text(
             """
-            INSERT INTO moderation.sanction_events
+            INSERT INTO moderation.sanction_event
                 (id, sanction_id, actor_account_id, action, reason, details, created_at)
             OVERRIDING SYSTEM VALUE
             VALUES
@@ -1005,7 +1005,7 @@ async def _migrate_auth_attempt_batch(
     key = settings.device_hmac_key.get_secret_value().encode()
     statement = text(
         """
-        INSERT INTO iam.auth_attempts
+        INSERT INTO iam.auth_attempt
             (id, account_id, session_id, device_id, identifier_hmac, ip_address,
              client_family, client_version, result, failure_reason, country_code, asn, context, created_at)
         OVERRIDING SYSTEM VALUE
@@ -1167,7 +1167,7 @@ def _negative_id(runtime: MigrationRuntime, entity: str, source_id: object) -> i
 
 
 async def _next_account_id(session: AsyncSession, *, reserved: set[int]) -> int:
-    target_max = await session.scalar(text("SELECT COALESCE(MAX(id), 0) FROM core.accounts"))
+    target_max = await session.scalar(text("SELECT COALESCE(MAX(id), 0) FROM core.account"))
     if not isinstance(target_max, int):
         raise RuntimeError("target account maximum is not an integer")
     reserved_max = max((value for value in reserved if value <= 2_147_483_647), default=0)
