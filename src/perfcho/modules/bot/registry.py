@@ -4,6 +4,7 @@ import inspect
 import shlex
 import time
 
+from perfcho.infra.logging import log_event
 from perfcho.modules.bot.models import (
     BotDirective,
     BotInvocation,
@@ -130,7 +131,19 @@ class CommandRegistry:
                     effect=reply.effect,
                 )
             return _result(started, response=reply, hidden=definition.hidden)
-        except Exception:
+        except Exception as error:
+            log_event(
+                "ERROR",
+                "bot.command.execution_failed",
+                exception=error,
+                command=trigger,
+                args=args,
+                sender=invocation.sender_name,
+                recipient=invocation.recipient,
+                private=invocation.private,
+                error_type=type(error).__name__,
+                duration_ms=(time.perf_counter_ns() - started) / 1_000_000,
+            )
             return _result(started, response="An error occurred while executing the command.")
 
     def _format_group_help(self, group: CommandGroup) -> str:

@@ -119,6 +119,39 @@ async def test_core_catalog_contains_only_bot_owned_commands() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_command_logs_context_and_returns_error_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    def capture(level: str, event: str, **fields: object) -> None:
+        events.append((level, event, fields))
+
+    monkeypatch.setattr("perfcho.modules.bot.registry.log_event", capture)
+
+    registry = CommandRegistry()
+
+    def boom(_context: CommandContext, _parsed: ParsedArguments) -> str:
+        raise ValueError("boom")
+
+    registry.register(command("boom", "<value:string>").action(boom))
+
+    result = await registry.try_execute(invocation("!boom value"))
+
+    assert result is not None and result.response == "An error occurred while executing the command."
+    assert len(events) == 1
+    level, event, fields = events[0]
+    assert (level, event) == ("ERROR", "bot.command.execution_failed")
+    assert fields["command"] == "boom"
+    assert fields["args"] == ("value",)
+    assert fields["sender"] == "Tester"
+    assert fields["recipient"] == "#osu"
+    assert fields["private"] is False
+    assert fields["error_type"] == "ValueError"
+    assert isinstance(fields["duration_ms"], float) and fields["duration_ms"] >= 0
+    assert isinstance(fields["exception"], ValueError)
+    assert fields["exception"].args == ("boom",)
+
+
+@pytest.mark.asyncio
 async def test_core_roll_and_lifecycle_directives_are_executable() -> None:
     bot = service()
 
