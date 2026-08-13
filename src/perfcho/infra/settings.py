@@ -136,7 +136,7 @@ class Settings(BaseSettings):
     durable_relay_enqueue_concurrency: int = Field(default=16, ge=1, le=256)
     outbox_delivery_batch_size: int = Field(default=100, ge=1, le=1000)
     outbox_delivery_lease_seconds: int = Field(default=300, ge=30)
-    outbox_delivery_max_attempts: int = Field(default=10, ge=1)
+    outbox_delivery_max_attempts: int = Field(default=3, ge=1)
     outbox_delivery_max_retry_seconds: int = Field(default=300, ge=1)
 
     performance_calculator_urls: dict[str, str] = Field(default_factory=dict)

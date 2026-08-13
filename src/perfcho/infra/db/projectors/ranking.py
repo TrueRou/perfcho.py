@@ -84,11 +84,12 @@ async def _project_policy(
     """Project one score's eligibility under one configured policy."""
     metric = _configuration_string(policy.configuration, "metric")
     calculation_release_id = _calculation_release_id(policy.configuration, metric)
-    mod_rules = _configuration_mapping(policy.configuration, "mod_rules")
-    beatmap_rules = _configuration_mapping(policy.configuration, "beatmap_rules")
+    eligibility = _configuration_mapping(policy.configuration, "eligibility")
+    mod_rules = _configuration_mapping(eligibility, "mods")
+    beatmap_statuses = _rule_strings(eligibility, "beatmap_statuses")
     policy_eligible = (
         score.outcome.value == "passed"
-        and _beatmap_is_eligible(beatmap_status, beatmap_rules)
+        and _beatmap_is_eligible(beatmap_status, beatmap_statuses)
         and _mods_are_eligible(set(score.mods_acronyms), mod_rules)
     )
     performance_pending = (
@@ -272,8 +273,7 @@ def _calculation_release_id(configuration: dict[str, object], metric: str) -> uu
         raise RuntimeError("ranking policy calculation_release_id must be a UUID string") from error
 
 
-def _beatmap_is_eligible(status: str, rules: dict[str, object]) -> bool:
-    statuses = _rule_strings(rules, "allowed_statuses")
+def _beatmap_is_eligible(status: str, statuses: set[str]) -> bool:
     return status in statuses
 
 

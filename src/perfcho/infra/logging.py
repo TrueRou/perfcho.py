@@ -44,6 +44,9 @@ _LOKI_METADATA_KEYS = (
     "pid",
 )
 _NOISY_WORKER_LIBRARY_LOGS = frozenset({("taskiq.redis_broker", "Starting fetching new messages")})
+_NOISY_LIBRARY_LOGS = frozenset(
+    {("apscheduler._schedulers.async_", "Cleaned up expired job results and finished schedules")}
+)
 _relay_task_name: ContextVar[str | None] = ContextVar("perfcho_relay_task_name", default=None)
 _relay_event_type: ContextVar[str | None] = ContextVar("perfcho_relay_event_type", default=None)
 _relay_delay_ms: ContextVar[float | None] = ContextVar("perfcho_relay_delay_ms", default=None)
@@ -73,6 +76,8 @@ class InterceptHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         """Translate one library record into a structured event."""
         message = record.getMessage()
+        if (record.name, message) in _NOISY_LIBRARY_LOGS:
+            return
         if self._process_role == "worker" and (record.name, message) in _NOISY_WORKER_LIBRARY_LOGS:
             return
         if (

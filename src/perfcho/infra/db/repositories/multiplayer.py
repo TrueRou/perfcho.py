@@ -272,16 +272,6 @@ class SqlAlchemyMultiplayerRepository:
         ).scalar_one_or_none()
         if active_round is None:
             return DurableRoomSnapshot(durable, account_ids)
-        rows = (
-            await self._session.execute(
-                select(RoundParticipant)
-                .where(
-                    RoundParticipant.round_id == active_round.id,
-                    RoundParticipant.account_id.in_(account_ids),
-                )
-                .order_by(RoundParticipant.slot_number, RoundParticipant.account_id)
-            )
-        ).all()
         participants = tuple(
             RoundParticipantSelection(
                 participant.account_id,
@@ -289,7 +279,14 @@ class SqlAlchemyMultiplayerRepository:
                 participant.team_number,
                 _mods_from_json(participant.mods_details),
             )
-            for participant in rows
+            for participant in await self._session.scalars(
+                select(RoundParticipant)
+                .where(
+                    RoundParticipant.round_id == active_round.id,
+                    RoundParticipant.account_id.in_(account_ids),
+                )
+                .order_by(RoundParticipant.slot_number, RoundParticipant.account_id)
+            )
             if participant.slot_number is not None
         )
         return DurableRoomSnapshot(durable, account_ids, active_round.id, participants)
