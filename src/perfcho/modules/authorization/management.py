@@ -31,7 +31,7 @@ from perfcho.modules.common.errors import AuthenticationFailed
 from perfcho.modules.common.idempotency import CommandClaim, CommandReceiptStoreFactory
 from perfcho.modules.common.models import JsonValue
 
-_AUTHORIZATION_CONSUMERS = ("authorization-projector.v1",)
+_AUTHORIZATION_CONSUMERS = ("authorization-consumer.v1",)
 _EFFECTS = frozenset({"allow", "deny"})
 
 type _GrantCommand = GrantRole | GrantPermission | GrantEntitlement

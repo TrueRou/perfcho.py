@@ -14,9 +14,9 @@ from fastapi import FastAPI
 
 from perfcho.api.stable import router
 from perfcho.api.stable.dependencies import get_stable_services
+from perfcho.consumers.ranking import _calculation_release_id, _metric_expression
 from perfcho.infra.compose import StableServices
 from perfcho.infra.db.models.scoring import Score, ScorePerformance
-from perfcho.infra.db.projectors.ranking import _calculation_release_id, _metric_expression
 from perfcho.infra.security.rijndael import Rijndael256Cbc
 from perfcho.infra.settings import Settings
 from perfcho.modules.authorization import AuthorizationQueryService

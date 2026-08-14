@@ -57,7 +57,7 @@ from perfcho.modules.identity.ports import (
     OnlineCredentialVerificationCache,
 )
 
-_IDENTITY_CONSUMERS = ("identity-projector.v1",)
+_IDENTITY_CONSUMERS = ("identity-consumer.v1",)
 _ACCOUNT_ID_MAX = 2_147_483_647
 _TOKEN_PREFIX_LENGTH = 16
 

@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import Table, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from perfcho.consumers.multiplayer import CONSUMER_NAME, consume_multiplayer_results
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.enums import AccountStatus, AccountType, AttemptStatus, BeatmapStatus
 from perfcho.infra.db.enums import ClientFamily as DbClientFamily
@@ -15,7 +16,7 @@ from perfcho.infra.db.enums import ScoreGrade as DbScoreGrade
 from perfcho.infra.db.enums import ScoreOutcome as DbScoreOutcome
 from perfcho.infra.db.models.content import Beatmap, BeatmapRevision, Beatmapset
 from perfcho.infra.db.models.core import Account
-from perfcho.infra.db.models.events import OutboxDelivery, OutboxEvent, ProjectionCheckpoint
+from perfcho.infra.db.models.events import ConsumerCheckpoint, OutboxDelivery, OutboxEvent
 from perfcho.infra.db.models.multiplayer import (
     MultiplayerAttempt,
     MultiplayerEvent,
@@ -31,7 +32,6 @@ from perfcho.infra.db.models.multiplayer import (
     SessionStanding,
 )
 from perfcho.infra.db.models.scoring import PlayAttempt, Score
-from perfcho.infra.db.projectors.multiplayer import CONSUMER_NAME, project_multiplayer_results
 from perfcho.infra.db.repositories.multiplayer import SqlAlchemyMultiplayerRepository
 from perfcho.infra.db.repositories.outbox import append_outbox_event
 from perfcho.modules.common import PendingEvent
@@ -497,7 +497,7 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
         async with session_factory.begin() as session:
             first_event = await session.get(OutboxEvent, first_event_id)
             assert first_event is not None
-            await project_multiplayer_results(session, first_event, f"round:{first_round_id}")
+            await consume_multiplayer_results(session, first_event, f"round:{first_round_id}")
 
         async with session_factory() as session:
             first_result = await session.scalar(select(RoundResult).where(RoundResult.round_id == first_round_id))
@@ -540,7 +540,7 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
         async with session_factory.begin() as session:
             second_event = await session.get(OutboxEvent, second_event_id)
             assert second_event is not None
-            await project_multiplayer_results(session, second_event, f"round:{second_round_id}")
+            await consume_multiplayer_results(session, second_event, f"round:{second_round_id}")
 
         async with session_factory() as session:
             assert (
@@ -570,11 +570,11 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
             score_event = await session.get(OutboxEvent, score_event_id)
             assert score_event is not None
             score_partition = f"account:1:scoreboard:{scoreboard_id}"
-            await project_multiplayer_results(session, score_event, score_partition)
+            await consume_multiplayer_results(session, score_event, score_partition)
             late_result = await session.scalar(select(RoundResult).where(RoundResult.round_id == second_round_id))
             assert late_result is not None
             digest = late_result.result_digest
-            await project_multiplayer_results(session, score_event, score_partition)
+            await consume_multiplayer_results(session, score_event, score_partition)
             assert late_result.result_digest == digest
 
         async with session_factory.begin() as session:
@@ -600,7 +600,7 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
         async with session_factory.begin() as session:
             aborted_event = await session.get(OutboxEvent, aborted_event_id)
             assert aborted_event is not None
-            await project_multiplayer_results(session, aborted_event, f"round:{aborted_round_id}")
+            await consume_multiplayer_results(session, aborted_event, f"round:{aborted_round_id}")
 
         async with session_factory() as session:
             assert (
@@ -632,8 +632,8 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
                 {"room_id": room.room_id, "account_id": 2},
             )
             checkpoint = await session.get(
-                ProjectionCheckpoint,
-                {"projector": CONSUMER_NAME, "partition_key": f"account:1:scoreboard:{scoreboard_id}"},
+                ConsumerCheckpoint,
+                {"consumer": CONSUMER_NAME, "partition_key": f"account:1:scoreboard:{scoreboard_id}"},
             )
             assert standing is not None and standing.points == Decimal("2.0000")
             assert playlist_summary is not None

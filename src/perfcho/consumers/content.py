@@ -3,9 +3,7 @@
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.models.content import Beatmapset
-from perfcho.infra.db.models.events import OutboxEvent
-from perfcho.infra.db.projectors.common import (
+from perfcho.consumers.common import (
     advance_checkpoint,
     payload_datetime,
     payload_integer,
@@ -13,26 +11,28 @@ from perfcho.infra.db.projectors.common import (
     payload_optional_integer,
     payload_optional_string,
     payload_string,
-    project_activity,
-    project_notification,
+    record_activity,
+    record_notification,
     require_event_context,
 )
+from perfcho.infra.db.models.content import Beatmapset
+from perfcho.infra.db.models.events import OutboxEvent
 
-CONSUMER_NAME = "content-projector.v1"
+CONSUMER_NAME = "content-consumer.v1"
 EVENT_TYPES = frozenset({"content.beatmapset-synchronized.v1", "content.beatmapset-status-changed.v1"})
 
 
-async def project_content_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def consume_content_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Route one content event to its type-specific projection handler."""
     if event.event_type == "content.beatmapset-synchronized.v1":
-        await _project_synchronized(session, event, partition_key)
+        await _apply_synchronized(session, event, partition_key)
     elif event.event_type == "content.beatmapset-status-changed.v1":
-        await _project_status_changed(session, event, partition_key)
+        await _apply_status_changed(session, event, partition_key)
     else:
         raise RuntimeError(f"unsupported content event type: {event.event_type}")
 
 
-async def _project_synchronized(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def _apply_synchronized(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Notify a linked creator about the latest beatmapset synchronization."""
     beatmapset_id = payload_integer(event.payload, "beatmapset_id")
     external_beatmapset_id = payload_integer(event.payload, "external_beatmapset_id")
@@ -59,7 +59,7 @@ async def _project_synchronized(session: AsyncSession, event: OutboxEvent, parti
             "unchanged_revision_count": unchanged_revision_count,
             "removed_beatmap_count": removed_beatmap_count,
         }
-        await project_activity(
+        await record_activity(
             session,
             event,
             subject_account_id=beatmapset.creator_account_id,
@@ -69,7 +69,7 @@ async def _project_synchronized(session: AsyncSession, event: OutboxEvent, parti
             occurred_at=source_updated_at,
             snapshot=snapshot,
         )
-        await project_notification(
+        await record_notification(
             session,
             event,
             actor_account_id=None,
@@ -80,10 +80,10 @@ async def _project_synchronized(session: AsyncSession, event: OutboxEvent, parti
             payload=snapshot,
             recipient_account_ids=(beatmapset.creator_account_id,),
         )
-    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+    await advance_checkpoint(session, event, consumer=CONSUMER_NAME, partition_key=partition_key)
 
 
-async def _project_status_changed(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def _apply_status_changed(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Notify a linked creator about a ranking status transition."""
     beatmapset_id = payload_integer(event.payload, "beatmapset_id")
     external_beatmapset_id = payload_integer(event.payload, "external_beatmapset_id")
@@ -110,7 +110,7 @@ async def _project_status_changed(session: AsyncSession, event: OutboxEvent, par
             "status": status,
             "source": source,
         }
-        await project_activity(
+        await record_activity(
             session,
             event,
             subject_account_id=beatmapset.creator_account_id,
@@ -120,7 +120,7 @@ async def _project_status_changed(session: AsyncSession, event: OutboxEvent, par
             occurred_at=effective_at,
             snapshot=snapshot,
         )
-        await project_notification(
+        await record_notification(
             session,
             event,
             actor_account_id=actor_account_id,
@@ -131,4 +131,4 @@ async def _project_status_changed(session: AsyncSession, event: OutboxEvent, par
             payload=snapshot,
             recipient_account_ids=(beatmapset.creator_account_id,),
         )
-    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+    await advance_checkpoint(session, event, consumer=CONSUMER_NAME, partition_key=partition_key)

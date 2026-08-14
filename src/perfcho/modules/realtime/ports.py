@@ -202,7 +202,7 @@ class RealtimeStateRepository(Protocol):
 
 @runtime_checkable
 class RealtimeBubbleSubscription(Protocol):
-    """Consume and acknowledge Bubbles for one session fence."""
+    """Consume and acknowledge Bubbles for one account."""
 
     async def receive(self, *, timeout: float) -> RealtimeBubble | None:
         """Wait for one valid Bubble or return None at timeout."""
@@ -223,17 +223,22 @@ class RealtimeBubbleSubscription(Protocol):
 
 @runtime_checkable
 class RealtimeBubbleBus(Protocol):
-    """Publish and consume bounded session-scoped Bubbles."""
+    """Publish and consume bounded account-scoped Bubbles.
 
-    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
+    Every subscriber opens its own consumer group so a single account's events
+    fan out to all concurrently connected consumers regardless of which worker
+    hosts each connection.
+    """
+
+    async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
         """Publish one Bubble and return the number of streams written."""
         ...
 
-    async def publish_many(self, recipient_fences: Sequence[SessionFence], bubble: RealtimeBubble) -> int:
-        """Publish one Bubble to many exact session epochs and return streams written."""
+    async def publish_many(self, account_ids: Sequence[int], bubble: RealtimeBubble) -> int:
+        """Publish one Bubble to many account streams and return streams written."""
         ...
 
-    def subscribe(self, recipient_fence: SessionFence) -> AbstractAsyncContextManager[RealtimeBubbleSubscription]:
+    def subscribe(self, account_id: int) -> AbstractAsyncContextManager[RealtimeBubbleSubscription]:
         """Open a subscription confirmed before entering its context."""
         ...
 
@@ -255,38 +260,4 @@ class RealtimePollGate(Protocol):
 
     async def release(self, account_id: int, recipient_fence: SessionFence, gate_id: uuid.UUID) -> None:
         """Release the gate only when all owner components match."""
-        ...
-
-
-@runtime_checkable
-class UserEventSubscription(Protocol):
-    """Consume account-keyed realtime events until closed."""
-
-    async def receive(self, *, timeout: float) -> RealtimeBubble | None:
-        """Wait for the next event or return None at timeout."""
-        ...
-
-    async def acknowledge(self) -> None:
-        """Acknowledge every event returned by this subscription."""
-        ...
-
-    async def aclose(self) -> None:
-        """Stop consuming the account stream."""
-        ...
-
-
-@runtime_checkable
-class UserEventBus(Protocol):
-    """Fan realtime events out to an account regardless of its transport worker."""
-
-    async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
-        """Append one encoded event to a bounded account stream."""
-        ...
-
-    async def publish_many(self, account_ids: Sequence[int], bubble: RealtimeBubble) -> int:
-        """Append one encoding to many account streams."""
-        ...
-
-    def subscribe(self, account_id: int) -> AbstractAsyncContextManager[UserEventSubscription]:
-        """Open a subscription for one account's event stream."""
         ...

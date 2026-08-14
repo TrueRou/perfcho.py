@@ -104,6 +104,7 @@ class Settings(BaseSettings):
     oauth_access_token_lifetime_seconds: int = Field(default=24 * 60 * 60, ge=60)
     oauth_refresh_token_lifetime_seconds: int = Field(default=30 * 24 * 60 * 60, ge=300)
     lazer_solo_score_token_lifetime_seconds: int = Field(default=2 * 60 * 60, ge=60, le=24 * 60 * 60)
+    notifications_ws_path: str = Field(default="/notifications/ws", min_length=1, max_length=256)
 
     bot_account_id: int = Field(default=1, ge=1)
     bot_name: str = Field(default="BanchoBot", min_length=1, max_length=32)

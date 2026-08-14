@@ -2,8 +2,7 @@
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.models.events import OutboxEvent
-from perfcho.infra.db.projectors.common import (
+from perfcho.consumers.common import (
     advance_checkpoint,
     payload_boolean,
     payload_datetime,
@@ -11,16 +10,17 @@ from perfcho.infra.db.projectors.common import (
     payload_optional_string,
     payload_string,
     payload_uuid,
-    project_activity,
+    record_activity,
     require_accounts,
     require_event_context,
 )
+from perfcho.infra.db.models.events import OutboxEvent
 
-CONSUMER_NAME = "identity-projector.v1"
+CONSUMER_NAME = "identity-consumer.v1"
 EVENT_TYPES = frozenset({"identity.session-opened.v1", "identity.session-closed.v1"})
 
 
-async def project_identity_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def consume_identity_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project one opened or closed authentication session without changing Presence."""
     account_id = payload_integer(event.payload, "account_id")
     session_id = payload_uuid(event.payload, "session_id")
@@ -51,7 +51,7 @@ async def project_identity_event(session: AsyncSession, event: OutboxEvent, part
             "reason": payload_string(event.payload, "reason"),
             "revoked": payload_boolean(event.payload, "revoked"),
         }
-    await project_activity(
+    await record_activity(
         session,
         event,
         subject_account_id=account_id,
@@ -61,4 +61,4 @@ async def project_identity_event(session: AsyncSession, event: OutboxEvent, part
         occurred_at=occurred_at,
         snapshot=snapshot,
     )
-    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+    await advance_checkpoint(session, event, consumer=CONSUMER_NAME, partition_key=partition_key)

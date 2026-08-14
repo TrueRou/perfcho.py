@@ -1,7 +1,7 @@
 """Adapt osu!lazer notification endpoints onto the community query service.
 
 Notifications are projected durably by the community-message outbox consumer
-(``project_notification``) and read back through :class:`CommunityQueryService`.
+(``record_notification``) and read back through :class:`CommunityQueryService`.
 """
 
 from typing import Annotated
@@ -34,7 +34,7 @@ async def list_notifications(
         "has_more": page.has_more,
         "notifications": [_notification(view) for view in page.notifications],
         "unread_count": page.unread_count,
-        "notification_endpoint": "/signalr/metadata",
+        "notification_endpoint": services.settings.notifications_ws_path,
     }
 
 

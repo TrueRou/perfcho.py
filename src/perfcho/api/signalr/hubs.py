@@ -29,6 +29,8 @@ from perfcho.modules.multiplayer import (
 from perfcho.modules.realtime import (
     InvalidFrame,
     MultiplayerRoomBubble,
+    MultiplayerSignalBubble,
+    MultiplayerSignalKind,
     PresenceUpdatedBubble,
     RealtimeBubble,
     RealtimeSession,
@@ -83,8 +85,8 @@ class SpectatorHub(PerfchoHub):
         spectators = await services.realtime.list_spectators(
             self.account_id, host_fence=realtime.fence, at=services.clock.now()
         )
-        if services.user_events is not None:
-            await services.user_events.publish_many(
+        if services.bubbles is not None:
+            await services.bubbles.publish_many(
                 tuple(relation.spectator_account_id for relation in spectators),
                 SpectatorLifecycleBubble(SpectatorAction.ATTACHED_TO_HOST, self.account_id, self.account_id),
             )
@@ -109,8 +111,8 @@ class SpectatorHub(PerfchoHub):
             )
         except (InvalidFrame, SpectatorHostOffline, RealtimeSessionFenced, RealtimeSessionNotFound):
             return
-        if services.user_events is not None:
-            await services.user_events.publish_many(
+        if services.bubbles is not None:
+            await services.bubbles.publish_many(
                 tuple(recipient.account_id for recipient in result.recipients),
                 bubble,
             )
@@ -403,9 +405,13 @@ class MultiplayerHub(PerfchoHub):
         )
 
     async def handle_bubble(self, bubble: RealtimeBubble) -> None:
-        """Translate a room bubble into lazer client callbacks."""
-        if not isinstance(bubble, MultiplayerRoomBubble):
-            return
+        """Translate a room or signal bubble into lazer client callbacks."""
+        if isinstance(bubble, MultiplayerRoomBubble):
+            await self._handle_room_bubble(bubble)
+        elif isinstance(bubble, MultiplayerSignalBubble):
+            await self._handle_signal_bubble(bubble)
+
+    async def _handle_room_bubble(self, bubble: MultiplayerRoomBubble) -> None:
         room = bubble.room
         await self._caller("RoomStateChanged", "Playing" if room.in_progress else "Open")
         await self._caller(
@@ -421,6 +427,24 @@ class MultiplayerHub(PerfchoHub):
                 "maxParticipants": room.capacity,
             },
         )
+
+    async def _handle_signal_bubble(self, bubble: MultiplayerSignalBubble) -> None:
+        match bubble.kind:
+            case MultiplayerSignalKind.HOST_TRANSFERRED:
+                if bubble.actor_account_id is not None:
+                    await self._caller("HostChanged", bubble.actor_account_id)
+            case MultiplayerSignalKind.INVITED:
+                if bubble.invitation is not None and bubble.actor_account_id is not None:
+                    await self._caller(
+                        "Invited",
+                        bubble.actor_account_id,
+                        bubble.room_public_id,
+                        bubble.invitation.admission_token,
+                    )
+            case _:
+                # Loading/skip/fail/score signals have no standalone lazer client
+                # callback; the client reconciles them from the next room state.
+                return
 
 
 def _change_host_cmd(meta: CommandMeta, state: RoomState, target_account_id: int) -> ChangeHost:

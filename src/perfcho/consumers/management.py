@@ -2,18 +2,18 @@
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.models.events import OutboxEvent
-from perfcho.infra.db.projectors.common import (
+from perfcho.consumers.common import (
     advance_checkpoint,
     payload_datetime,
     payload_integer,
-    project_activity,
+    record_activity,
     require_accounts,
     require_event_context,
 )
+from perfcho.infra.db.models.events import OutboxEvent
 
-AUTHORIZATION_CONSUMER_NAME = "authorization-projector.v1"
-MODERATION_CONSUMER_NAME = "moderation-projector.v1"
+AUTHORIZATION_CONSUMER_NAME = "authorization-consumer.v1"
+MODERATION_CONSUMER_NAME = "moderation-consumer.v1"
 
 AUTHORIZATION_EVENT_TYPES = frozenset(
     {
@@ -36,7 +36,7 @@ MODERATION_EVENT_TYPES = frozenset(
 )
 
 
-async def project_authorization_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def consume_authorization_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project one authorization management event as staff-only activity."""
     if event.event_type not in AUTHORIZATION_EVENT_TYPES:
         raise RuntimeError(f"unsupported authorization management event: {event.event_type}")
@@ -48,10 +48,10 @@ async def project_authorization_event(session: AsyncSession, event: OutboxEvent,
         aggregate_id=event.aggregate_id,
         expected_partition_key=f"account:{subject_account_id}",
     )
-    await _project(session, event, partition_key, AUTHORIZATION_CONSUMER_NAME)
+    await _apply(session, event, partition_key, AUTHORIZATION_CONSUMER_NAME)
 
 
-async def project_moderation_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def consume_moderation_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project one moderation management event as staff-only activity."""
     if event.event_type not in MODERATION_EVENT_TYPES:
         raise RuntimeError(f"unsupported moderation management event: {event.event_type}")
@@ -62,10 +62,10 @@ async def project_moderation_event(session: AsyncSession, event: OutboxEvent, pa
         aggregate_id=event.aggregate_id,
         expected_partition_key=f"{event.aggregate_type}:{event.aggregate_id}",
     )
-    await _project(session, event, partition_key, MODERATION_CONSUMER_NAME)
+    await _apply(session, event, partition_key, MODERATION_CONSUMER_NAME)
 
 
-async def _project(
+async def _apply(
     session: AsyncSession,
     event: OutboxEvent,
     partition_key: str,
@@ -74,7 +74,7 @@ async def _project(
     actor_account_id = payload_integer(event.payload, "actor_account_id")
     subject_account_id = payload_integer(event.payload, "subject_account_id")
     await require_accounts(session, (actor_account_id, subject_account_id))
-    await project_activity(
+    await record_activity(
         session,
         event,
         subject_account_id=subject_account_id,
@@ -84,4 +84,4 @@ async def _project(
         occurred_at=payload_datetime(event.payload, "occurred_at"),
         snapshot=event.payload,
     )
-    await advance_checkpoint(session, event, projector=consumer_name, partition_key=partition_key)
+    await advance_checkpoint(session, event, consumer=consumer_name, partition_key=partition_key)

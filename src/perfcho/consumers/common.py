@@ -1,4 +1,4 @@
-"""Provide strict payload parsing and idempotent projector writes."""
+"""Provide strict payload parsing and idempotent consumer writes."""
 
 import uuid
 from collections.abc import Mapping, Sequence
@@ -16,7 +16,7 @@ from perfcho.infra.db.models.community import (
     NotificationRecipient,
 )
 from perfcho.infra.db.models.core import Account
-from perfcho.infra.db.models.events import ActivityEvent, OutboxEvent, ProjectionCheckpoint
+from perfcho.infra.db.models.events import ActivityEvent, ConsumerCheckpoint, OutboxEvent
 from perfcho.infra.db.repositories.outbox import append_outbox_event
 from perfcho.modules.common.models import JsonValue, PendingEvent
 
@@ -117,7 +117,7 @@ async def require_accounts(session: AsyncSession, account_ids: Sequence[int]) ->
         raise RuntimeError("event references one or more missing accounts")
 
 
-async def project_activity(
+async def record_activity(
     session: AsyncSession,
     event: OutboxEvent,
     *,
@@ -153,7 +153,7 @@ async def project_activity(
     )
 
 
-async def project_notification(
+async def record_notification(
     session: AsyncSession,
     event: OutboxEvent,
     *,
@@ -250,7 +250,7 @@ async def project_notification(
                 "resource_id": resource_id,
                 "payload": cast(dict[str, JsonValue], dict(payload)),
             },
-            consumers=("notification-realtime-projector.v1",),
+            consumers=("notification-realtime-consumer.v1",),
             partition_key=f"notification:{notification_id}",
         ),
     )
@@ -261,24 +261,24 @@ async def advance_checkpoint(
     session: AsyncSession,
     event: OutboxEvent,
     *,
-    projector: str,
+    consumer: str,
     partition_key: str,
 ) -> None:
-    """Advance a projector partition watermark without allowing regression."""
-    statement = insert(ProjectionCheckpoint).values(
-        projector=projector,
+    """Advance a consumer partition watermark without allowing regression."""
+    statement = insert(ConsumerCheckpoint).values(
+        consumer=consumer,
         partition_key=partition_key,
         source_event_id=event.id,
         source_position=event.position,
     )
     await session.execute(
         statement.on_conflict_do_update(
-            index_elements=(ProjectionCheckpoint.projector, ProjectionCheckpoint.partition_key),
+            index_elements=(ConsumerCheckpoint.consumer, ConsumerCheckpoint.partition_key),
             set_={
                 "source_event_id": event.id,
                 "source_position": event.position,
                 "updated_at": datetime.now(UTC),
             },
-            where=statement.excluded.source_position > ProjectionCheckpoint.source_position,
+            where=statement.excluded.source_position > ConsumerCheckpoint.source_position,
         )
     )

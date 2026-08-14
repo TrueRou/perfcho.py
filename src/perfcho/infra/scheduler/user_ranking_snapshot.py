@@ -14,7 +14,7 @@ from perfcho.infra.db.models.core import Account
 from perfcho.infra.db.models.events import OutboxDelivery
 from perfcho.infra.db.models.scoring import RankingPolicy, UserRanking, UserRankingSnapshot
 
-_RANKING_CONSUMER = "ranking-projector.v1"
+_RANKING_CONSUMER = "ranking-consumer.v1"
 _USER_RANKING_SNAPSHOT_LOCK_ID = 0x72616E6B736E6170
 
 

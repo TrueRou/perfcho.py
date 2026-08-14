@@ -15,6 +15,8 @@ from sqlalchemy.exc import SAWarning
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import FROM_LINTING
 
+from perfcho.consumers.ranking import consume_accepted_score
+from perfcho.consumers.scoring_stats import consume_scoring_stats
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.enums import BeatmapStatus as DbBeatmapStatus
 from perfcho.infra.db.enums import Ruleset as DbRuleset
@@ -43,8 +45,6 @@ from perfcho.infra.db.models.scoring import (
     ScoreAttestation as DbScoreAttestation,
 )
 from perfcho.infra.db.models.social import AchievementDefinition, AchievementTranslation, AchievementUnlock
-from perfcho.infra.db.projectors.ranking import project_accepted_score
-from perfcho.infra.db.projectors.scoring_stats import project_scoring_stats
 from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
 from perfcho.infra.db.repositories.scoring import (
     SqlAlchemyAccountSubmissionValidator,
@@ -320,9 +320,9 @@ async def test_scoring_service_persists_validated_facts_and_event_in_one_transac
     assert repository.record.validated.total_hits == 10
     assert outbox.events[0].event_type == "score.accepted.v1"
     assert outbox.events[0].consumers == (
-        "ranking-projector.v1",
-        "scoring-stats-projector.v1",
-        "performance-projector.v1",
+        "ranking-consumer.v1",
+        "scoring-stats-consumer.v1",
+        "performance-consumer.v1",
     )
     assert outbox.events[0].payload["country_code"] == "JP"
     assert "performance_release_ids" not in outbox.events[0].payload
@@ -362,7 +362,7 @@ async def test_scoring_service_does_not_commit_when_achievement_awarding_fails()
 
 
 @pytest.mark.asyncio
-async def test_multiplayer_score_routes_results_projector_in_acceptance_transaction() -> None:
+async def test_multiplayer_score_routes_results_consumer_in_acceptance_transaction() -> None:
     calls: list[str] = []
     repository = FakeRepository(calls)
     outbox = FakeOutbox(calls)
@@ -380,10 +380,10 @@ async def test_multiplayer_score_routes_results_projector_in_acceptance_transact
     await service.accept(replace(command(), multiplayer=MultiplayerSubmissionContext(uuid.uuid7(), b"m" * 32)))
 
     assert outbox.events[0].consumers == (
-        "ranking-projector.v1",
-        "scoring-stats-projector.v1",
-        "performance-projector.v1",
-        "multiplayer-results-projector.v1",
+        "ranking-consumer.v1",
+        "scoring-stats-consumer.v1",
+        "performance-consumer.v1",
+        "multiplayer-results-consumer.v1",
     )
 
 
@@ -683,8 +683,8 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 )
             ).all()
             for event in events:
-                await project_accepted_score(session, event, "account:1:ruleset:osu")
-                await project_scoring_stats(session, event, "account:1:ruleset:osu")
+                await consume_accepted_score(session, event, "account:1:ruleset:osu")
+                await consume_scoring_stats(session, event, "account:1:ruleset:osu")
             scoring_repository = SqlAlchemyScoringRepository(session)
             counting_leaderboard_statements = True
             exact_mods = await scoring_repository.get_public_leaderboard(
@@ -738,7 +738,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 await session.scalars(select(OutboxEvent).where(OutboxEvent.event_type == "score.replay-viewed.v1"))
             ).all()
             assert len(replay_events) == 1
-            await project_scoring_stats(session, replay_events[0], "account:1:ruleset:osu")
+            await consume_scoring_stats(session, replay_events[0], "account:1:ruleset:osu")
 
         assert replayed == replace(first, new_achievement_unlocks=())
         assert len(exact_mods) == 1
@@ -848,7 +848,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                         "pp": "200",
                         "output_digest": (b"o" * 32).hex(),
                     },
-                    consumers=("ranking-projector.v1",),
+                    consumers=("ranking-consumer.v1",),
                     partition_key="account:1:ruleset:osu",
                 )
             )
@@ -860,7 +860,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 )
             )
             assert performance_event is not None
-            await project_accepted_score(session, performance_event, "account:1:ruleset:osu")
+            await consume_accepted_score(session, performance_event, "account:1:ruleset:osu")
             user_ranking = await session.get(UserRanking, {"account_id": 1, "policy_id": policy_id})
             assert user_ranking is not None
             await session.refresh(user_ranking)
@@ -915,8 +915,8 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 )
             )
             assert failed_event is not None
-            await project_accepted_score(session, failed_event, "account:1:ruleset:osu")
-            await project_scoring_stats(session, failed_event, "account:1:ruleset:osu")
+            await consume_accepted_score(session, failed_event, "account:1:ruleset:osu")
+            await consume_scoring_stats(session, failed_event, "account:1:ruleset:osu")
         async with session_factory() as session:
             histogram = await session.get(
                 BeatmapFailHistogram,

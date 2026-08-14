@@ -63,12 +63,12 @@ class PerfchoHub(Hub):
     async def _bridge_loop(self) -> None:
         """Forward account-keyed events to this connection until it closes."""
         services = self._services()
-        user_events = services.user_events if services is not None else None
+        bubbles = services.bubbles if services is not None else None
         account_id = self.account_id
-        if user_events is None or account_id is None:
+        if bubbles is None or account_id is None:
             return
         try:
-            async with user_events.subscribe(account_id) as subscription:
+            async with bubbles.subscribe(account_id) as subscription:
                 while True:
                     bubble = await subscription.receive(timeout=30.0)
                     if bubble is None:

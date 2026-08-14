@@ -14,18 +14,18 @@ from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.models.events import OutboxEvent
-from perfcho.infra.db.projectors.common import (
+from perfcho.consumers.common import (
     advance_checkpoint,
     payload_integer,
     payload_string,
     require_event_context,
 )
+from perfcho.infra.db.models.events import OutboxEvent
 from perfcho.infra.logging import log_event
 from perfcho.modules.realtime.bubbles import ChatMessageBubble, RealtimeBubble
 from perfcho.modules.realtime.models import PresenceSnapshot, SessionFence
 
-CONSUMER_NAME = "notification-realtime-projector.v1"
+CONSUMER_NAME = "notification-realtime-consumer.v1"
 EVENT_TYPES = frozenset({"community.notification-created.v1"})
 
 type ConsumerHandler = Callable[[AsyncSession, OutboxEvent, str], Awaitable[None]]
@@ -81,7 +81,7 @@ def notification_realtime_handler(
         )
         text = render_notification_text(kind, _mapping(event.payload.get("payload")))
         if text is None:
-            await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+            await advance_checkpoint(session, event, consumer=CONSUMER_NAME, partition_key=partition_key)
             return
 
         recipients = _recipient_ids(event.payload.get("recipient_account_ids"))
@@ -103,7 +103,7 @@ def notification_realtime_handler(
                 direct=True,
             )
             try:
-                await bubbles.publish(presence.fence, bubble)
+                await bubbles.publish(presence.account_id, bubble)
                 delivered += 1
             except Exception as error:
                 log_event(
@@ -122,7 +122,7 @@ def notification_realtime_handler(
             recipient_count=len(recipients),
             delivered=delivered,
         )
-        await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+        await advance_checkpoint(session, event, consumer=CONSUMER_NAME, partition_key=partition_key)
 
     return handler
 
@@ -131,7 +131,7 @@ def _mapping(value: object) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
 
 
-async def unconfigured_handler(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def unconfigured_consumer(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Reject execution when runtime notification delivery is not configured."""
     del session, event, partition_key
     raise RuntimeError("notification realtime delivery is not configured")

@@ -9,6 +9,11 @@ from loguru import logger
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from perfcho.consumers.catalog import (
+    DEFAULT_CONSUMER_CATALOG,
+    ConsumerCatalog,
+    ConsumerRegistration,
+)
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.enums import AccountStatus, AccountType, BeatmapStatus, ChannelKind, OutboxDeliveryStatus
 from perfcho.infra.db.models.community import (
@@ -23,13 +28,8 @@ from perfcho.infra.db.models.community import (
 )
 from perfcho.infra.db.models.content import Beatmapset
 from perfcho.infra.db.models.core import Account
-from perfcho.infra.db.models.events import ActivityEvent, OutboxDelivery, OutboxEvent, ProjectionCheckpoint
+from perfcho.infra.db.models.events import ActivityEvent, ConsumerCheckpoint, OutboxDelivery, OutboxEvent
 from perfcho.infra.db.models.social import AchievementDefinition, AchievementUnlock
-from perfcho.infra.db.projectors.catalog import (
-    DEFAULT_CONSUMER_CATALOG,
-    ConsumerCatalog,
-    ConsumerRegistration,
-)
 from perfcho.infra.db.repositories.outbox import append_outbox_event
 from perfcho.infra.db.repositories.outbox_delivery import SqlAlchemyOutboxDeliveryRepository
 from perfcho.infra.settings import settings
@@ -41,28 +41,28 @@ NOW = datetime(2026, 7, 29, 12, 30, tzinfo=UTC)
 ACTOR_ACCOUNT_ID = 2001
 RECIPIENT_ACCOUNT_ID = 2002
 EXPECTED_CONSUMERS = {
-    "account-projector.v1": {"account.registered.v1"},
-    "identity-projector.v1": {"identity.session-opened.v1", "identity.session-closed.v1"},
-    "content-projector.v1": {"content.beatmapset-synchronized.v1", "content.beatmapset-status-changed.v1"},
-    "social-projector.v1": {
+    "account-consumer.v1": {"account.registered.v1"},
+    "identity-consumer.v1": {"identity.session-opened.v1", "identity.session-closed.v1"},
+    "content-consumer.v1": {"content.beatmapset-synchronized.v1", "content.beatmapset-status-changed.v1"},
+    "social-consumer.v1": {
         "social.account-followed.v1",
         "social.account-unfollowed.v1",
         "social.account-blocked.v1",
         "social.account-unblocked.v1",
     },
-    "achievement-projector.v1": {"social.achievement-unlocked.v1"},
-    "community-projector.v1": {
+    "achievement-consumer.v1": {"social.achievement-unlocked.v1"},
+    "community-consumer.v1": {
         "community.direct-conversation-created.v1",
         "community.channel-member-joined.v1",
         "community.channel-member-left.v1",
     },
-    "community-message-projector.v1": {"community.message-sent.v1"},
-    "notification-realtime-projector.v1": {"community.notification-created.v1"},
-    "performance-projector.v1": {"score.accepted.v1"},
-    "ranking-projector.v1": {"score.accepted.v1", "score.performance-calculated.v1"},
-    "scoring-stats-projector.v1": {"score.accepted.v1", "score.replay-viewed.v1"},
-    "multiplayer-results-projector.v1": {"multiplayer.round-completed.v1", "score.accepted.v1"},
-    "authorization-projector.v1": {
+    "community-message-consumer.v1": {"community.message-sent.v1"},
+    "notification-realtime-consumer.v1": {"community.notification-created.v1"},
+    "performance-consumer.v1": {"score.accepted.v1"},
+    "ranking-consumer.v1": {"score.accepted.v1", "score.performance-calculated.v1"},
+    "scoring-stats-consumer.v1": {"score.accepted.v1", "score.replay-viewed.v1"},
+    "multiplayer-results-consumer.v1": {"multiplayer.round-completed.v1", "score.accepted.v1"},
+    "authorization-consumer.v1": {
         "authorization.role-granted.v1",
         "authorization.role-revoked.v1",
         "authorization.permission-granted.v1",
@@ -70,7 +70,7 @@ EXPECTED_CONSUMERS = {
         "authorization.entitlement-granted.v1",
         "authorization.entitlement-revoked.v1",
     },
-    "moderation-projector.v1": {
+    "moderation-consumer.v1": {
         "moderation.case.opened.v1",
         "moderation.case.entry_added.v1",
         "moderation.sanction.imposed.v1",
@@ -79,7 +79,7 @@ EXPECTED_CONSUMERS = {
     },
 }
 
-TEST_CONSUMER = "tests-projector.v1"
+TEST_CONSUMER = "tests-consumer.v1"
 TEST_EVENT_TYPE = "tests.event.v1"
 
 
@@ -89,7 +89,7 @@ async def _complete_test_event(session: AsyncSession, event: OutboxEvent, partit
 
 async def _fail_test_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     del session, event, partition_key
-    raise RuntimeError("projector failed")
+    raise RuntimeError("consumer failed")
 
 
 async def write_outbox_event(
@@ -190,7 +190,7 @@ async def test_outbox_dead_delivery_blocks_later_partition_events(postgres_datab
         records: list[dict[str, Any]] = []
         sink_id = logger.add(lambda message: records.append(cast(dict[str, Any], message.record)))
         try:
-            with pytest.raises(RuntimeError, match="projector failed"):
+            with pytest.raises(RuntimeError, match="consumer failed"):
                 await processor.execute(claims[0])
         finally:
             logger.remove(sink_id)
@@ -207,7 +207,7 @@ async def test_outbox_dead_delivery_blocks_later_partition_events(postgres_datab
         assert dead_event["extra"]["outbox_payload"] == {"detail": "outbox body"}
         assert dead_event["extra"]["error_type"] == "RuntimeError"
         assert dead_event["exception"] is not None
-        assert "projector failed" not in dead_event["message"]
+        assert "consumer failed" not in dead_event["message"]
         assert {"partition_key", "delivery_token", "lease_owner", "error"}.isdisjoint(dead_event["extra"])
         assert await store.claim("tests:next-owner") == ()
 
@@ -334,7 +334,7 @@ async def test_outbox_stale_token_and_enqueue_failure_do_not_consume_attempt(
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payload(
+async def test_outbox_consumers_apply_idempotently_and_rollback_invalid_payload(
     postgres_database_url: str,
 ) -> None:
     del postgres_database_url
@@ -449,7 +449,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "registered_at": NOW.isoformat(),
                         "request_id": str(uuid.uuid7()),
                     },
-                    consumers=("account-projector.v1",),
+                    consumers=("account-consumer.v1",),
                     partition_key=f"account:{ACTOR_ACCOUNT_ID}",
                 ),
                 await write_outbox_event(
@@ -469,7 +469,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "expires_at": NOW.replace(hour=23).isoformat(),
                         "request_id": str(uuid.uuid7()),
                     },
-                    consumers=("identity-projector.v1",),
+                    consumers=("identity-consumer.v1",),
                     partition_key=f"account:{ACTOR_ACCOUNT_ID}",
                 ),
                 await write_outbox_event(
@@ -486,7 +486,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "removed_beatmap_count": 0,
                         "source_updated_at": NOW.isoformat(),
                     },
-                    consumers=("content-projector.v1",),
+                    consumers=("content-consumer.v1",),
                     partition_key=f"beatmapset:{beatmapset.id}",
                 ),
                 await write_outbox_event(
@@ -501,7 +501,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "mutual": False,
                         "followed_at": NOW.isoformat(),
                     },
-                    consumers=("social-projector.v1",),
+                    consumers=("social-consumer.v1",),
                     partition_key=f"social-pair:{ACTOR_ACCOUNT_ID}:{RECIPIENT_ACCOUNT_ID}",
                 ),
                 await write_outbox_event(
@@ -517,7 +517,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "score_id": None,
                         "unlocked_at": NOW.isoformat(),
                     },
-                    consumers=("achievement-projector.v1",),
+                    consumers=("achievement-consumer.v1",),
                     partition_key=f"account:{ACTOR_ACCOUNT_ID}",
                 ),
                 await write_outbox_event(
@@ -531,7 +531,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "low_account_id": ACTOR_ACCOUNT_ID,
                         "high_account_id": RECIPIENT_ACCOUNT_ID,
                     },
-                    consumers=("community-projector.v1",),
+                    consumers=("community-consumer.v1",),
                     partition_key=f"channel:{channel.id}",
                 ),
                 await write_outbox_event(
@@ -551,18 +551,18 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                         "reply_to_id": None,
                         "created_at": NOW.isoformat(),
                     },
-                    consumers=("community-message-projector.v1",),
+                    consumers=("community-message-consumer.v1",),
                     partition_key=f"channel:{channel.id}",
                 ),
             )
             event_consumers = (
-                "account-projector.v1",
-                "identity-projector.v1",
-                "content-projector.v1",
-                "social-projector.v1",
-                "achievement-projector.v1",
-                "community-projector.v1",
-                "community-message-projector.v1",
+                "account-consumer.v1",
+                "identity-consumer.v1",
+                "content-consumer.v1",
+                "social-consumer.v1",
+                "achievement-consumer.v1",
+                "community-consumer.v1",
+                "community-message-consumer.v1",
             )
 
         claims = await relay_store.claim("tests:consumer-owner")
@@ -585,7 +585,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
             assert await session.scalar(select(func.count()).select_from(Notification)) == 3
             assert await session.scalar(select(func.count()).select_from(NotificationRecipient)) == 3
             assert await session.scalar(select(func.count()).select_from(NotificationDispatch)) == 1
-            assert await session.scalar(select(func.count()).select_from(ProjectionCheckpoint)) == 7
+            assert await session.scalar(select(func.count()).select_from(ConsumerCheckpoint)) == 7
             channel_projection = await session.get(ChannelReadProjection, channel.id)
             assert channel_projection is not None
             assert channel_projection.latest_message_id == message.id
@@ -599,7 +599,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                 event_type="account.registered.v1",
                 schema_version=1,
                 payload={"account_id": "invalid"},
-                consumers=("account-projector.v1",),
+                consumers=("account-consumer.v1",),
                 partition_key=f"account:{ACTOR_ACCOUNT_ID}",
             )
         invalid_claim = await relay_store.claim("tests:invalid-owner")
@@ -609,7 +609,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
         async with session_factory() as session:
             delivery = await session.get(
                 OutboxDelivery,
-                {"event_id": invalid.id, "consumer": "account-projector.v1"},
+                {"event_id": invalid.id, "consumer": "account-consumer.v1"},
             )
             assert delivery is not None
             assert delivery.attempt_count == 1

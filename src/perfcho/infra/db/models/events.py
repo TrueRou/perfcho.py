@@ -136,13 +136,13 @@ class ActivityEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     snapshot: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
 
 
-class ProjectionCheckpoint(TimestampMixin, DbBase):
-    """Tracks the event-processing watermark of each asynchronous projector."""
+class ConsumerCheckpoint(TimestampMixin, DbBase):
+    """Tracks the event-processing watermark of each asynchronous consumer."""
 
-    __tablename__ = "projection_checkpoint"
+    __tablename__ = "consumer_checkpoint"
     __table_args__ = ({"schema": "event"},)
 
-    projector: Mapped[str] = mapped_column(String(100), primary_key=True)
+    consumer: Mapped[str] = mapped_column(String(100), primary_key=True)
     partition_key: Mapped[str] = mapped_column(
         String(100), primary_key=True, default="default", server_default="default"
     )

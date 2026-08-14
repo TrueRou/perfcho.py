@@ -5,13 +5,13 @@ import hashlib
 import orjson
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.models.events import OutboxEvent
-from perfcho.infra.db.projectors.common import (
+from perfcho.consumers.common import (
     advance_checkpoint,
     payload_integer,
     payload_string,
     require_event_context,
 )
+from perfcho.infra.db.models.events import OutboxEvent
 from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
 from perfcho.infra.db.repositories.performance.projection import SqlAlchemyPerformanceProjectionRepository
 from perfcho.modules.common.models import PendingEvent
@@ -19,12 +19,12 @@ from perfcho.modules.common.ports import ObjectUrlProvider
 from perfcho.modules.performance.models import PerformanceResult, thaw_json_mapping
 from perfcho.modules.performance.ports import PerformanceCalculator
 
-CONSUMER_NAME = "performance-projector.v1"
+CONSUMER_NAME = "performance-consumer.v1"
 EVENT_TYPES = frozenset({"score.accepted.v1"})
-_RANKING_CONSUMER = "ranking-projector.v1"
+_RANKING_CONSUMER = "ranking-consumer.v1"
 
 
-class PerformanceProjector:
+class PerformanceConsumer:
     """Calculate every matching release as a normal outbox projection."""
 
     def __init__(
@@ -88,13 +88,13 @@ class PerformanceProjector:
                     partition_key=partition_key,
                 )
             )
-        await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+        await advance_checkpoint(session, event, consumer=CONSUMER_NAME, partition_key=partition_key)
 
 
-async def unconfigured_projector(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def unconfigured_consumer(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Reject execution when a runtime catalog omitted Performance dependencies."""
     del session, event, partition_key
-    raise RuntimeError("performance projector is not configured")
+    raise RuntimeError("performance consumer is not configured")
 
 
 def _performance_output_digest(result: PerformanceResult) -> bytes:

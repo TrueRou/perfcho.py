@@ -48,8 +48,8 @@ from perfcho.modules.community.ports import (
     CommunityUnitOfWork,
 )
 
-_MESSAGE_CONSUMERS = ("community-message-projector.v1",)
-_COMMUNITY_CONSUMERS = ("community-projector.v1",)
+_MESSAGE_CONSUMERS = ("community-message-consumer.v1",)
+_COMMUNITY_CONSUMERS = ("community-consumer.v1",)
 _DURABLE_MEMBERSHIP_KINDS = frozenset({"private", "group", "team"})
 
 

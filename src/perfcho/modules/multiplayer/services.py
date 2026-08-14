@@ -62,7 +62,7 @@ _STATE_LIFETIME = timedelta(minutes=15)
 _ADMISSION_LIFETIME = timedelta(minutes=2)
 _COMMAND_NAMESPACE = uuid.UUID("d184efea-948d-5e23-80d2-0d66fa0e813a")
 _SPEED_MODS = frozenset({"DT", "NC", "HT"})
-_RESULTS_CONSUMER = "multiplayer-results-projector.v1"
+_RESULTS_CONSUMER = "multiplayer-results-consumer.v1"
 
 
 class MultiplayerService:

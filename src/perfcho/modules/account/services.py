@@ -22,7 +22,7 @@ from perfcho.modules.common.ports import Clock, OutboxWriterFactory
 
 _RECEIPT_SCOPE = "account.register"
 _DEFAULT_RECEIPT_TTL = timedelta(days=1)
-_REGISTRATION_CONSUMERS = ("account-projector.v1",)
+_REGISTRATION_CONSUMERS = ("account-consumer.v1",)
 
 
 class AccountService:

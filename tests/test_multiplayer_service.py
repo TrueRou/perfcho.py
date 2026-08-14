@@ -514,7 +514,7 @@ async def test_complete_round_writes_results_projection_event_in_command_transac
         "room_id": str(created.room.room_id),
         "aborted": False,
     }
-    assert event.consumers == ("multiplayer-results-projector.v1",)
+    assert event.consumers == ("multiplayer-results-consumer.v1",)
     assert event.partition_key == f"round:{round_id}"
 
 

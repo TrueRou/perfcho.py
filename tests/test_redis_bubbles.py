@@ -40,7 +40,7 @@ async def test_subscribe_propagates_group_creation_failure() -> None:
     bus = RedisRealtimeBubbleBus(redis, prefix="tests:bubbles")
 
     with pytest.raises(ResponseError, match="failure"):
-        async with bus.subscribe(SessionFence(uuid.uuid7(), 1)):
+        async with bus.subscribe(42):
             pass
 
 
@@ -69,42 +69,65 @@ async def test_subscription_reads_pending_then_new_entries_and_acknowledges_retu
 
 
 @pytest.mark.skipif(not os.getenv("TEST_REDIS_URL"), reason="TEST_REDIS_URL is not configured")
-async def test_real_redis_stream_is_fenced_ordered_durable_and_acknowledged() -> None:
+async def test_real_redis_stream_is_account_scoped_ordered_durable_and_acknowledged() -> None:
     prefix = f"tests:bubbles:{uuid.uuid7()}"
     subscriber_redis = Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=False)
     publisher_redis = Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=False)
-    fence = SessionFence(uuid.uuid7(), 1)
-    other_revision = SessionFence(fence.session_id, 2)
+    account_id = 42
+    other_account = 43
     subscriber = RedisRealtimeBubbleBus(subscriber_redis, prefix=prefix)
     publisher = RedisRealtimeBubbleBus(publisher_redis, prefix=prefix)
     try:
-        assert await publisher.publish(fence, ToastBubble("queued")) == 1
-        async with subscriber.subscribe(fence) as subscription:
+        assert await publisher.publish(account_id, ToastBubble("queued")) == 1
+        async with subscriber.subscribe(account_id) as subscription:
             assert isinstance(subscription, RealtimeBubbleSubscription)
             assert await subscription.receive(timeout=1) == ToastBubble("queued")
             await subscription.acknowledge()
-            assert await publisher.publish(other_revision, ToastBubble("isolated")) == 1
-            await publisher.publish(fence, ToastBubble("one"))
-            await publisher.publish(fence, ToastBubble("two"))
+            assert await publisher.publish(other_account, ToastBubble("isolated")) == 1
+            await publisher.publish(account_id, ToastBubble("one"))
+            await publisher.publish(account_id, ToastBubble("two"))
             assert await subscription.receive(timeout=1) == ToastBubble("one")
             assert await subscription.receive(timeout=1) == ToastBubble("two")
             await subscription.acknowledge()
             assert await subscription.receive(timeout=0.01) is None
-            second_fence = SessionFence(uuid.uuid7(), 1)
-            async with subscriber.subscribe(second_fence) as second_subscription:
+            second_account = 44
+            async with subscriber.subscribe(second_account) as second_subscription:
                 bubble = ToastBubble("fanout")
-                assert await publisher.publish_many((fence, second_fence), bubble) == 2
+                assert await publisher.publish_many((account_id, second_account), bubble) == 2
                 assert await subscription.receive(timeout=1) == bubble
                 assert await second_subscription.receive(timeout=1) == bubble
                 await subscription.acknowledge()
                 await second_subscription.acknowledge()
-        assert await publisher.publish(fence, ToastBubble("after-close")) == 1
-        async with subscriber.subscribe(fence) as resumed:
+        assert await publisher.publish(account_id, ToastBubble("after-close")) == 1
+        async with subscriber.subscribe(account_id) as resumed:
             assert await resumed.receive(timeout=1) == ToastBubble("after-close")
             await resumed.acknowledge()
     finally:
         await subscriber_redis.aclose()
         await publisher_redis.aclose()
+
+
+@pytest.mark.skipif(not os.getenv("TEST_REDIS_URL"), reason="TEST_REDIS_URL is not configured")
+async def test_real_redis_fans_out_to_concurrent_subscribers_of_one_account() -> None:
+    prefix = f"tests:bubbles:{uuid.uuid7()}"
+    first_redis = Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=False)
+    second_redis = Redis.from_url(os.environ["TEST_REDIS_URL"], decode_responses=False)
+    publisher = RedisRealtimeBubbleBus(first_redis, prefix=prefix)
+    account_id = 7
+    try:
+        assert await publisher.publish(account_id, ToastBubble("pre")) == 1
+        async with (
+            publisher.subscribe(account_id) as first,
+            publisher.subscribe(account_id) as second,
+        ):
+            assert await publisher.publish(account_id, ToastBubble("fanout")) == 1
+            assert await first.receive(timeout=1) == ToastBubble("fanout")
+            assert await second.receive(timeout=1) == ToastBubble("fanout")
+            await first.acknowledge()
+            await second.acknowledge()
+    finally:
+        await first_redis.aclose()
+        await second_redis.aclose()
 
 
 @pytest.mark.skipif(not os.getenv("TEST_REDIS_URL"), reason="TEST_REDIS_URL is not configured")

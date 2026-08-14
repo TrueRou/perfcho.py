@@ -12,7 +12,15 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
-from perfcho.infra.db.models.events import OutboxEvent, ProjectionCheckpoint
+from perfcho.consumers.common import (
+    advance_checkpoint,
+    payload_boolean,
+    payload_integer,
+    payload_string,
+    payload_uuid,
+    require_event_context,
+)
+from perfcho.infra.db.models.events import ConsumerCheckpoint, OutboxEvent
 from perfcho.infra.db.models.multiplayer import (
     MultiplayerAttempt,
     MultiplayerSession,
@@ -25,16 +33,8 @@ from perfcho.infra.db.models.multiplayer import (
     SessionStanding,
 )
 from perfcho.infra.db.models.scoring import Score
-from perfcho.infra.db.projectors.common import (
-    advance_checkpoint,
-    payload_boolean,
-    payload_integer,
-    payload_string,
-    payload_uuid,
-    require_event_context,
-)
 
-CONSUMER_NAME = "multiplayer-results-projector.v1"
+CONSUMER_NAME = "multiplayer-results-consumer.v1"
 EVENT_TYPES = frozenset({"multiplayer.round-completed.v1", "score.accepted.v1"})
 _TEAM_MODES = frozenset({"team_vs", "tag_team_vs"})
 
@@ -63,7 +63,7 @@ class _RoundResultValue(TypedDict):
     result_digest: NotRequired[bytes]
 
 
-async def project_multiplayer_results(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def consume_multiplayer_results(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Rebuild affected multiplayer result projections and advance one checkpoint."""
     if not await _is_new_event(session, event, partition_key):
         return
@@ -106,11 +106,11 @@ async def project_multiplayer_results(session: AsyncSession, event: OutboxEvent,
         raise RuntimeError(f"unsupported multiplayer results event: {event.event_type}")
 
     if round_id is not None:
-        await _project_round(session, round_id)
-    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+        await _apply_round(session, round_id)
+    await advance_checkpoint(session, event, consumer=CONSUMER_NAME, partition_key=partition_key)
 
 
-async def _project_round(session: AsyncSession, round_id: uuid.UUID) -> None:
+async def _apply_round(session: AsyncSession, round_id: uuid.UUID) -> None:
     lifecycle = (
         await session.execute(
             select(Round, MultiplayerSession)
@@ -513,8 +513,8 @@ def _result_digest(
 
 async def _is_new_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> bool:
     checkpoint = await session.get(
-        ProjectionCheckpoint,
-        {"projector": CONSUMER_NAME, "partition_key": partition_key},
+        ConsumerCheckpoint,
+        {"consumer": CONSUMER_NAME, "partition_key": partition_key},
         with_for_update=True,
     )
     return checkpoint is None or event.position > checkpoint.source_position

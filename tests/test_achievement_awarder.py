@@ -125,7 +125,7 @@ async def test_unknown_achievement_evaluator_is_safe_and_does_not_unlock() -> No
 
 
 @pytest.mark.asyncio
-async def test_score_achievement_unlock_is_new_once_and_keeps_projector_event() -> None:
+async def test_score_achievement_unlock_is_new_once_and_keeps_consumer_event() -> None:
     repository = FakeRepository(
         AchievementEvaluationDefinition(
             1,
@@ -152,7 +152,7 @@ async def test_score_achievement_unlock_is_new_once_and_keeps_projector_event() 
     assert second == ()
     assert len(outbox.events) == 1
     assert outbox.events[0].event_type == "social.achievement-unlocked.v1"
-    assert outbox.events[0].consumers == ("achievement-projector.v1",)
+    assert outbox.events[0].consumers == ("achievement-consumer.v1",)
 
 
 @pytest.mark.asyncio

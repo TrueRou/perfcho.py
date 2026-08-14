@@ -37,8 +37,8 @@ from perfcho.modules.social.ports import (
 )
 from perfcho.modules.social.queries import SocialQueryService
 
-_SOCIAL_CONSUMERS = ("social-projector.v1",)
-_ACHIEVEMENT_CONSUMERS = ("achievement-projector.v1",)
+_SOCIAL_CONSUMERS = ("social-consumer.v1",)
+_ACHIEVEMENT_CONSUMERS = ("achievement-consumer.v1",)
 
 
 class SocialService:
@@ -453,7 +453,7 @@ class TransactionAchievementAwarder:
         *,
         at: datetime,
     ) -> tuple[AchievementUnlockView, ...]:
-        """Create first unlocks and preserve achievement projector outbox semantics."""
+        """Create first unlocks and preserve achievement consumer outbox semantics."""
         definitions = await self._repository.list_score_achievement_definitions(
             account_id=context.account_id,
             ruleset=context.ruleset,

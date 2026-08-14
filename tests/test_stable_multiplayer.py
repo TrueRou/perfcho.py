@@ -240,15 +240,10 @@ class FakeBubbleBus:
     def __init__(self, realtime: object | None) -> None:
         self.realtime = realtime
 
-    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
+    async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
         if isinstance(self.realtime, RoomRealtime):
-            account_id = next(
-                account_id
-                for account_id, presence in self.realtime.presences.items()
-                if presence.fence == recipient_fence
-            )
             self.realtime.delivered.append((account_id, StableBubbleRenderer().render(bubble)))
-        elif isinstance(self.realtime, InviteRealtime) and self.realtime.target.fence == recipient_fence:
+        elif isinstance(self.realtime, InviteRealtime) and self.realtime.target.account_id == account_id:
             self.realtime.delivered.append((self.realtime.target.account_id, StableBubbleRenderer().render(bubble)))
         return 1
 

@@ -60,10 +60,10 @@ from perfcho.modules.social.models import ScoreAchievementContext
 from perfcho.modules.social.ports import AchievementAwarderFactory
 
 _RECEIPT_TTL = timedelta(days=7)
-_RANKING_CONSUMER = "ranking-projector.v1"
-_STATS_CONSUMER = "scoring-stats-projector.v1"
-_MULTIPLAYER_RESULTS_CONSUMER = "multiplayer-results-projector.v1"
-_PERFORMANCE_CONSUMER = "performance-projector.v1"
+_RANKING_CONSUMER = "ranking-consumer.v1"
+_STATS_CONSUMER = "scoring-stats-consumer.v1"
+_MULTIPLAYER_RESULTS_CONSUMER = "multiplayer-results-consumer.v1"
+_PERFORMANCE_CONSUMER = "performance-consumer.v1"
 _KEY_MODS = frozenset({"1K", "2K", "3K", "4K", "5K", "6K", "7K", "8K", "9K", "CO"})
 _INCOMPATIBLE_MOD_GROUPS = (
     frozenset({"EZ", "HR"}),

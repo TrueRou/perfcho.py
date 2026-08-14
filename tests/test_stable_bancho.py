@@ -118,25 +118,25 @@ class FakeBubbleBus:
     def __init__(self) -> None:
         self.pending: list[RealtimeBubble] = []
         self.wait_bubble: RealtimeBubble | None = None
-        self.published: list[tuple[SessionFence, RealtimeBubble]] = []
+        self.published: list[tuple[int, RealtimeBubble]] = []
         self.subscribed = False
         self.receive_calls = 0
         self.drain_calls = 0
         self.drain_error: Exception | None = None
         self.acknowledge_calls = 0
         self.acknowledge_error: Exception | None = None
-        self.subscribe_calls: list[SessionFence] = []
+        self.subscribe_calls: list[int] = []
 
-    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
-        self.published.append((recipient_fence, bubble))
-        return int(self.subscribed and self.subscribe_calls[-1] == recipient_fence)
+    async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
+        self.published.append((account_id, bubble))
+        return int(self.subscribed and self.subscribe_calls[-1] == account_id)
 
     @asynccontextmanager
     async def subscribe(
         self,
-        recipient_fence: SessionFence,
+        account_id: int,
     ) -> AsyncIterator[RealtimeBubbleSubscription]:
-        self.subscribe_calls.append(recipient_fence)
+        self.subscribe_calls.append(account_id)
         self.subscribed = True
         subscription = FakeBubbleSubscription(self)
         try:
@@ -1001,7 +1001,7 @@ async def test_login_bootstraps_online_users_channels_silence_and_timestamped_ma
     assert realtime.channel_members == {7: {3}}
     assert realtime.presence is not None
     published = fake_bubbles(services).published
-    assert published == [(SessionFence(other_session_id, 4), presence_updated_bubble(realtime.presence))]
+    assert published == [(8, presence_updated_bubble(realtime.presence))]
     broadcast_packets = list(PacketReader(StableBubbleRenderer().render(published[0][1]), packet_enum=ServerPacket))
     assert [packet.packet_type for packet in broadcast_packets] == [
         ServerPacket.USER_PRESENCE,

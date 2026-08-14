@@ -5,8 +5,14 @@ from datetime import UTC, date, datetime
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from perfcho.consumers.common import (
+    advance_checkpoint,
+    payload_integer,
+    payload_string,
+    require_event_context,
+)
 from perfcho.infra.db.enums import ScoreOutcome
-from perfcho.infra.db.models.events import OutboxEvent, ProjectionCheckpoint
+from perfcho.infra.db.models.events import ConsumerCheckpoint, OutboxEvent
 from perfcho.infra.db.models.scoring import (
     BeatmapActivity,
     BeatmapFailHistogram,
@@ -17,31 +23,25 @@ from perfcho.infra.db.models.scoring import (
     UserMonthlyActivity,
     UserPlayStat,
 )
-from perfcho.infra.db.projectors.common import (
-    advance_checkpoint,
-    payload_integer,
-    payload_string,
-    require_event_context,
-)
 
-CONSUMER_NAME = "scoring-stats-projector.v1"
+CONSUMER_NAME = "scoring-stats-consumer.v1"
 EVENT_TYPES = frozenset({"score.accepted.v1", "score.replay-viewed.v1"})
 
 
-async def project_scoring_stats(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def consume_scoring_stats(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Apply one ordered score or replay-view event to factual statistics."""
     if not await _is_new_event(session, event, partition_key):
         return
     if event.event_type == "score.accepted.v1":
-        await _project_score(session, event, partition_key)
+        await _apply_score(session, event, partition_key)
     elif event.event_type == "score.replay-viewed.v1":
-        await _project_replay_view(session, event, partition_key)
+        await _apply_replay_view(session, event, partition_key)
     else:
         raise RuntimeError(f"unsupported scoring statistics event: {event.event_type}")
-    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+    await advance_checkpoint(session, event, consumer=CONSUMER_NAME, partition_key=partition_key)
 
 
-async def _project_score(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def _apply_score(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     score_id = payload_integer(event.payload, "score_id")
     account_id = payload_integer(event.payload, "account_id")
     ruleset = payload_string(event.payload, "ruleset")
@@ -175,7 +175,7 @@ async def _project_score(session: AsyncSession, event: OutboxEvent, partition_ke
             histogram.quit = values
 
 
-async def _project_replay_view(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def _apply_replay_view(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     score_id = payload_integer(event.payload, "score_id")
     account_id = payload_integer(event.payload, "account_id")
     ruleset = payload_string(event.payload, "ruleset")
@@ -233,8 +233,8 @@ async def _project_replay_view(session: AsyncSession, event: OutboxEvent, partit
 
 async def _is_new_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> bool:
     checkpoint = await session.get(
-        ProjectionCheckpoint,
-        {"projector": CONSUMER_NAME, "partition_key": partition_key},
+        ConsumerCheckpoint,
+        {"consumer": CONSUMER_NAME, "partition_key": partition_key},
         with_for_update=True,
     )
     return checkpoint is None or event.position > checkpoint.source_position

@@ -466,11 +466,6 @@ def decode_bubble(payload: bytes) -> RealtimeBubble | None:
         return None
 
 
-def bubble_channel(prefix: str, fence: SessionFence) -> str:
-    """Return the stream isolated to one exact session epoch."""
-    return f"{prefix.rstrip(':')}:events:v1:session:{fence.session_id}:{fence.revision}"
-
-
 class RedisBubbleSubscription:
     """Consume valid Bubbles from one Redis Stream consumer group."""
 
@@ -559,7 +554,14 @@ class RedisBubbleSubscription:
 
 
 class RedisRealtimeBubbleBus:
-    """Publish typed Bubbles over bounded session-fenced Redis Streams."""
+    """Publish typed Bubbles over bounded account-keyed Redis Streams.
+
+    Delivery is keyed by account rather than by session fence, so any consumer
+    (a Stable Poll, a SignalR hub, or the notifications WebSocket) running in
+    any worker can reach the account's live connection. Each subscriber opens
+    its own consumer group so one account's events fan out to every
+    concurrently connected consumer.
+    """
 
     def __init__(self, redis: Redis, *, prefix: str, max_entries: int = 4096, ttl_seconds: int = 360) -> None:
         """Bind the bus to an isolated Redis client and bounded retention."""
@@ -569,73 +571,10 @@ class RedisRealtimeBubbleBus:
         self._prefix = prefix
         self._max_entries = max_entries
         self._ttl_seconds = ttl_seconds
-        self._group = "delivery-v1"
-        self._consumer = "session"
-
-    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
-        """Append one encoded Bubble to a bounded session stream."""
-        stream = bubble_channel(self._prefix, recipient_fence)
-        async with self._redis.pipeline(transaction=False) as pipeline:
-            pipeline.xadd(stream, {"payload": encode_bubble(bubble)}, maxlen=self._max_entries)
-            pipeline.expire(stream, self._ttl_seconds)
-            await pipeline.execute()
-        return 1
-
-    async def publish_many(self, recipient_fences: Sequence[SessionFence], bubble: RealtimeBubble) -> int:
-        """Append one encoding to many fenced streams in one Redis pipeline."""
-        if not recipient_fences:
-            return 0
-        payload = encode_bubble(bubble)
-        async with self._redis.pipeline(transaction=False) as pipeline:
-            for fence in recipient_fences:
-                stream = bubble_channel(self._prefix, fence)
-                pipeline.xadd(stream, {"payload": payload}, maxlen=self._max_entries)
-                pipeline.expire(stream, self._ttl_seconds)
-            await pipeline.execute()
-        return len(recipient_fences)
-
-    @asynccontextmanager
-    async def subscribe(self, recipient_fence: SessionFence) -> AsyncIterator[RedisBubbleSubscription]:
-        """Ensure the consumer group exists before yielding its typed consumer."""
-        stream = bubble_channel(self._prefix, recipient_fence)
-        try:
-            await self._redis.xgroup_create(stream, self._group, id="0", mkstream=True)
-        except ResponseError as error:
-            if "BUSYGROUP" not in str(error):
-                raise
-        await self._redis.expire(stream, self._ttl_seconds)
-        subscription = RedisBubbleSubscription(self._redis, stream, self._group, self._consumer)
-        try:
-            yield subscription
-        finally:
-            await subscription.aclose()
-
-
-def user_event_channel(prefix: str, account_id: int) -> str:
-    """Return the account-keyed event stream independent of any session epoch."""
-    return f"{prefix.rstrip(':')}:user-events:v1:account:{account_id}"
-
-
-class RedisUserEventBus:
-    """Fan typed Bubbles out to an account across workers via Redis Streams.
-
-    Unlike :class:`RedisRealtimeBubbleBus`, delivery is keyed by account rather
-    than by session fence, so a SignalR hub running in any worker can deliver an
-    event to the worker that currently hosts the account's live connection.
-    """
-
-    def __init__(self, redis: Redis, *, prefix: str, max_entries: int = 4096, ttl_seconds: int = 360) -> None:
-        """Bind the bus to an isolated Redis client and bounded retention."""
-        if max_entries < 1 or ttl_seconds < 1:
-            raise ValueError("User event Stream limits must be positive")
-        self._redis = redis
-        self._prefix = prefix
-        self._max_entries = max_entries
-        self._ttl_seconds = ttl_seconds
-        self._group = "delivery-v1"
+        self._consumer = "consumer"
 
     async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
-        """Append one encoded event to a bounded account stream."""
+        """Append one encoded Bubble to a bounded account stream."""
         if account_id < 1:
             raise ValueError("account_id must be positive")
         stream = user_event_channel(self._prefix, account_id)
@@ -662,21 +601,27 @@ class RedisUserEventBus:
 
     @asynccontextmanager
     async def subscribe(self, account_id: int) -> AsyncIterator[RedisBubbleSubscription]:
-        """Ensure the consumer group exists before yielding its typed consumer."""
+        """Ensure an isolated consumer group exists before yielding its consumer.
+
+        Each subscription owns a unique group so that concurrent consumers of
+        the same account stream each receive the full event history.
+        """
         if account_id < 1:
             raise ValueError("account_id must be positive")
         stream = user_event_channel(self._prefix, account_id)
-        try:
-            await self._redis.xgroup_create(stream, self._group, id="0", mkstream=True)
-        except ResponseError as error:
-            if "BUSYGROUP" not in str(error):
-                raise
+        group = f"delivery-{uuid.uuid4().hex}"
+        await self._redis.xgroup_create(stream, group, id="0", mkstream=True)
         await self._redis.expire(stream, self._ttl_seconds)
-        subscription = RedisBubbleSubscription(self._redis, stream, self._group, "signalr")
+        subscription = RedisBubbleSubscription(self._redis, stream, group, self._consumer)
         try:
             yield subscription
         finally:
             await subscription.aclose()
+
+
+def user_event_channel(prefix: str, account_id: int) -> str:
+    """Return the account-keyed event stream independent of any session epoch."""
+    return f"{prefix.rstrip(':')}:user-events:v1:account:{account_id}"
 
 
 _ACQUIRE_POLL_GATE = """-- perfcho:acquire-poll-gate:v1

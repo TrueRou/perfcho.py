@@ -75,13 +75,13 @@ async def test_outbox_enqueue_passes_persisted_trace_to_taskiq(monkeypatch: pyte
     monkeypatch.setattr(dispatch_outbox_delivery, "kiq", enqueue)
 
     task_id = await _enqueue_outbox(
-        OutboxDeliveryReference(event_id, "tests-projector.v1", delivery_token, trace_id, "score.accepted.v1")
+        OutboxDeliveryReference(event_id, "tests-consumer.v1", delivery_token, trace_id, "score.accepted.v1")
     )
 
     assert task_id == "task-1"
     enqueue.assert_awaited_once_with(
         str(event_id),
-        "tests-projector.v1",
+        "tests-consumer.v1",
         str(delivery_token),
         trace_id.hex,
         "score.accepted.v1",
@@ -134,7 +134,7 @@ async def test_task_payload_and_context_failures_include_exception_details() -> 
         with pytest.raises(AttributeError):
             await cast(Any, dispatch_outbox_delivery).original_func(
                 str(event_id),
-                "tests-projector.v1",
+                "tests-consumer.v1",
                 str(uuid.uuid4()),
                 "0123456789abcdef0123456789abcdef",
                 "score.accepted.v1",
@@ -146,7 +146,7 @@ async def test_task_payload_and_context_failures_include_exception_details() -> 
 
     unexpected = next(record for record in records if record["extra"]["event"] == "task.outbox_delivery.failed")
     assert unexpected["extra"]["event_id"] == str(event_id)
-    assert unexpected["extra"]["consumer"] == "tests-projector.v1"
+    assert unexpected["extra"]["consumer"] == "tests-consumer.v1"
     assert unexpected["extra"]["trace_id"] == "0123456789abcdef0123456789abcdef"
     assert unexpected["extra"]["event_type"] == "score.accepted.v1"
     assert cast(float, unexpected["extra"]["delay_ms"]) >= 900

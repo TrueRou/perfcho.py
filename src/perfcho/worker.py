@@ -10,15 +10,15 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from taskiq import Context, TaskiqDepends, TaskiqEvents, TaskiqState
 
+from perfcho.consumers import notification, ranking
+from perfcho.consumers.catalog import ConsumerCatalog, build_consumer_catalog
+from perfcho.consumers.performance import PerformanceConsumer
 from perfcho.infra import logging
 from perfcho.infra.cache import RedisCache
 from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.base import DbSessionFactory
 from perfcho.infra.db.enums import OutboxDeliveryStatus
 from perfcho.infra.db.models.events import OutboxDelivery, OutboxEvent
-from perfcho.infra.db.projectors import notification, ranking
-from perfcho.infra.db.projectors.catalog import ConsumerCatalog, build_consumer_catalog
-from perfcho.infra.db.projectors.performance import PerformanceProjector
 from perfcho.infra.db.repositories.outbox_delivery import (
     OutboxDeliveryReference,
     SqlAlchemyOutboxDeliveryRepository,
@@ -79,7 +79,7 @@ class OutboxEventLogFields(TypedDict, total=False):
 
 
 class OutboxDeliveryProcessor:
-    """Execute one fenced projector transaction and persist bounded failures."""
+    """Execute one fenced consumer transaction and persist bounded failures."""
 
     def __init__(
         self,
@@ -305,7 +305,7 @@ async def worker_startup(state: TaskiqState) -> None:
             await cache.increment(cache.key("scoring", "leaderboard-generation", str(beatmap_id)))
 
         async def ranking_handler(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
-            await ranking.project_accepted_score(session, event, partition_key, invalidate_leaderboard)
+            await ranking.consume_accepted_score(session, event, partition_key, invalidate_leaderboard)
 
         realtime = RedisRealtimeStateRepository(
             state_redis,
@@ -330,7 +330,7 @@ async def worker_startup(state: TaskiqState) -> None:
         )
 
         consumer_catalog = build_consumer_catalog(
-            PerformanceProjector(
+            PerformanceConsumer(
                 HttpPerformanceCalculator(http_client, settings.performance_calculator_urls),
                 S3ObjectStorage.from_settings(settings),
                 beatmap_url_expiry_seconds=settings.performance_beatmap_url_expiry_seconds,

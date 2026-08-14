@@ -9,6 +9,12 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
+from perfcho.consumers.common import (
+    advance_checkpoint,
+    payload_integer,
+    payload_string,
+    require_event_context,
+)
 from perfcho.infra.db.enums import ScoreGrade
 from perfcho.infra.db.models.content import Beatmap, Beatmapset
 from perfcho.infra.db.models.events import OutboxEvent
@@ -19,18 +25,12 @@ from perfcho.infra.db.models.scoring import (
     ScorePerformance,
     UserRanking,
 )
-from perfcho.infra.db.projectors.common import (
-    advance_checkpoint,
-    payload_integer,
-    payload_string,
-    require_event_context,
-)
 
-CONSUMER_NAME = "ranking-projector.v1"
+CONSUMER_NAME = "ranking-consumer.v1"
 EVENT_TYPES = frozenset({"score.accepted.v1", "score.performance-calculated.v1"})
 
 
-async def project_accepted_score(
+async def consume_accepted_score(
     session: AsyncSession,
     event: OutboxEvent,
     partition_key: str,
@@ -71,14 +71,14 @@ async def project_accepted_score(
         )
     )
     for policy in policies:
-        await _project_policy(session, score, beatmap_status.value, policy)
-        await _project_user_ranking(session, score.account_id, policy, event.id)
-    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+        await _apply_policy(session, score, beatmap_status.value, policy)
+        await _apply_user_ranking(session, score.account_id, policy, event.id)
+    await advance_checkpoint(session, event, consumer=CONSUMER_NAME, partition_key=partition_key)
     if invalidate is not None:
         await invalidate(score.beatmap_id)
 
 
-async def _project_policy(
+async def _apply_policy(
     session: AsyncSession,
     score: Score,
     beatmap_status: str,
@@ -119,7 +119,7 @@ async def _project_policy(
     )
 
 
-async def _project_user_ranking(
+async def _apply_user_ranking(
     session: AsyncSession,
     account_id: int,
     policy: RankingPolicy,

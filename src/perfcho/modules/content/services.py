@@ -617,7 +617,7 @@ class ContentSyncService:
                         "removed_beatmap_count": result.removed_beatmap_count,
                         "source_updated_at": snapshot.last_updated_at.isoformat(),
                     },
-                    consumers=("content-projector.v1",),
+                    consumers=("content-consumer.v1",),
                     partition_key=f"beatmapset:{result.beatmapset_id}",
                 )
             )
@@ -776,6 +776,6 @@ def _status_changed_event(
             "actor_account_id": actor_account_id,
             "effective_at": effective_at.isoformat(),
         },
-        consumers=("content-projector.v1",),
+        consumers=("content-consumer.v1",),
         partition_key=f"beatmapset:{beatmapset_id}",
     )

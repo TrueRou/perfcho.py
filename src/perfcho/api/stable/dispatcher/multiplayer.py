@@ -1051,7 +1051,7 @@ async def _broadcast_lobby(
         if presence is None:
             continue
         try:
-            await services.bubbles.publish(presence.fence, bubble)
+            await services.bubbles.publish(presence.account_id, bubble)
         except Exception as error:
             failed[account_id] = error
     _log_broadcast_failures("lobby", failed)
@@ -1074,7 +1074,7 @@ async def _publish(
     if services.bubbles is None:
         return False
     try:
-        await services.bubbles.publish(presence.fence, bubble)
+        await services.bubbles.publish(presence.account_id, bubble)
     except Exception as error:
         if failure_errors is not None:
             failure_errors[account_id] = error

@@ -476,7 +476,7 @@ async def broadcast_presence_update(
         if services.bubbles is None:
             return RuntimeError("realtime Bubble bus is unavailable")
         try:
-            await services.bubbles.publish(snapshot.fence, bubble)
+            await services.bubbles.publish(snapshot.account_id, bubble)
         except Exception as error:
             return error
         return None
@@ -1273,7 +1273,7 @@ async def _publish_to_presence(
     if services.bubbles is None:
         return False
     try:
-        await services.bubbles.publish(presence.fence, bubble)
+        await services.bubbles.publish(presence.account_id, bubble)
     except Exception as error:
         if rate_limit("stable-message-delivery-failed", interval_seconds=5):
             log_event(
@@ -1550,7 +1550,7 @@ async def _start_spectating(
     relation = attachment.relation
     delivery_failure_count = int(
         not await _publish_spectator_bubble(
-            relation.host_fence,
+            relation.host_account_id,
             SpectatorLifecycleBubble(
                 SpectatorAction.ATTACHED_TO_HOST,
                 host_account_id,
@@ -1573,7 +1573,7 @@ async def _start_spectating(
             )
         )
         delivered = await _publish_spectator_bubble(
-            existing_relation.spectator_fence,
+            existing_relation.spectator_account_id,
             SpectatorLifecycleBubble(
                 SpectatorAction.FELLOW_ATTACHED,
                 host_account_id,
@@ -1641,7 +1641,7 @@ async def _detach_spectator(
         return
     delivery_failure_count = int(
         not await _publish_spectator_bubble(
-            relation.host_fence,
+            relation.host_account_id,
             SpectatorLifecycleBubble(
                 SpectatorAction.DETACHED_FROM_HOST,
                 relation.host_account_id,
@@ -1655,7 +1655,7 @@ async def _detach_spectator(
         if spectator.spectator_account_id != relation.spectator_account_id:
             fellow_count += 1
             delivered = await _publish_spectator_bubble(
-                spectator.spectator_fence,
+                spectator.spectator_account_id,
                 SpectatorLifecycleBubble(
                     SpectatorAction.FELLOW_DETACHED,
                     relation.host_account_id,
@@ -1705,7 +1705,7 @@ async def _publish_spectator_frames(
             )
         return
     delivered = await _publish_spectator_many(
-        tuple(recipient.fence for recipient in result.recipients), frame, services
+        tuple(recipient.account_id for recipient in result.recipients), frame, services
     )
     if sampled((started_ns, frame.sequence, "spectator_frame"), services.settings.log_hot_path_sample_rate):
         log_event(
@@ -1744,21 +1744,21 @@ async def _cant_spectate(context: StableRuntimeContext, services: StableServices
         context.identity.account_id,
     )
     await _publish_spectator_many(
-        (relation.host_fence, *(recipient.spectator_fence for recipient in recipients)),
+        (relation.host_account_id, *(recipient.spectator_account_id for recipient in recipients)),
         bubble,
         services,
     )
 
 
 async def _publish_spectator_bubble(
-    recipient_fence: SessionFence,
+    recipient_account_id: int,
     bubble: RealtimeBubble,
     services: StableServices,
 ) -> bool:
     if services.bubbles is None:
         return False
     try:
-        await services.bubbles.publish(recipient_fence, bubble)
+        await services.bubbles.publish(recipient_account_id, bubble)
     except Exception as error:
         _log_spectator_delivery_failure("publish", error)
         return False
@@ -1766,14 +1766,14 @@ async def _publish_spectator_bubble(
 
 
 async def _publish_spectator_many(
-    recipient_fences: tuple[SessionFence, ...],
+    recipient_account_ids: tuple[int, ...],
     bubble: RealtimeBubble,
     services: StableServices,
 ) -> int:
-    if services.bubbles is None or not recipient_fences:
+    if services.bubbles is None or not recipient_account_ids:
         return 0
     try:
-        return await services.bubbles.publish_many(recipient_fences, bubble)
+        return await services.bubbles.publish_many(recipient_account_ids, bubble)
     except Exception as error:
         _log_spectator_delivery_failure("publish_many", error)
         return 0

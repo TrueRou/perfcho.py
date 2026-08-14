@@ -2,22 +2,22 @@
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.models.events import OutboxEvent
-from perfcho.infra.db.projectors.common import (
+from perfcho.consumers.common import (
     advance_checkpoint,
     payload_datetime,
     payload_integer,
     payload_string,
-    project_activity,
+    record_activity,
     require_accounts,
     require_event_context,
 )
+from perfcho.infra.db.models.events import OutboxEvent
 
-CONSUMER_NAME = "account-projector.v1"
+CONSUMER_NAME = "account-consumer.v1"
 EVENT_TYPES = frozenset({"account.registered.v1"})
 
 
-async def project_account_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def consume_account_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project a new account into its public activity history."""
     account_id = payload_integer(event.payload, "account_id")
     require_event_context(
@@ -28,7 +28,7 @@ async def project_account_event(session: AsyncSession, event: OutboxEvent, parti
         expected_partition_key=f"account:{account_id}",
     )
     await require_accounts(session, (account_id,))
-    await project_activity(
+    await record_activity(
         session,
         event,
         subject_account_id=account_id,
@@ -42,4 +42,4 @@ async def project_account_event(session: AsyncSession, event: OutboxEvent, parti
             "status": payload_string(event.payload, "status"),
         },
     )
-    await advance_checkpoint(session, event, projector=CONSUMER_NAME, partition_key=partition_key)
+    await advance_checkpoint(session, event, consumer=CONSUMER_NAME, partition_key=partition_key)

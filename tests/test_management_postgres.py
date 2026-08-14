@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.schema import CreateSchema
 
 import perfcho.infra.db.models  # noqa: F401
+from perfcho.consumers.management import consume_authorization_event, consume_moderation_event
 from perfcho.infra.compose import compose_admin_services as compose_management_services
 from perfcho.infra.db.base import MODEL_SCHEMAS, DbBase
 from perfcho.infra.db.bootstrap import bootstrap_database
@@ -18,9 +19,8 @@ from perfcho.infra.db.enums import AccountStatus, AccountType
 from perfcho.infra.db.models.audit import AuditEvent
 from perfcho.infra.db.models.authz import AccountRoleGrant
 from perfcho.infra.db.models.core import Account
-from perfcho.infra.db.models.events import ActivityEvent, OutboxDelivery, OutboxEvent, ProjectionCheckpoint
+from perfcho.infra.db.models.events import ActivityEvent, ConsumerCheckpoint, OutboxDelivery, OutboxEvent
 from perfcho.infra.db.models.moderation import CaseEntry, ModerationCase, Sanction, SanctionEvent
-from perfcho.infra.db.projectors.management import project_authorization_event, project_moderation_event
 from perfcho.infra.db.repositories.audit import SqlAlchemyAuditWriter
 from perfcho.infra.db.repositories.authorization import SqlAlchemyAuthorizationRepository
 from perfcho.infra.db.repositories.moderation import SqlAlchemyModerationRepository
@@ -144,16 +144,16 @@ async def test_management_writes_are_atomic_audited_and_revoke_once(postgres_dat
             events = tuple(await session.scalars(select(OutboxEvent).order_by(OutboxEvent.position)))
             for event in events:
                 if event.event_type.startswith("authorization."):
-                    await project_authorization_event(session, event, "account:2")
+                    await consume_authorization_event(session, event, "account:2")
                 else:
-                    await project_moderation_event(
+                    await consume_moderation_event(
                         session,
                         event,
                         f"{event.aggregate_type}:{event.aggregate_id}",
                     )
         async with session_factory() as session:
             assert await session.scalar(select(func.count()).select_from(ActivityEvent)) == 5
-            assert await session.scalar(select(func.count()).select_from(ProjectionCheckpoint)) == 4
+            assert await session.scalar(select(func.count()).select_from(ConsumerCheckpoint)) == 4
 
         failing_service = ModerationService(
             SqlAlchemyUnitOfWorkFactory(session_factory),

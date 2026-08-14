@@ -301,7 +301,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             if services.bubbles is None:
                 return RuntimeError("realtime Bubble bus is unavailable")
             try:
-                await services.bubbles.publish(snapshot.fence, own_bubble)
+                await services.bubbles.publish(snapshot.account_id, own_bubble)
             except Exception as error:
                 return error
             return None
@@ -531,7 +531,7 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
 
     try:
         try:
-            async with services.bubbles.subscribe(realtime.fence) as subscription:
+            async with services.bubbles.subscribe(identity.account_id) as subscription:
                 return await _poll_subscribed(
                     body,
                     context,

@@ -69,15 +69,15 @@ class FakeIds:
 
 class FakeBubbleBus:
     def __init__(self) -> None:
-        self.published: list[tuple[SessionFence, RealtimeBubble]] = []
+        self.published: list[tuple[int, RealtimeBubble]] = []
 
-    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
-        self.published.append((recipient_fence, bubble))
+    async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
+        self.published.append((account_id, bubble))
         return 1
 
-    async def publish_many(self, recipient_fences: Sequence[SessionFence], bubble: RealtimeBubble) -> int:
-        self.published.extend((fence, bubble) for fence in recipient_fences)
-        return len(recipient_fences)
+    async def publish_many(self, account_ids: Sequence[int], bubble: RealtimeBubble) -> int:
+        self.published.extend((account_id, bubble) for account_id in account_ids)
+        return len(account_ids)
 
 
 class SpectatorRealtime(RedisRealtimeStateRepository):
@@ -307,9 +307,8 @@ def packet_types(payloads: list[bytes] | bytes) -> list[ServerPacket]:
 
 
 def delivered_packet_types(realtime: SpectatorRealtime, account_id: int) -> list[ServerPacket]:
-    fence = realtime.fences[account_id]
     rendered = [
-        StableBubbleRenderer().render(bubble) for target, bubble in realtime.bubbles.published if target == fence
+        StableBubbleRenderer().render(bubble) for target, bubble in realtime.bubbles.published if target == account_id
     ]
     return packet_types(rendered)
 
@@ -441,7 +440,7 @@ async def test_stale_spectator_detach_does_not_emit_leave_notifications() -> Non
 
 
 @pytest.mark.asyncio
-async def test_cant_spectate_uses_each_relation_recipient_fence() -> None:
+async def test_cant_spectate_uses_each_relation_recipient_account() -> None:
     realtime = SpectatorRealtime()
     stable_services = services(realtime)
     spectator = context(3, "spectator", realtime)
@@ -454,11 +453,7 @@ async def test_cant_spectate_uses_each_relation_recipient_fence() -> None:
 
     await dispatch_packets(build_packet(ClientPacket.CANT_SPECTATE), spectator, stable_services)
 
-    assert {fence for fence, _ in realtime.bubbles.published} == {
-        realtime.fences[2],
-        realtime.fences[3],
-        realtime.fences[9],
-    }
+    assert {account_id for account_id, _ in realtime.bubbles.published} == {2, 3, 9}
     assert [
         packet_type for account_id in (2, 3, 9) for packet_type in delivered_packet_types(realtime, account_id)
     ] == [ServerPacket.SPECTATOR_CANT_SPECTATE] * 3

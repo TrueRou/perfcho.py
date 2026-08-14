@@ -53,7 +53,7 @@ class _FakeSubscription:
         pass
 
 
-class _FakeUserEvents:
+class _FakeBubbleBus:
     def __init__(self, bubbles: list[RealtimeBubble] = ()) -> None:
         self.subscription = _FakeSubscription(list(bubbles))
 
@@ -71,9 +71,9 @@ class _FakeUserEvents:
 
 
 class _SimpleServices:
-    def __init__(self, identity, user_events) -> None:
+    def __init__(self, identity, bubbles) -> None:
         self.identity = identity
-        self.user_events = user_events
+        self.bubbles = bubbles
 
 
 class _RecordingHub(PerfchoHub):
@@ -90,13 +90,13 @@ class _RecordingHub(PerfchoHub):
         await super().close(code, reason)
 
 
-def _hub(identity, user_events, headers=None) -> tuple[_RecordingHub, HubContext]:
+def _hub(identity, bubbles, headers=None) -> tuple[_RecordingHub, HubContext]:
     hub = _RecordingHub()
     hub.context = HubContext(
         "conn-1",
         dict(headers or {"authorization": "Bearer access-value"}),
         {},
-        state={"stable_services": _SimpleServices(identity, user_events)},
+        state={"stable_services": _SimpleServices(identity, bubbles)},
     )
     return hub, hub.context
 
@@ -104,7 +104,7 @@ def _hub(identity, user_events, headers=None) -> tuple[_RecordingHub, HubContext
 @pytest.mark.asyncio
 async def test_connected_authenticates_and_binds_user_id() -> None:
     identity = _FakeIdentity()
-    events = _FakeUserEvents()
+    events = _FakeBubbleBus()
     hub, context = _hub(identity, events)
 
     await hub.on_connected()
@@ -120,7 +120,7 @@ async def test_connected_authenticates_and_binds_user_id() -> None:
 async def test_connected_rejects_invalid_token() -> None:
     identity = _FakeIdentity()
     identity.invalid = True
-    events = _FakeUserEvents()
+    events = _FakeBubbleBus()
     hub, context = _hub(identity, events)
 
     await hub.on_connected()
@@ -142,7 +142,7 @@ async def test_connected_rejects_missing_services() -> None:
 async def test_bridge_forwards_account_events_to_hub() -> None:
     identity = _FakeIdentity()
     bubble = ToastBubble("hello")
-    events = _FakeUserEvents([bubble])
+    events = _FakeBubbleBus([bubble])
     hub, _ = _hub(identity, events)
 
     await hub.on_connected()

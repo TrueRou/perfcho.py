@@ -6,6 +6,19 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from perfcho.consumers.common import (
+    advance_checkpoint,
+    payload_boolean,
+    payload_datetime,
+    payload_integer,
+    payload_optional_integer,
+    payload_string,
+    payload_uuid,
+    record_activity,
+    record_notification,
+    require_accounts,
+    require_event_context,
+)
 from perfcho.infra.db.models.community import (
     Channel,
     ChannelMembership,
@@ -14,22 +27,9 @@ from perfcho.infra.db.models.community import (
     Message,
 )
 from perfcho.infra.db.models.events import OutboxEvent
-from perfcho.infra.db.projectors.common import (
-    advance_checkpoint,
-    payload_boolean,
-    payload_datetime,
-    payload_integer,
-    payload_optional_integer,
-    payload_string,
-    payload_uuid,
-    project_activity,
-    project_notification,
-    require_accounts,
-    require_event_context,
-)
 
-COMMUNITY_CONSUMER_NAME = "community-projector.v1"
-MESSAGE_CONSUMER_NAME = "community-message-projector.v1"
+COMMUNITY_CONSUMER_NAME = "community-consumer.v1"
+MESSAGE_CONSUMER_NAME = "community-message-consumer.v1"
 COMMUNITY_EVENT_TYPES = frozenset(
     {
         "community.direct-conversation-created.v1",
@@ -40,7 +40,7 @@ COMMUNITY_EVENT_TYPES = frozenset(
 MESSAGE_EVENT_TYPES = frozenset({"community.message-sent.v1"})
 
 
-async def project_community_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def consume_community_event(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project direct-conversation and durable membership changes."""
     channel_id = payload_integer(event.payload, "channel_id")
     require_event_context(
@@ -66,7 +66,7 @@ async def project_community_event(session: AsyncSession, event: OutboxEvent, par
         account_id = payload_integer(event.payload, "account_id")
         await require_accounts(session, (account_id,))
         joined = event.event_type == "community.channel-member-joined.v1"
-        await project_activity(
+        await record_activity(
             session,
             event,
             subject_account_id=account_id,
@@ -76,10 +76,10 @@ async def project_community_event(session: AsyncSession, event: OutboxEvent, par
             occurred_at=event.created_at,
             snapshot={"channel_id": channel_id},
         )
-    await advance_checkpoint(session, event, projector=COMMUNITY_CONSUMER_NAME, partition_key=partition_key)
+    await advance_checkpoint(session, event, consumer=COMMUNITY_CONSUMER_NAME, partition_key=partition_key)
 
 
-async def project_community_message(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
+async def consume_community_message(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
     """Project channel recency and create durable direct-message notification intents."""
     message_id = payload_integer(event.payload, "message_id")
     channel_id = payload_integer(event.payload, "channel_id")
@@ -127,7 +127,7 @@ async def project_community_message(session: AsyncSession, event: OutboxEvent, p
             or recipient_account_id == sender_account_id
         ):
             raise RuntimeError("direct message recipient does not match the authoritative conversation")
-        await project_notification(
+        await record_notification(
             session,
             event,
             actor_account_id=sender_account_id,
@@ -143,7 +143,7 @@ async def project_community_message(session: AsyncSession, event: OutboxEvent, p
             },
             recipient_account_ids=(recipient_account_id,),
         )
-    await advance_checkpoint(session, event, projector=MESSAGE_CONSUMER_NAME, partition_key=partition_key)
+    await advance_checkpoint(session, event, consumer=MESSAGE_CONSUMER_NAME, partition_key=partition_key)
 
 
 async def _upsert_channel_projection(

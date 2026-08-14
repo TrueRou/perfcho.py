@@ -31,7 +31,7 @@ from perfcho.modules.moderation.commands import (
 )
 from perfcho.modules.moderation.ports import ModerationRepository, ModerationRepositoryFactory
 
-_MODERATION_CONSUMERS = ("moderation-projector.v1",)
+_MODERATION_CONSUMERS = ("moderation-consumer.v1",)
 _SANCTION_KINDS = frozenset({"restriction", "silence", "channel_mute", "tournament_ban", "leaderboard_freeze"})
 _VISIBILITIES = frozenset({"staff", "subject", "public"})
 

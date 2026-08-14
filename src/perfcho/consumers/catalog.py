@@ -1,4 +1,4 @@
-"""Compose the complete catalog of database outbox projectors."""
+"""Compose the complete catalog of database outbox consumers."""
 
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -6,8 +6,7 @@ from types import MappingProxyType
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.models.events import OutboxEvent
-from perfcho.infra.db.projectors import (
+from perfcho.consumers import (
     account,
     community,
     content,
@@ -20,6 +19,7 @@ from perfcho.infra.db.projectors import (
     scoring_stats,
     social,
 )
+from perfcho.infra.db.models.events import OutboxEvent
 
 type ConsumerHandler = Callable[[AsyncSession, OutboxEvent, str], Awaitable[None]]
 
@@ -63,31 +63,31 @@ class ConsumerCatalog(Mapping[str, ConsumerRegistration]):
 
 
 def build_consumer_catalog(
-    performance_handler: ConsumerHandler = performance.unconfigured_projector,
-    ranking_handler: ConsumerHandler = ranking.project_accepted_score,
-    notification_realtime_handler: ConsumerHandler = notification.unconfigured_handler,
+    performance_handler: ConsumerHandler = performance.unconfigured_consumer,
+    ranking_handler: ConsumerHandler = ranking.consume_accepted_score,
+    notification_realtime_handler: ConsumerHandler = notification.unconfigured_consumer,
 ) -> ConsumerCatalog:
     """Compose all consumers with the runtime-owned Performance handler."""
     return ConsumerCatalog(
         (
-            ConsumerRegistration(account.CONSUMER_NAME, account.EVENT_TYPES, account.project_account_event),
-            ConsumerRegistration(identity.CONSUMER_NAME, identity.EVENT_TYPES, identity.project_identity_event),
-            ConsumerRegistration(content.CONSUMER_NAME, content.EVENT_TYPES, content.project_content_event),
-            ConsumerRegistration(social.SOCIAL_CONSUMER_NAME, social.SOCIAL_EVENT_TYPES, social.project_social_event),
+            ConsumerRegistration(account.CONSUMER_NAME, account.EVENT_TYPES, account.consume_account_event),
+            ConsumerRegistration(identity.CONSUMER_NAME, identity.EVENT_TYPES, identity.consume_identity_event),
+            ConsumerRegistration(content.CONSUMER_NAME, content.EVENT_TYPES, content.consume_content_event),
+            ConsumerRegistration(social.SOCIAL_CONSUMER_NAME, social.SOCIAL_EVENT_TYPES, social.consume_social_event),
             ConsumerRegistration(
                 social.ACHIEVEMENT_CONSUMER_NAME,
                 social.ACHIEVEMENT_EVENT_TYPES,
-                social.project_achievement_event,
+                social.consume_achievement_event,
             ),
             ConsumerRegistration(
                 community.COMMUNITY_CONSUMER_NAME,
                 community.COMMUNITY_EVENT_TYPES,
-                community.project_community_event,
+                community.consume_community_event,
             ),
             ConsumerRegistration(
                 community.MESSAGE_CONSUMER_NAME,
                 community.MESSAGE_EVENT_TYPES,
-                community.project_community_message,
+                community.consume_community_message,
             ),
             ConsumerRegistration(notification.CONSUMER_NAME, notification.EVENT_TYPES, notification_realtime_handler),
             ConsumerRegistration(performance.CONSUMER_NAME, performance.EVENT_TYPES, performance_handler),
@@ -95,22 +95,22 @@ def build_consumer_catalog(
             ConsumerRegistration(
                 scoring_stats.CONSUMER_NAME,
                 scoring_stats.EVENT_TYPES,
-                scoring_stats.project_scoring_stats,
+                scoring_stats.consume_scoring_stats,
             ),
             ConsumerRegistration(
                 multiplayer.CONSUMER_NAME,
                 multiplayer.EVENT_TYPES,
-                multiplayer.project_multiplayer_results,
+                multiplayer.consume_multiplayer_results,
             ),
             ConsumerRegistration(
                 management.AUTHORIZATION_CONSUMER_NAME,
                 management.AUTHORIZATION_EVENT_TYPES,
-                management.project_authorization_event,
+                management.consume_authorization_event,
             ),
             ConsumerRegistration(
                 management.MODERATION_CONSUMER_NAME,
                 management.MODERATION_EVENT_TYPES,
-                management.project_moderation_event,
+                management.consume_moderation_event,
             ),
         )
     )

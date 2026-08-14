@@ -5,8 +5,8 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.projectors import notification
-from perfcho.infra.db.projectors.notification import _recipient_ids, render_notification_text
+from perfcho.consumers import notification
+from perfcho.consumers.notification import _recipient_ids, render_notification_text
 
 NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 
@@ -50,10 +50,10 @@ class _FakeRealtime:
 
 class _FakeBubbles:
     def __init__(self) -> None:
-        self.published: list[tuple[tuple, object]] = []
+        self.published: list[tuple[int, object]] = []
 
-    async def publish(self, fence: tuple, bubble: object) -> int:
-        self.published.append((fence, bubble))
+    async def publish(self, account_id: int, bubble: object) -> int:
+        self.published.append((account_id, bubble))
         return 1
 
 
@@ -90,9 +90,9 @@ def handler_env(monkeypatch: pytest.MonkeyPatch) -> tuple[_FakeRealtime, _FakeBu
         realtime=realtime, bubbles=bubbles, bot_account_id=1, bot_name="BanchoBot"
     )
 
-    async def fake_advance(session: AsyncSession, event: object, *, projector: str, partition_key: str) -> None:
+    async def fake_advance(session: AsyncSession, event: object, *, consumer: str, partition_key: str) -> None:
         del event
-        session.advanced = (projector, partition_key)
+        session.advanced = (consumer, partition_key)
 
     monkeypatch.setattr(notification, "advance_checkpoint", fake_advance)
     return realtime, bubbles, handler
@@ -107,13 +107,13 @@ async def test_handler_delivers_to_online_recipients(handler_env: tuple) -> None
 
     assert realtime.queries == [7, 8]
     assert len(bubbles.published) == 1
-    fence, bubble = bubbles.published[0]
-    assert fence == ("fence", 7)
+    account_id, bubble = bubbles.published[0]
+    assert account_id == 7
     assert bubble.sender_account_id == 1
     assert bubble.sender_name == "BanchoBot"
     assert bubble.content == "You unlocked a new achievement!"
     assert bubble.direct is True
-    assert session.advanced == ("notification-realtime-projector.v1", "notification:100")
+    assert session.advanced == ("notification-realtime-consumer.v1", "notification:100")
 
 
 @pytest.mark.asyncio
@@ -125,7 +125,7 @@ async def test_handler_skips_direct_message_kind(handler_env: tuple) -> None:
 
     assert realtime.queries == []
     assert bubbles.published == []
-    assert session.advanced == ("notification-realtime-projector.v1", "notification:101")
+    assert session.advanced == ("notification-realtime-consumer.v1", "notification:101")
 
 
 @pytest.mark.asyncio
@@ -137,4 +137,4 @@ async def test_handler_skips_offline_recipients(handler_env: tuple) -> None:
 
     assert realtime.queries == [99]
     assert bubbles.published == []
-    assert session.advanced == ("notification-realtime-projector.v1", "notification:102")
+    assert session.advanced == ("notification-realtime-consumer.v1", "notification:102")

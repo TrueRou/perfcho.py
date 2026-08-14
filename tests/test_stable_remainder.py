@@ -347,10 +347,7 @@ class FakeBubbleBus:
     def __init__(self, realtime: FakeRealtime) -> None:
         self.realtime = realtime
 
-    async def publish(self, recipient_fence: SessionFence, bubble: RealtimeBubble) -> int:
-        account_id = next(
-            account_id for account_id, presence in self.realtime.presences.items() if presence.fence == recipient_fence
-        )
+    async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
         if account_id in self.realtime.failed_publish_accounts:
             raise RuntimeError("publish failed")
         self.realtime.published.append((account_id, bubble))

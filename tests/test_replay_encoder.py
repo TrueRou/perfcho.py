@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from perfcho.modules.realtime.models import CanonicalReplayFrame
 from perfcho.modules.scoring.models import Ruleset
-from perfcho.infra.wire.replay import encode_replay, replay_digest
+from perfcho.modules.scoring.replay_encoding import encode_replay, replay_digest
 
 NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 
