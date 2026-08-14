@@ -24,8 +24,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from perfcho.infra.db.base import DbBase
-from perfcho.infra.db.enums import BeatmapStatus, Ruleset, enum_type
-from perfcho.infra.db.mixins import BigIntIdentityMixin, CreatedAtMixin, TimestampMixin, Uuid7PrimaryKeyMixin
+from perfcho.infra.db.enums import BeatmapStatus, BeatmapStatusEventSource, Ruleset, enum_type
+from perfcho.infra.db.mixins import BigIntIdentityMixin, CreatedAtMixin, TimestampMixin
 
 
 class ContentSource(DbBase):
@@ -68,7 +68,13 @@ class Beatmapset(BigIntIdentityMixin, TimestampMixin, DbBase):
     language_id: Mapped[int | None] = mapped_column(SmallInteger)
     description: Mapped[str | None] = mapped_column(Text)
     status: Mapped[BeatmapStatus] = mapped_column(
-        enum_type(BeatmapStatus, "beatmapset_status", 16),
+        enum_type(BeatmapStatus, "beatmap_status", 16),
+        nullable=False,
+        default=BeatmapStatus.PENDING,
+        server_default=BeatmapStatus.PENDING.value,
+    )
+    source_status: Mapped[BeatmapStatus] = mapped_column(
+        enum_type(BeatmapStatus, "source_beatmap_status", 16),
         nullable=False,
         default=BeatmapStatus.PENDING,
         server_default=BeatmapStatus.PENDING.value,
@@ -106,24 +112,14 @@ class Beatmap(BigIntIdentityMixin, TimestampMixin, DbBase):
         CheckConstraint("external_id > 0", name="positive_external_id"),
         UniqueConstraint("source_id", "external_id"),
         Index("ix_beatmap_set_id", "beatmapset_id", "id"),
-        Index("ix_beatmap_status_ruleset", "status", "ruleset"),
         {"schema": "content"},
     )
 
-    beatmapset_id: Mapped[int] = mapped_column(
-        ForeignKey("content.beatmapset.id", ondelete="RESTRICT"), nullable=False
-    )
+    beatmapset_id: Mapped[int] = mapped_column(ForeignKey("content.beatmapset.id", ondelete="RESTRICT"), nullable=False)
     source_id: Mapped[int] = mapped_column(ForeignKey("content.source.id", ondelete="RESTRICT"), nullable=False)
     external_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     ruleset: Mapped[Ruleset] = mapped_column(enum_type(Ruleset, "beatmap_ruleset", 16), nullable=False)
     difficulty_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    status: Mapped[BeatmapStatus] = mapped_column(
-        enum_type(BeatmapStatus, "beatmap_status", 16),
-        nullable=False,
-        default=BeatmapStatus.PENDING,
-        server_default=BeatmapStatus.PENDING.value,
-    )
-    status_locked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     beatmapset: Mapped[Beatmapset] = relationship(back_populates="beatmaps", lazy="raise")
@@ -201,32 +197,34 @@ class BeatmapRevision(BigIntIdentityMixin, CreatedAtMixin, DbBase):
     beatmap: Mapped[Beatmap] = relationship(back_populates="revisions", lazy="raise")
 
 
-class BeatmapStatusEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
-    """Records every beatmap ranking status transition and its source."""
+class BeatmapsetStatusEvent(BigIntIdentityMixin, CreatedAtMixin, DbBase):
+    """Records every beatmapset ranking status transition and its source."""
 
-    __tablename__ = "beatmap_status_event"
+    __tablename__ = "beatmapset_status_event"
     __table_args__ = (
-        Index("ix_beatmap_status_event_beatmap_effective", "beatmap_id", "effective_at"),
+        Index("ix_beatmapset_status_event_set_effective", "beatmapset_id", "effective_at"),
         {"schema": "content"},
     )
 
-    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmap.id", ondelete="RESTRICT"), nullable=False)
+    beatmapset_id: Mapped[int] = mapped_column(ForeignKey("content.beatmapset.id", ondelete="RESTRICT"), nullable=False)
     previous_status: Mapped[BeatmapStatus | None] = mapped_column(
         enum_type(BeatmapStatus, "previous_beatmap_status", 16)
     )
     status: Mapped[BeatmapStatus] = mapped_column(enum_type(BeatmapStatus, "new_beatmap_status", 16), nullable=False)
+    source: Mapped[BeatmapStatusEventSource] = mapped_column(
+        enum_type(BeatmapStatusEventSource, "beatmap_status_event_source", 16), nullable=False
+    )
     actor_account_id: Mapped[int | None] = mapped_column(ForeignKey("core.account.id", ondelete="SET NULL"))
-    source: Mapped[str] = mapped_column(String(32), nullable=False)
     reason: Mapped[str | None] = mapped_column(String(255))
     effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-class ContentSyncState(TimestampMixin, DbBase):
-    """Tracks upstream beatmapset synchronization watermarks and retry state."""
+class BeatmapsetSyncState(TimestampMixin, DbBase):
+    """Tracks upstream beatmapset synchronization lease and retry state."""
 
     __tablename__ = "sync_state"
     __table_args__ = (
-        CheckConstraint("unchanged_count >= 0 AND error_count >= 0", name="nonnegative_counts"),
+        CheckConstraint("error_count >= 0", name="nonnegative_error_count"),
         Index("ix_sync_state_next_check", "next_check_at"),
         {"schema": "content"},
     )
@@ -234,42 +232,9 @@ class ContentSyncState(TimestampMixin, DbBase):
     beatmapset_id: Mapped[int] = mapped_column(
         ForeignKey("content.beatmapset.id", ondelete="CASCADE"), primary_key=True
     )
-    etag: Mapped[str | None] = mapped_column(String(255))
-    last_modified: Mapped[str | None] = mapped_column(String(255))
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    unchanged_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
-    last_error: Mapped[str | None] = mapped_column(Text)
-
-
-class BeatmapsetSyncProjection(TimestampMixin, DbBase):
-    """Projects the latest completed synchronization result for a beatmapset."""
-
-    __tablename__ = "beatmapset_sync_projection"
-    __table_args__ = (
-        CheckConstraint(
-            "created_revision_count >= 0 AND unchanged_revision_count >= 0 AND removed_beatmap_count >= 0",
-            name="nonnegative_counts",
-        ),
-        CheckConstraint("source_position > 0", name="positive_source_position"),
-        UniqueConstraint("source_event_id"),
-        Index("ix_beatmapset_sync_projection_position", "source_position"),
-        {"schema": "content"},
-    )
-
-    beatmapset_id: Mapped[int] = mapped_column(
-        ForeignKey("content.beatmapset.id", ondelete="CASCADE"), primary_key=True
-    )
-    external_beatmapset_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    created_revision_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    unchanged_revision_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    removed_beatmap_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    source_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    source_event_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("event.outbox_event.id", ondelete="RESTRICT"), nullable=False
-    )
-    source_position: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
 class BeatmapsetFavourite(CreatedAtMixin, DbBase):
@@ -341,36 +306,6 @@ class BeatmapTagVote(CreatedAtMixin, DbBase):
     beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmap.id", ondelete="CASCADE"), primary_key=True)
     tag_id: Mapped[int] = mapped_column(ForeignKey("content.tag_definition.id", ondelete="CASCADE"), primary_key=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("core.account.id", ondelete="RESTRICT"), primary_key=True)
-
-
-class MapStatusRequest(Uuid7PrimaryKeyMixin, CreatedAtMixin, DbBase):
-    """Tracks requested beatmap status changes and their resolution workflow."""
-
-    __tablename__ = "map_status_request"
-    __table_args__ = (
-        Index(
-            "uq_map_status_request_open",
-            "beatmap_id",
-            "requester_account_id",
-            unique=True,
-            postgresql_where=text("status = 'open'"),
-        ),
-        Index("ix_map_status_request_queue", "status", "created_at"),
-        {"schema": "content"},
-    )
-
-    beatmap_id: Mapped[int] = mapped_column(ForeignKey("content.beatmap.id", ondelete="RESTRICT"), nullable=False)
-    requester_account_id: Mapped[int] = mapped_column(
-        ForeignKey("core.account.id", ondelete="RESTRICT"), nullable=False
-    )
-    requested_status: Mapped[BeatmapStatus] = mapped_column(
-        enum_type(BeatmapStatus, "requested_beatmap_status", 16), nullable=False
-    )
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", server_default="open")
-    reason: Mapped[str | None] = mapped_column(Text)
-    resolved_by_id: Mapped[int | None] = mapped_column(ForeignKey("core.account.id", ondelete="SET NULL"))
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    resolution: Mapped[str | None] = mapped_column(Text)
 
 
 class Comment(BigIntIdentityMixin, CreatedAtMixin, DbBase):

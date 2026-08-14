@@ -21,7 +21,7 @@ from perfcho.infra.db.models.community import (
     NotificationPreference,
     NotificationRecipient,
 )
-from perfcho.infra.db.models.content import Beatmapset, BeatmapsetSyncProjection
+from perfcho.infra.db.models.content import Beatmapset
 from perfcho.infra.db.models.core import Account
 from perfcho.infra.db.models.events import ActivityEvent, OutboxDelivery, OutboxEvent, ProjectionCheckpoint
 from perfcho.infra.db.models.social import AchievementDefinition, AchievementUnlock
@@ -43,7 +43,7 @@ RECIPIENT_ACCOUNT_ID = 2002
 EXPECTED_CONSUMERS = {
     "account-projector.v1": {"account.registered.v1"},
     "identity-projector.v1": {"identity.session-opened.v1", "identity.session-closed.v1"},
-    "content-projector.v1": {"content.beatmapset-synchronized.v1"},
+    "content-projector.v1": {"content.beatmapset-synchronized.v1", "content.beatmapset-status-changed.v1"},
     "social-projector.v1": {
         "social.account-followed.v1",
         "social.account-unfollowed.v1",
@@ -57,6 +57,7 @@ EXPECTED_CONSUMERS = {
         "community.channel-member-left.v1",
     },
     "community-message-projector.v1": {"community.message-sent.v1"},
+    "notification-realtime-projector.v1": {"community.notification-created.v1"},
     "performance-projector.v1": {"score.accepted.v1"},
     "ranking-projector.v1": {"score.accepted.v1", "score.performance-calculated.v1"},
     "scoring-stats-projector.v1": {"score.accepted.v1", "score.replay-viewed.v1"},
@@ -383,6 +384,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
                 artist="Artist",
                 title="Title",
                 status=BeatmapStatus.RANKED,
+                source_status=BeatmapStatus.RANKED,
                 available=True,
             )
             achievement = AchievementDefinition(
@@ -584,10 +586,7 @@ async def test_outbox_consumers_project_idempotently_and_rollback_invalid_payloa
             assert await session.scalar(select(func.count()).select_from(NotificationRecipient)) == 3
             assert await session.scalar(select(func.count()).select_from(NotificationDispatch)) == 1
             assert await session.scalar(select(func.count()).select_from(ProjectionCheckpoint)) == 7
-            sync_projection = await session.get(BeatmapsetSyncProjection, beatmapset.id)
             channel_projection = await session.get(ChannelReadProjection, channel.id)
-            assert sync_projection is not None
-            assert sync_projection.source_event_id == events[2].id
             assert channel_projection is not None
             assert channel_projection.latest_message_id == message.id
             assert channel_projection.active_member_count == 2

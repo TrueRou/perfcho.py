@@ -555,6 +555,7 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 artist="Artist",
                 title="Title",
                 status=DbBeatmapStatus.RANKED,
+                source_status=DbBeatmapStatus.RANKED,
                 available=True,
             )
             session.add(beatmapset)
@@ -565,7 +566,6 @@ async def test_postgres_scoring_acceptance_is_atomic_and_exactly_replayable(
                 external_id=100,
                 ruleset=DbRuleset.OSU,
                 difficulty_name="Test",
-                status=DbBeatmapStatus.RANKED,
             )
             session.add(beatmap)
             await session.flush()

@@ -3,14 +3,13 @@
 import asyncio
 import uuid
 from datetime import UTC, datetime
-from typing import cast
 
 import pytest
 from aiosignalr.server import HubContext
 
 from perfcho.api.signalr.base import PerfchoHub
 from perfcho.modules.identity import AuthenticatedAccount, InvalidAccessToken
-from perfcho.modules.realtime import NotificationBubble, RealtimeBubble
+from perfcho.modules.realtime import RealtimeBubble, ToastBubble
 
 NOW = datetime(2026, 8, 10, 12, tzinfo=UTC)
 
@@ -142,7 +141,7 @@ async def test_connected_rejects_missing_services() -> None:
 @pytest.mark.asyncio
 async def test_bridge_forwards_account_events_to_hub() -> None:
     identity = _FakeIdentity()
-    bubble = NotificationBubble("hello")
+    bubble = ToastBubble("hello")
     events = _FakeUserEvents([bubble])
     hub, _ = _hub(identity, events)
 

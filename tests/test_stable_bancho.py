@@ -36,7 +36,6 @@ from perfcho.modules.identity import (
     ResolvedClientSession,
 )
 from perfcho.modules.realtime import (
-    NotificationBubble,
     PresenceCapacityReached,
     PresenceSnapshot,
     RealtimeBubble,
@@ -46,6 +45,7 @@ from perfcho.modules.realtime import (
     RealtimeSession,
     RealtimeStateRepository,
     SessionFence,
+    ToastBubble,
     presence_updated_bubble,
 )
 from perfcho.modules.social import SocialService
@@ -485,7 +485,7 @@ async def test_authenticated_client_keepalive_drains_buffered_bubble() -> None:
         expires_at=NOW + timedelta(minutes=5),
         durable_expires_at=NOW + timedelta(hours=1),
     )
-    fake_bubbles(services).pending.append(NotificationBubble("ready"))
+    fake_bubbles(services).pending.append(ToastBubble("ready"))
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_stable_services] = lambda: services
@@ -513,7 +513,7 @@ async def test_idle_ping_waits_for_bubble_and_returns_it_immediately() -> None:
         expires_at=NOW + timedelta(minutes=5),
         durable_expires_at=NOW + timedelta(hours=1),
     )
-    fake_bubbles(services).wait_bubble = NotificationBubble("ready")
+    fake_bubbles(services).wait_bubble = ToastBubble("ready")
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_stable_services] = lambda: services
@@ -573,7 +573,7 @@ async def test_poll_renders_local_and_remote_bubbles_without_publishing_local(
         durable_expires_at=NOW + timedelta(hours=1),
     )
     bus = fake_bubbles(services)
-    bus.pending.append(NotificationBubble("remote"))
+    bus.pending.append(ToastBubble("remote"))
 
     async def local_dispatch(
         body: bytes,
@@ -583,7 +583,7 @@ async def test_poll_renders_local_and_remote_bubbles_without_publishing_local(
         del body, context
         assert dispatched_services is services
         assert bus.subscribed
-        return (NotificationBubble("local"),)
+        return (ToastBubble("local"),)
 
     monkeypatch.setattr(cho_module, "dispatch_packets", local_dispatch)
     app = FastAPI()
@@ -605,7 +605,7 @@ async def test_poll_renders_local_and_remote_bubbles_without_publishing_local(
 @pytest.mark.asyncio
 async def test_poll_drops_over_budget_bubble_without_caching_it() -> None:
     services, identity, realtime = stable_services()
-    maximum = len(StableBubbleRenderer().render(NotificationBubble("fits")))
+    maximum = len(StableBubbleRenderer().render(ToastBubble("fits")))
     object.__setattr__(services, "settings", Settings(stable_max_response_bytes=maximum))
     await realtime.open_session(
         session_id=identity.session_id,
@@ -613,7 +613,7 @@ async def test_poll_drops_over_budget_bubble_without_caching_it() -> None:
         expires_at=NOW + timedelta(minutes=5),
         durable_expires_at=NOW + timedelta(hours=1),
     )
-    fake_bubbles(services).pending.append(NotificationBubble("x" * 200))
+    fake_bubbles(services).pending.append(ToastBubble("x" * 200))
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_stable_services] = lambda: services
@@ -654,7 +654,7 @@ async def test_poll_subscription_failure_returns_existing_local_bubbles(monkeypa
         dispatched_services: StableServices,
     ) -> tuple[RealtimeBubble, ...]:
         del body, context, dispatched_services
-        return (NotificationBubble("local"),)
+        return (ToastBubble("local"),)
 
     monkeypatch.setattr(cho_module, "dispatch_packets", local_dispatch)
     app = FastAPI()

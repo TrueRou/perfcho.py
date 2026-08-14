@@ -33,6 +33,7 @@ from perfcho.infra.db.repositories.multiplayer import (
     SqlAlchemyMultiplayerRepository,
 )
 from perfcho.infra.db.repositories.outbox import SqlAlchemyOutboxWriter
+from perfcho.infra.db.repositories.performance.difficulty import SqlAlchemyDifficultyRepository
 from perfcho.infra.db.repositories.performance.query import SqlAlchemyPerformanceQueryRepository
 from perfcho.infra.db.repositories.scoring import (
     SqlAlchemyAccountStatisticsRepository,
@@ -66,6 +67,7 @@ from perfcho.modules.bot import BotCommandService, register_core_commands
 from perfcho.modules.common import Clock, IdGenerator, ObjectStorage
 from perfcho.modules.community import CommunityQueryService, CommunityService
 from perfcho.modules.content import BeatmapRevisionView, ContentQueryService, ContentService, ContentSyncService
+from perfcho.modules.content.commands import ContentCommandDependencies, build_content_commands
 from perfcho.modules.identity import IdentityService
 from perfcho.modules.moderation.services import ModerationService
 from perfcho.modules.multiplayer import (
@@ -88,9 +90,6 @@ from perfcho.modules.scoring import (
 )
 from perfcho.modules.social import SocialQueryService, SocialService, TransactionAchievementAwarder, build_clan_commands
 from perfcho.modules.social.achievements import default_achievement_evaluator_registry
-
-core_services: CoreServices | None = None
-stable_services: StableServices | None = None
 
 _ACHIEVEMENT_EVALUATORS = default_achievement_evaluator_registry()
 
@@ -181,6 +180,10 @@ def _performance_query_repository(session: object) -> SqlAlchemyPerformanceQuery
     return SqlAlchemyPerformanceQueryRepository(cast(AsyncSession, session))
 
 
+def _difficulty_repository(session: object) -> SqlAlchemyDifficultyRepository:
+    return SqlAlchemyDifficultyRepository(cast(AsyncSession, session))
+
+
 def _account_submission_validator(session: object) -> SqlAlchemyAccountSubmissionValidator:
     return SqlAlchemyAccountSubmissionValidator(cast(AsyncSession, session))
 
@@ -261,13 +264,13 @@ async def compose_core_services() -> CoreServices:
     config = Settings()
     cleanups: list[AsyncCleanup] = []
     try:
-        postgres = await infra_db.create_engine()
+        postgres = await infra_db.create_engine(config)
         cleanups.append(("PostgreSQL", postgres.dispose))
-        state_redis = await infra_redis.create_state_redis()
+        state_redis = await infra_redis.create_state_redis(config)
         cleanups.append(("state Redis", state_redis.aclose))
-        bubble_redis = await infra_redis.create_bubble_redis()
+        bubble_redis = await infra_redis.create_bubble_redis(config)
         cleanups.append(("bubble Redis", bubble_redis.aclose))
-        cache_redis = await infra_redis.create_cache_redis()
+        cache_redis = await infra_redis.create_cache_redis(config)
         cleanups.append(("cache Redis", cache_redis.aclose))
         cache = RedisCache(cache_redis, prefix=config.redis_cache_prefix)
         session_factory = infra_db.create_session_factory(postgres)
@@ -413,7 +416,7 @@ async def compose_stable_services(
         core.clock,
     )
     content_query = ContentQueryService(uow_factory, _content_repository, core.cache)
-    content = ContentService(uow_factory, _content_repository)
+    content = ContentService(uow_factory, _content_repository, _outbox_writer, core.clock)
     social_query = SocialQueryService(uow_factory, _social_repository, core.cache)
     social = SocialService(uow_factory, _social_repository, _outbox_writer, core.clock, social_query)
     community = CommunityService(
@@ -476,6 +479,7 @@ async def compose_stable_services(
     )
     bot.register_group(build_pool_commands())
     bot.register_group(build_clan_commands())
+    bot.register_group(build_content_commands(ContentCommandDependencies(service=content, authorization=authorization)))
 
     object_storage = S3ObjectStorage.from_settings(core.config)
 
@@ -512,7 +516,8 @@ async def compose_stable_services(
         score_query=ScoreQueryService(uow_factory, _score_query_repository),
         performance_query=PerformanceQueryService(uow_factory, _performance_query_repository),
         difficulty_query=DifficultyQueryService(
-            core.session_factory,
+            uow_factory,
+            _difficulty_repository,
             core.cache,
             HttpPerformanceCalculator(core.http_client, core.config.performance_calculator_urls),
             S3ObjectStorage.from_settings(core.config),

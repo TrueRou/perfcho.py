@@ -174,5 +174,12 @@ class Settings(BaseSettings):
             raise ValueError("performance Beatmap URL expiry must exceed the HTTP timeout by at least 30 seconds")
         return self
 
+    @model_validator(mode="after")
+    def validate_argon2_policy(self) -> Self:
+        """Keep Argon2 memory within the cost model enforced by the password policy."""
+        if self.argon2_memory_cost_kib < 8 * self.argon2_parallelism:
+            raise ValueError("Argon2 memory cost must be at least eight times the parallelism")
+        return self
+
 
 settings = Settings()

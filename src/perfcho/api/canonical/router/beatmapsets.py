@@ -10,10 +10,12 @@ from perfcho.api.canonical.router._shared import error
 from perfcho.modules.content import (
     BeatmapRevisionView,
     BeatmapsetNotFound,
+    BeatmapsetStatusEventView,
     BeatmapsetView,
     ContentInputRejected,
     ContentSearch,
     ContentSearchPage,
+    InvalidStatusTransition,
 )
 
 router = APIRouter()
@@ -88,9 +90,7 @@ async def toggle_favourite(
     """Favourite or unfavourite a beatmapset."""
     if services.content is None:
         return error(503, "service_unavailable", "Content service is unavailable.")
-    result = await services.content.set_favourite(
-        account.account_id, beatmapset_id, favourited=action == "favourite"
-    )
+    result = await services.content.set_favourite(account.account_id, beatmapset_id, favourited=action == "favourite")
     return {"favourite_count": 1, "has_favourited": result.favourited}
 
 
@@ -116,6 +116,150 @@ async def my_favourites(
         return error(503, "service_unavailable", "Content service is unavailable.")
     ids = await services.content_query.list_favourites(account.account_id)
     return {"beatmapsets": list(ids)}
+
+
+@router.get("/beatmapsets/{beatmapset_id}/events", response_model=None, tags=["Beatmapsets"])
+async def beatmapset_status_events(
+    beatmapset_id: int,
+    services: CanonicalServicesDependency,
+) -> dict[str, object] | JSONResponse:
+    """Return one beatmapset's ranking status history."""
+    if services.content is None:
+        return error(503, "service_unavailable", "Content service is unavailable.")
+    events = await services.content.list_status_events(beatmapset_id)
+    return {"events": [_status_event(e) for e in events]}
+
+
+@router.post("/beatmapsets/{beatmapset_id}/qualify", response_model=None, tags=["Beatmapsets"])
+async def qualify_beatmapset(
+    beatmapset_id: int,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+) -> dict[str, object] | JSONResponse:
+    """Qualify a pending beatmapset."""
+    return await _run_status_command(services, account, beatmapset_id, "qualify")
+
+
+@router.post("/beatmapsets/{beatmapset_id}/rank", response_model=None, tags=["Beatmapsets"])
+async def rank_beatmapset(
+    beatmapset_id: int,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+) -> dict[str, object] | JSONResponse:
+    """Rank a qualified beatmapset."""
+    return await _run_status_command(services, account, beatmapset_id, "rank")
+
+
+@router.post("/beatmapsets/{beatmapset_id}/love", response_model=None, tags=["Beatmapsets"])
+async def love_beatmapset(
+    beatmapset_id: int,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+) -> dict[str, object] | JSONResponse:
+    """Move a ranked beatmapset to loved."""
+    return await _run_status_command(services, account, beatmapset_id, "love")
+
+
+@router.post("/beatmapsets/{beatmapset_id}/unlove", response_model=None, tags=["Beatmapsets"])
+async def unlove_beatmapset(
+    beatmapset_id: int,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+) -> dict[str, object] | JSONResponse:
+    """Move a loved beatmapset back to ranked."""
+    return await _run_status_command(services, account, beatmapset_id, "unlove")
+
+
+@router.post("/beatmapsets/{beatmapset_id}/disqualify", response_model=None, tags=["Beatmapsets"])
+async def disqualify_beatmapset(
+    beatmapset_id: int,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+    reason: Annotated[str | None, Query()] = None,
+) -> dict[str, object] | JSONResponse:
+    """Disqualify a qualified beatmapset back to pending."""
+    return await _run_status_command(services, account, beatmapset_id, "disqualify", reason)
+
+
+@router.post("/beatmapsets/{beatmapset_id}/graveyard", response_model=None, tags=["Beatmapsets"])
+async def graveyard_beatmapset(
+    beatmapset_id: int,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+) -> dict[str, object] | JSONResponse:
+    """Move a ranked, wip, or pending beatmapset to graveyard."""
+    return await _run_status_command(services, account, beatmapset_id, "graveyard")
+
+
+@router.post("/beatmapsets/{beatmapset_id}/pending", response_model=None, tags=["Beatmapsets"])
+async def pending_beatmapset(
+    beatmapset_id: int,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+) -> dict[str, object] | JSONResponse:
+    """Restore a graveyard beatmapset to pending."""
+    return await _run_status_command(services, account, beatmapset_id, "restore_pending")
+
+
+@router.post("/beatmapsets/{beatmapset_id}/revert", response_model=None, tags=["Beatmapsets"])
+async def revert_beatmapset_status(
+    beatmapset_id: int,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+) -> dict[str, object] | JSONResponse:
+    """Revert a local status override back to the upstream source status."""
+    if services.content is None:
+        return error(503, "service_unavailable", "Content service is unavailable.")
+    if not await _allowed(services, account):
+        return error(403, "forbidden", "Account lacks content.manage permission.")
+    try:
+        state = await services.content.revert_status(account.account_id, beatmapset_id)
+    except BeatmapsetNotFound as exc:
+        return error(404, "not_found", str(exc))
+    return {"status": state.status, "source_status": state.source_status}
+
+
+async def _run_status_command(
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+    beatmapset_id: int,
+    command: str,
+    reason: str | None = None,
+) -> dict[str, object] | JSONResponse:
+    if services.content is None:
+        return error(503, "service_unavailable", "Content service is unavailable.")
+    if not await _allowed(services, account):
+        return error(403, "forbidden", "Account lacks content.manage permission.")
+    handler = getattr(services.content, command)
+    try:
+        if command == "disqualify":
+            state = await handler(account.account_id, beatmapset_id, reason)
+        else:
+            state = await handler(account.account_id, beatmapset_id)
+    except BeatmapsetNotFound as exc:
+        return error(404, "not_found", str(exc))
+    except InvalidStatusTransition as exc:
+        return error(409, "invalid_status_transition", str(exc))
+    except ContentInputRejected as exc:
+        return error(422, "invalid_request", str(exc))
+    return {"status": state.status, "source_status": state.source_status}
+
+
+async def _allowed(services: CanonicalServicesDependency, account: CanonicalAccountDependency) -> bool:
+    effective = await services.authorization.get_effective(account.account_id)
+    return effective.allows("content.manage")
+
+
+def _status_event(event: BeatmapsetStatusEventView) -> dict[str, object]:
+    return {
+        "beatmapset_id": event.beatmapset_id,
+        "previous_status": event.previous_status,
+        "status": event.status,
+        "source": event.source,
+        "actor_account_id": event.actor_account_id,
+        "reason": event.reason,
+        "effective_at": event.effective_at.isoformat(),
+    }
 
 
 def _beatmapset(beatmapset: BeatmapsetView) -> dict[str, object]:

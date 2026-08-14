@@ -486,13 +486,13 @@ class SpectatorFrameBubble:
 
 
 @dataclass(frozen=True, slots=True)
-class NotificationBubble:
-    """Carry a transient user-facing notification."""
+class ToastBubble:
+    """Carry a transient user-facing toast."""
 
     message: str
 
     def __post_init__(self) -> None:
-        """Require notification text."""
+        """Require toast text."""
         _text("message", self.message)
 
 
@@ -526,6 +526,6 @@ type RealtimeBubble = (
     | MultiplayerSignalBubble
     | SpectatorLifecycleBubble
     | SpectatorFrameBubble
-    | NotificationBubble
+    | ToastBubble
     | SessionControlBubble
 )

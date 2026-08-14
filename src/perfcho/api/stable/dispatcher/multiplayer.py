@@ -40,8 +40,8 @@ from perfcho.modules.realtime import (
     MultiplayerScoreState,
     MultiplayerSignalBubble,
     MultiplayerSignalKind,
-    NotificationBubble,
     RealtimeBubble,
+    ToastBubble,
     multiplayer_room_snapshot,
 )
 from perfcho.modules.scoring import Ruleset
@@ -119,7 +119,7 @@ async def dispatch_multiplayer_packet(
         )
         if packet_type in {ClientPacket.CREATE_MATCH, ClientPacket.JOIN_MATCH}:
             context.local_bubbles.append(MultiplayerSignalBubble(MultiplayerSignalKind.JOIN_FAILED, None))
-        context.local_bubbles.append(NotificationBubble(_failure_message(error)))
+        context.local_bubbles.append(ToastBubble(_failure_message(error)))
         return b""
     except ProtocolError:
         raise
@@ -136,7 +136,7 @@ async def dispatch_multiplayer_packet(
         )
         if packet_type in {ClientPacket.CREATE_MATCH, ClientPacket.JOIN_MATCH}:
             context.local_bubbles.append(MultiplayerSignalBubble(MultiplayerSignalKind.JOIN_FAILED, None))
-        context.local_bubbles.append(NotificationBubble("The multiplayer request is invalid."))
+        context.local_bubbles.append(ToastBubble("The multiplayer request is invalid."))
         return b""
     return b""
 
@@ -858,7 +858,7 @@ async def _invite_player(dispatch: _MultiplayerPacketContext, current: RoomState
         return b""
     target_presence = await dispatch.services.realtime.get_presence(target_account_id, at=dispatch.services.clock.now())
     if target_presence is None:
-        dispatch.context.local_bubbles.append(NotificationBubble("The invited player is offline."))
+        dispatch.context.local_bubbles.append(ToastBubble("The invited player is offline."))
         return b""
     target_name = target_presence.identity.display_name
     admission = await dispatch.multiplayer.issue_admission_token(
@@ -881,7 +881,7 @@ async def _invite_player(dispatch: _MultiplayerPacketContext, current: RoomState
     delivered = await _publish(target_account_id, bubble, current, dispatch.services)
     if not delivered:
         dispatch.context.local_bubbles.append(
-            NotificationBubble("The invite could not be delivered; the room is still available.")
+            ToastBubble("The invite could not be delivered; the room is still available.")
         )
     return b""
 
@@ -1190,7 +1190,7 @@ def _failure_message(error: MultiplayerError) -> str:
 def _append_delivery_warning(local_bubbles: list[RealtimeBubble], failed_account_ids: object) -> None:
     if failed_account_ids:
         local_bubbles.append(
-            NotificationBubble("A multiplayer update was lost; affected players can recover the current room state.")
+            ToastBubble("A multiplayer update was lost; affected players can recover the current room state.")
         )
 
 

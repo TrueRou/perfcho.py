@@ -26,7 +26,7 @@ dependencies = [
     "python-multipart>=0.0.20",
     "redis>=8.0.1",
     "requests>=2.32.3",
-    "sqlalchemy==2.1.0b3",
+    "sqlalchemy==2.0.52",
     "taskiq>=0.12.4",
     "taskiq-redis>=1.2.3",
     "uvicorn>=0.38.0",
@@ -50,7 +50,7 @@ requires = ["uv_build>=0.9.7,<0.10.0"]
 build-backend = "uv_build"
 
 [tool.uv]
-override-dependencies = ["sqlalchemy==2.1.0b3"]
+override-dependencies = ["sqlalchemy==2.0.52"]
 prerelease = "allow"
 
 [tool.uv.sources]

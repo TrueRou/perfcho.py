@@ -25,13 +25,13 @@ from perfcho.api.stable.realtime.builders import (
     match_start,
     match_transfer_host,
     new_match,
-    notification,
     restart,
     send_message,
     spectate_frames,
     spectator_cant_spectate,
     spectator_joined,
     spectator_left,
+    toast,
     update_match,
     user_logout,
     user_presence,
@@ -63,7 +63,6 @@ from perfcho.modules.realtime import (
     MultiplayerRoomSnapshot,
     MultiplayerSignalBubble,
     MultiplayerSignalKind,
-    NotificationBubble,
     PlayerActivity,
     PlayerStatistics,
     PresenceIdentity,
@@ -75,6 +74,7 @@ from perfcho.modules.realtime import (
     SpectatorFrameAction,
     SpectatorFrameBubble,
     SpectatorLifecycleBubble,
+    ToastBubble,
     UserLogoutBubble,
 )
 from perfcho.modules.scoring import CanonicalMod, Ruleset
@@ -343,8 +343,8 @@ class StableBubbleRenderer:
                     else b""
                 )
                 return transition + channel_info(Channel(name, bubble.topic, bubble.member_count))
-            case NotificationBubble():
-                return notification(bubble.message)
+            case ToastBubble():
+                return toast(bubble.message)
             case SessionControlBubble():
                 # Stable has no graceful close packet; RESTART is its session-control primitive.
                 match bubble.action:

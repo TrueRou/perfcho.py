@@ -10,6 +10,7 @@ from typing import Protocol
 from perfcho.infra.cache import cached
 from perfcho.infra.cache.backend import CacheBackend
 from perfcho.infra.cache.values import decode_json, encode_json
+from perfcho.infra.db.enums import BeatmapStatus, BeatmapStatusEventSource
 from perfcho.infra.logging import duration_ms, log_event
 from perfcho.modules.common.models import PendingEvent
 from perfcho.modules.common.ports import Clock, IdGenerator, ObjectStorage, OutboxWriterFactory
@@ -17,10 +18,13 @@ from perfcho.modules.content.errors import (
     BeatmapNotFound,
     BeatmapsetNotFound,
     ContentInputRejected,
+    InvalidStatusTransition,
     UpstreamContentUnavailable,
 )
 from perfcho.modules.content.models import (
     BeatmapRevisionView,
+    BeatmapsetStatusEventView,
+    BeatmapsetStatusState,
     BeatmapsetView,
     CommentView,
     ContentSearch,
@@ -37,6 +41,7 @@ from perfcho.modules.content.ports import (
     ContentUnitOfWork,
     UpstreamContentSource,
 )
+from perfcho.modules.content.status import is_valid_transition
 
 _REFRESH_LEASE = timedelta(minutes=30)
 _REFRESH_RETRY = timedelta(minutes=5)
@@ -203,16 +208,20 @@ class ContentQueryService:
 
 
 class ContentService:
-    """Mutate favourite and rating facts in explicit short transactions."""
+    """Mutate favourite, rating, and ranking-status facts in explicit short transactions."""
 
     def __init__(
         self,
         uow_factory: Callable[[], ContentUnitOfWork],
         repository_factory: ContentRepositoryFactory,
+        outbox_writer_factory: OutboxWriterFactory,
+        clock: Clock,
     ) -> None:
-        """Bind transaction and persistence factories."""
+        """Bind transaction, persistence, event, and time dependencies."""
         self._uow_factory = uow_factory
         self._repository_factory = repository_factory
+        self._outbox_writer_factory = outbox_writer_factory
+        self._clock = clock
 
     async def set_favourite(self, account_id: int, beatmapset_id: int, favourited: bool = True) -> FavouriteResult:
         """Set a naturally idempotent account favourite."""
@@ -278,6 +287,155 @@ class ContentService:
             )
             await uow.commit()
             return result
+
+    async def qualify(self, actor_account_id: int, beatmapset_id: int) -> BeatmapsetStatusState:
+        """Transition a pending beatmapset to qualified."""
+        return await self._transition(
+            actor_account_id, beatmapset_id, BeatmapStatus.QUALIFIED, BeatmapStatusEventSource.QUALIFICATION
+        )
+
+    async def disqualify(
+        self, actor_account_id: int, beatmapset_id: int, reason: str | None = None
+    ) -> BeatmapsetStatusState:
+        """Transition a qualified beatmapset back to pending."""
+        return await self._transition(
+            actor_account_id, beatmapset_id, BeatmapStatus.PENDING, BeatmapStatusEventSource.DISQUALIFICATION, reason
+        )
+
+    async def rank(self, actor_account_id: int, beatmapset_id: int) -> BeatmapsetStatusState:
+        """Transition a qualified beatmapset to ranked."""
+        return await self._transition(
+            actor_account_id, beatmapset_id, BeatmapStatus.RANKED, BeatmapStatusEventSource.RANK
+        )
+
+    async def love(self, actor_account_id: int, beatmapset_id: int) -> BeatmapsetStatusState:
+        """Transition a ranked beatmapset to loved."""
+        return await self._transition(
+            actor_account_id, beatmapset_id, BeatmapStatus.LOVED, BeatmapStatusEventSource.LOVE
+        )
+
+    async def unlove(self, actor_account_id: int, beatmapset_id: int) -> BeatmapsetStatusState:
+        """Transition a loved beatmapset back to ranked."""
+        return await self._transition(
+            actor_account_id, beatmapset_id, BeatmapStatus.RANKED, BeatmapStatusEventSource.UNLOVE
+        )
+
+    async def unrank(self, actor_account_id: int, beatmapset_id: int) -> BeatmapsetStatusState:
+        """Transition a ranked beatmapset to graveyard."""
+        return await self._transition(
+            actor_account_id, beatmapset_id, BeatmapStatus.GRAVEYARD, BeatmapStatusEventSource.GRAVEYARD
+        )
+
+    async def restore_pending(self, actor_account_id: int, beatmapset_id: int) -> BeatmapsetStatusState:
+        """Transition a graveyard beatmapset back to pending."""
+        return await self._transition(
+            actor_account_id, beatmapset_id, BeatmapStatus.PENDING, BeatmapStatusEventSource.GRAVEYARD
+        )
+
+    async def abandon(self, actor_account_id: int, beatmapset_id: int) -> BeatmapsetStatusState:
+        """Transition a wip or pending beatmapset to graveyard."""
+        return await self._transition(
+            actor_account_id, beatmapset_id, BeatmapStatus.GRAVEYARD, BeatmapStatusEventSource.GRAVEYARD
+        )
+
+    async def withdraw(self, actor_account_id: int, beatmapset_id: int) -> BeatmapsetStatusState:
+        """Transition a pending beatmapset back to wip."""
+        return await self._transition(
+            actor_account_id, beatmapset_id, BeatmapStatus.WIP, BeatmapStatusEventSource.GRAVEYARD
+        )
+
+    async def revert_status(self, actor_account_id: int, beatmapset_id: int) -> BeatmapsetStatusState:
+        """Restore the authoritative status to the upstream source status."""
+        _positive("beatmapset_id", beatmapset_id)
+        del actor_account_id
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            state = await repository.get_status_state(beatmapset_id, for_update=True)
+            if state is None:
+                raise BeatmapsetNotFound("beatmapset is unknown")
+            if state.status == state.source_status:
+                await uow.commit()
+                return state
+            effective_at = self._clock.now()
+            await repository.revert_status(
+                state.beatmapset_id, source=BeatmapStatusEventSource.REVERT, effective_at=effective_at
+            )
+            await self._outbox_writer_factory(uow.session).append(
+                _status_changed_event(
+                    state.beatmapset_id,
+                    state.external_beatmapset_id,
+                    state.status,
+                    state.source_status,
+                    BeatmapStatusEventSource.REVERT,
+                    None,
+                    effective_at,
+                )
+            )
+            await uow.commit()
+        return BeatmapsetStatusState(
+            beatmapset_id=state.beatmapset_id,
+            external_beatmapset_id=state.external_beatmapset_id,
+            status=state.source_status,
+            source_status=state.source_status,
+        )
+
+    async def list_status_events(self, beatmapset_id: int) -> tuple[BeatmapsetStatusEventView, ...]:
+        """List a beatmapset's status transitions."""
+        _positive("beatmapset_id", beatmapset_id)
+        async with self._uow_factory() as uow:
+            return await self._repository_factory(uow.session).list_status_events(beatmapset_id)
+
+    async def _transition(
+        self,
+        actor_account_id: int,
+        beatmapset_id: int,
+        target_status: BeatmapStatus,
+        source: BeatmapStatusEventSource,
+        reason: str | None = None,
+    ) -> BeatmapsetStatusState:
+        """Validate and atomically persist one ranking status transition."""
+        _positive("beatmapset_id", beatmapset_id)
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            state = await repository.get_status_state(beatmapset_id, for_update=True)
+            if state is None:
+                raise BeatmapsetNotFound("beatmapset is unknown")
+            current_status = BeatmapStatus(state.status)
+            if current_status == target_status:
+                await uow.commit()
+                return state
+            if not is_valid_transition(state.status, target_status.value):
+                raise InvalidStatusTransition(
+                    f"cannot transition beatmapset from {state.status} to {target_status.value}"
+                )
+            effective_at = self._clock.now()
+            await repository.apply_status_transition(
+                state.beatmapset_id,
+                previous_status=current_status,
+                target_status=target_status,
+                source=source,
+                actor_account_id=actor_account_id,
+                reason=reason,
+                effective_at=effective_at,
+            )
+            await self._outbox_writer_factory(uow.session).append(
+                _status_changed_event(
+                    state.beatmapset_id,
+                    state.external_beatmapset_id,
+                    state.status,
+                    target_status.value,
+                    source,
+                    actor_account_id,
+                    effective_at,
+                )
+            )
+            await uow.commit()
+        return BeatmapsetStatusState(
+            beatmapset_id=state.beatmapset_id,
+            external_beatmapset_id=state.external_beatmapset_id,
+            status=target_status.value,
+            source_status=state.source_status,
+        )
 
 
 class ContentSyncService:
@@ -593,3 +751,31 @@ def _positive(name: str, value: int) -> None:
 def _comment_target(value: str) -> None:
     if value not in {"map", "song", "replay"}:
         raise ContentInputRejected("comment target is invalid")
+
+
+def _status_changed_event(
+    beatmapset_id: int,
+    external_beatmapset_id: int,
+    previous_status: str,
+    status: str,
+    source: BeatmapStatusEventSource,
+    actor_account_id: int | None,
+    effective_at: datetime,
+) -> PendingEvent:
+    return PendingEvent(
+        aggregate_type="beatmapset",
+        aggregate_id=str(beatmapset_id),
+        event_type="content.beatmapset-status-changed.v1",
+        schema_version=1,
+        payload={
+            "beatmapset_id": beatmapset_id,
+            "external_beatmapset_id": external_beatmapset_id,
+            "previous_status": previous_status,
+            "status": status,
+            "source": source.value,
+            "actor_account_id": actor_account_id,
+            "effective_at": effective_at.isoformat(),
+        },
+        consumers=("content-projector.v1",),
+        partition_key=f"beatmapset:{beatmapset_id}",
+    )

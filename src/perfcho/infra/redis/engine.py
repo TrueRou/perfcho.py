@@ -5,11 +5,12 @@ from time import monotonic_ns
 from redis.asyncio import Redis
 
 from perfcho.infra.logging import duration_ms, log_event
-from perfcho.infra.settings import settings
+from perfcho.infra.settings import Settings, settings
 
 
-async def create_state_redis() -> Redis:
+async def create_state_redis(config: Settings | None = None) -> Redis:
     """Create a binary Redis client and fail fast when unavailable."""
+    cfg = config or settings
     started_ns = monotonic_ns()
     log_event(
         "INFO",
@@ -17,10 +18,10 @@ async def create_state_redis() -> Redis:
         endpoint_label="state",
     )
     redis_engine = Redis.from_url(
-        settings.redis_state_url,
+        cfg.redis_state_url,
         decode_responses=False,
-        socket_timeout=settings.redis_socket_timeout,
-        socket_connect_timeout=settings.redis_socket_timeout,
+        socket_timeout=cfg.redis_socket_timeout,
+        socket_connect_timeout=cfg.redis_socket_timeout,
     )
     try:
         await redis_engine.ping()
@@ -39,13 +40,14 @@ async def create_state_redis() -> Redis:
     return redis_engine
 
 
-async def create_cache_redis() -> Redis:
+async def create_cache_redis(config: Settings | None = None) -> Redis:
     """Create the isolated Redis client used by best-effort query caches."""
+    cfg = config or settings
     redis_engine = Redis.from_url(
-        settings.redis_cache_url,
+        cfg.redis_cache_url,
         decode_responses=False,
-        socket_timeout=settings.redis_cache_socket_timeout,
-        socket_connect_timeout=settings.redis_cache_socket_timeout,
+        socket_timeout=cfg.redis_cache_socket_timeout,
+        socket_connect_timeout=cfg.redis_cache_socket_timeout,
     )
     try:
         await redis_engine.ping()
@@ -55,14 +57,15 @@ async def create_cache_redis() -> Redis:
     return redis_engine
 
 
-async def create_bubble_redis() -> Redis:
+async def create_bubble_redis(config: Settings | None = None) -> Redis:
     """Create the isolated client used for best-effort Pub/Sub bubbles."""
+    cfg = config or settings
     redis_engine = Redis.from_url(
-        settings.redis_bubble_url or settings.redis_state_url,
+        cfg.redis_bubble_url or cfg.redis_state_url,
         decode_responses=False,
-        max_connections=settings.redis_bubble_max_connections,
-        socket_timeout=settings.redis_socket_timeout,
-        socket_connect_timeout=settings.redis_socket_timeout,
+        max_connections=cfg.redis_bubble_max_connections,
+        socket_timeout=cfg.redis_socket_timeout,
+        socket_connect_timeout=cfg.redis_socket_timeout,
     )
     try:
         await redis_engine.ping()

@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import event, func, select
 
 from perfcho.infra.db import engine as infra_db
-from perfcho.infra.db.models.content import Beatmap, BeatmapRevision, BeatmapStatusEvent, RatingVote
+from perfcho.infra.db.models.content import Beatmap, BeatmapRevision, BeatmapsetStatusEvent, RatingVote
 from perfcho.infra.db.repositories.content import (
     SqlAlchemyContentRepository,
     _snapshot_beatmap_metadata,
@@ -472,10 +472,10 @@ async def test_content_repository_sync_query_count_is_bounded_and_history_is_res
             assert (
                 await session.scalar(
                     select(func.count())
-                    .select_from(BeatmapStatusEvent)
-                    .where(BeatmapStatusEvent.beatmap_id == first_beatmap_id)
+                    .select_from(BeatmapsetStatusEvent)
+                    .where(BeatmapsetStatusEvent.beatmapset_id == restored_snapshot.external_beatmapset_id)
                 )
-                == 1
+                == 0
             )
 
             stale_result = await repository.synchronize_beatmapset(

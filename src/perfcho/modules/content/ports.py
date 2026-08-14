@@ -3,9 +3,12 @@
 from datetime import datetime
 from typing import Protocol
 
+from perfcho.infra.db.enums import BeatmapStatus, BeatmapStatusEventSource
 from perfcho.modules.common.ports import UnitOfWork
 from perfcho.modules.content.models import (
     BeatmapRevisionView,
+    BeatmapsetStatusEventView,
+    BeatmapsetStatusState,
     BeatmapsetView,
     CommentView,
     ContentSearch,
@@ -124,6 +127,38 @@ class ContentRepository(Protocol):
         error: str,
     ) -> None:
         """Record one failed refresh and its bounded retry time."""
+        ...
+
+    async def get_status_state(self, external_beatmapset_id: int, *, for_update: bool) -> BeatmapsetStatusState | None:
+        """Return one beatmapset's authoritative and upstream status, optionally locking it."""
+        ...
+
+    async def apply_status_transition(
+        self,
+        beatmapset_id: int,
+        previous_status: BeatmapStatus,
+        target_status: BeatmapStatus,
+        *,
+        source: BeatmapStatusEventSource,
+        actor_account_id: int | None,
+        reason: str | None,
+        effective_at: datetime,
+    ) -> None:
+        """Persist one status transition and its event inside the caller-owned transaction."""
+        ...
+
+    async def revert_status(
+        self,
+        beatmapset_id: int,
+        *,
+        source: BeatmapStatusEventSource,
+        effective_at: datetime,
+    ) -> None:
+        """Restore the authoritative status to the upstream source status."""
+        ...
+
+    async def list_status_events(self, external_beatmapset_id: int) -> tuple[BeatmapsetStatusEventView, ...]:
+        """List a beatmapset's status transitions in chronological order."""
         ...
 
 

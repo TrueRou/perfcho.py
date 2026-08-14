@@ -223,6 +223,7 @@ async def test_postgres_multiplayer_lifecycle_and_known_map_attempts(postgres_da
                 artist="Artist",
                 title="Title",
                 status=BeatmapStatus.RANKED,
+                source_status=BeatmapStatus.RANKED,
                 available=True,
             )
             session.add(beatmapset)
@@ -233,7 +234,6 @@ async def test_postgres_multiplayer_lifecycle_and_known_map_attempts(postgres_da
                 external_id=100,
                 ruleset=DbRuleset.OSU,
                 difficulty_name="Hard",
-                status=BeatmapStatus.RANKED,
             )
             session.add(beatmap)
             await session.flush()
@@ -403,6 +403,7 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
                 artist="Artist",
                 title="Projection",
                 status=BeatmapStatus.RANKED,
+                source_status=BeatmapStatus.RANKED,
                 available=True,
             )
             session.add(beatmapset)
@@ -413,7 +414,6 @@ async def test_postgres_multiplayer_results_handle_normal_late_duplicate_and_abo
                 external_id=100,
                 ruleset=DbRuleset.OSU,
                 difficulty_name="Hard",
-                status=BeatmapStatus.RANKED,
             )
             session.add(beatmap)
             await session.flush()

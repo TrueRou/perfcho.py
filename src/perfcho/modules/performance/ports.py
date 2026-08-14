@@ -1,5 +1,6 @@
 """Define transaction and calculator ports for performance workflows."""
 
+import uuid
 from typing import Protocol
 
 from perfcho.modules.common.ports import UnitOfWork
@@ -10,6 +11,7 @@ from perfcho.modules.performance.models import (
     PerformanceResult,
     ScorePerformanceView,
 )
+from perfcho.modules.scoring.models import Ruleset
 
 
 class PerformanceUnitOfWork(UnitOfWork, Protocol):
@@ -56,4 +58,35 @@ class PerformanceQueryRepositoryFactory(Protocol):
 
     def __call__(self, session: object) -> PerformanceQueryRepository:
         """Return a transaction-bound query repository."""
+        ...
+
+
+class DifficultyRepository(Protocol):
+    """Read the active difficulty release and persist deterministic attributes."""
+
+    async def active_difficulty_release(self, ruleset: Ruleset) -> dict[str, object] | None:
+        """Return the newest active difficulty release metadata for one ruleset."""
+        ...
+
+    async def get(
+        self,
+        *,
+        beatmap_revision_id: int,
+        ruleset: Ruleset,
+        mods_digest: bytes,
+        release_id: uuid.UUID,
+    ) -> DifficultyCalculationResult | None:
+        """Return a persisted difficulty result, or None when absent."""
+        ...
+
+    async def put(self, request: DifficultyRequest, result: DifficultyCalculationResult) -> None:
+        """Idempotently persist one deterministic difficulty result."""
+        ...
+
+
+class DifficultyRepositoryFactory(Protocol):
+    """Bind difficulty persistence to one caller-owned transaction."""
+
+    def __call__(self, session: object) -> DifficultyRepository:
+        """Return a transaction-bound difficulty repository."""
         ...

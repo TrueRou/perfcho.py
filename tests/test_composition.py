@@ -55,7 +55,7 @@ async def test_stable_composition_wires_independent_security_keys() -> None:
             "quit",
             "help",
         }
-        assert {group.name for group in services.bot.registry.get_groups()} == {"mp", "pool", "clan"}
+        assert {group.name for group in services.bot.registry.get_groups()} == {"mp", "pool", "clan", "content"}
         assert services.identity._token_hmac_key == token_key.encode()
         assert services.identity._client_session_stale_grace == timedelta(seconds=180)
         assert services.multiplayer is not None

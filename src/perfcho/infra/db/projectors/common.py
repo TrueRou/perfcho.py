@@ -3,6 +3,7 @@
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from typing import cast
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
@@ -16,6 +17,8 @@ from perfcho.infra.db.models.community import (
 )
 from perfcho.infra.db.models.core import Account
 from perfcho.infra.db.models.events import ActivityEvent, OutboxEvent, ProjectionCheckpoint
+from perfcho.infra.db.repositories.outbox import append_outbox_event
+from perfcho.modules.common.models import JsonValue, PendingEvent
 
 
 def require_event_context(
@@ -231,6 +234,26 @@ async def project_notification(
                     )
                 )
             )
+    await append_outbox_event(
+        session,
+        PendingEvent(
+            aggregate_type="notification",
+            aggregate_id=str(notification_id),
+            event_type="community.notification-created.v1",
+            schema_version=1,
+            payload={
+                "notification_id": notification_id,
+                "recipient_account_ids": list(recipients),
+                "kind": kind,
+                "category": category,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "payload": cast(dict[str, JsonValue], dict(payload)),
+            },
+            consumers=("notification-realtime-projector.v1",),
+            partition_key=f"notification:{notification_id}",
+        ),
+    )
     return notification_id
 
 

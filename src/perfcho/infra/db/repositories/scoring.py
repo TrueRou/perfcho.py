@@ -30,7 +30,7 @@ from perfcho.infra.db.enums import (
     ScoreOutcome as DbScoreOutcome,
 )
 from perfcho.infra.db.idempotency import CommandReceiptRepository, ReceiptClaim, ReceiptClaimState
-from perfcho.infra.db.models.content import Beatmap, BeatmapRevision
+from perfcho.infra.db.models.content import Beatmap, BeatmapRevision, Beatmapset
 from perfcho.infra.db.models.core import Account, AccountName
 from perfcho.infra.db.models.moderation import Sanction
 from perfcho.infra.db.models.multiplayer import (
@@ -125,11 +125,12 @@ class SqlAlchemyScoringRepository:
                 Beatmap.id,
                 BeatmapRevision.id.label("revision_id"),
                 Beatmap.ruleset,
-                Beatmap.status,
+                Beatmapset.status,
                 BeatmapRevision.object_count,
                 BeatmapRevision.max_combo,
             )
             .join(BeatmapRevision, BeatmapRevision.beatmap_id == Beatmap.id)
+            .join(Beatmapset, Beatmapset.id == Beatmap.beatmapset_id)
             .where(BeatmapRevision.is_current.is_(True), Beatmap.deleted_at.is_(None))
         )
         if reference.beatmap_id is not None:

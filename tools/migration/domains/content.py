@@ -20,11 +20,9 @@ from perfcho.infra.db.models.content import (
     BeatmapRevision,
     Beatmapset,
     BeatmapsetFavourite,
-    BeatmapStatusEvent,
+    BeatmapsetSyncState,
     Comment,
     ContentSource,
-    ContentSyncState,
-    MapStatusRequest,
     RatingVote,
 )
 from perfcho.infra.db.models.core import MediaAsset
@@ -54,7 +52,6 @@ _PHASE_MAPSETS = "content.mapsets"
 _PHASE_MAPS = "content.maps"
 _PHASE_FAVOURITES = "content.favourites"
 _PHASE_RATINGS = "content.ratings"
-_PHASE_MAP_REQUESTS = "content.map_requests"
 _PHASE_COMMENTS = "content.comments"
 _COLOR = re.compile(r"[0-9A-Fa-f]{6}")
 
@@ -80,7 +77,6 @@ class _StagedMap:
     status: BeatmapStatus
     ruleset: Ruleset
     difficulty_name: str
-    status_locked: bool
     file_name: str
     source_updated_at: datetime
     total_length_ms: int
@@ -108,7 +104,6 @@ async def migrate_content(runtime: MigrationRuntime) -> None:
     await _populate_content_mappings(runtime)
     await _migrate_favourites(runtime)
     await _migrate_ratings(runtime)
-    await _migrate_map_requests(runtime)
     await _migrate_comments(runtime)
 
 
@@ -367,57 +362,6 @@ async def _migrate_ratings(runtime: MigrationRuntime) -> None:
     )
 
 
-async def _migrate_map_requests(runtime: MigrationRuntime) -> None:
-    async def handler(session: AsyncSession, rows: list[SourceRow]) -> None:
-        for row in rows:
-            try:
-                source_id = _positive(row, "id")
-                source_map_id = _positive(row, "map_id")
-                source_account_id = _positive(row, "player_id")
-                beatmap_id = runtime.mappings.beatmaps.get(source_map_id)
-                account_id = runtime.mappings.accounts.get(source_account_id)
-                if beatmap_id is None:
-                    _dependency_missing(runtime, _PHASE_MAP_REQUESTS, "map_request", source_id, "map", source_map_id)
-                    continue
-                if account_id is None:
-                    _dependency_missing(
-                        runtime, _PHASE_MAP_REQUESTS, "map_request", source_id, "account", source_account_id
-                    )
-                    continue
-                active = _boolean(row["active"], "map request active")
-                created_at = aware_datetime(
-                    row["datetime"], runtime.config.source_timezone, fallback=runtime.started_at
-                )
-                statement = insert(MapStatusRequest).values(
-                    id=runtime.ids.make("map-status-request", source_id),
-                    beatmap_id=beatmap_id,
-                    requester_account_id=account_id,
-                    requested_status=BeatmapStatus.RANKED,
-                    status="open" if active else "closed",
-                    reason="Migrated from bancho.py map_requests.",
-                    created_at=created_at,
-                )
-                await session.execute(statement.on_conflict_do_nothing())
-                runtime.report.increment(_PHASE_MAP_REQUESTS, "merged")
-            except (KeyError, TypeError, ValueError) as error:
-                _diagnose(
-                    runtime,
-                    _PHASE_MAP_REQUESTS,
-                    "map_request_invalid",
-                    error,
-                    "map_request",
-                    row.get("id"),
-                )
-
-    await run_batched_phase(
-        runtime,
-        phase=_PHASE_MAP_REQUESTS,
-        table="map_requests",
-        key="id",
-        handler=handler,
-    )
-
-
 async def _migrate_comments(runtime: MigrationRuntime) -> None:
     async def handler(session: AsyncSession, rows: list[SourceRow]) -> None:
         for row in rows:
@@ -516,6 +460,7 @@ async def _persist_mapset(session: AsyncSession, metadata: _SetMetadata) -> tupl
             title=metadata.title,
             tags="",
             status=metadata.status,
+            source_status=metadata.status,
             last_source_update_at=metadata.last_source_update_at,
             available=True,
             nsfw=False,
@@ -534,14 +479,13 @@ async def _persist_mapset(session: AsyncSession, metadata: _SetMetadata) -> tupl
         )
     if beatmapset_id is None:
         raise RuntimeError("target-first mapset merge did not resolve an identity")
-    sync_statement = insert(ContentSyncState).values(
+    sync_statement = insert(BeatmapsetSyncState).values(
         beatmapset_id=beatmapset_id,
         last_checked_at=metadata.last_checked_at,
         next_check_at=metadata.last_checked_at + timedelta(hours=24),
-        unchanged_count=0,
         error_count=0,
     )
-    await session.execute(sync_statement.on_conflict_do_nothing(index_elements=(ContentSyncState.beatmapset_id,)))
+    await session.execute(sync_statement.on_conflict_do_nothing(index_elements=(BeatmapsetSyncState.beatmapset_id,)))
     return beatmapset_id, created
 
 
@@ -562,7 +506,6 @@ def _stage_map(
         status=beatmap_status(row["status"]),
         ruleset=source_ruleset(row["mode"]),
         difficulty_name=_text(row["version"], "difficulty name", maximum=255),
-        status_locked=_boolean(row["frozen"], "frozen"),
         file_name=_file_name(row["filename"]),
         source_updated_at=aware_datetime(
             row["last_update"], runtime.config.source_timezone, fallback=runtime.started_at
@@ -595,31 +538,17 @@ async def _persist_map(
             external_id=item.external_id,
             ruleset=item.ruleset,
             difficulty_name=item.difficulty_name,
-            status=item.status,
-            status_locked=item.status_locked,
         )
         .on_conflict_do_nothing(index_elements=(Beatmap.source_id, Beatmap.external_id))
         .returning(Beatmap.id)
     )
     beatmap_id = await session.scalar(map_statement)
-    created_map = beatmap_id is not None
     if beatmap_id is None:
         beatmap_id = await session.scalar(
             select(Beatmap.id).where(Beatmap.source_id == source_id, Beatmap.external_id == item.external_id)
         )
     if beatmap_id is None:
         raise RuntimeError("target-first map merge did not resolve an identity")
-    if created_map:
-        session.add(
-            BeatmapStatusEvent(
-                beatmap_id=beatmap_id,
-                previous_status=None,
-                status=item.status,
-                source="migration",
-                reason=f"Imported by migration {runtime.config.migration_id}"[:255],
-                effective_at=item.source_updated_at,
-            )
-        )
 
     asset_id = await _ensure_media_asset(runtime, session, item.stored_object)
     existing = (

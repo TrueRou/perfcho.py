@@ -36,7 +36,7 @@ from perfcho.infra.db.models.scoring import (
     RankingPolicy,
 )
 from perfcho.infra.security.tokens import digest_opaque_token
-from perfcho.infra.settings import settings
+from perfcho.infra.settings import Settings, settings
 
 STABLE_PROTOCOL_VERSION = 19
 
@@ -327,7 +327,7 @@ async def _seed_identity(session: AsyncSession) -> None:
     )
 
 
-async def _seed_access_catalog(session: AsyncSession) -> None:
+async def _seed_access_catalog(session: AsyncSession, config: Settings) -> None:
     await _upsert_catalog(
         session,
         Scope.__table__,
@@ -370,7 +370,7 @@ async def _seed_access_catalog(session: AsyncSession) -> None:
             client_id=lazer_client_id,
             secret_digest=digest_opaque_token(
                 _LAZER_CLIENT_SECRET,
-                key=settings.token_hmac_key.get_secret_value().encode(),
+                key=config.token_hmac_key.get_secret_value().encode(),
             ),
             secret_prefix=_LAZER_CLIENT_SECRET[:16],
             created_at=_BOOTSTRAP_EPOCH,
@@ -383,7 +383,7 @@ async def _seed_access_catalog(session: AsyncSession) -> None:
                 "client_id": lazer_client_id,
                 "secret_digest": digest_opaque_token(
                     _LAZER_CLIENT_SECRET,
-                    key=settings.token_hmac_key.get_secret_value().encode(),
+                    key=config.token_hmac_key.get_secret_value().encode(),
                 ),
                 "secret_prefix": _LAZER_CLIENT_SECRET[:16],
                 "expires_at": None,
@@ -625,12 +625,13 @@ async def _seed_content_source(session: AsyncSession) -> None:
     )
 
 
-async def bootstrap_database(session_factory: DbSessionFactory) -> None:
+async def bootstrap_database(session_factory: DbSessionFactory, config: Settings | None = None) -> None:
     """Idempotently install records required by every runtime process."""
+    cfg = config or settings
     async with session_factory.begin() as session:
         await acquire_transaction_lock(session, "database-bootstrap", _BOOTSTRAP_VERSION)
         await _seed_identity(session)
-        await _seed_access_catalog(session)
+        await _seed_access_catalog(session, cfg)
         await _seed_scoring_catalog(session)
         await _seed_community_catalog(session)
         await _seed_content_source(session)

@@ -117,7 +117,7 @@ class BanchoUpstreamContentSource:
             digest = bytes.fromhex(checksum)
         except ValueError as error:
             raise ValueError("beatmap checksum must be hexadecimal") from error
-        if len(checksum) != 32 or len(digest) != 16:
+        if len(digest) != 16:
             raise ValueError("beatmap checksum must contain 32 hexadecimal characters")
         if not file_name or len(file_name) > 255:
             raise ValueError("beatmap filename is invalid")

@@ -25,3 +25,9 @@ class UpstreamContentUnavailable(DependencyUnavailable):
     """Indicate that authoritative upstream metadata or files cannot be fetched."""
 
     code = "upstream_content_unavailable"
+
+
+class InvalidStatusTransition(ContentInputRejected):
+    """Reject a ranking status change that violates the state machine."""
+
+    code = "invalid_status_transition"

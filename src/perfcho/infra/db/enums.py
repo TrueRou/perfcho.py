@@ -96,6 +96,20 @@ class BeatmapStatus(StrEnum):
     LOVED = "loved"
 
 
+class BeatmapStatusEventSource(StrEnum):
+    """Describe the actor behind a beatmapset status transition."""
+
+    UPSTREAM_SYNC = "upstream_sync"
+    QUALIFICATION = "qualification"
+    DISQUALIFICATION = "disqualification"
+    RANK = "rank"
+    LOVE = "love"
+    UNLOVE = "unlove"
+    GRAVEYARD = "graveyard"
+    REVERT = "revert"
+    MIGRATION = "migration"
+
+
 class ScoreOutcome(StrEnum):
     """Record whether a play ended, failed, or passed."""
 

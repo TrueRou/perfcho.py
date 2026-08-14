@@ -30,12 +30,12 @@ from perfcho.api.stable.realtime import (
     channel_info_end,
     friends_list,
     login_reply,
-    notification,
     privileges,
     protocol_version,
     restart,
     send_message,
     silence_end,
+    toast,
 )
 from perfcho.api.stable.realtime.countries import stable_country_id
 from perfcho.infra.compose import StableServices
@@ -123,7 +123,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
                 duration_ms=duration_ms(started_ns),
             )
         return _binary_response(
-            notification(str(error)) + login_reply(reason),
+            toast(str(error)) + login_reply(reason),
             token="invalid-request",
         )
 
@@ -168,7 +168,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
                 duration_ms=duration_ms(started_ns),
             )
         return _binary_response(
-            notification("Authentication failed.") + login_reply(LoginFailureReason.AUTHENTICATION_FAILED),
+            toast("Authentication failed.") + login_reply(LoginFailureReason.AUTHENTICATION_FAILED),
             token="invalid-credentials",
         )
     except SessionAlreadyActive as error:
@@ -183,7 +183,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             duration_ms=duration_ms(started_ns),
         )
         return _binary_response(
-            login_reply(LoginFailureReason.AUTHENTICATION_FAILED) + notification("You are already logged in."),
+            login_reply(LoginFailureReason.AUTHENTICATION_FAILED) + toast("You are already logged in."),
             token="already-logged-in",
         )
 
@@ -337,7 +337,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
                 protocol_version(services.settings.stable_protocol_version),
                 login_reply(result.account_id),
                 privileges(int(stable_privileges)),
-                notification(services.settings.stable_welcome_notification),
+                toast(services.settings.stable_welcome_notification),
                 *channel_packets,
                 channel_info_end(),
                 friends_list(friend_ids),
@@ -377,7 +377,7 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             duration_ms=duration_ms(started_ns),
         )
         return _binary_response(
-            login_reply(LoginFailureReason.ERROR) + notification("The server has reached its online capacity."),
+            login_reply(LoginFailureReason.ERROR) + toast("The server has reached its online capacity."),
             token="server-full",
         )
     except BaseException as error:
@@ -402,7 +402,7 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
         identity = await services.identity.touch_client_session(raw_token)
     except InvalidSession as error:
         _log_invalid_poll_session("touch_identity", error)
-        return _binary_response(notification("Session expired. Please reconnect.") + restart(0))
+        return _binary_response(toast("Session expired. Please reconnect.") + restart(0))
 
     try:
         realtime = await services.realtime.resolve_session(identity.session_id, at=now)
@@ -798,7 +798,7 @@ async def _realtime_lost(
             error_code=getattr(cleanup_error, "code", "cleanup_failed"),
             error_type=type(cleanup_error).__name__,
         )
-    return _binary_response(notification("Session state was lost. Please reconnect.") + restart(0))
+    return _binary_response(toast("Session state was lost. Please reconnect.") + restart(0))
 
 
 def _log_invalid_poll_session(stage: str, error: InvalidSession) -> None:
@@ -815,7 +815,7 @@ def _log_invalid_poll_session(stage: str, error: InvalidSession) -> None:
 
 
 def _protocol_failure(message: str) -> Response:
-    return _binary_response(notification(message) + restart(0))
+    return _binary_response(toast(message) + restart(0))
 
 
 def _binary_response(payload: bytes, *, token: str | None = None) -> Response:

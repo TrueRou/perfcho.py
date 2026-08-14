@@ -38,7 +38,7 @@ from perfcho.api.stable.realtime import (
     build_packet,
     channel_info,
     login_reply,
-    notification,
+    toast,
     pong,
     send_message,
     spectate_frames,
@@ -182,7 +182,7 @@ def test_packet_enum_inventory_is_complete_and_numeric() -> None:
 def test_exact_core_packet_bytes() -> None:
     assert pong() == b"\x08\x00\x00\x00\x00\x00\x00"
     assert login_reply(42) == b"\x05\x00\x00\x04\x00\x00\x00\x2a\x00\x00\x00"
-    assert notification("hi") == b"\x18\x00\x00\x04\x00\x00\x00\x0b\x02hi"
+    assert toast("hi") == b"\x18\x00\x00\x04\x00\x00\x00\x0b\x02hi"
     assert build_packet(0x1234, b"abc") == b"\x34\x12\x00\x03\x00\x00\x00abc"
 
 

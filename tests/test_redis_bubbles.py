@@ -15,11 +15,11 @@ from perfcho.infra.redis.bubbles import (
     encode_bubble,
 )
 from perfcho.modules.realtime import (
-    NotificationBubble,
     RealtimeBubbleBus,
     RealtimeBubbleSubscription,
     RealtimePollGate,
     SessionFence,
+    ToastBubble,
 )
 
 
@@ -46,8 +46,8 @@ async def test_subscribe_propagates_group_creation_failure() -> None:
 
 async def test_subscription_reads_pending_then_new_entries_and_acknowledges_returned_entries() -> None:
     redis = MagicMock()
-    pending = NotificationBubble("pending")
-    new = NotificationBubble("new")
+    pending = ToastBubble("pending")
+    new = ToastBubble("new")
     redis.xreadgroup = AsyncMock(
         side_effect=[
             [[b"stream", [(b"0-0", {b"payload": encode_bubble(pending)})]]],
@@ -78,29 +78,29 @@ async def test_real_redis_stream_is_fenced_ordered_durable_and_acknowledged() ->
     subscriber = RedisRealtimeBubbleBus(subscriber_redis, prefix=prefix)
     publisher = RedisRealtimeBubbleBus(publisher_redis, prefix=prefix)
     try:
-        assert await publisher.publish(fence, NotificationBubble("queued")) == 1
+        assert await publisher.publish(fence, ToastBubble("queued")) == 1
         async with subscriber.subscribe(fence) as subscription:
             assert isinstance(subscription, RealtimeBubbleSubscription)
-            assert await subscription.receive(timeout=1) == NotificationBubble("queued")
+            assert await subscription.receive(timeout=1) == ToastBubble("queued")
             await subscription.acknowledge()
-            assert await publisher.publish(other_revision, NotificationBubble("isolated")) == 1
-            await publisher.publish(fence, NotificationBubble("one"))
-            await publisher.publish(fence, NotificationBubble("two"))
-            assert await subscription.receive(timeout=1) == NotificationBubble("one")
-            assert await subscription.receive(timeout=1) == NotificationBubble("two")
+            assert await publisher.publish(other_revision, ToastBubble("isolated")) == 1
+            await publisher.publish(fence, ToastBubble("one"))
+            await publisher.publish(fence, ToastBubble("two"))
+            assert await subscription.receive(timeout=1) == ToastBubble("one")
+            assert await subscription.receive(timeout=1) == ToastBubble("two")
             await subscription.acknowledge()
             assert await subscription.receive(timeout=0.01) is None
             second_fence = SessionFence(uuid.uuid7(), 1)
             async with subscriber.subscribe(second_fence) as second_subscription:
-                bubble = NotificationBubble("fanout")
+                bubble = ToastBubble("fanout")
                 assert await publisher.publish_many((fence, second_fence), bubble) == 2
                 assert await subscription.receive(timeout=1) == bubble
                 assert await second_subscription.receive(timeout=1) == bubble
                 await subscription.acknowledge()
                 await second_subscription.acknowledge()
-        assert await publisher.publish(fence, NotificationBubble("after-close")) == 1
+        assert await publisher.publish(fence, ToastBubble("after-close")) == 1
         async with subscriber.subscribe(fence) as resumed:
-            assert await resumed.receive(timeout=1) == NotificationBubble("after-close")
+            assert await resumed.receive(timeout=1) == ToastBubble("after-close")
             await resumed.acknowledge()
     finally:
         await subscriber_redis.aclose()

@@ -20,7 +20,6 @@ from perfcho.modules.realtime import (
     MultiplayerSignalBubble,
     MultiplayerSignalKind,
     MultiplayerSlotSnapshot,
-    NotificationBubble,
     PlayerActivity,
     PlayerStatistics,
     PresenceIdentity,
@@ -32,6 +31,7 @@ from perfcho.modules.realtime import (
     SpectatorFrameAction,
     SpectatorFrameBubble,
     SpectatorLifecycleBubble,
+    ToastBubble,
     UserLogoutBubble,
     presence_updated_bubble,
 )
@@ -92,7 +92,7 @@ BUBBLES = (
         CanonicalScoreFrame(123, 0, 1, 2, 3, 4, 5, 6, 1000, 20, 10, False, 200, 0, False),
         1,
     ),
-    NotificationBubble("notice"),
+    ToastBubble("notice"),
     SessionControlBubble(SessionControlAction.RECONNECT, 250),
 )
 
@@ -178,7 +178,7 @@ def test_models_preserve_canonical_collections() -> None:
 
 def test_session_ids_remain_transport_metadata_not_bubble_body() -> None:
     marker = uuid.uuid7().bytes
-    assert marker not in encode_bubble(NotificationBubble("safe"))
+    assert marker not in encode_bubble(ToastBubble("safe"))
 
 
 def test_presence_bubble_factory_copies_complete_canonical_snapshot() -> None:

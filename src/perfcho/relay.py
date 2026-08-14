@@ -69,7 +69,7 @@ class ReferenceLogFields(TypedDict):
 
 async def run_relay() -> None:
     """Create relay resources and supervise notification and delivery loops."""
-    db_engine = await infra_db.create_engine()
+    db_engine = await infra_db.create_engine(settings)
     session_factory = infra_db.create_session_factory(db_engine)
     owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
     wakeup = asyncio.Event()

@@ -24,8 +24,8 @@ from perfcho.api.stable.realtime.builders import (
     channel_join,
     channel_kick,
     friends_list,
-    notification,
     target_is_silenced,
+    toast,
     user_dm_blocked,
     user_stats,
 )
@@ -67,7 +67,6 @@ from perfcho.modules.realtime import (
     MultiplayerRoomBubble,
     MultiplayerSignalBubble,
     MultiplayerSignalKind,
-    NotificationBubble,
     PresenceSnapshot,
     PresenceSubscription,
     RealtimeBubble,
@@ -83,6 +82,7 @@ from perfcho.modules.realtime import (
     SpectatorHostOffline,
     SpectatorLifecycleBubble,
     SpectatorRelation,
+    ToastBubble,
     UserLogoutBubble,
     multiplayer_room_snapshot,
     presence_updated_bubble,
@@ -121,7 +121,7 @@ async def dispatch_packets(
         outcome = "realtime_fenced"
         context.local_bubbles.extend(
             (
-                NotificationBubble("Session state changed. Please reconnect."),
+                ToastBubble("Session state changed. Please reconnect."),
                 SessionControlBubble(SessionControlAction.RECONNECT),
             )
         )
@@ -139,7 +139,7 @@ async def dispatch_packets(
     except ApplicationError as error:
         dispatch_error = error
         outcome = "application_rejected"
-        context.local_bubbles.append(NotificationBubble("The request could not be completed."))
+        context.local_bubbles.append(ToastBubble("The request could not be completed."))
         output = b""
         if rate_limit(f"stable-packet-rejected:{error.code}", interval_seconds=5):
             log_event(
@@ -351,7 +351,7 @@ async def _dispatch_packets(
                 except ApplicationError:
                     _extend_response(
                         output,
-                        notification("The private-message policy could not be updated."),
+                        toast("The private-message policy could not be updated."),
                         response_limit,
                     )
         elif packet_type is ClientPacket.FRIEND_ADD:
@@ -673,7 +673,7 @@ async def _join_channel(name: str, context: StableRuntimeContext, services: Stab
         if _is_lobby_channel(name):
             members = await services.realtime.list_channel_members(channel.channel_id)
             if context.identity.account_id not in members:
-                return notification("Use the multiplayer lobby to join #lobby.")
+                return toast("Use the multiplayer lobby to join #lobby.")
         else:
             await services.realtime.join_channel(
                 channel.channel_id,
@@ -839,12 +839,12 @@ async def _send_multiplayer_message(
         return channel_kick("#multiplayer")
     if len(content) > 2000:
         _log_message_state("multiplayer", "rejected", context.identity.account_id, message_length=len(content))
-        return notification("The message is invalid.")
+        return toast("The message is invalid.")
     if services.community is not None:
         silence_remaining = await services.community.get_global_silence_remaining_seconds(context.identity.account_id)
         if silence_remaining > 0:
             _log_message_state("multiplayer", "silenced", context.identity.account_id, message_length=len(content))
-            return notification("You cannot send messages while silenced.")
+            return toast("You cannot send messages while silenced.")
     try:
         state = await services.multiplayer.find_room_for_account(context.identity.account_id)
     except ApplicationError as error:
@@ -855,7 +855,7 @@ async def _send_multiplayer_message(
             message_length=len(content),
             error=error,
         )
-        return notification("The multiplayer channel is unavailable.")
+        return toast("The multiplayer channel is unavailable.")
     if state is None:
         _log_message_state("multiplayer", "not_joined", context.identity.account_id, message_length=len(content))
         return channel_kick("#multiplayer")
@@ -926,7 +926,7 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
             message_length=len(content),
             error=error,
         )
-        return notification("The direct-message recipient does not exist.")
+        return toast("The direct-message recipient does not exist.")
     except (DirectMessageBlocked, PrivateMessageRejected) as error:
         _log_message_state(
             "direct",
@@ -953,7 +953,7 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
             message_length=len(content),
             error=error,
         )
-        return notification("You cannot send messages while silenced.")
+        return toast("You cannot send messages while silenced.")
     except ApplicationError as error:
         _log_message_state(
             "direct",
@@ -962,7 +962,7 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
             message_length=len(content),
             error=error,
         )
-        return notification("The direct message could not be sent.")
+        return toast("The direct message could not be sent.")
 
     if services.bot is not None and target.account_id == services.bot.bot_account_id:
         return await _execute_bot_command(
@@ -1000,7 +1000,7 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
             message_length=len(content),
             recipient_count=1,
         )
-        return notification(f"{target.display_name} is offline and will receive your message on their next login.")
+        return toast(f"{target.display_name} is offline and will receive your message on their next login.")
     if not await _publish_to_presence(target_presence, bubble, services):
         _log_message_state(
             "direct",
@@ -1009,7 +1009,7 @@ async def _send_private_message(message: Message, context: StableRuntimeContext,
             message_length=len(content),
             recipient_count=1,
         )
-        return notification("The recipient is temporarily unable to receive messages.")
+        return toast("The recipient is temporarily unable to receive messages.")
 
     if target_presence.activity.action == "away":
         away_message = await services.realtime.get_away_message(target.account_id)
@@ -1215,26 +1215,26 @@ def _is_multiplayer_channel(name: str) -> bool:
 
 def _channel_error_response(error: ApplicationError) -> bytes:
     if isinstance(error, ChannelNotFound):
-        return notification("Channel is unavailable.")
+        return toast("Channel is unavailable.")
     if isinstance(error, (ChannelAccessDenied, ChannelMembershipUnavailable)):
-        return notification("The channel cannot be joined right now.")
-    return notification("The channel request could not be completed.")
+        return toast("The channel cannot be joined right now.")
+    return toast("The channel request could not be completed.")
 
 
 def _public_message_error_response(error: ApplicationError) -> bytes:
     if isinstance(error, AccountSilenced):
-        return notification("You cannot send messages while silenced.")
+        return toast("You cannot send messages while silenced.")
     if isinstance(error, ChannelNotFound):
-        return notification("Channel is unavailable.")
+        return toast("Channel is unavailable.")
     if isinstance(error, ChannelMembershipRequired):
-        return notification("Join the channel before sending messages.")
+        return toast("Join the channel before sending messages.")
     if isinstance(error, ChannelAccessDenied):
-        return notification("You are not allowed to send messages to this channel.")
+        return toast("You are not allowed to send messages to this channel.")
     if isinstance(error, CommunityInputRejected):
-        return notification("The message is invalid.")
+        return toast("The message is invalid.")
     if isinstance(error, MessageIdempotencyConflict):
-        return notification("The message could not be retried safely.")
-    return notification("The message could not be sent.")
+        return toast("The message could not be retried safely.")
+    return toast("The message could not be sent.")
 
 
 async def _broadcast_channel_count(
@@ -1364,7 +1364,7 @@ async def _logout(context: StableRuntimeContext, services: StableServices) -> by
                 error_code=error.code,
                 error_type=type(error).__name__,
             )
-            output.extend(notification("Multiplayer presence cleanup could not be completed."))
+            output.extend(toast("Multiplayer presence cleanup could not be completed."))
     if context.raw_token is not None:
         durable_session_outcome = "closed"
         try:
@@ -1380,7 +1380,7 @@ async def _logout(context: StableRuntimeContext, services: StableServices) -> by
                 error_code=error.code,
                 error_type=type(error).__name__,
             )
-            output.extend(notification("The durable session could not be closed cleanly."))
+            output.extend(toast("The durable session could not be closed cleanly."))
     try:
         await services.realtime.fence_session(
             context.identity.session_id,
@@ -1446,11 +1446,11 @@ async def _change_friend(
     except SocialAccountNotFound, SocialInteractionBlocked, SocialRelationRejected:
         pass
     except ApplicationError:
-        return notification("The friend list could not be updated.")
+        return toast("The friend list could not be updated.")
     try:
         friends = await services.social.list_friends(context.identity.account_id)
     except ApplicationError:
-        return notification("The friend list could not be loaded.")
+        return toast("The friend list could not be loaded.")
     capacity = min(
         services.settings.stable_presence_batch_size,
         max(0, (max_bytes - 9) // 4),

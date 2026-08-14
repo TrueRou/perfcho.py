@@ -78,8 +78,8 @@ def friends_list(user_ids: Collection[int], *, limits: CodecLimits = DEFAULT_LIM
     return _build(ServerPacket.FRIENDS_LIST, lambda writer: writer.write_i32_list_u16(user_ids), limits=limits)
 
 
-def notification(text: str, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
-    """Build an in-client notification packet."""
+def toast(text: str, *, limits: CodecLimits = DEFAULT_LIMITS) -> bytes:
+    """Build an in-client toast packet."""
     return _build(ServerPacket.NOTIFICATION, lambda writer: writer.write_string(text), limits=limits)
 
 

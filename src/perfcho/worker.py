@@ -1,11 +1,12 @@
 """Compose the Taskiq worker process and execute durable deliveries."""
 
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from time import monotonic_ns
 from typing import Annotated, Literal, TypedDict, cast
 
 import httpx
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from taskiq import Context, TaskiqDepends, TaskiqEvents, TaskiqState
 
@@ -15,7 +16,7 @@ from perfcho.infra.db import engine as infra_db
 from perfcho.infra.db.base import DbSessionFactory
 from perfcho.infra.db.enums import OutboxDeliveryStatus
 from perfcho.infra.db.models.events import OutboxDelivery, OutboxEvent
-from perfcho.infra.db.projectors import ranking
+from perfcho.infra.db.projectors import notification, ranking
 from perfcho.infra.db.projectors.catalog import ConsumerCatalog, build_consumer_catalog
 from perfcho.infra.db.projectors.performance import PerformanceProjector
 from perfcho.infra.db.repositories.outbox_delivery import (
@@ -27,6 +28,8 @@ from perfcho.infra.db.repositories.outbox_delivery import (
     _retry_delay,
 )
 from perfcho.infra.redis import engine as infra_redis
+from perfcho.infra.redis.bubbles import RedisRealtimeBubbleBus
+from perfcho.infra.redis.realtime import RedisRealtimeStateRepository
 from perfcho.infra.settings import settings
 from perfcho.infra.storage import S3ObjectStorage
 from perfcho.infra.tracing import trace_context
@@ -51,12 +54,16 @@ class _WorkerResources:
         http_client: httpx.AsyncClient,
         cache: RedisCache,
         started_ns: int,
+        state_redis: Redis | None = None,
+        bubble_redis: Redis | None = None,
     ) -> None:
         """Store worker-owned resources."""
         self.db_engine = db_engine
         self.http_client = http_client
         self.cache = cache
         self.started_ns = started_ns
+        self.state_redis = state_redis
+        self.bubble_redis = bubble_redis
 
 
 class OutboxEventLogFields(TypedDict, total=False):
@@ -276,12 +283,16 @@ async def worker_startup(state: TaskiqState) -> None:
     db_engine: AsyncEngine | None = None
     http_client: httpx.AsyncClient | None = None
     cache: RedisCache | None = None
+    state_redis: Redis | None = None
+    bubble_redis: Redis | None = None
     try:
-        db_engine = await infra_db.create_engine()
+        db_engine = await infra_db.create_engine(settings)
         session_factory = infra_db.create_session_factory(db_engine)
         http_client = httpx.AsyncClient(timeout=settings.performance_http_timeout_seconds)
-        cache_redis = await infra_redis.create_cache_redis()
+        cache_redis = await infra_redis.create_cache_redis(settings)
         cache = RedisCache(cache_redis, prefix=settings.redis_cache_prefix)
+        state_redis = await infra_redis.create_state_redis(settings)
+        bubble_redis = await infra_redis.create_bubble_redis(settings)
         outbox_repository = SqlAlchemyOutboxDeliveryRepository(
             session_factory,
             batch_size=settings.outbox_delivery_batch_size,
@@ -296,6 +307,28 @@ async def worker_startup(state: TaskiqState) -> None:
         async def ranking_handler(session: AsyncSession, event: OutboxEvent, partition_key: str) -> None:
             await ranking.project_accepted_score(session, event, partition_key, invalidate_leaderboard)
 
+        realtime = RedisRealtimeStateRepository(
+            state_redis,
+            prefix=settings.redis_state_prefix,
+            session_ttl=timedelta(seconds=settings.redis_session_ttl_seconds),
+            presence_ttl=timedelta(seconds=settings.redis_presence_ttl_seconds),
+            max_frame_count=settings.redis_spectator_max_frames,
+            max_frame_bytes=settings.redis_spectator_max_bytes,
+            max_spectators_per_host=settings.redis_spectator_max_viewers,
+        )
+        bubble_bus = RedisRealtimeBubbleBus(
+            bubble_redis,
+            prefix=settings.redis_state_prefix,
+            max_entries=settings.redis_bubble_max_entries,
+            ttl_seconds=settings.redis_bubble_ttl_seconds,
+        )
+        notification_handler = notification.notification_realtime_handler(
+            realtime=realtime,
+            bubbles=bubble_bus,
+            bot_account_id=settings.bot_account_id,
+            bot_name=settings.bot_name,
+        )
+
         consumer_catalog = build_consumer_catalog(
             PerformanceProjector(
                 HttpPerformanceCalculator(http_client, settings.performance_calculator_urls),
@@ -303,6 +336,7 @@ async def worker_startup(state: TaskiqState) -> None:
                 beatmap_url_expiry_seconds=settings.performance_beatmap_url_expiry_seconds,
             ),
             ranking_handler=ranking_handler,
+            notification_realtime_handler=notification_handler,
         )
         unknown_consumers = await outbox_repository.unknown_consumers(consumer_catalog)
         if unknown_consumers:
@@ -315,7 +349,9 @@ async def worker_startup(state: TaskiqState) -> None:
             max_attempts=settings.outbox_delivery_max_attempts,
             max_retry_seconds=settings.outbox_delivery_max_retry_seconds,
         )
-        state.worker_resources = _WorkerResources(db_engine, http_client, cache, started_ns)
+        state.worker_resources = _WorkerResources(
+            db_engine, http_client, cache, started_ns, state_redis, bubble_redis
+        )
         logging.log_event("INFO", "runtime.worker.ready", duration_ms=logging.duration_ms(started_ns))
     except BaseException as error:
         logging.log_event(
@@ -326,7 +362,7 @@ async def worker_startup(state: TaskiqState) -> None:
             duration_ms=logging.duration_ms(started_ns),
         )
         logging.log_event("INFO", "runtime.worker.stopping")
-        await _cleanup_worker_resources(http_client, db_engine, cache)
+        await _cleanup_worker_resources(http_client, db_engine, cache, state_redis, bubble_redis)
         state.worker_lifecycle_stopped = True
         logging.log_event("INFO", "runtime.worker.stopped", duration_ms=logging.duration_ms(started_ns))
         raise
@@ -341,7 +377,9 @@ async def worker_shutdown(state: TaskiqState) -> None:
     started_ns = resources.started_ns if resources is not None else monotonic_ns()
     logging.log_event("INFO", "runtime.worker.stopping")
     if resources is not None:
-        await _cleanup_worker_resources(resources.http_client, resources.db_engine, resources.cache)
+        await _cleanup_worker_resources(
+            resources.http_client, resources.db_engine, resources.cache, resources.state_redis, resources.bubble_redis
+        )
     state.worker_lifecycle_stopped = True
     logging.log_event("INFO", "runtime.worker.stopped", duration_ms=logging.duration_ms(started_ns))
 
@@ -350,6 +388,8 @@ async def _cleanup_worker_resources(
     http_client: httpx.AsyncClient | None,
     db_engine: AsyncEngine | None,
     cache: RedisCache | None = None,
+    state_redis: Redis | None = None,
+    bubble_redis: Redis | None = None,
 ) -> None:
     """Close every initialized worker resource even when an earlier close fails."""
     if http_client is not None:
@@ -385,6 +425,18 @@ async def _cleanup_worker_resources(
                 resource="cache",
                 error_type=type(error).__name__,
             )
+    for resource, client in (("state", state_redis), ("bubble", bubble_redis)):
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception as error:
+                logging.log_event(
+                    "ERROR",
+                    "runtime.worker.resource_close_failed",
+                    exception=error,
+                    resource=resource,
+                    error_type=type(error).__name__,
+                )
 
 
 async def _dispatch_outbox_delivery(

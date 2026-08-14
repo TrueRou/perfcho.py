@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
 from perfcho.infra.db.enums import ScoreGrade
-from perfcho.infra.db.models.content import Beatmap
+from perfcho.infra.db.models.content import Beatmap, Beatmapset
 from perfcho.infra.db.models.events import OutboxEvent
 from perfcho.infra.db.models.scoring import (
     RankingPolicy,
@@ -49,7 +49,10 @@ async def project_accepted_score(
     )
     row = (
         await session.execute(
-            select(Score, Beatmap.status).join(Beatmap, Beatmap.id == Score.beatmap_id).where(Score.id == score_id)
+            select(Score, Beatmapset.status)
+            .join(Beatmap, Beatmap.id == Score.beatmap_id)
+            .join(Beatmapset, Beatmapset.id == Beatmap.beatmapset_id)
+            .where(Score.id == score_id)
         )
     ).one_or_none()
     if row is None:

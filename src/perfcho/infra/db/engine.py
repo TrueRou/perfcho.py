@@ -12,25 +12,26 @@ import perfcho.infra.db.models  # noqa: F401 - register all tables before create
 from perfcho.infra.db.base import MODEL_SCHEMAS, DbBase, DbSessionFactory
 from perfcho.infra.db.bootstrap import bootstrap_database
 from perfcho.infra.logging import duration_ms, log_event
-from perfcho.infra.settings import settings
+from perfcho.infra.settings import Settings, settings
 
 _SCHEMA_INITIALIZATION_LOCK_ID = 0x7065726663686F
 
 
-async def create_engine() -> AsyncEngine:
+async def create_engine(config: Settings | None = None) -> AsyncEngine:
     """Create a pooled engine and ensure every mapped PostgreSQL table exists."""
+    cfg = config or settings
     started_ns = monotonic_ns()
     phase = "engine"
     log_event(
         "INFO",
         "database.bootstrap.started",
-        pool_size=settings.database_pool_size,
-        max_overflow=settings.database_max_overflow,
+        pool_size=cfg.database_pool_size,
+        max_overflow=cfg.database_max_overflow,
     )
     async_engine = create_async_engine(
-        settings.database_url,
-        pool_size=settings.database_pool_size,
-        max_overflow=settings.database_max_overflow,
+        cfg.database_url,
+        pool_size=cfg.database_pool_size,
+        max_overflow=cfg.database_max_overflow,
         pool_pre_ping=True,
         pool_recycle=3600,
         hide_parameters=True,
@@ -47,7 +48,7 @@ async def create_engine() -> AsyncEngine:
                 await connection.execute(CreateSchema(schema, if_not_exists=True))
             await connection.run_sync(DbBase.metadata.create_all)
         phase = "catalog"
-        await bootstrap_database(create_session_factory(async_engine))
+        await bootstrap_database(create_session_factory(async_engine), cfg)
     except Exception as e:
         await async_engine.dispose()
         db_url = async_engine.url.render_as_string(hide_password=True)

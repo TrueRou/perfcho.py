@@ -53,7 +53,7 @@ def test_metadata_preserves_the_reviewed_table_inventory() -> None:
         "audit": 1,
         "authz": 7,
         "community": 11,
-        "content": 15,
+        "content": 13,
         "core": 8,
         "event": 4,
         "iam": 18,

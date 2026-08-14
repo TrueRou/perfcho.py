@@ -14,6 +14,7 @@ from perfcho.infra.db.projectors import (
     identity,
     management,
     multiplayer,
+    notification,
     performance,
     ranking,
     scoring_stats,
@@ -64,6 +65,7 @@ class ConsumerCatalog(Mapping[str, ConsumerRegistration]):
 def build_consumer_catalog(
     performance_handler: ConsumerHandler = performance.unconfigured_projector,
     ranking_handler: ConsumerHandler = ranking.project_accepted_score,
+    notification_realtime_handler: ConsumerHandler = notification.unconfigured_handler,
 ) -> ConsumerCatalog:
     """Compose all consumers with the runtime-owned Performance handler."""
     return ConsumerCatalog(
@@ -87,6 +89,7 @@ def build_consumer_catalog(
                 community.MESSAGE_EVENT_TYPES,
                 community.project_community_message,
             ),
+            ConsumerRegistration(notification.CONSUMER_NAME, notification.EVENT_TYPES, notification_realtime_handler),
             ConsumerRegistration(performance.CONSUMER_NAME, performance.EVENT_TYPES, performance_handler),
             ConsumerRegistration(ranking.CONSUMER_NAME, ranking.EVENT_TYPES, ranking_handler),
             ConsumerRegistration(

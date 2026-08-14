@@ -20,7 +20,6 @@ from perfcho.modules.realtime import (
     MultiplayerSignalBubble,
     MultiplayerSignalKind,
     MultiplayerSlotSnapshot,
-    NotificationBubble,
     PlayerActivity,
     PlayerStatistics,
     PresenceUpdatedBubble,
@@ -30,6 +29,7 @@ from perfcho.modules.realtime import (
     SpectatorFrameAction,
     SpectatorFrameBubble,
     SpectatorLifecycleBubble,
+    ToastBubble,
     UserLogoutBubble,
 )
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant
@@ -79,7 +79,7 @@ def test_renderer_supports_logout_chat_channel_notification_and_session_control(
         UserLogoutBubble(42),
         ChatMessageBubble(9, 3, "#general", 42, "player", "waves", True, datetime.now(UTC), False),
         ChannelUpdatedBubble(3, "general", "General", 20, ChannelMembershipAction.JOINED),
-        NotificationBubble("notice"),
+        ToastBubble("notice"),
         SessionControlBubble(SessionControlAction.RECONNECT, 250),
     )
     packets = list(PacketReader(b"".join(renderer.render(bubble) for bubble in bubbles), packet_enum=ServerPacket))
@@ -100,11 +100,11 @@ def test_renderer_supports_logout_chat_channel_notification_and_session_control(
 
 def test_renderer_budget_drops_oversized_bubble_without_deferring_it() -> None:
     renderer = StableBubbleRenderer()
-    first = renderer.render(NotificationBubble("first"))
+    first = renderer.render(ToastBubble("first"))
     third = renderer.render(UserLogoutBubble(42))
 
     rendered = renderer.render_many(
-        (NotificationBubble("first"), NotificationBubble("x" * 200), UserLogoutBubble(42)),
+        (ToastBubble("first"), ToastBubble("x" * 200), UserLogoutBubble(42)),
         max_bytes=len(first) + len(third),
     )
 
@@ -120,7 +120,7 @@ def test_renderer_drops_one_failed_bubble_and_continues() -> None:
         patch("perfcho.api.stable.bubbles.log_event") as log_event,
         patch("perfcho.api.stable.bubbles.rate_limit", return_value=True),
     ):
-        rendered = renderer.render_many((NotificationBubble("broken"), UserLogoutBubble(42)), max_bytes=100)
+        rendered = renderer.render_many((ToastBubble("broken"), UserLogoutBubble(42)), max_bytes=100)
 
     assert rendered == expected
     log_event.assert_called_once()

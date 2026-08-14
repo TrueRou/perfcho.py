@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import cast
+from typing import Any, cast
 
 from perfcho.infra.cache import cached
 from perfcho.infra.cache.backend import CacheBackend
@@ -633,6 +633,9 @@ class RankingQueryService:
         )
 
     async def _leaderboard_generation(self, beatmap_id: int) -> str:
+        # Read the generation on every key build: workers increment this Redis value
+        # after projecting a new accepted score, so caching it in-process would leave
+        # a stale leaderboard for the remainder of the TTL.
         key = self._cache.key("scoring", "leaderboard-generation", str(beatmap_id))
         raw = await self._cache.get(key)
         if raw is None:
@@ -773,22 +776,22 @@ def _leaderboard_score_from_mapping(value: object) -> LeaderboardScoreView:
     if not isinstance(value, dict):
         raise ValueError("invalid cached leaderboard score")
     return LeaderboardScoreView(
-        score_id=int(value["score_id"]),
-        account_id=int(value["account_id"]),
-        display_name=str(value["display_name"]),
-        metric_value=_decimal_cache_value(value["metric_value"]),
-        max_combo=int(value["max_combo"]),
-        n50=int(value["n50"]),
-        n100=int(value["n100"]),
-        n300=int(value["n300"]),
-        nmiss=int(value["nmiss"]),
-        nkatu=int(value["nkatu"]),
-        ngeki=int(value["ngeki"]),
-        perfect=bool(value["perfect"]),
-        mods=_mods_from_cache(value["mods"]),
-        rank=int(value["rank"]),
-        ended_at=_datetime_cache_value(value["ended_at"]),
-        has_replay=bool(value["has_replay"]),
+        score_id=int(_required(value, "score_id")),
+        account_id=int(_required(value, "account_id")),
+        display_name=str(_required(value, "display_name")),
+        metric_value=_decimal_cache_value(_required(value, "metric_value")),
+        max_combo=int(_required(value, "max_combo")),
+        n50=int(_required(value, "n50")),
+        n100=int(_required(value, "n100")),
+        n300=int(_required(value, "n300")),
+        nmiss=int(_required(value, "nmiss")),
+        nkatu=int(_required(value, "nkatu")),
+        ngeki=int(_required(value, "ngeki")),
+        perfect=bool(_required(value, "perfect")),
+        mods=_mods_from_cache(_required(value, "mods")),
+        rank=int(_required(value, "rank")),
+        ended_at=_datetime_cache_value(_required(value, "ended_at")),
+        has_replay=bool(_required(value, "has_replay")),
     )
 
 
@@ -797,12 +800,12 @@ def _account_stats_from_cache(raw: bytes) -> AccountStatsView:
     if not isinstance(value, dict):
         raise ValueError("invalid cached account stats")
     return AccountStatsView(
-        ranked_score=int(value["ranked_score"]),
-        accuracy=_decimal_cache_value(value["accuracy"]),
-        play_count=int(value["play_count"]),
-        total_score=int(value["total_score"]),
-        global_rank=int(value["global_rank"]) if value["global_rank"] is not None else None,
-        performance=int(value["performance"]),
+        ranked_score=int(_required(value, "ranked_score")),
+        accuracy=_decimal_cache_value(_required(value, "accuracy")),
+        play_count=int(_required(value, "play_count")),
+        total_score=int(_required(value, "total_score")),
+        global_rank=int(_required(value, "global_rank")) if _required(value, "global_rank") is not None else None,
+        performance=int(_required(value, "performance")),
         country_rank=int(value["country_rank"]) if value.get("country_rank") is not None else None,
         play_time_ms=int(value.get("play_time_ms", 0)),
         total_hits=int(value.get("total_hits", 0)),
@@ -810,6 +813,18 @@ def _account_stats_from_cache(raw: bytes) -> AccountStatsView:
         replay_views=int(value.get("replay_views", 0)),
         grade_counts=cast(dict[str, int], value.get("grade_counts", {})),
     )
+
+
+def _required(value: dict[str, object], key: str) -> Any:  # noqa: ANN401 - cached JSON field, coerced at call site
+    """Return a cached field, raising ValueError (not KeyError) when absent.
+
+    ``cache/decorator.py`` evicts and reloads on ``ValueError``/``KeyError``,
+    so raising ``ValueError`` here keeps the decode-failure contract explicit.
+    """
+    try:
+        return value[key]
+    except KeyError as error:
+        raise ValueError(f"cached value is missing required field: {key}") from error
 
 
 def _mods_from_cache(value: object) -> tuple[CanonicalMod, ...]:

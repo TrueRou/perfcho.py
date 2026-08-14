@@ -9,7 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfcho.infra.db.models.scoring import BeatmapDifficultyAttribute
+from perfcho.infra.db.enums import CalculationKind
+from perfcho.infra.db.models.scoring import BeatmapDifficultyAttribute, CalculationFormula, CalculationRelease
 from perfcho.modules.performance.models import DifficultyCalculationResult, DifficultyRequest
 from perfcho.modules.scoring.models import Ruleset
 
@@ -20,6 +21,36 @@ class SqlAlchemyDifficultyRepository:
     def __init__(self, session: AsyncSession) -> None:
         """Bind operations to one caller-owned session."""
         self._session = session
+
+    async def active_difficulty_release(self, ruleset: Ruleset) -> dict[str, object] | None:
+        """Return the newest active difficulty release metadata for one ruleset."""
+        row = (
+            await self._session.execute(
+                select(
+                    CalculationFormula.code.label("formula_code"),
+                    CalculationFormula.calculator,
+                    CalculationRelease.id.label("release_id"),
+                    CalculationRelease.version,
+                )
+                .join(CalculationRelease, CalculationRelease.formula_id == CalculationFormula.id)
+                .where(
+                    CalculationFormula.kind == CalculationKind.DIFFICULTY,
+                    CalculationFormula.enabled.is_(True),
+                    CalculationRelease.ruleset == ruleset,
+                    CalculationRelease.active.is_(True),
+                )
+                .order_by(CalculationRelease.created_at.desc())
+                .limit(1)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return {
+            "formula_code": row.formula_code,
+            "calculator": row.calculator,
+            "release_id": row.release_id,
+            "version": row.version,
+        }
 
     async def get(
         self,

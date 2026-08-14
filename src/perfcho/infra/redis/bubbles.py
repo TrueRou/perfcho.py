@@ -28,7 +28,6 @@ from perfcho.modules.realtime.bubbles import (
     MultiplayerSignalBubble,
     MultiplayerSignalKind,
     MultiplayerSlotSnapshot,
-    NotificationBubble,
     PresenceUpdatedBubble,
     RealtimeBubble,
     SessionControlAction,
@@ -37,6 +36,7 @@ from perfcho.modules.realtime.bubbles import (
     SpectatorFrameAction,
     SpectatorFrameBubble,
     SpectatorLifecycleBubble,
+    ToastBubble,
     UserLogoutBubble,
 )
 from perfcho.modules.realtime.models import PlayerActivity, PlayerStatistics, SessionFence
@@ -340,8 +340,8 @@ def _encode_body(bubble: RealtimeBubble) -> tuple[str, dict[str, Any]]:
                 "score": {field: getattr(bubble.score, field) for field in bubble.score.__dataclass_fields__},
                 "extra": bubble.extra,
             }
-        case NotificationBubble():
-            return "notification", {"message": bubble.message}
+        case ToastBubble():
+            return "toast", {"message": bubble.message}
         case SessionControlBubble():
             return "session.control", {"action": bubble.action.value, "retry_after_ms": bubble.retry_after_ms}
     raise TypeError(f"unsupported bubble type: {type(bubble).__name__}")
@@ -440,8 +440,8 @@ def _decode_body(kind: str, value: object) -> RealtimeBubble:
             _score_frame(body["score"]),
             body["extra"],
         )
-    if kind == "notification":
-        return NotificationBubble(**_map(value, frozenset({"message"})))
+    if kind == "toast":
+        return ToastBubble(**_map(value, frozenset({"message"})))
     if kind == "session.control":
         body = _map(value, frozenset({"action", "retry_after_ms"}))
         return SessionControlBubble(SessionControlAction(body["action"]), body["retry_after_ms"])

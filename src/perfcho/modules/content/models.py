@@ -246,3 +246,26 @@ class ContentSyncResult:
     unchanged_revision_count: int
     removed_beatmap_count: int
     published: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class BeatmapsetStatusState:
+    """Describe the locked authoritative and upstream status of one beatmapset."""
+
+    beatmapset_id: int
+    external_beatmapset_id: int
+    status: str
+    source_status: str
+
+
+@dataclass(frozen=True, slots=True)
+class BeatmapsetStatusEventView:
+    """Describe one beatmapset status transition."""
+
+    beatmapset_id: int
+    previous_status: str | None
+    status: str
+    source: str
+    actor_account_id: int | None
+    reason: str | None
+    effective_at: datetime

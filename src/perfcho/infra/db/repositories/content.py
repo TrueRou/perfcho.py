@@ -11,16 +11,16 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import Select
 
-from perfcho.infra.db.enums import BeatmapStatus, Ruleset
+from perfcho.infra.db.enums import BeatmapStatus, BeatmapStatusEventSource, Ruleset
 from perfcho.infra.db.models.content import (
     Beatmap,
     BeatmapRevision,
     Beatmapset,
     BeatmapsetFavourite,
-    BeatmapStatusEvent,
+    BeatmapsetStatusEvent,
+    BeatmapsetSyncState,
     Comment,
     ContentSource,
-    ContentSyncState,
     RatingVote,
 )
 from perfcho.infra.db.models.core import MediaAsset
@@ -28,6 +28,8 @@ from perfcho.infra.db.models.scoring import BeatmapDifficultyAttribute
 from perfcho.infra.db.mods import canonical_mods_digest
 from perfcho.modules.content.models import (
     BeatmapRevisionView,
+    BeatmapsetStatusEventView,
+    BeatmapsetStatusState,
     BeatmapsetView,
     CommentView,
     ContentSearch,
@@ -52,7 +54,6 @@ _RevisionRow = tuple[
 _CurrentBeatmapMetadata = tuple[
     Ruleset,
     str,
-    BeatmapStatus,
     bytes | None,
     str | None,
     datetime | None,
@@ -347,7 +348,7 @@ class SqlAlchemyContentRepository:
             .with_for_update()
         )
         if set_record is None:
-            beatmapset_id = await self._session.scalar(
+            set_record = await self._session.scalar(
                 insert(Beatmapset)
                 .values(
                     source_id=source_id,
@@ -364,6 +365,7 @@ class SqlAlchemyContentRepository:
                     language_id=snapshot.language_id,
                     description=snapshot.description,
                     status=BeatmapStatus(snapshot.status),
+                    source_status=BeatmapStatus(snapshot.status),
                     submitted_at=snapshot.submitted_at,
                     ranked_at=snapshot.ranked_at,
                     last_source_update_at=snapshot.last_updated_at,
@@ -371,10 +373,10 @@ class SqlAlchemyContentRepository:
                     nsfw=snapshot.nsfw,
                 )
                 .on_conflict_do_nothing(index_elements=(Beatmapset.source_id, Beatmapset.external_id))
-                .returning(Beatmapset.id)
+                .returning(Beatmapset)
             )
             previous_source_update = None
-            if beatmapset_id is None:
+            if set_record is None:
                 set_record = await self._session.scalar(
                     select(Beatmapset)
                     .where(
@@ -385,8 +387,8 @@ class SqlAlchemyContentRepository:
                 )
                 if set_record is None:
                     raise RuntimeError("database did not resolve the synchronized beatmapset")
-                beatmapset_id = set_record.id
                 previous_source_update = set_record.last_source_update_at
+            beatmapset_id = set_record.id
         else:
             beatmapset_id = set_record.id
             previous_source_update = set_record.last_source_update_at
@@ -410,38 +412,43 @@ class SqlAlchemyContentRepository:
                 published=False,
             )
 
-        await self._session.execute(
-            update(Beatmapset)
-            .where(Beatmapset.id == beatmapset_id)
-            .values(
-                creator_external_id=snapshot.creator_external_id,
-                creator_name=snapshot.creator_name,
-                artist=snapshot.artist,
-                artist_unicode=snapshot.artist_unicode,
-                title=snapshot.title,
-                title_unicode=snapshot.title_unicode,
-                source_text=snapshot.source_text,
-                tags=snapshot.tags,
-                genre_id=snapshot.genre_id,
-                language_id=snapshot.language_id,
-                description=snapshot.description,
-                status=BeatmapStatus(snapshot.status),
-                submitted_at=snapshot.submitted_at,
-                ranked_at=snapshot.ranked_at,
-                last_source_update_at=snapshot.last_updated_at,
-                available=snapshot.available,
-                nsfw=snapshot.nsfw,
-            )
-        )
+        snapshot_status = BeatmapStatus(snapshot.status)
+        status_overridden = set_record.status != set_record.source_status
+        beatmapset_values: dict[str, object] = {
+            "creator_external_id": snapshot.creator_external_id,
+            "creator_name": snapshot.creator_name,
+            "artist": snapshot.artist,
+            "artist_unicode": snapshot.artist_unicode,
+            "title": snapshot.title,
+            "title_unicode": snapshot.title_unicode,
+            "source_text": snapshot.source_text,
+            "tags": snapshot.tags,
+            "genre_id": snapshot.genre_id,
+            "language_id": snapshot.language_id,
+            "description": snapshot.description,
+            "source_status": snapshot_status,
+            "submitted_at": snapshot.submitted_at,
+            "ranked_at": snapshot.ranked_at,
+            "last_source_update_at": snapshot.last_updated_at,
+            "available": snapshot.available,
+            "nsfw": snapshot.nsfw,
+        }
+        if not status_overridden:
+            beatmapset_values["status"] = snapshot_status
+        await self._session.execute(update(Beatmapset).where(Beatmapset.id == beatmapset_id).values(beatmapset_values))
 
-        existing_rows = (
+        if set_record.status != snapshot_status:
             await self._session.execute(
-                select(Beatmap.id, Beatmap.external_id, Beatmap.status)
-                .where(Beatmap.source_id == source_id, Beatmap.beatmapset_id == beatmapset_id)
-                .with_for_update()
+                insert(BeatmapsetStatusEvent).values(
+                    beatmapset_id=beatmapset_id,
+                    previous_status=set_record.status,
+                    status=snapshot_status,
+                    source=BeatmapStatusEventSource.UPSTREAM_SYNC,
+                    actor_account_id=None,
+                    effective_at=now,
+                )
             )
-        ).all()
-        existing = {row.external_id: row for row in existing_rows}
+
         beatmap_rows = (
             await self._session.execute(
                 insert(Beatmap)
@@ -453,7 +460,6 @@ class SqlAlchemyContentRepository:
                             "external_id": item.beatmap.external_beatmap_id,
                             "ruleset": Ruleset(item.beatmap.ruleset),
                             "difficulty_name": item.beatmap.difficulty_name,
-                            "status": BeatmapStatus(item.beatmap.status),
                             "deleted_at": None,
                         }
                         for item in files
@@ -465,7 +471,6 @@ class SqlAlchemyContentRepository:
                         "beatmapset_id": beatmapset_id,
                         "ruleset": insert(Beatmap).excluded.ruleset,
                         "difficulty_name": insert(Beatmap).excluded.difficulty_name,
-                        "status": insert(Beatmap).excluded.status,
                         "deleted_at": None,
                     },
                 )
@@ -475,21 +480,6 @@ class SqlAlchemyContentRepository:
         beatmap_ids = {row.external_id: row.id for row in beatmap_rows}
         if len(beatmap_ids) != len(files):
             raise RuntimeError("database did not return every synchronized beatmap")
-
-        status_events = [
-            {
-                "beatmap_id": beatmap_ids[item.beatmap.external_beatmap_id],
-                "previous_status": previous.status,
-                "status": BeatmapStatus(item.beatmap.status),
-                "source": "upstream_sync",
-                "effective_at": now,
-            }
-            for item in files
-            if (previous := existing.get(item.beatmap.external_beatmap_id)) is not None
-            and previous.status.value != item.beatmap.status
-        ]
-        if status_events:
-            await self._session.execute(insert(BeatmapStatusEvent).values(status_events))
 
         asset_values = []
         requested_digests = set()
@@ -619,29 +609,20 @@ class SqlAlchemyContentRepository:
                 .returning(Beatmap.id)
             )
         )
-        unchanged_sync = int(created_revision_count == 0 and not removed_ids)
         await self._session.execute(
-            insert(ContentSyncState)
+            insert(BeatmapsetSyncState)
             .values(
                 beatmapset_id=beatmapset_id,
-                etag=snapshot.etag,
-                last_modified=snapshot.last_modified,
                 last_checked_at=now,
                 next_check_at=next_check_at,
-                unchanged_count=unchanged_sync,
                 error_count=0,
-                last_error=None,
             )
             .on_conflict_do_update(
-                index_elements=(ContentSyncState.beatmapset_id,),
+                index_elements=(BeatmapsetSyncState.beatmapset_id,),
                 set_={
-                    "etag": snapshot.etag,
-                    "last_modified": snapshot.last_modified,
                     "last_checked_at": now,
                     "next_check_at": next_check_at,
-                    "unchanged_count": ContentSyncState.unchanged_count + unchanged_sync,
                     "error_count": 0,
-                    "last_error": None,
                 },
             )
         )
@@ -665,26 +646,25 @@ class SqlAlchemyContentRepository:
         if beatmapset_id is None:
             return False
         inserted = await self._session.scalar(
-            insert(ContentSyncState)
+            insert(BeatmapsetSyncState)
             .values(
                 beatmapset_id=beatmapset_id,
                 next_check_at=lease_until,
-                unchanged_count=0,
                 error_count=0,
             )
-            .on_conflict_do_nothing(index_elements=(ContentSyncState.beatmapset_id,))
-            .returning(ContentSyncState.beatmapset_id)
+            .on_conflict_do_nothing(index_elements=(BeatmapsetSyncState.beatmapset_id,))
+            .returning(BeatmapsetSyncState.beatmapset_id)
         )
         if inserted is not None:
             return True
         claimed = await self._session.scalar(
-            update(ContentSyncState)
+            update(BeatmapsetSyncState)
             .where(
-                ContentSyncState.beatmapset_id == beatmapset_id,
-                or_(ContentSyncState.next_check_at.is_(None), ContentSyncState.next_check_at <= now),
+                BeatmapsetSyncState.beatmapset_id == beatmapset_id,
+                or_(BeatmapsetSyncState.next_check_at.is_(None), BeatmapsetSyncState.next_check_at <= now),
             )
             .values(next_check_at=lease_until)
-            .returning(ContentSyncState.beatmapset_id)
+            .returning(BeatmapsetSyncState.beatmapset_id)
         )
         return claimed is not None
 
@@ -702,16 +682,15 @@ class SqlAlchemyContentRepository:
         if beatmapset_id is None:
             return
         await self._session.execute(
-            update(ContentSyncState)
+            update(BeatmapsetSyncState)
             .where(
-                ContentSyncState.beatmapset_id == beatmapset_id,
-                ContentSyncState.next_check_at == expected_lease_until,
+                BeatmapsetSyncState.beatmapset_id == beatmapset_id,
+                BeatmapsetSyncState.next_check_at == expected_lease_until,
             )
             .values(
                 last_checked_at=checked_at,
                 next_check_at=next_check_at,
-                error_count=ContentSyncState.error_count + 1,
-                last_error=error[:1024],
+                error_count=BeatmapsetSyncState.error_count + 1,
             )
         )
 
@@ -721,6 +700,86 @@ class SqlAlchemyContentRepository:
             .join(ContentSource, ContentSource.id == Beatmapset.source_id)
             .where(ContentSource.code == "osu", Beatmapset.external_id == external_beatmapset_id)
         )
+
+    async def get_status_state(self, external_beatmapset_id: int, *, for_update: bool) -> BeatmapsetStatusState | None:
+        """Return one beatmapset's authoritative and upstream status, optionally locking it."""
+        statement = select(Beatmapset).where(Beatmapset.external_id == external_beatmapset_id)
+        if for_update:
+            statement = statement.with_for_update()
+        beatmapset = await self._session.scalar(statement)
+        if beatmapset is None:
+            return None
+        return BeatmapsetStatusState(
+            beatmapset_id=beatmapset.id,
+            external_beatmapset_id=beatmapset.external_id,
+            status=beatmapset.status.value,
+            source_status=beatmapset.source_status.value,
+        )
+
+    async def apply_status_transition(
+        self,
+        beatmapset_id: int,
+        previous_status: BeatmapStatus,
+        target_status: BeatmapStatus,
+        *,
+        source: BeatmapStatusEventSource,
+        actor_account_id: int | None,
+        reason: str | None,
+        effective_at: datetime,
+    ) -> None:
+        """Persist one status transition and its event inside the caller-owned transaction."""
+        await self._session.execute(
+            update(Beatmapset).where(Beatmapset.id == beatmapset_id).values(status=target_status)
+        )
+        await self._session.execute(
+            insert(BeatmapsetStatusEvent).values(
+                beatmapset_id=beatmapset_id,
+                previous_status=previous_status,
+                status=target_status,
+                source=source,
+                actor_account_id=actor_account_id,
+                reason=reason,
+                effective_at=effective_at,
+            )
+        )
+
+    async def revert_status(
+        self, beatmapset_id: int, *, source: BeatmapStatusEventSource, effective_at: datetime
+    ) -> None:
+        """Restore the authoritative status to the upstream source status."""
+        state = await self._session.scalar(
+            select(Beatmapset.status, Beatmapset.source_status).where(Beatmapset.id == beatmapset_id).with_for_update()
+        )
+        if state is None:
+            raise RuntimeError("beatmapset status cannot be resolved")
+        current_status, source_status = state
+        if current_status == source_status:
+            return
+        await self._session.execute(
+            update(Beatmapset).where(Beatmapset.id == beatmapset_id).values(status=source_status)
+        )
+        await self._session.execute(
+            insert(BeatmapsetStatusEvent).values(
+                beatmapset_id=beatmapset_id,
+                previous_status=current_status,
+                status=source_status,
+                source=source,
+                actor_account_id=None,
+                effective_at=effective_at,
+            )
+        )
+
+    async def list_status_events(self, external_beatmapset_id: int) -> tuple[BeatmapsetStatusEventView, ...]:
+        """List a beatmapset's status transitions in chronological order."""
+        rows = (
+            await self._session.execute(
+                select(BeatmapsetStatusEvent)
+                .join(Beatmapset, Beatmapset.id == BeatmapsetStatusEvent.beatmapset_id)
+                .where(Beatmapset.external_id == external_beatmapset_id)
+                .order_by(BeatmapsetStatusEvent.effective_at, BeatmapsetStatusEvent.id)
+            )
+        ).scalars()
+        return tuple(_status_event_view(event) for event in rows)
 
     async def _snapshot_extends_current(
         self,
@@ -750,7 +809,6 @@ class SqlAlchemyContentRepository:
             metadata: _CurrentBeatmapMetadata = (
                 beatmap.ruleset,
                 beatmap.difficulty_name,
-                beatmap.status,
                 revision.md5 if revision is not None else None,
                 revision.file_name if revision is not None else None,
                 revision.source_updated_at if revision is not None else None,
@@ -814,6 +872,18 @@ def _snapshot_extends_current_revision_set(
     )
 
 
+def _status_event_view(event: BeatmapsetStatusEvent) -> BeatmapsetStatusEventView:
+    return BeatmapsetStatusEventView(
+        beatmapset_id=event.beatmapset_id,
+        previous_status=event.previous_status.value if event.previous_status is not None else None,
+        status=event.status.value,
+        source=event.source.value,
+        actor_account_id=event.actor_account_id,
+        reason=event.reason,
+        effective_at=event.effective_at,
+    )
+
+
 def _comment_view(comment: Comment, target: str) -> CommentView:
     return CommentView(
         comment_id=comment.id,
@@ -839,7 +909,7 @@ def _beatmapset_metadata(beatmapset: Beatmapset) -> tuple[object, ...]:
         beatmapset.genre_id,
         beatmapset.language_id,
         beatmapset.description,
-        beatmapset.status.value,
+        beatmapset.source_status.value,
         beatmapset.submitted_at,
         beatmapset.ranked_at,
         beatmapset.available,
@@ -872,7 +942,6 @@ def _current_beatmap_metadata(row: _CurrentBeatmapMetadata) -> tuple[object, ...
     (
         ruleset,
         difficulty_name,
-        status,
         md5,
         file_name,
         source_updated_at,
@@ -893,7 +962,6 @@ def _current_beatmap_metadata(row: _CurrentBeatmapMetadata) -> tuple[object, ...
     return (
         ruleset.value,
         difficulty_name,
-        status.value,
         md5,
         file_name,
         source_updated_at,
@@ -917,7 +985,6 @@ def _snapshot_beatmap_metadata(beatmap: UpstreamBeatmapSnapshot) -> tuple[object
     return (
         beatmap.ruleset,
         beatmap.difficulty_name,
-        beatmap.status,
         beatmap.md5,
         beatmap.file_name,
         beatmap.source_updated_at,
@@ -965,7 +1032,7 @@ def _required_revision_view(row: _RevisionRow) -> BeatmapRevisionView:
         creator=beatmapset.creator_name,
         difficulty_name=beatmap.difficulty_name,
         ruleset=beatmap.ruleset.value,
-        status=beatmap.status.value,
+        status=beatmapset.status.value,
         source_updated_at=revision.source_updated_at,
         total_length_ms=revision.total_length_ms,
         drain_length_ms=revision.drain_length_ms,

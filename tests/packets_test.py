@@ -152,8 +152,8 @@ def test_write_get_attention() -> None:
         ("", b"\x18\x00\x00\x01\x00\x00\x00\x00"),
     ],
 )
-def test_write_notification(test_input: str, expected: bytes) -> None:
-    assert packets.notification(test_input) == expected
+def test_write_toast(test_input: str, expected: bytes) -> None:
+    assert packets.toast(test_input) == expected
 
 
 def _read_match_packet(encoded: bytes, packet_type: ServerPacket) -> MultiplayerMatch:
