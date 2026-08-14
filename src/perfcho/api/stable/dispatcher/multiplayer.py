@@ -980,10 +980,12 @@ async def _broadcast_match(
     excluded_account_id: int | None,
     services: StableServices,
 ) -> frozenset[int]:
-    failed: dict[int, BaseException] = {}
-    for account_id in {slot.account_id for slot in state.slots if slot.account_id is not None}:
-        if account_id != excluded_account_id:
-            await _publish(account_id, bubble, state, services, failure_errors=failed)
+    account_ids = tuple(
+        account_id
+        for account_id in {slot.account_id for slot in state.slots if slot.account_id is not None}
+        if account_id != excluded_account_id
+    )
+    failed = await _publish_many(account_ids, bubble, services)
     _log_broadcast_failures("match", failed, room_id=state.room.public_id)
     return frozenset(failed)
 
@@ -995,10 +997,8 @@ async def _broadcast_accounts(
     excluded_account_id: int | None,
     services: StableServices,
 ) -> frozenset[int]:
-    failed: dict[int, BaseException] = {}
-    for account_id in account_ids:
-        if account_id != excluded_account_id:
-            await _publish(account_id, bubble, state, services, failure_errors=failed)
+    recipients = tuple(account_id for account_id in account_ids if account_id != excluded_account_id)
+    failed = await _publish_many(recipients, bubble, services)
     _log_broadcast_failures("round_accounts", failed, room_id=state.room.public_id)
     return frozenset(failed)
 
@@ -1009,10 +1009,14 @@ async def _broadcast_playing(
     excluded_account_id: int | None,
     services: StableServices,
 ) -> frozenset[int]:
-    failed: dict[int, BaseException] = {}
-    for slot in state.slots:
-        if slot.status is SlotStatus.PLAYING and slot.account_id is not None and slot.account_id != excluded_account_id:
-            await _publish(slot.account_id, bubble, state, services, failure_errors=failed)
+    account_ids = tuple(
+        slot.account_id
+        for slot in state.slots
+        if slot.status is SlotStatus.PLAYING
+        and slot.account_id is not None
+        and slot.account_id != excluded_account_id
+    )
+    failed = await _publish_many(account_ids, bubble, services)
     _log_broadcast_failures("playing", failed, room_id=state.room.public_id)
     return frozenset(failed)
 
@@ -1043,19 +1047,34 @@ async def _broadcast_lobby(
             error_type=type(error).__name__,
         )
         return frozenset()
-    failed: dict[int, BaseException] = {}
-    for account_id in await services.realtime.list_channel_members(lobby.channel_id):
-        if account_id == excluded_account_id:
-            continue
-        presence = await services.realtime.get_presence(account_id, at=services.clock.now())
-        if presence is None:
-            continue
-        try:
-            await services.bubbles.publish(presence.account_id, bubble)
-        except Exception as error:
-            failed[account_id] = error
+    account_ids = tuple(
+        account_id
+        for account_id in await services.realtime.list_channel_members(lobby.channel_id)
+        if account_id != excluded_account_id
+    )
+    failed = await _publish_many(account_ids, bubble, services)
     _log_broadcast_failures("lobby", failed)
     return frozenset(failed)
+
+
+async def _publish_many(
+    account_ids: tuple[int, ...],
+    bubble: RealtimeBubble,
+    services: StableServices,
+) -> dict[int, BaseException]:
+    if isinstance(bubble, MultiplayerRoomBubble) and bubble.local_admission_credential is not None:
+        raise ValueError("local multiplayer admission credentials cannot be published")
+    if services.bubbles is None:
+        return {}
+    presences = await services.realtime.get_presences(account_ids, at=services.clock.now())
+    online_account_ids = tuple(presence.account_id for presence in presences)
+    if not online_account_ids:
+        return {}
+    try:
+        await services.bubbles.publish_many(online_account_ids, bubble)
+    except Exception as error:
+        return dict.fromkeys(online_account_ids, error)
+    return {}
 
 
 async def _publish(

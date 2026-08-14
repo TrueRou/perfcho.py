@@ -23,7 +23,7 @@ from perfcho.consumers.common import (
 from perfcho.infra.db.models.events import OutboxEvent
 from perfcho.infra.logging import log_event
 from perfcho.modules.realtime.bubbles import ChatMessageBubble, RealtimeBubble
-from perfcho.modules.realtime.models import PresenceSnapshot, SessionFence
+from perfcho.modules.realtime.models import PresenceSnapshot
 
 CONSUMER_NAME = "notification-realtime-consumer.v1"
 EVENT_TYPES = frozenset({"community.notification-created.v1"})
@@ -32,17 +32,24 @@ type ConsumerHandler = Callable[[AsyncSession, OutboxEvent, str], Awaitable[None
 
 
 class PresenceResolver(Protocol):
-    """Resolve online presence for one account."""
+    """Resolve online presence for many accounts."""
 
-    async def get_presence(self, account_id: int, *, at: datetime) -> PresenceSnapshot | None:
-        """Return the account's live presence snapshot, or None when offline."""
+    async def get_presences(
+        self,
+        account_ids: tuple[int, ...],
+        *,
+        at: datetime,
+    ) -> tuple[PresenceSnapshot, ...]:
+        """Return live presence snapshots in recipient order."""
+        ...
 
 
 class BubblePublisher(Protocol):
-    """Publish fenced bubbles to online sessions."""
+    """Publish account-scoped bubbles to online sessions."""
 
-    async def publish(self, fence: SessionFence, bubble: RealtimeBubble) -> int:
-        """Publish one bubble to a session fence and return the stream count."""
+    async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
+        """Publish one bubble to an account stream and return the stream count."""
+        ...
 
 
 def render_notification_text(kind: str, payload: Mapping[str, object]) -> str | None:
@@ -87,10 +94,8 @@ def notification_realtime_handler(
         recipients = _recipient_ids(event.payload.get("recipient_account_ids"))
         now = datetime.now(UTC)
         delivered = 0
-        for account_id in recipients:
-            presence = await realtime.get_presence(account_id, at=now)
-            if presence is None:
-                continue
+        presences = await realtime.get_presences(recipients, at=now)
+        for presence in presences:
             bubble = ChatMessageBubble(
                 message_id=None,
                 channel_id=None,
@@ -111,7 +116,7 @@ def notification_realtime_handler(
                     "notification.realtime.delivery_failed",
                     exception=error,
                     notification_id=notification_id,
-                    account_id=account_id,
+                    account_id=presence.account_id,
                     kind=kind,
                 )
         log_event(

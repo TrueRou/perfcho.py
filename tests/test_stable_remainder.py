@@ -255,10 +255,12 @@ class FakeRealtime:
     def __init__(self, presences: tuple[PresenceSnapshot, ...]) -> None:
         self.presences = {snapshot.account_id: snapshot for snapshot in presences}
         self.published: list[tuple[int, RealtimeBubble]] = []
+        self.publish_many_calls: list[tuple[int, ...]] = []
         self.filter_value: PresenceSubscription | None = None
         self.fenced: tuple[uuid.UUID, int] | None = None
         self.away = "Away for lunch"
         self.get_presence_calls: list[int] = []
+        self.get_presences_calls: list[tuple[int, ...]] = []
         self.failed_publish_accounts: frozenset[int] = frozenset()
         self.channel_members: set[int] = set()
         self.stored_presence: PresenceSnapshot | None = None
@@ -267,6 +269,17 @@ class FakeRealtime:
         del at
         self.get_presence_calls.append(account_id)
         return self.presences.get(account_id)
+
+    async def get_presences(
+        self,
+        account_ids: tuple[int, ...],
+        *,
+        at: datetime,
+    ) -> tuple[PresenceSnapshot, ...]:
+        del at
+        accounts = tuple(dict.fromkeys(account_ids))
+        self.get_presences_calls.append(accounts)
+        return tuple(self.presences[account_id] for account_id in accounts if account_id in self.presences)
 
     async def list_presences(self, *, at: datetime, limit: int) -> tuple[PresenceSnapshot, ...]:
         del at
@@ -352,6 +365,18 @@ class FakeBubbleBus:
             raise RuntimeError("publish failed")
         self.realtime.published.append((account_id, bubble))
         return 1
+
+    async def publish_many(self, account_ids: tuple[int, ...], bubble: RealtimeBubble) -> int:
+        self.realtime.publish_many_calls.append(account_ids)
+        failed = False
+        for account_id in account_ids:
+            if account_id in self.realtime.failed_publish_accounts:
+                failed = True
+            else:
+                self.realtime.published.append((account_id, bubble))
+        if failed:
+            raise RuntimeError("publish failed")
+        return len(account_ids)
 
 
 def snapshot(account_id: int, name: str, *, action: int = 0) -> PresenceSnapshot:
@@ -558,6 +583,7 @@ async def test_logout_closes_identity_fences_session_and_broadcasts() -> None:
     assert response == b""
     assert identity.closed == ("raw-token", "client_logout")
     assert realtime.fenced == (current.identity.session_id, 1)
+    assert realtime.publish_many_calls == [(20,)]
     assert len(multiplayer.cleanup_commands) == 1
     cleanup = multiplayer.cleanup_commands[0]
     assert isinstance(cleanup, CleanupPresence)
@@ -580,7 +606,8 @@ async def test_presence_requests_deduplicate_exclude_self_and_share_response_bud
 
     packets = list(PacketReader(response, packet_enum=ServerPacket))
     assert [packet.payload.read_user_stats().user_id for packet in packets] == [20]
-    assert realtime.get_presence_calls == [20]
+    assert realtime.get_presence_calls == []
+    assert realtime.get_presences_calls == [(20, 30)]
     assert len(response) <= config.stable_max_response_bytes
 
 
@@ -664,6 +691,7 @@ async def test_change_action_normalizes_assistance_and_stores_consistent_presenc
     assert realtime.stored_presence.activity.ruleset == "mania"
     assert realtime.stored_presence.statistics.global_rank is None
     assert social.incoming_follower_queries == [(10, (20,))]
+    assert realtime.publish_many_calls == [(20,)]
     assert [recipient_account_id for recipient_account_id, _ in realtime.published] == [20]
 
 
@@ -738,6 +766,7 @@ async def test_public_message_replay_block_filter_and_publish_failure_are_recipi
 
     assert first == replay == b""
     assert social.filtered == (20, 30, 40)
+    assert realtime.publish_many_calls == [(20, 40)]
     assert [account_id for account_id, _ in realtime.published] == [40]
     assert len(community.public_client_message_ids) == 1
 
@@ -853,6 +882,7 @@ async def test_channel_join_broadcasts_authoritative_counts() -> None:
         ServerPacket.CHANNEL_INFO,
     ]
     assert joined_packets[1].payload.read_channel().player_count == 2
+    assert realtime.publish_many_calls == [(20,)]
     broadcast = next(PacketReader(StableBubbleRenderer().render(realtime.published[0][1]), packet_enum=ServerPacket))
     assert broadcast.payload.read_channel().player_count == 2
 

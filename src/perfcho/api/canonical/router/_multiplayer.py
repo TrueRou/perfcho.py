@@ -7,7 +7,7 @@ single room is simultaneously addressable by stable (16-slot) and lazer
 (participant list) clients.
 """
 
-from perfcho.modules.multiplayer import RoomState, SlotStatus, TeamMode, WinCondition
+from perfcho.modules.multiplayer import RoomSlot, RoomState, SlotStatus, TeamMode, WinCondition
 from perfcho.modules.scoring import Ruleset
 
 _RULESET_IDS = {Ruleset.OSU: 0, Ruleset.TAIKO: 1, Ruleset.FRUITS: 2, Ruleset.MANIA: 3}
@@ -108,7 +108,7 @@ def multiplayer_room(state: RoomState) -> dict[str, object]:
     }
 
 
-def _user_state(slot: object) -> str:
+def _user_state(slot: RoomSlot) -> str:
     status = slot.status
     if status is SlotStatus.PLAYING:
         return "Playing"

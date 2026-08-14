@@ -832,7 +832,7 @@ class SqlAlchemyContentRepository:
         return _snapshot_extends_current_revision_set(current, snapshot)
 
 
-def _revision_statement() -> Select[*_RevisionRow]:
+def _revision_statement() -> Select[_RevisionRow]:
     no_mod_digest = canonical_mods_digest(())
     no_mod_stars = (
         select(func.max(BeatmapDifficultyAttribute.star_rating))

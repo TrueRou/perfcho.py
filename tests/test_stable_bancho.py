@@ -119,6 +119,7 @@ class FakeBubbleBus:
         self.pending: list[RealtimeBubble] = []
         self.wait_bubble: RealtimeBubble | None = None
         self.published: list[tuple[int, RealtimeBubble]] = []
+        self.publish_many_calls: list[tuple[int, ...]] = []
         self.subscribed = False
         self.receive_calls = 0
         self.drain_calls = 0
@@ -130,6 +131,11 @@ class FakeBubbleBus:
     async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
         self.published.append((account_id, bubble))
         return int(self.subscribed and self.subscribe_calls[-1] == account_id)
+
+    async def publish_many(self, account_ids: tuple[int, ...], bubble: RealtimeBubble) -> int:
+        self.publish_many_calls.append(account_ids)
+        self.published.extend((account_id, bubble) for account_id in account_ids)
+        return sum(self.subscribed and self.subscribe_calls[-1] == account_id for account_id in account_ids)
 
     @asynccontextmanager
     async def subscribe(
@@ -293,6 +299,19 @@ class FakeRealtime:
     async def get_presence(self, account_id: int, *, at: datetime) -> PresenceSnapshot | None:
         del at
         return self.online_presences.get(account_id)
+
+    async def get_presences(
+        self,
+        account_ids: tuple[int, ...],
+        *,
+        at: datetime,
+    ) -> tuple[PresenceSnapshot, ...]:
+        del at
+        return tuple(
+            self.online_presences[account_id]
+            for account_id in dict.fromkeys(account_ids)
+            if account_id in self.online_presences
+        )
 
     async def list_presences(self, *, at: datetime, limit: int) -> tuple[PresenceSnapshot, ...]:
         del at
@@ -1000,7 +1019,9 @@ async def test_login_bootstraps_online_users_channels_silence_and_timestamped_ma
     assert community.policy == "friends"
     assert realtime.channel_members == {7: {3}}
     assert realtime.presence is not None
-    published = fake_bubbles(services).published
+    bus = fake_bubbles(services)
+    published = bus.published
+    assert bus.publish_many_calls == [(8,)]
     assert published == [(8, presence_updated_bubble(realtime.presence))]
     broadcast_packets = list(PacketReader(StableBubbleRenderer().render(published[0][1]), packet_enum=ServerPacket))
     assert [packet.packet_type for packet in broadcast_packets] == [

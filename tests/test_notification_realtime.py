@@ -1,6 +1,7 @@
 """Tests for durable-notification realtime delivery (BanchoBot DM)."""
 
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,11 +42,12 @@ class _FakePresence:
 class _FakeRealtime:
     def __init__(self, online: set[int]) -> None:
         self.online = online
-        self.queries: list[int] = []
+        self.queries: list[tuple[int, ...]] = []
 
-    async def get_presence(self, account_id: int, *, at: datetime) -> _FakePresence | None:
-        self.queries.append(account_id)
-        return _FakePresence(account_id) if account_id in self.online else None
+    async def get_presences(self, account_ids: tuple[int, ...], *, at: datetime) -> tuple[_FakePresence, ...]:
+        del at
+        self.queries.append(account_ids)
+        return tuple(_FakePresence(account_id) for account_id in account_ids if account_id in self.online)
 
 
 class _FakeBubbles:
@@ -87,7 +89,10 @@ def handler_env(monkeypatch: pytest.MonkeyPatch) -> tuple[_FakeRealtime, _FakeBu
     realtime = _FakeRealtime({7})
     bubbles = _FakeBubbles()
     handler = notification.notification_realtime_handler(
-        realtime=realtime, bubbles=bubbles, bot_account_id=1, bot_name="BanchoBot"
+        realtime=cast(notification.PresenceResolver, realtime),
+        bubbles=bubbles,
+        bot_account_id=1,
+        bot_name="BanchoBot",
     )
 
     async def fake_advance(session: AsyncSession, event: object, *, consumer: str, partition_key: str) -> None:
@@ -105,7 +110,7 @@ async def test_handler_delivers_to_online_recipients(handler_env: tuple) -> None
 
     await handler(session, _event(100, "achievement_unlocked", [7, 8]), "notification:100")
 
-    assert realtime.queries == [7, 8]
+    assert realtime.queries == [(7, 8)]
     assert len(bubbles.published) == 1
     account_id, bubble = bubbles.published[0]
     assert account_id == 7
@@ -135,6 +140,6 @@ async def test_handler_skips_offline_recipients(handler_env: tuple) -> None:
 
     await handler(session, _event(102, "achievement_unlocked", [99]), "notification:102")
 
-    assert realtime.queries == [99]
+    assert realtime.queries == [(99,)]
     assert bubbles.published == []
     assert session.advanced == ("notification-realtime-consumer.v1", "notification:102")

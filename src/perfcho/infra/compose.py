@@ -59,7 +59,6 @@ from perfcho.infra.settings import Settings
 from perfcho.infra.storage import S3ObjectStorage
 from perfcho.infra.upstream.bancho import BanchoUpstreamContentSource
 from perfcho.infra.upstream.calculator import HttpPerformanceCalculator
-from perfcho.modules.scoring.reconstruction import ReplayReconstructionService
 from perfcho.modules.account import AccountService
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.authorization.management import AuthorizationManagementService
@@ -88,6 +87,7 @@ from perfcho.modules.scoring import (
     ScoreQueryService,
     ScoringService,
 )
+from perfcho.modules.scoring.reconstruction import ReplayReconstructionService
 from perfcho.modules.social import SocialQueryService, SocialService, TransactionAchievementAwarder, build_clan_commands
 from perfcho.modules.social.achievements import default_achievement_evaluator_registry
 
@@ -241,8 +241,8 @@ class CoreServices:
     postgres: AsyncEngine
     session_factory: DbSessionFactory
     scheduler: AsyncScheduler
-    bubble_redis: Redis | None = None
-    http_client: httpx.AsyncClient | None = None
+    bubble_redis: Redis
+    http_client: httpx.AsyncClient
 
     async def aclose(self) -> None:
         """Stop process-owned scheduling and close shared infrastructure resources."""
@@ -250,12 +250,10 @@ class CoreServices:
             ("scheduler", lambda: stop_scheduler(self.scheduler)),
             ("cache Redis", self.cache_redis.aclose),
             ("state Redis", self.state_redis.aclose),
+            ("bubble Redis", self.bubble_redis.aclose),
+            ("httpx", self.http_client.aclose),
+            ("postgres", self.postgres.dispose),
         ]
-        if self.bubble_redis is not None:
-            cleanups.append(("bubble Redis", self.bubble_redis.aclose))
-        if self.http_client is not None:
-            cleanups.append(("HTTP client", self.http_client.aclose))
-        cleanups.append(("PostgreSQL", self.postgres.dispose))
         await _run_cleanups(cleanups, message="core service shutdown failed")
 
 
@@ -375,7 +373,7 @@ async def compose_stable_services(
         max_channels_per_session=core.config.redis_realtime_max_channels_per_session,
         max_spectators_per_host=core.config.redis_spectator_max_viewers,
     )
-    bubble_redis = core.bubble_redis or core.state_redis
+    bubble_redis = core.bubble_redis
     bubbles = RedisRealtimeBubbleBus(
         bubble_redis,
         prefix=core.config.redis_state_prefix,

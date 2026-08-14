@@ -74,7 +74,6 @@ from perfcho.modules.realtime import (
     RealtimeSessionNotFound,
     SessionControlAction,
     SessionControlBubble,
-    SessionFence,
     SpectatorAction,
     SpectatorFrame,
     SpectatorFrameAction,
@@ -412,15 +411,16 @@ async def _requested_packets(
     max_bytes: int,
 ) -> bytes:
     output = bytearray()
+    if max_bytes <= 0:
+        return bytes(output)
     now = services.clock.now()
-    for account_id in dict.fromkeys(account_ids):
-        if len(output) >= max_bytes:
-            break
-        if account_id < 1 or account_id == requester_account_id:
-            continue
-        snapshot = await services.realtime.get_presence(account_id, at=now)
-        if snapshot is None:
-            continue
+    requested_account_ids = tuple(
+        account_id
+        for account_id in dict.fromkeys(account_ids)
+        if account_id > 0 and account_id != requester_account_id
+    )
+    snapshots = await services.realtime.get_presences(requested_account_ids, at=now)
+    for snapshot in snapshots:
         bubble = presence_updated_bubble(snapshot)
         wire = _BUBBLE_RENDERER.render_presence(
             bubble,
@@ -465,7 +465,7 @@ async def broadcast_presence_update(
         else frozenset()
     )
 
-    async def publish_snapshot(snapshot: PresenceSnapshot) -> BaseException | None:
+    async def eligible_account_id(snapshot: PresenceSnapshot) -> int | None:
         if snapshot.account_id == account_id:
             return None
         subscription = await services.realtime.get_presence_subscription(snapshot.account_id)
@@ -473,25 +473,27 @@ async def broadcast_presence_update(
             subscription is PresenceSubscription.FOLLOWED and snapshot.account_id in followers
         ):
             return None
-        if services.bubbles is None:
-            return RuntimeError("realtime Bubble bus is unavailable")
-        try:
-            await services.bubbles.publish(snapshot.account_id, bubble)
-        except Exception as error:
-            return error
-        return None
+        return snapshot.account_id
 
-    errors = tuple(
-        error
-        for error in await _bounded_gather(
+    recipient_ids = tuple(
+        recipient_id
+        for recipient_id in await _bounded_gather(
             snapshots,
-            publish_snapshot,
+            eligible_account_id,
             limit=services.settings.stable_presence_fanout_concurrency,
         )
-        if error is not None
+        if recipient_id is not None
     )
-    failure_count = len(errors)
-    representative_error = errors[0] if errors else None
+    representative_error: BaseException | None = None
+    if recipient_ids:
+        if services.bubbles is None:
+            representative_error = RuntimeError("realtime Bubble bus is unavailable")
+        else:
+            try:
+                await services.bubbles.publish_many(recipient_ids, bubble)
+            except Exception as error:
+                representative_error = error
+    failure_count = len(recipient_ids) if representative_error is not None else 0
     if representative_error is not None and rate_limit("stable-presence-broadcast-failed", interval_seconds=5):
         log_event(
             "WARNING",
@@ -652,7 +654,7 @@ async def account_stats(stats: UserStats, services: StableServices) -> UserStats
         float(view.accuracy),
         view.play_count,
         view.total_score,
-        view.global_rank,
+        view.global_rank if view.global_rank is not None else 0,
         view.performance,
     )
 
@@ -809,9 +811,7 @@ async def _send_public_message(message: Message, context: StableRuntimeContext, 
         result.created_at,
         False,
     )
-    delivered_count = 0
-    for account_id in member_ids:
-        delivered_count += int(await _publish_online_recipient(account_id, bubble, services))
+    delivered_count = await _publish_many_online_recipients(member_ids, bubble, services)
     _log_message_state(
         "public",
         "persisted",
@@ -881,9 +881,7 @@ async def _send_multiplayer_message(
         services.clock.now(),
         False,
     )
-    delivered_count = 0
-    for account_id in recipient_ids:
-        delivered_count += int(await _publish_online_recipient(account_id, bubble, services))
+    delivered_count = await _publish_many_online_recipients(recipient_ids, bubble, services)
     _log_message_state(
         "multiplayer",
         "delivered",
@@ -1102,9 +1100,11 @@ async def _execute_bot_command(
         )
         context.local_bubbles.append(bubble)
         if not private:
-            for account_id in public_recipient_ids:
-                if account_id != context.identity.account_id:
-                    await _publish_online_recipient(account_id, bubble, services)
+            await _publish_many_online_recipients(
+                tuple(account_id for account_id in public_recipient_ids if account_id != context.identity.account_id),
+                bubble,
+                services,
+            )
 
     if result.directive is BotDirective.RECONNECT:
         context.local_bubbles.append(SessionControlBubble(SessionControlAction.RECONNECT))
@@ -1249,20 +1249,33 @@ async def _broadcast_channel_count(
         bubble.topic,
         bubble.member_count,
     )
-    for account_id in member_ids:
-        if account_id != excluded_account_id:
-            await _publish_online_recipient(account_id, remote_bubble, services)
+    await _publish_many_online_recipients(
+        tuple(account_id for account_id in member_ids if account_id != excluded_account_id),
+        remote_bubble,
+        services,
+    )
 
 
-async def _publish_online_recipient(
-    account_id: int,
+async def _publish_many_online_recipients(
+    account_ids: Sequence[int],
     bubble: RealtimeBubble,
     services: StableServices,
-) -> bool:
-    presence = await services.realtime.get_presence(account_id, at=services.clock.now())
-    if presence is None:
-        return False
-    return await _publish_to_presence(presence, bubble, services)
+) -> int:
+    presences = await services.realtime.get_presences(account_ids, at=services.clock.now())
+    if not presences or services.bubbles is None:
+        return 0
+    try:
+        return await services.bubbles.publish_many(tuple(presence.account_id for presence in presences), bubble)
+    except Exception as error:
+        if rate_limit("stable-message-delivery-failed", interval_seconds=5):
+            log_event(
+                "WARNING",
+                "stable.message.delivery_failed",
+                exception=error,
+                outcome="deferred",
+                failure_count=len(presences),
+            )
+        return 0
 
 
 async def _publish_to_presence(
@@ -1399,14 +1412,21 @@ async def _logout(context: StableRuntimeContext, services: StableServices) -> by
             error_type=type(error).__name__,
         )
     bubble = UserLogoutBubble(context.identity.account_id)
-    recipient_count = 0
+    recipient_ids = tuple(
+        snapshot.account_id for snapshot in snapshots if snapshot.account_id != context.identity.account_id
+    )
+    recipient_count = len(recipient_ids)
     delivery_failure_count = 0
     delivery_error: BaseException | None = None
-    for snapshot in snapshots:
-        if snapshot.account_id != context.identity.account_id:
-            recipient_count += 1
-            if not await _publish_to_presence(snapshot, bubble, services):
-                delivery_failure_count += 1
+    if recipient_ids:
+        if services.bubbles is None:
+            delivery_failure_count = recipient_count
+        else:
+            try:
+                await services.bubbles.publish_many(recipient_ids, bubble)
+            except Exception as error:
+                delivery_error = error
+                delivery_failure_count = recipient_count
     log_event(
         "INFO",
         "stable.logout.completed",

@@ -303,6 +303,45 @@ async def test_list_presences_decodes_pipeline_values_without_per_account_reads(
 
 
 @pytest.mark.asyncio
+async def test_get_presences_deduplicates_and_decodes_one_pipeline(repository_double: RepositoryDouble) -> None:
+    first_session = uuid.uuid7()
+    second_session = uuid.uuid7()
+    pipeline = MagicMock()
+    pipeline.__aenter__.return_value = pipeline
+    first = presence_snapshot(43, 2, "first", PRESENCE_EXPIRY, first_session)
+    second = presence_snapshot(42, 3, "second", PRESENCE_EXPIRY, second_session)
+    pipeline.execute = AsyncMock(
+        return_value=[
+            {
+                b"account_id": b"43",
+                b"revision": b"2",
+                b"expires_at": str(datetime_to_milliseconds(PRESENCE_EXPIRY)).encode(),
+                b"session_id": str(first_session).encode(),
+                b"state": encode_presence(first),
+            },
+            {
+                b"account_id": b"42",
+                b"revision": b"3",
+                b"expires_at": str(datetime_to_milliseconds(PRESENCE_EXPIRY)).encode(),
+                b"session_id": str(second_session).encode(),
+                b"state": encode_presence(second),
+            },
+        ]
+    )
+    repository_double.redis.pipeline.return_value = pipeline
+
+    snapshots = await repository_double.repository.get_presences((43, 42, 43), at=NOW)
+
+    assert snapshots == (first, second)
+    assert [call.args[0] for call in pipeline.hgetall.call_args_list] == [
+        f"{PREFIX}:v2:presence:43",
+        f"{PREFIX}:v2:presence:42",
+    ]
+    repository_double.redis.hgetall.assert_not_awaited()
+    repository_double.redis.pipeline.assert_called_once_with(transaction=False)
+
+
+@pytest.mark.asyncio
 async def test_spectator_contract_returns_atomic_handoff_and_live_recipients(
     repository_double: RepositoryDouble,
 ) -> None:

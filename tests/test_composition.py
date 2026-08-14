@@ -2,6 +2,7 @@ from datetime import timedelta
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from apscheduler import AsyncScheduler
 from pydantic import SecretStr
@@ -43,6 +44,8 @@ async def test_stable_composition_wires_independent_security_keys() -> None:
             postgres=cast(AsyncEngine, MagicMock()),
             session_factory=session_factory,
             scheduler=cast(AsyncScheduler, MagicMock()),
+            bubble_redis=redis,
+            http_client=cast(httpx.AsyncClient, MagicMock(spec=httpx.AsyncClient)),
         )
         services = await compose_stable_services(core)
         assert services.account is not None
@@ -87,6 +90,7 @@ async def test_core_shutdown_attempts_every_cleanup_after_failures() -> None:
     cache_redis = MagicMock(aclose=AsyncMock())
     bubble_redis = MagicMock(aclose=AsyncMock())
     postgres = MagicMock(dispose=AsyncMock(side_effect=RuntimeError("postgres close failed")))
+    http_client = MagicMock(aclose=AsyncMock())
     core = CoreServices(
         config=Settings(),
         clock=cast(Clock, MagicMock()),
@@ -98,6 +102,7 @@ async def test_core_shutdown_attempts_every_cleanup_after_failures() -> None:
         session_factory=async_sessionmaker(expire_on_commit=False),
         scheduler=scheduler,
         bubble_redis=bubble_redis,
+        http_client=http_client,
     )
 
     with (
@@ -111,6 +116,7 @@ async def test_core_shutdown_attempts_every_cleanup_after_failures() -> None:
     cache_redis.aclose.assert_awaited_once()
     state_redis.aclose.assert_awaited_once()
     bubble_redis.aclose.assert_awaited_once()
+    http_client.aclose.assert_awaited_once()
     postgres.dispose.assert_awaited_once()
 
 

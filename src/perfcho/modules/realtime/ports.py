@@ -66,6 +66,15 @@ class RealtimeStateRepository(Protocol):
         """Return a live presence snapshot when one exists."""
         ...
 
+    async def get_presences(
+        self,
+        account_ids: Sequence[int],
+        *,
+        at: datetime,
+    ) -> tuple[PresenceSnapshot, ...]:
+        """Return live snapshots for the supplied accounts in first-seen order."""
+        ...
+
     async def list_presences(self, *, at: datetime, limit: int) -> tuple[PresenceSnapshot, ...]:
         """Return a bounded online presence snapshot ordered by account ID."""
         ...

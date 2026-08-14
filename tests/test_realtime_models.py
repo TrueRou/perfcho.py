@@ -183,6 +183,7 @@ def test_repository_protocol_covers_the_realtime_state_lifecycle() -> None:
         "fence_session",
         "set_presence",
         "get_presence",
+        "get_presences",
         "clear_presence",
         "join_channel",
         "leave_channel",

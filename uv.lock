@@ -143,28 +143,16 @@ wheels = [
 
 [[package]]
 name = "aiosignalr"
-version = "0.1.0"
-source = { directory = "../aiosignalr" }
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
     { name = "msgpack" },
     { name = "websockets" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9,<4" },
-    { name = "msgpack", specifier = ">=1.0,<2" },
-    { name = "websockets", specifier = ">=16,<17" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.10" },
-    { name = "pytest", specifier = ">=8" },
-    { name = "pytest-asyncio", specifier = ">=0.23" },
-    { name = "ruff", specifier = ">=0.5" },
-    { name = "uvicorn", specifier = ">=0.30" },
+sdist = { url = "https://files.pythonhosted.org/packages/77/8f/19ef04d43260aebd5f855608667801d5cf05932d347f29dedf38e7b58f16/aiosignalr-0.1.1.tar.gz", hash = "sha256:0fccde5ff5198eb0a9f1a036b0670135e1a680944dfe9a6841620ab67a2e5048", size = 41755, upload-time = "2026-08-14T15:34:29.211Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c0/4a/ffb1defd3df0dd1afae900b20f5fed771d4db2b9833a805d62adb7248541/aiosignalr-0.1.1-py3-none-any.whl", hash = "sha256:affcedf54c3612f53d634f8513aad672b4150ea2f8fb0c7c4e2850dcc02c25dc", size = 57864, upload-time = "2026-08-14T15:34:27.928Z" },
 ]
 
 [[package]]
@@ -1000,7 +988,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aioboto3", specifier = ">=15.5.0" },
-    { name = "aiosignalr", directory = "../aiosignalr" },
+    { name = "aiosignalr", specifier = ">=0.1.1" },
     { name = "apscheduler", specifier = ">=4.0.0a6,<5" },
     { name = "argon2-cffi", specifier = ">=25.1.0" },
     { name = "asyncpg", specifier = ">=0.31.0" },

@@ -54,7 +54,6 @@ from perfcho.modules.realtime import (
     RealtimeBubbleBus,
     RealtimeSession,
     RealtimeStateRepository,
-    SessionFence,
     multiplayer_room_snapshot,
 )
 from perfcho.modules.scoring import Ruleset, ScoreboardVariant
@@ -230,10 +229,23 @@ class RoomRealtime:
     def __init__(self, *account_ids: int) -> None:
         self.presences = {account_id: presence_snapshot(account_id, f"user-{account_id}") for account_id in account_ids}
         self.delivered: list[tuple[int, bytes]] = []
+        self.publish_many_calls: list[tuple[int, ...]] = []
+        self.get_presences_calls: list[tuple[int, ...]] = []
 
     async def get_presence(self, account_id: int, *, at: datetime) -> PresenceSnapshot | None:
         del at
         return self.presences.get(account_id)
+
+    async def get_presences(
+        self,
+        account_ids: tuple[int, ...],
+        *,
+        at: datetime,
+    ) -> tuple[PresenceSnapshot, ...]:
+        del at
+        accounts = tuple(dict.fromkeys(account_ids))
+        self.get_presences_calls.append(accounts)
+        return tuple(self.presences[account_id] for account_id in accounts if account_id in self.presences)
 
 
 class FakeBubbleBus:
@@ -246,6 +258,13 @@ class FakeBubbleBus:
         elif isinstance(self.realtime, InviteRealtime) and self.realtime.target.account_id == account_id:
             self.realtime.delivered.append((self.realtime.target.account_id, StableBubbleRenderer().render(bubble)))
         return 1
+
+    async def publish_many(self, account_ids: tuple[int, ...], bubble: RealtimeBubble) -> int:
+        if isinstance(self.realtime, RoomRealtime):
+            self.realtime.publish_many_calls.append(account_ids)
+        for account_id in account_ids:
+            await self.publish(account_id, bubble)
+        return len(account_ids)
 
 
 class FakeCommunity:
@@ -732,6 +751,8 @@ async def test_score_frame_hot_path_echoes_immediately_and_broadcasts_to_other_r
     assert echoed.payload.read_score_frame() == replace(frame, frame_id=0)
     echoed.payload.require_exhausted()
     assert [account_id for account_id, _ in realtime.delivered] == [20]
+    assert realtime.get_presences_calls == [(20,)]
+    assert realtime.publish_many_calls == [(20,)]
     for _, payload in realtime.delivered:
         packet = next(PacketReader(payload, packet_enum=ServerPacket))
         assert packet.packet_type is ServerPacket.MATCH_SCORE_UPDATE

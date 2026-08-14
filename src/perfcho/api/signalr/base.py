@@ -8,6 +8,7 @@ the connection to the account's cross-worker event stream.
 """
 
 import asyncio
+from inspect import isawaitable
 from typing import TYPE_CHECKING
 
 from aiosignalr.server import Hub
@@ -38,12 +39,12 @@ class PerfchoHub(Hub):
         """Authenticate the connection or close it before any invocation."""
         services = self._services()
         if services is None:
-            await self.close(_UNAUTHORIZED_CODE, "Services unavailable.")
+            await self._close(_UNAUTHORIZED_CODE, "Services unavailable.")
             return
         try:
             account = await authenticate(services, self.context.http_headers)
         except InvalidAccessToken:
-            await self.close(_UNAUTHORIZED_CODE, "Unauthorized.")
+            await self._close(_UNAUTHORIZED_CODE, "Unauthorized.")
             return
         self.account_id = account.account_id
         self.context.user_id = str(account.account_id)
@@ -102,7 +103,19 @@ class PerfchoHub(Hub):
     # -- helpers -----------------------------------------------------------
 
     def _services(self) -> StableServices | None:
-        return self.context.state.get("stable_services")
+        state = getattr(self.context, "state", None)
+        if not isinstance(state, dict):
+            return None
+        return state.get("stable_services")
+
+    async def _close(self, code: int, reason: str) -> None:
+        close = getattr(self, "close", None)
+        if not callable(close):
+            raise RuntimeError("SignalR hub does not provide a close operation")
+        result = close(code, reason)
+        if not isawaitable(result):
+            raise RuntimeError("SignalR hub close operation is not asynchronous")
+        await result
 
     async def _caller(self, method: str, *args: object) -> None:
         await self.clients.caller.send(method, *args)

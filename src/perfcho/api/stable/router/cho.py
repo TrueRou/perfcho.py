@@ -297,26 +297,21 @@ async def _login(request: Request, body: bytes, services: StableServices) -> Res
             if snapshot.account_id != result.account_id
         )
 
-        async def publish_presence(snapshot: PresenceSnapshot) -> BaseException | None:
+        presence_broadcast_error: BaseException | None = None
+        presence_broadcast_failure_count = 0
+        if online_presences:
             if services.bubbles is None:
-                return RuntimeError("realtime Bubble bus is unavailable")
-            try:
-                await services.bubbles.publish(snapshot.account_id, own_bubble)
-            except Exception as error:
-                return error
-            return None
-
-        broadcast_errors = tuple(
-            error
-            for error in await _bounded_gather(
-                online_presences,
-                publish_presence,
-                limit=services.settings.stable_presence_fanout_concurrency,
-            )
-            if error is not None
-        )
-        presence_broadcast_failure_count = len(broadcast_errors)
-        presence_broadcast_error = broadcast_errors[0] if broadcast_errors else None
+                presence_broadcast_error = RuntimeError("realtime Bubble bus is unavailable")
+            else:
+                try:
+                    await services.bubbles.publish_many(
+                        tuple(snapshot.account_id for snapshot in online_presences),
+                        own_bubble,
+                    )
+                except Exception as error:
+                    presence_broadcast_error = error
+            if presence_broadcast_error is not None:
+                presence_broadcast_failure_count = len(online_presences)
 
         online_packets = tuple(
             _BUBBLE_RENDERER.render(presence_updated_bubble(snapshot)) for snapshot in online_presences

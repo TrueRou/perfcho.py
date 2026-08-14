@@ -18,6 +18,7 @@ from perfcho.modules.multiplayer import (
     JoinRoom,
     KickParticipant,
     LeaveRoom,
+    MultiplayerService,
     RoomSettings,
     RoomState,
     SlotStatus,
@@ -189,7 +190,8 @@ class SpectatorHub(PerfchoHub):
 
     @property
     def _session_id(self) -> uuid.UUID:
-        session_id = self.context.state.get("session_id")
+        state = getattr(self.context, "state", None)
+        session_id = state.get("session_id") if isinstance(state, dict) else None
         if isinstance(session_id, uuid.UUID):
             return session_id
         # Lazer connections carry no durable session; derive a stable one.
@@ -291,35 +293,35 @@ class MultiplayerHub(PerfchoHub):
     async def TransferHost(self, user_id: int) -> None:
         """Transfer host authority to another participant."""
         services = self._services()
-        state = await self._current_room(services)
-        await services.multiplayer.change_host(
+        multiplayer, state = await self._current_room(services)
+        await multiplayer.change_host(
             _change_host_cmd(self._meta("transfer_host"), state, user_id)
         )
 
     async def KickUser(self, user_id: int) -> None:
         """Kick a participant."""
         services = self._services()
-        state = await self._current_room(services)
-        await services.multiplayer.kick_participant(
+        multiplayer, state = await self._current_room(services)
+        await multiplayer.kick_participant(
             KickParticipant(self._meta("kick"), state.room.public_id, state.state_revision, user_id)
         )
 
     async def ChangeSettings(self, settings: dict[str, Any]) -> None:
         """Apply new room settings."""
         services = self._services()
-        state = await self._current_room(services)
-        await services.multiplayer.update_settings(
+        multiplayer, state = await self._current_room(services)
+        await multiplayer.update_settings(
             _update_settings_cmd(self._meta("settings"), state, settings)
         )
 
     async def ChangeState(self, new_state: str) -> None:
         """Change the caller's ready state."""
         services = self._services()
-        state = await self._current_room(services)
+        multiplayer, state = await self._current_room(services)
         if self.account_id is None or state.slot_for(self.account_id) is None:
             return
         target = SlotStatus.READY if new_state in {"Ready", "Loaded", "ReadyForGameplay"} else SlotStatus.NOT_READY
-        await services.multiplayer.set_slot_status(state.room.public_id, self.account_id, target)
+        await multiplayer.set_slot_status(state.room.public_id, self.account_id, target)
 
     async def ChangeBeatmapAvailability(self, availability: dict[str, Any]) -> None:
         """No-op beatmap availability acknowledgement for now."""
@@ -332,11 +334,11 @@ class MultiplayerHub(PerfchoHub):
     async def ChangeUserMods(self, new_mods: list[dict[str, Any]]) -> None:
         """Apply the caller's local mods."""
         services = self._services()
-        state = await self._current_room(services)
+        multiplayer, state = await self._current_room(services)
         if self.account_id is None:
             return
         mods = tuple(CanonicalMod(str(m.get("acronym", "")), dict(m.get("settings", {}) or {})) for m in new_mods)
-        await services.multiplayer.set_slot_mods(state.room.public_id, self.account_id, mods)
+        await multiplayer.set_slot_mods(state.room.public_id, self.account_id, mods)
 
     async def SendMatchRequest(self, request: dict[str, Any]) -> None:
         """No-op match request for now."""
@@ -345,16 +347,16 @@ class MultiplayerHub(PerfchoHub):
     async def StartMatch(self) -> None:
         """Start the current round."""
         services = self._services()
-        state = await self._current_room(services)
-        await services.multiplayer.start_round(
+        multiplayer, state = await self._current_room(services)
+        await multiplayer.start_round(
             _round_cmd(self._meta("start"), state)
         )
 
     async def AbortMatch(self) -> None:
         """Abort the current round."""
         services = self._services()
-        state = await self._current_room(services)
-        await services.multiplayer.complete_round(
+        multiplayer, state = await self._current_room(services)
+        await multiplayer.complete_round(
             _complete_round_cmd(self._meta("abort"), state, aborted=True)
         )
 
@@ -382,13 +384,13 @@ class MultiplayerHub(PerfchoHub):
 
     # -- helpers -----------------------------------------------------------
 
-    async def _current_room(self, services: StableServices | None) -> RoomState:
+    async def _current_room(self, services: StableServices | None) -> tuple[MultiplayerService, RoomState]:
         if services is None or services.multiplayer is None or self.account_id is None:
             raise _unavailable()
         state = await services.multiplayer.find_room_for_account(self.account_id)
         if state is None:
             raise _not_joined()
-        return state
+        return services.multiplayer, state
 
     def _meta(self, operation: str) -> CommandMeta:
         from datetime import UTC, datetime

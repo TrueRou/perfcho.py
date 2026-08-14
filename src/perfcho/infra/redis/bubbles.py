@@ -7,9 +7,8 @@ from datetime import UTC, datetime
 from time import monotonic
 from typing import Any, cast
 
-import msgpack  # type: ignore[import-untyped]
+import msgpack
 from redis.asyncio import Redis
-from redis.exceptions import ResponseError
 
 from perfcho.infra.db.mods import project_scoreboard_variant
 from perfcho.infra.logging import log_event
@@ -61,6 +60,27 @@ def _map(value: object, fields: frozenset[str]) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != fields or any(not isinstance(key, str) for key in value):
         raise ValueError("bubble body has invalid fields")
     return cast(dict[str, Any], value)
+
+
+def _required_int(body: Mapping[str, Any], field: str) -> int:
+    value = body[field]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"bubble field {field} must be an integer")
+    return value
+
+
+def _required_str(body: Mapping[str, Any], field: str) -> str:
+    value = body[field]
+    if not isinstance(value, str):
+        raise ValueError(f"bubble field {field} must be a string")
+    return value
+
+
+def _required_bool(body: Mapping[str, Any], field: str) -> bool:
+    value = body[field]
+    if not isinstance(value, bool):
+        raise ValueError(f"bubble field {field} must be a boolean")
+    return value
 
 
 def _activity(value: object) -> PlayerActivity:
@@ -350,7 +370,10 @@ def _encode_body(bubble: RealtimeBubble) -> tuple[str, dict[str, Any]]:
 def encode_bubble(bubble: RealtimeBubble) -> bytes:
     """Encode one known Bubble as a versioned MessagePack map."""
     kind, body = _encode_body(bubble)
-    return msgpack.packb({"v": _VERSION, "kind": kind, "body": body}, use_bin_type=True)
+    payload = msgpack.packb({"v": _VERSION, "kind": kind, "body": body}, use_bin_type=True)
+    if not isinstance(payload, bytes):
+        raise TypeError("MessagePack encoder returned a non-byte payload")
+    return payload
 
 
 def _decode_body(kind: str, value: object) -> RealtimeBubble:
@@ -398,12 +421,26 @@ def _decode_body(kind: str, value: object) -> RealtimeBubble:
                 }
             ),
         )
-        return ChatMessageBubble(**body | {"created_at": _datetime(body["created_at"])})
+        return ChatMessageBubble(
+            message_id=_required_int(body, "message_id"),
+            channel_id=_required_int(body, "channel_id"),
+            channel_name=_required_str(body, "channel_name"),
+            sender_account_id=_required_int(body, "sender_account_id"),
+            sender_name=_required_str(body, "sender_name"),
+            content=_required_str(body, "content"),
+            is_action=_required_bool(body, "is_action"),
+            created_at=_datetime(body["created_at"]),
+            direct=_required_bool(body, "direct"),
+        )
     if kind == "channel.updated":
         body = _map(value, frozenset({"channel_id", "name", "topic", "member_count", "membership_action"}))
         action = body["membership_action"]
         return ChannelUpdatedBubble(
-            **body | {"membership_action": None if action is None else ChannelMembershipAction(action)}
+            channel_id=_required_int(body, "channel_id"),
+            name=_required_str(body, "name"),
+            topic=_required_str(body, "topic"),
+            member_count=_required_int(body, "member_count"),
+            membership_action=None if action is None else ChannelMembershipAction(action),
         )
     if kind == "multiplayer.room":
         body = _map(value, frozenset({"action", "room", "local_admission_credential"}))

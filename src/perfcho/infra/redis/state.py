@@ -4,7 +4,7 @@ import struct
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any
 
 import msgpack
 
@@ -59,7 +59,7 @@ def encode_presence(snapshot: PresenceSnapshot) -> bytes:
     identity = snapshot.identity
     activity = snapshot.activity
     statistics = snapshot.statistics
-    return msgpack.packb(
+    payload = msgpack.packb(
         {
             "v": _PRESENCE_VERSION,
             "account_id": snapshot.account_id,
@@ -93,12 +93,61 @@ def encode_presence(snapshot: PresenceSnapshot) -> bytes:
         },
         use_bin_type=True,
     )
+    if not isinstance(payload, bytes):
+        raise TypeError("MessagePack encoder returned a non-byte payload")
+    return payload
 
 
 def _presence_map(value: object, fields: frozenset[str], *, name: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != fields or any(not isinstance(key, str) for key in value):
         raise ValueError(f"stored presence {name} has invalid fields")
-    return cast(dict[str, Any], value)
+    return {key: item for key, item in value.items() if isinstance(key, str)}
+
+
+def _required_int(body: dict[str, Any], field: str) -> int:
+    value = body[field]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"stored presence {field} is invalid")
+    return value
+
+
+def _optional_int(body: dict[str, Any], field: str) -> int | None:
+    value = body[field]
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"stored presence {field} is invalid")
+    return value
+
+
+def _required_str(body: dict[str, Any], field: str) -> str:
+    value = body[field]
+    if not isinstance(value, str):
+        raise ValueError(f"stored presence {field} is invalid")
+    return value
+
+
+def _optional_str(body: dict[str, Any], field: str) -> str | None:
+    value = body[field]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"stored presence {field} is invalid")
+    return value
+
+
+def _required_float(body: dict[str, Any], field: str) -> float:
+    value = body[field]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"stored presence {field} is invalid")
+    return float(value)
+
+
+def _required_str_list(body: dict[str, Any], field: str) -> list[str]:
+    value = body[field]
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"stored presence {field} is invalid")
+    return value
 
 
 def decode_presence(value: bytes) -> PresenceSnapshot:
@@ -133,17 +182,36 @@ def decode_presence(value: bytes) -> PresenceSnapshot:
         session_bytes = body["session_id"]
         if not isinstance(session_bytes, bytes) or len(session_bytes) != 16:
             raise ValueError("stored presence session_id is invalid")
-        privileges = identity["privileges"]
-        mods = activity["mods"]
-        if not isinstance(privileges, list) or not isinstance(mods, list):
-            raise ValueError("stored presence collections are invalid")
+        privileges = _required_str_list(identity, "privileges")
+        mods = _required_str_list(activity, "mods")
         return PresenceSnapshot(
-            account_id=body["account_id"],
-            revision=body["revision"],
-            identity=PresenceIdentity(**identity | {"privileges": frozenset(privileges)}),
-            activity=PlayerActivity(**activity | {"mods": tuple(mods)}),
-            statistics=PlayerStatistics(**statistics),
-            expires_at=datetime_from_milliseconds(body["expires_at"]),
+            account_id=_required_int(body, "account_id"),
+            revision=_required_int(body, "revision"),
+            identity=PresenceIdentity(
+                display_name=_required_str(identity, "display_name"),
+                country_code=_optional_str(identity, "country_code"),
+                utc_offset=_required_int(identity, "utc_offset"),
+                privileges=frozenset(privileges),
+                longitude=_required_float(identity, "longitude"),
+                latitude=_required_float(identity, "latitude"),
+            ),
+            activity=PlayerActivity(
+                action=_required_str(activity, "action"),
+                info=_required_str(activity, "info"),
+                beatmap_id=_optional_int(activity, "beatmap_id"),
+                beatmap_checksum=_optional_str(activity, "beatmap_checksum"),
+                ruleset=_required_str(activity, "ruleset"),
+                mods=tuple(mods),
+            ),
+            statistics=PlayerStatistics(
+                ranked_score=_required_int(statistics, "ranked_score"),
+                accuracy=_required_float(statistics, "accuracy"),
+                play_count=_required_int(statistics, "play_count"),
+                total_score=_required_int(statistics, "total_score"),
+                global_rank=_optional_int(statistics, "global_rank"),
+                performance=_required_float(statistics, "performance"),
+            ),
+            expires_at=datetime_from_milliseconds(_required_int(body, "expires_at")),
             session_id=uuid.UUID(bytes=session_bytes),
         )
     except (KeyError, OverflowError, TypeError, ValueError, msgpack.UnpackException) as error:

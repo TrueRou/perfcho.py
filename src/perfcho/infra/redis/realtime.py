@@ -353,6 +353,28 @@ class RedisRealtimeStateRepository(RealtimeStateRepository):
         values = await self._redis.hgetall(self._keys.presence(account_id))
         return self._decode_presence(account_id, values, at=at)
 
+    async def get_presences(
+        self,
+        account_ids: Sequence[int],
+        *,
+        at: datetime,
+    ) -> tuple[PresenceSnapshot, ...]:
+        """Read many live presence projections in one Redis round trip."""
+        accounts = tuple(dict.fromkeys(account_ids))
+        for account_id in accounts:
+            _positive_integer("account_id", account_id)
+        if not accounts:
+            return ()
+        async with self._redis.pipeline(transaction=False) as pipeline:
+            for account_id in accounts:
+                pipeline.hgetall(self._keys.presence(account_id))
+            values = await pipeline.execute()
+        return tuple(
+            snapshot
+            for account_id, presence in zip(accounts, values, strict=True)
+            if (snapshot := self._decode_presence(account_id, presence, at=at)) is not None
+        )
+
     @staticmethod
     def _decode_presence(
         account_id: int,
