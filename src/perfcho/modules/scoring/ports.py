@@ -20,11 +20,13 @@ from perfcho.modules.scoring.models import (
     MultiplayerSubmissionContext,
     PlayAttemptRecord,
     PlayAttemptSubmission,
+    ReplayReconstructionFacts,
     ReplayReference,
     Ruleset,
     ScoreAcceptanceRecord,
     ScoreDetailView,
     SoloScoreToken,
+    StagedReplayManifest,
     UserRankingView,
 )
 
@@ -121,6 +123,14 @@ class ReplayRepository(Protocol):
         viewer_account_id: int | None,
     ) -> bool:
         """Idempotently append one replay view fact and report whether it was new."""
+        ...
+
+    async def get_replay_reconstruction_facts(self, score_id: int) -> ReplayReconstructionFacts | None:
+        """Return the immutable facts needed to rebuild a client replay."""
+        ...
+
+    async def persist_replay(self, score_id: int, manifest: StagedReplayManifest) -> None:
+        """Upsert one ready replay manifest for an already-accepted score."""
         ...
 
 

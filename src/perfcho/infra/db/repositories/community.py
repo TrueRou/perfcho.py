@@ -18,6 +18,8 @@ from perfcho.infra.db.models.community import (
     ChannelUserState,
     DirectConversation,
     Message,
+    Notification,
+    NotificationRecipient,
 )
 from perfcho.infra.db.models.core import Account, AccountName, UserPreference
 from perfcho.infra.db.models.moderation import Sanction
@@ -29,6 +31,8 @@ from perfcho.modules.community.models import (
     DirectConversationResult,
     DirectMessageContext,
     MessageResult,
+    NotificationPage,
+    NotificationView,
     OfflineDirectMessage,
     ReadCursorResult,
 )
@@ -524,6 +528,75 @@ class SqlAlchemyCommunityRepository:
             .returning(ChannelMembership.id)
         )
         return identifier is not None
+
+    async def list_notifications(
+        self,
+        account_id: int,
+        *,
+        before_notification_id: int | None,
+        limit: int,
+    ) -> NotificationPage:
+        """Return one recipient's notifications and unread count."""
+        base = (
+            select(NotificationRecipient.notification_id)
+            .where(NotificationRecipient.account_id == account_id)
+        )
+        unread = base.where(NotificationRecipient.read_at.is_(None))
+        unread_count = int(await self._session.scalar(select(func.count()).select_from(unread.subquery())) or 0)
+        statement = (
+            select(
+                Notification.id,
+                Notification.actor_account_id,
+                Notification.kind,
+                Notification.category,
+                Notification.resource_type,
+                Notification.resource_id,
+                Notification.created_at,
+                NotificationRecipient.read_at,
+            )
+            .select_from(Notification)
+            .join(NotificationRecipient, NotificationRecipient.notification_id == Notification.id)
+            .where(NotificationRecipient.account_id == account_id)
+            .order_by(Notification.id.desc())
+            .limit(limit + 1)
+        )
+        if before_notification_id is not None:
+            statement = statement.where(Notification.id < before_notification_id)
+        rows = (await self._session.execute(statement)).all()
+        has_more = len(rows) > limit
+        notifications = tuple(
+            NotificationView(
+                notification_id=row.id,
+                actor_account_id=row.actor_account_id,
+                kind=row.kind,
+                category=row.category,
+                resource_type=row.resource_type,
+                resource_id=row.resource_id,
+                created_at=row.created_at,
+                read=row.read_at is not None,
+            )
+            for row in rows[:limit]
+        )
+        return NotificationPage(notifications, has_more, unread_count)
+
+    async def mark_notifications_read(self, account_id: int, notification_ids: tuple[int, ...]) -> int:
+        """Mark a set of recipient notifications read at the current instant."""
+        if not notification_ids:
+            return 0
+        from datetime import UTC
+
+        now = datetime.now(UTC)
+        result = await self._session.execute(
+            update(NotificationRecipient)
+            .where(
+                NotificationRecipient.account_id == account_id,
+                NotificationRecipient.notification_id.in_(notification_ids),
+                NotificationRecipient.read_at.is_(None),
+            )
+            .values(read_at=now)
+        )
+        rowcount = getattr(result, "rowcount", None)
+        return int(rowcount or 0)
 
 
 class SqlAlchemyActiveSilencePolicy:

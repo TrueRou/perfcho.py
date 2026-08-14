@@ -530,6 +530,33 @@ class ReplayReference:
 
 
 @dataclass(frozen=True, slots=True)
+class ReplayReconstructionFacts:
+    """Carry the immutable score facts needed to rebuild a client replay."""
+
+    score_id: int
+    account_id: int
+    display_name: str
+    beatmap_id: int
+    beatmap_md5: bytes
+    ruleset: Ruleset
+    total_score: int
+    max_combo: int
+    perfect: bool
+    mods: tuple[CanonicalMod, ...]
+    statistics: Mapping[str, int]
+    ended_at: datetime
+
+    def __post_init__(self) -> None:
+        """Require valid score and beatmap identities."""
+        if min(self.score_id, self.account_id, self.beatmap_id) < 1:
+            raise ValueError("replay reconstruction identifiers must be positive")
+        if len(self.beatmap_md5) != 16:
+            raise ValueError("replay reconstruction beatmap_md5 must contain 16 bytes")
+        object.__setattr__(self, "mods", tuple(self.mods))
+        object.__setattr__(self, "statistics", MappingProxyType(dict(self.statistics)))
+
+
+@dataclass(frozen=True, slots=True)
 class LeaderboardScoreView:
     """Describe one projected leaderboard score."""
 

@@ -13,6 +13,7 @@ from perfcho.modules.community.models import (
     DirectConversationResult,
     DirectMessageContext,
     MessageResult,
+    NotificationPage,
     OfflineDirectMessage,
     ReadCursorResult,
 )
@@ -173,6 +174,20 @@ class CommunityRepository(Protocol):
 
     async def leave_membership(self, channel_id: int, account_id: int, *, now: datetime) -> bool:
         """Close an active durable channel membership."""
+        ...
+
+    async def list_notifications(
+        self,
+        account_id: int,
+        *,
+        before_notification_id: int | None,
+        limit: int,
+    ) -> NotificationPage:
+        """Return one recipient's notifications and unread count."""
+        ...
+
+    async def mark_notifications_read(self, account_id: int, notification_ids: tuple[int, ...]) -> int:
+        """Mark a set of recipient notifications read."""
         ...
 
 

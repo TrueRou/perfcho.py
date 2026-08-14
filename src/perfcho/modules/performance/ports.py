@@ -4,6 +4,8 @@ from typing import Protocol
 
 from perfcho.modules.common.ports import UnitOfWork
 from perfcho.modules.performance.models import (
+    DifficultyCalculationResult,
+    DifficultyRequest,
     PerformanceCalculationInput,
     PerformanceResult,
     ScorePerformanceView,
@@ -29,6 +31,15 @@ class PerformanceCalculator(Protocol):
         beatmap_url: str,
     ) -> PerformanceResult:
         """Return deterministic output after reading the immutable Beatmap URL."""
+        ...
+
+    async def calculate_difficulty(
+        self,
+        request: DifficultyRequest,
+        *,
+        beatmap_url: str,
+    ) -> DifficultyCalculationResult:
+        """Return deterministic difficulty attributes for one beatmap and mods."""
         ...
 
 

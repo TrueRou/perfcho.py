@@ -292,3 +292,33 @@ class ActiveSilence:
             _require_positive_id("channel_id", self.channel_id)
         if self.ends_at is not None:
             _require_aware("ends_at", self.ends_at)
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationView:
+    """Describe one durable notification and its recipient read state."""
+
+    notification_id: int
+    actor_account_id: int | None
+    kind: str
+    category: str
+    resource_type: str | None
+    resource_id: str | None
+    created_at: datetime
+    read: bool
+
+    def __post_init__(self) -> None:
+        """Validate the notification identity and aware creation instant."""
+        _require_positive_id("notification_id", self.notification_id)
+        if self.actor_account_id is not None:
+            _require_positive_id("actor_account_id", self.actor_account_id)
+        _require_aware("created_at", self.created_at)
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationPage:
+    """Return a bounded notification page and unread summary."""
+
+    notifications: tuple[NotificationView, ...]
+    has_more: bool
+    unread_count: int

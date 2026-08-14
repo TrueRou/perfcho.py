@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import and_, func, or_, select, update
@@ -73,6 +73,7 @@ from perfcho.modules.scoring.models import (
     PlayAttemptRecord,
     PlayAttemptSubmission,
     PopulationFilter,
+    ReplayReconstructionFacts,
     ReplayReference,
     Ruleset,
     ScoreAcceptanceRecord,
@@ -81,6 +82,7 @@ from perfcho.modules.scoring.models import (
     ScoreGrade,
     ScoreOutcome,
     SoloScoreToken,
+    StagedReplayManifest,
     UserRankingView,
     thaw_json_mapping,
 )
@@ -478,6 +480,74 @@ class SqlAlchemyScoringRepository:
             .returning(ReplayViewEvent.id)
         )
         return inserted is not None
+
+    async def get_replay_reconstruction_facts(self, score_id: int) -> ReplayReconstructionFacts | None:
+        """Return the immutable facts needed to rebuild a lazer replay."""
+        row = (
+            await self._session.execute(
+                select(
+                    Score.id,
+                    Score.account_id,
+                    Score.beatmap_id,
+                    Score.ruleset,
+                    Score.total_score,
+                    Score.max_combo,
+                    Score.perfect,
+                    Score.mods_details,
+                    Score.ended_at,
+                    AccountName.display_name,
+                    BeatmapRevision.md5,
+                )
+                .join(AccountName, and_(AccountName.account_id == Score.account_id, AccountName.ended_at.is_(None)))
+                .join(BeatmapRevision, BeatmapRevision.id == Score.beatmap_revision_id)
+                .where(Score.id == score_id)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        hits = await self._score_hits({score_id})
+        return ReplayReconstructionFacts(
+            score_id=row.id,
+            account_id=row.account_id,
+            display_name=row.display_name,
+            beatmap_id=row.beatmap_id,
+            beatmap_md5=row.md5,
+            ruleset=Ruleset(row.ruleset.value),
+            total_score=row.total_score,
+            max_combo=row.max_combo,
+            perfect=row.perfect,
+            mods=_canonical_mods(row.mods_details),
+            statistics=hits.get(score_id, {}),
+            ended_at=row.ended_at,
+        )
+
+    async def persist_replay(self, score_id: int, manifest: StagedReplayManifest) -> None:
+        """Upsert one ready replay manifest for an already-accepted score."""
+        await self._session.execute(
+            insert(Replay)
+            .values(
+                score_id=score_id,
+                format=manifest.format,
+                sha256=manifest.sha256,
+                size_bytes=manifest.size_bytes,
+                storage_key=manifest.storage_key,
+                state="ready",
+                client_version=manifest.client_version,
+                verified_at=datetime.now(UTC),
+            )
+            .on_conflict_do_update(
+                index_elements=(Replay.score_id,),
+                set_={
+                    "format": manifest.format,
+                    "sha256": manifest.sha256,
+                    "size_bytes": manifest.size_bytes,
+                    "storage_key": manifest.storage_key,
+                    "state": "ready",
+                    "client_version": manifest.client_version,
+                    "verified_at": datetime.now(UTC),
+                },
+            )
+        )
 
     async def get_score_detail(self, score_id: int) -> ScoreDetailView | None:
         """Read immutable score facts and its live classic-score position."""

@@ -103,6 +103,32 @@ class PerformanceCalculationInput:
 
 
 @dataclass(frozen=True, slots=True)
+class DifficultyRequest:
+    """Describe one standalone difficulty calculation for a beatmap and mods."""
+
+    beatmap_revision_id: int
+    beatmap_sha256: bytes
+    beatmap_storage_key: str
+    ruleset: Ruleset
+    mods_digest: bytes
+    mods: tuple[CanonicalMod, ...]
+    difficulty_formula_code: str
+    difficulty_release_version: str
+    difficulty_release_id: uuid.UUID
+    calculator: str
+
+    def __post_init__(self) -> None:
+        """Validate identifiers and digests."""
+        if self.beatmap_revision_id < 1:
+            raise ValueError("difficulty beatmap revision identifier must be positive")
+        if len(self.beatmap_sha256) != 32 or len(self.mods_digest) != 32:
+            raise ValueError("difficulty digests must contain 32 bytes")
+        if not self.beatmap_storage_key or not self.difficulty_formula_code or not self.difficulty_release_version:
+            raise ValueError("difficulty request metadata must be non-empty")
+        object.__setattr__(self, "mods", tuple(self.mods))
+
+
+@dataclass(frozen=True, slots=True)
 class DifficultyCalculationResult:
     """Describe difficulty attributes returned with one PP calculation."""
 

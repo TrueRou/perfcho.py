@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
+import httpx
 from apscheduler import AsyncScheduler
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -56,6 +57,8 @@ from perfcho.infra.security.password import Argon2Policy, PasswordPepper
 from perfcho.infra.settings import Settings
 from perfcho.infra.storage import S3ObjectStorage
 from perfcho.infra.upstream.bancho import BanchoUpstreamContentSource
+from perfcho.infra.upstream.calculator import HttpPerformanceCalculator
+from perfcho.infra.wire.reconstruction import ReplayReconstructionService
 from perfcho.modules.account import AccountService
 from perfcho.modules.authorization import AuthorizationQueryService
 from perfcho.modules.authorization.management import AuthorizationManagementService
@@ -71,6 +74,7 @@ from perfcho.modules.multiplayer import (
     build_multiplayer_commands,
     build_pool_commands,
 )
+from perfcho.modules.performance.difficulty import DifficultyQueryService
 from perfcho.modules.performance.services import PerformanceQueryService
 from perfcho.modules.realtime import RealtimeBubbleBus, RealtimePollGate, RealtimeStateRepository, UserEventBus
 from perfcho.modules.scoring import (
@@ -235,6 +239,7 @@ class CoreServices:
     session_factory: DbSessionFactory
     scheduler: AsyncScheduler
     bubble_redis: Redis | None = None
+    http_client: httpx.AsyncClient | None = None
 
     async def aclose(self) -> None:
         """Stop process-owned scheduling and close shared infrastructure resources."""
@@ -245,6 +250,8 @@ class CoreServices:
         ]
         if self.bubble_redis is not None:
             cleanups.append(("bubble Redis", self.bubble_redis.aclose))
+        if self.http_client is not None:
+            cleanups.append(("HTTP client", self.http_client.aclose))
         cleanups.append(("PostgreSQL", self.postgres.dispose))
         await _run_cleanups(cleanups, message="core service shutdown failed")
 
@@ -268,6 +275,8 @@ async def compose_core_services() -> CoreServices:
             session_factory,
             user_ranking_snapshot_cron=config.user_ranking_snapshot_cron,
         )
+        http_client = httpx.AsyncClient(timeout=config.performance_http_timeout_seconds)
+        cleanups.append(("HTTP client", http_client.aclose))
     except BaseException as startup_error:
         try:
             await _run_cleanups(tuple(reversed(cleanups)), message="core service startup cleanup failed")
@@ -285,6 +294,7 @@ async def compose_core_services() -> CoreServices:
         session_factory=session_factory,
         scheduler=scheduler,
         bubble_redis=bubble_redis,
+        http_client=http_client,
     )
 
 
@@ -312,8 +322,10 @@ class StableServices:
     scoring: ScoringService | None = None
     score_query: ScoreQueryService | None = None
     performance_query: PerformanceQueryService | None = None
+    difficulty_query: DifficultyQueryService | None = None
     replay_query: ReplayQueryService | None = None
     replay: ReplayService | None = None
+    replay_reconstruction: ReplayReconstructionService | None = None
     ranking_query: RankingQueryService | None = None
     account_statistics: AccountStatisticsQueryService | None = None
     beatmap_scores: BeatmapScoresQueryService | None = None
@@ -499,8 +511,21 @@ async def compose_stable_services(
         scoring=scoring,
         score_query=ScoreQueryService(uow_factory, _score_query_repository),
         performance_query=PerformanceQueryService(uow_factory, _performance_query_repository),
+        difficulty_query=DifficultyQueryService(
+            core.session_factory,
+            core.cache,
+            HttpPerformanceCalculator(core.http_client, core.config.performance_calculator_urls),
+            S3ObjectStorage.from_settings(core.config),
+            beatmap_url_expiry_seconds=core.config.performance_beatmap_url_expiry_seconds,
+        ),
         replay_query=ReplayQueryService(uow_factory, _replay_repository),
         replay=ReplayService(uow_factory, _replay_repository, _outbox_writer),
+        replay_reconstruction=ReplayReconstructionService(
+            uow_factory,
+            _replay_repository,
+            S3ObjectStorage.from_settings(core.config),
+            realtime,
+        ),
         ranking_query=RankingQueryService(uow_factory, _ranking_repository, core.cache),
         account_statistics=AccountStatisticsQueryService(uow_factory, _account_statistics_repository, core.cache),
         beatmap_scores=BeatmapScoresQueryService(uow_factory, _beatmap_scores_repository),

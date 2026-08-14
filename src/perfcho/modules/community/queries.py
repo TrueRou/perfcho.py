@@ -9,6 +9,7 @@ from perfcho.modules.community.errors import ChannelAccessDenied, ChannelNotFoun
 from perfcho.modules.community.models import (
     ChannelSelector,
     ChannelView,
+    NotificationPage,
     OfflineDirectMessage,
     OfflineDirectMessagePage,
 )
@@ -119,3 +120,32 @@ class CommunityQueryService:
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise RuntimeError("active channel membership query returned an invalid count")
         return count
+
+    async def list_notifications(
+        self,
+        account_id: int,
+        *,
+        before_notification_id: int | None = None,
+        limit: int = 50,
+    ) -> NotificationPage:
+        """Return one recipient's notifications and unread count."""
+        _validate_account_id(account_id)
+        if not 1 <= limit <= 100:
+            raise CommunityInputRejected("notification limit must be between 1 and 100")
+        async with self._uow_factory() as uow:
+            return await self._repository_factory(uow.session).list_notifications(
+                account_id, before_notification_id=before_notification_id, limit=limit
+            )
+
+    async def mark_notifications_read(self, account_id: int, notification_ids: tuple[int, ...]) -> int:
+        """Mark a set of recipient notifications read."""
+        _validate_account_id(account_id)
+        if not notification_ids or len(notification_ids) > 500:
+            raise CommunityInputRejected("notification identity batch is invalid")
+        async with self._uow_factory() as uow:
+            result = await self._repository_factory(uow.session).mark_notifications_read(
+                account_id, notification_ids
+            )
+            await uow.commit()
+            return result
+

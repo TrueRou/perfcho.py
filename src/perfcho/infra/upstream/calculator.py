@@ -13,6 +13,7 @@ from perfcho.modules.common.models import JsonValue
 from perfcho.modules.performance.errors import PerformanceCalculationError
 from perfcho.modules.performance.models import (
     DifficultyCalculationResult,
+    DifficultyRequest,
     PerformanceCalculationInput,
     PerformanceResult,
 )
@@ -25,6 +26,19 @@ class HttpPerformanceCalculator:
         """Bind a shared HTTP client and calculator-code endpoint registry."""
         self._client = client
         self._calculator_urls = {code: url.rstrip("/") for code, url in calculator_urls.items() if url.strip()}
+
+    async def calculate_difficulty(
+        self,
+        request: DifficultyRequest,
+        *,
+        beatmap_url: str,
+    ) -> DifficultyCalculationResult:
+        """Route one difficulty-only request to a separate calculator client."""
+        from perfcho.infra.upstream.difficulty import HttpDifficultyCalculator
+
+        return await HttpDifficultyCalculator(self._client, self._calculator_urls).calculate(
+            request, beatmap_url=beatmap_url
+        )
 
     async def calculate(
         self,

@@ -116,11 +116,12 @@ class SpectatorHub(PerfchoHub):
             )
 
     async def EndPlaySessionV2(self, score_token: int | None, final_state: str) -> None:
-        """Signal the end of a play session."""
-        del final_state
-        services = self._services()
-        if services is None or self.account_id is None:
-            return
+        """Signal the end of a play session.
+
+        Replay reconstruction is triggered after the score is accepted (the solo
+        score PUT handler), when the retained frame stream is still addressable.
+        """
+        del score_token, final_state
 
     async def StartWatchingUser(self, user_id: int) -> None:
         """Subscribe to another user's plays."""

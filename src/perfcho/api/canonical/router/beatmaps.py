@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from perfcho.api.canonical.dependencies import CanonicalServicesDependency
 from perfcho.api.canonical.router._shared import error
 from perfcho.modules.content import BeatmapNotFound, BeatmapRevisionView, BeatmapsetNotFound
+from perfcho.modules.scoring import CanonicalMod, Ruleset
+from perfcho.modules.scoring.mods import canonical_json_digest
 
 router = APIRouter()
 
@@ -78,6 +80,49 @@ async def get_beatmaps(
     return {"beatmaps": [_beatmap(beatmap) for beatmap in beatmaps]}
 
 
+@router.post("/beatmaps/{beatmap_id}/attributes", response_model=None, tags=["Beatmaps"])
+async def get_beatmap_attributes(
+    beatmap_id: int,
+    services: CanonicalServicesDependency,
+    mods: Annotated[list[str] | None, Query()] = None,
+    ruleset: Annotated[str | None, Query()] = None,
+    ruleset_id: Annotated[int | None, Query(ge=0, le=3)] = None,
+) -> dict[str, object] | JSONResponse:
+    """Return calculated difficulty attributes for a beatmap and mods."""
+    if services.content_query is None or services.difficulty_query is None:
+        return error(503, "service_unavailable", "Difficulty calculation is unavailable.")
+    try:
+        beatmap = await services.content_query.lookup_beatmap(beatmap_id, external=True)
+    except BeatmapNotFound:
+        return error(404, "not_found", "Beatmap was not found.")
+    if beatmap.file_storage_key is None:
+        return error(404, "not_found", "Beatmap object is unavailable.")
+
+    selected = _ruleset_from(ruleset, ruleset_id) or _ruleset_from_name(beatmap.ruleset)
+    if selected is None:
+        return error(422, "invalid_request", "The requested ruleset is invalid.")
+
+    canonical_mods = tuple(_parse_mod(value) for value in (mods or ()))
+    mods_digest = _mods_digest(canonical_mods)
+    try:
+        result = await services.difficulty_query.resolve(
+            beatmap_revision_id=beatmap.revision_id,
+            beatmap_sha256=beatmap.sha256,
+            beatmap_storage_key=beatmap.file_storage_key,
+            ruleset=selected,
+            mods_digest=mods_digest,
+            mods=canonical_mods,
+        )
+    except Exception as exc:
+        return error(502, "calculation_failed", str(exc))
+
+    return {
+        "star_rating": float(result.star_rating),
+        "max_combo": result.max_combo,
+        "attributes": dict(result.attributes),
+    }
+
+
 def _beatmap(beatmap: BeatmapRevisionView) -> dict[str, object]:
     return {
         "id": beatmap.external_beatmap_id,
@@ -117,3 +162,29 @@ def _beatmap(beatmap: BeatmapRevisionView) -> dict[str, object]:
 
 def _ruleset_id(ruleset: str) -> int:
     return {"osu": 0, "taiko": 1, "fruits": 2, "mania": 3}.get(ruleset, 0)
+
+
+_RULESET_BY_ID = {0: Ruleset.OSU, 1: Ruleset.TAIKO, 2: Ruleset.FRUITS, 3: Ruleset.MANIA}
+
+
+def _ruleset_from(name: str | None, identifier: int | None) -> Ruleset | None:
+    if identifier is not None:
+        return _RULESET_BY_ID.get(identifier)
+    return _ruleset_from_name(name) if name else None
+
+
+def _ruleset_from_name(name: str | None) -> Ruleset | None:
+    if name is None:
+        return None
+    try:
+        return Ruleset(name)
+    except ValueError:
+        return None
+
+
+def _parse_mod(value: str) -> CanonicalMod:
+    return CanonicalMod(value.strip().upper())
+
+
+def _mods_digest(mods: tuple[CanonicalMod, ...]) -> bytes:
+    return canonical_json_digest([mod.as_json() for mod in sorted(mods, key=lambda m: m.acronym)])

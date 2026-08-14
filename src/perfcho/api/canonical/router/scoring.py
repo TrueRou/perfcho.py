@@ -1,5 +1,6 @@
 """Adapt osu!lazer solo score upload onto canonical scoring commands."""
 
+import contextlib
 import hashlib
 import uuid
 from collections.abc import AsyncIterator
@@ -237,6 +238,7 @@ async def submit_solo_score(
 
     if detail is None:
         return _error(503, "projection_unavailable", "Accepted score could not be read.")
+    await _reconstruct_replay(services, result.score_id, account)
     return _score_response(detail)
 
 
@@ -400,6 +402,21 @@ async def get_user_scores(
         limit=limit,
     )
     return [_score_response(detail).model_dump(mode="json") for detail in details]
+
+
+async def _reconstruct_replay(services: StableServices, score_id: int, account: object) -> None:
+    """Best-effort reconstruct a lazer replay from retained spectator frames."""
+    if services.replay_reconstruction is None or services.realtime is None:
+        return
+    session_id = getattr(account, "session_id", None)
+    if session_id is None:
+        return
+    try:
+        realtime = await services.realtime.resolve_session(session_id, at=services.clock.now())
+    except Exception:
+        return
+    with contextlib.suppress(Exception):
+        await services.replay_reconstruction.reconstruct(score_id, realtime.fence)
 
 
 async def _get_score_response(
