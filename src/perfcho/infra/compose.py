@@ -47,7 +47,7 @@ from perfcho.infra.db.repositories.scoring import (
 from perfcho.infra.db.repositories.social import SqlAlchemySocialRepository
 from perfcho.infra.db.uow import SqlAlchemyUnitOfWorkFactory
 from perfcho.infra.redis import engine as infra_redis
-from perfcho.infra.redis.bubbles import RedisRealtimeBubbleBus, RedisRealtimePollGate
+from perfcho.infra.redis.bubbles import RedisRealtimeBubbleBus, RedisRealtimePollGate, RedisUserEventBus
 from perfcho.infra.redis.identity import RedisOnlineCredentialVerificationCache
 from perfcho.infra.redis.multiplayer import RedisMultiplayerStateRepository
 from perfcho.infra.redis.realtime import RedisRealtimeStateRepository
@@ -72,7 +72,7 @@ from perfcho.modules.multiplayer import (
     build_pool_commands,
 )
 from perfcho.modules.performance.services import PerformanceQueryService
-from perfcho.modules.realtime import RealtimeBubbleBus, RealtimePollGate, RealtimeStateRepository
+from perfcho.modules.realtime import RealtimeBubbleBus, RealtimePollGate, RealtimeStateRepository, UserEventBus
 from perfcho.modules.scoring import (
     AccountStatisticsQueryService,
     BeatmapScoresQueryService,
@@ -299,6 +299,7 @@ class StableServices:
     id_generator: IdGenerator
     settings: Settings
     bubbles: RealtimeBubbleBus | None = None
+    user_events: UserEventBus | None = None
     poll_gate: RealtimePollGate | None = None
     content_query: ContentQueryService | None = None
     content: ContentService | None = None
@@ -362,6 +363,12 @@ async def compose_stable_services(
     )
     bubble_redis = core.bubble_redis or core.state_redis
     bubbles = RedisRealtimeBubbleBus(
+        bubble_redis,
+        prefix=core.config.redis_state_prefix,
+        max_entries=core.config.redis_bubble_max_entries,
+        ttl_seconds=core.config.redis_bubble_ttl_seconds,
+    )
+    user_events = RedisUserEventBus(
         bubble_redis,
         prefix=core.config.redis_state_prefix,
         max_entries=core.config.redis_bubble_max_entries,
@@ -480,6 +487,7 @@ async def compose_stable_services(
         id_generator=core.id_generator,
         settings=core.config,
         bubbles=bubbles,
+        user_events=user_events,
         poll_gate=poll_gate,
         content_query=content_query,
         content=content,

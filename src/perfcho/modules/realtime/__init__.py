@@ -56,6 +56,8 @@ from perfcho.modules.realtime.ports import (
     RealtimeBubbleSubscription,
     RealtimePollGate,
     RealtimeStateRepository,
+    UserEventBus,
+    UserEventSubscription,
 )
 
 __all__ = (
@@ -107,5 +109,7 @@ __all__ = (
     "SpectatorLifecycleBubble",
     "SpectatorRecipient",
     "SpectatorRelation",
+    "UserEventBus",
+    "UserEventSubscription",
     "UserLogoutBubble",
 )

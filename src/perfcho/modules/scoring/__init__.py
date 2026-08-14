@@ -26,14 +26,16 @@ from perfcho.modules.scoring.models import (
     ReplayReference,
     Ruleset,
     ScoreAttestation,
+    ScoreboardVariant,
     ScoreDetailView,
     ScoreDimension,
     ScoreGrade,
     ScoreOutcome,
-    ScoreboardVariant,
     ScoreSubmission,
     SoloScoreToken,
     StagedReplayManifest,
+    UserRankingPage,
+    UserRankingView,
     weighted_total_performance,
 )
 from perfcho.modules.scoring.services import (
@@ -85,5 +87,7 @@ __all__ = (
     "ScoreQueryService",
     "SoloScoreToken",
     "StagedReplayManifest",
+    "UserRankingPage",
+    "UserRankingView",
     "weighted_total_performance",
 )

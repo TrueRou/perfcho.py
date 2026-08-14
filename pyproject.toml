@@ -30,6 +30,7 @@ dependencies = [
     "taskiq>=0.12.4",
     "taskiq-redis>=1.2.3",
     "uvicorn>=0.38.0",
+    "aiosignalr",
 ]
 
 [dependency-groups]
@@ -51,6 +52,9 @@ build-backend = "uv_build"
 [tool.uv]
 override-dependencies = ["sqlalchemy==2.1.0b3"]
 prerelease = "allow"
+
+[tool.uv.sources]
+aiosignalr = { path = "../aiosignalr" }
 
 [tool.ruff]
 line-length = 120

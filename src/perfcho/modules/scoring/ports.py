@@ -25,6 +25,7 @@ from perfcho.modules.scoring.models import (
     ScoreAcceptanceRecord,
     ScoreDetailView,
     SoloScoreToken,
+    UserRankingView,
 )
 
 
@@ -158,12 +159,45 @@ class RankingRepository(Protocol):
         """Return the complete number of accounts in one scope."""
         ...
 
+    async def list_rankings(
+        self,
+        *,
+        ruleset: Ruleset,
+        sort: str,
+        country_code: str | None,
+        offset: int,
+        limit: int,
+    ) -> tuple[UserRankingView, ...]:
+        """Return a bounded global or country ranking list."""
+        ...
+
+    async def count_rankings(
+        self,
+        *,
+        ruleset: Ruleset,
+        sort: str,
+        country_code: str | None,
+    ) -> int:
+        """Return the complete number of ranked accounts in a ranking list."""
+        ...
+
 
 class ScoreQueryRepository(Protocol):
     """Read canonical score facts and current ranking projections."""
 
     async def get_score_detail(self, score_id: int) -> ScoreDetailView | None:
         """Return one score detail or None when it does not exist."""
+        ...
+
+    async def list_user_scores(
+        self,
+        *,
+        account_id: int,
+        ruleset: Ruleset | None,
+        score_type: str,
+        limit: int,
+    ) -> tuple[ScoreDetailView, ...]:
+        """Return a bounded account's best or recent scores."""
         ...
 
 

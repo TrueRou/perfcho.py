@@ -2,13 +2,14 @@
 
 import hashlib
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Literal, cast
 
 import orjson
 from fastapi import APIRouter, Body, Form, Header, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from perfcho.api.canonical.dependencies import CanonicalAccountDependency, CanonicalServicesDependency
@@ -25,6 +26,7 @@ from perfcho.modules.scoring import (
     LeaderboardScope,
     PlayAttemptSubmission,
     PopulationFilter,
+    ReplayNotFound,
     Ruleset,
     ScoreAttestation,
     ScoreDetailView,
@@ -310,6 +312,94 @@ async def get_beatmap_scores(
             "score": _score_response(personal_detail).model_dump(mode="json"),
         }
     return {"scores": scores, "user_score": user_score, "score_count": page.total_count}
+
+
+@router.get("/scores/{score_id}/download", response_model=None, tags=["Scores"])
+async def download_score_replay(
+    score_id: int,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+) -> Response | JSONResponse:
+    """Stream one ready replay and record an idempotent non-owner view."""
+    if services.replay_query is None or services.replay is None:
+        return _error(503, "service_unavailable", "Replay service is unavailable.")
+    if services.object_storage is None:
+        return _error(503, "service_unavailable", "Object storage is unavailable.")
+    try:
+        replay = await services.replay_query.get(score_id)
+    except ReplayNotFound:
+        return _error(404, "not_found", "Replay was not found.")
+    stream_context = services.object_storage.open(replay.storage_key)
+    try:
+        object_stream = await stream_context.__aenter__()
+    except Exception:
+        return _error(404, "not_found", "Replay object is unavailable.")
+    await services.replay.record_view(
+        request_id=services.id_generator.new(),
+        replay=replay,
+        viewer_account_id=account.account_id,
+    )
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in object_stream.iter_chunks():
+                yield chunk
+        finally:
+            await stream_context.__aexit__(None, None, None)
+
+    return StreamingResponse(
+        body(),
+        media_type="application/octet-stream",
+        headers={"Content-Length": str(replay.size_bytes)},
+    )
+
+
+@router.get("/beatmaps/{beatmap_id}/scores/users/{user_id}", response_model=None, tags=["Scores"])
+async def get_user_beatmap_score(
+    beatmap_id: int,
+    user_id: int,
+    services: CanonicalServicesDependency,
+    account: CanonicalAccountDependency,
+    mode: Annotated[Ruleset, Query()],
+) -> dict[str, object] | JSONResponse:
+    """Return one user's best score on a beatmap."""
+    del account
+    if services.ranking_query is None or services.score_query is None:
+        return _error(503, "service_unavailable", "Ranking is unavailable.")
+    personal = await services.ranking_query.get_personal_leaderboard(
+        beatmap_id=beatmap_id,
+        ruleset=mode,
+        scope=LeaderboardScope.overall(),
+        account_id=user_id,
+    )
+    if personal is None:
+        return _error(404, "not_found", "Score was not found.")
+    detail = await services.score_query.get(personal.score_id)
+    if detail is None:
+        return _error(404, "not_found", "Score was not found.")
+    return {"score": _score_response(detail).model_dump(mode="json")}
+
+
+@router.get("/users/{user_id}/scores/{score_type}", response_model=None, tags=["Scores"])
+async def get_user_scores(
+    user_id: int,
+    score_type: str,
+    services: CanonicalServicesDependency,
+    mode: Annotated[Ruleset | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> list[dict[str, object]] | JSONResponse:
+    """Return a user's best or recent scores."""
+    if score_type not in {"best", "recent"}:
+        return _error(422, "invalid_request", "The requested score type is invalid.")
+    if services.score_query is None:
+        return _error(503, "service_unavailable", "Score queries are unavailable.")
+    details = await services.score_query.list_user_scores(
+        account_id=user_id,
+        ruleset=mode,
+        score_type=score_type,
+        limit=limit,
+    )
+    return [_score_response(detail).model_dump(mode="json") for detail in details]
 
 
 async def _get_score_response(

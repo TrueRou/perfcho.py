@@ -8,6 +8,7 @@ from typing import TypedDict
 from fastapi import FastAPI
 
 from perfcho.api import router
+from perfcho.api.signalr import register_signalr
 from perfcho.api.tracing import TraceContextMiddleware
 from perfcho.infra import logging
 from perfcho.infra.compose import CoreServices, StableServices, compose_core_services, compose_stable_services
@@ -55,6 +56,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[AppState]:
 def init_routes(asgi_app: FastAPI) -> None:
     """Attach all HTTP and protocol adapters to the application."""
     asgi_app.include_router(router)
+    register_signalr(asgi_app)
 
 
 def create_app() -> FastAPI:

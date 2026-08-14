@@ -256,3 +256,37 @@ class RealtimePollGate(Protocol):
     async def release(self, account_id: int, recipient_fence: SessionFence, gate_id: uuid.UUID) -> None:
         """Release the gate only when all owner components match."""
         ...
+
+
+@runtime_checkable
+class UserEventSubscription(Protocol):
+    """Consume account-keyed realtime events until closed."""
+
+    async def receive(self, *, timeout: float) -> RealtimeBubble | None:
+        """Wait for the next event or return None at timeout."""
+        ...
+
+    async def acknowledge(self) -> None:
+        """Acknowledge every event returned by this subscription."""
+        ...
+
+    async def aclose(self) -> None:
+        """Stop consuming the account stream."""
+        ...
+
+
+@runtime_checkable
+class UserEventBus(Protocol):
+    """Fan realtime events out to an account regardless of its transport worker."""
+
+    async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
+        """Append one encoded event to a bounded account stream."""
+        ...
+
+    async def publish_many(self, account_ids: Sequence[int], bubble: RealtimeBubble) -> int:
+        """Append one encoding to many account streams."""
+        ...
+
+    def subscribe(self, account_id: int) -> AbstractAsyncContextManager[UserEventSubscription]:
+        """Open a subscription for one account's event stream."""
+        ...

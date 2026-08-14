@@ -611,6 +611,74 @@ class RedisRealtimeBubbleBus:
             await subscription.aclose()
 
 
+def user_event_channel(prefix: str, account_id: int) -> str:
+    """Return the account-keyed event stream independent of any session epoch."""
+    return f"{prefix.rstrip(':')}:user-events:v1:account:{account_id}"
+
+
+class RedisUserEventBus:
+    """Fan typed Bubbles out to an account across workers via Redis Streams.
+
+    Unlike :class:`RedisRealtimeBubbleBus`, delivery is keyed by account rather
+    than by session fence, so a SignalR hub running in any worker can deliver an
+    event to the worker that currently hosts the account's live connection.
+    """
+
+    def __init__(self, redis: Redis, *, prefix: str, max_entries: int = 4096, ttl_seconds: int = 360) -> None:
+        """Bind the bus to an isolated Redis client and bounded retention."""
+        if max_entries < 1 or ttl_seconds < 1:
+            raise ValueError("User event Stream limits must be positive")
+        self._redis = redis
+        self._prefix = prefix
+        self._max_entries = max_entries
+        self._ttl_seconds = ttl_seconds
+        self._group = "delivery-v1"
+
+    async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
+        """Append one encoded event to a bounded account stream."""
+        if account_id < 1:
+            raise ValueError("account_id must be positive")
+        stream = user_event_channel(self._prefix, account_id)
+        async with self._redis.pipeline(transaction=False) as pipeline:
+            pipeline.xadd(stream, {"payload": encode_bubble(bubble)}, maxlen=self._max_entries)
+            pipeline.expire(stream, self._ttl_seconds)
+            await pipeline.execute()
+        return 1
+
+    async def publish_many(self, account_ids: Sequence[int], bubble: RealtimeBubble) -> int:
+        """Append one encoding to many account streams in one Redis pipeline."""
+        if not account_ids:
+            return 0
+        if any(account_id < 1 for account_id in account_ids):
+            raise ValueError("account IDs must be positive")
+        payload = encode_bubble(bubble)
+        async with self._redis.pipeline(transaction=False) as pipeline:
+            for account_id in account_ids:
+                stream = user_event_channel(self._prefix, account_id)
+                pipeline.xadd(stream, {"payload": payload}, maxlen=self._max_entries)
+                pipeline.expire(stream, self._ttl_seconds)
+            await pipeline.execute()
+        return len(account_ids)
+
+    @asynccontextmanager
+    async def subscribe(self, account_id: int) -> AsyncIterator[RedisBubbleSubscription]:
+        """Ensure the consumer group exists before yielding its typed consumer."""
+        if account_id < 1:
+            raise ValueError("account_id must be positive")
+        stream = user_event_channel(self._prefix, account_id)
+        try:
+            await self._redis.xgroup_create(stream, self._group, id="0", mkstream=True)
+        except ResponseError as error:
+            if "BUSYGROUP" not in str(error):
+                raise
+        await self._redis.expire(stream, self._ttl_seconds)
+        subscription = RedisBubbleSubscription(self._redis, stream, self._group, "signalr")
+        try:
+            yield subscription
+        finally:
+            await subscription.aclose()
+
+
 _ACQUIRE_POLL_GATE = """-- perfcho:acquire-poll-gate:v1
 local current = redis.call('GET', KEYS[1])
 if current ~= ARGV[1] then return 0 end

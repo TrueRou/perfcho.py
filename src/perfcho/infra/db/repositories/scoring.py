@@ -81,6 +81,7 @@ from perfcho.modules.scoring.models import (
     ScoreGrade,
     ScoreOutcome,
     SoloScoreToken,
+    UserRankingView,
     thaw_json_mapping,
 )
 
@@ -680,6 +681,153 @@ class SqlAlchemyScoringRepository:
             return len(rows)
         ranked = self._ranked_scores(beatmap_id, ruleset, scope)
         return int(await self._session.scalar(select(func.count()).select_from(ranked)) or 0)
+
+    async def list_rankings(
+        self,
+        *,
+        ruleset: Ruleset,
+        sort: str,
+        country_code: str | None,
+        offset: int,
+        limit: int,
+    ) -> tuple[UserRankingView, ...]:
+        """Return a bounded global or country ranking list by metric."""
+        metric = UserRanking.performance if sort == "performance" else UserRanking.ranked_score
+        policy = select(RankingPolicy.id).where(
+            RankingPolicy.ruleset == DbRuleset(ruleset.value),
+            RankingPolicy.active.is_(True),
+        )
+        statement = (
+            select(
+                UserRanking.account_id,
+                AccountName.display_name,
+                Account.country_code,
+                UserRanking.performance,
+                UserRanking.ranked_score,
+                UserRanking.accuracy,
+                func.row_number().over(order_by=(metric.desc(), UserRanking.account_id.asc())).label("rank"),
+            )
+            .select_from(UserRanking)
+            .join(Account, Account.id == UserRanking.account_id)
+            .join(AccountName, and_(AccountName.account_id == UserRanking.account_id, AccountName.ended_at.is_(None)))
+            .where(UserRanking.policy_id.in_(policy))
+        )
+        if country_code is not None:
+            statement = statement.where(Account.country_code == country_code)
+        ranked = statement.subquery()
+        rows = (await self._session.execute(select(ranked).order_by(ranked.c.rank).offset(offset).limit(limit))).all()
+        return tuple(
+            UserRankingView(
+                account_id=row.account_id,
+                display_name=row.display_name,
+                country_code=row.country_code,
+                rank=row.rank,
+                performance=int(row.performance),
+                ranked_score=row.ranked_score,
+                accuracy=row.accuracy,
+            )
+            for row in rows
+        )
+
+    async def count_rankings(
+        self,
+        *,
+        ruleset: Ruleset,
+        sort: str,
+        country_code: str | None,
+    ) -> int:
+        """Return the complete number of ranked accounts in a ranking list."""
+        policy = select(RankingPolicy.id).where(
+            RankingPolicy.ruleset == DbRuleset(ruleset.value),
+            RankingPolicy.active.is_(True),
+        )
+        statement = (
+            select(func.count())
+            .select_from(UserRanking)
+            .join(Account, Account.id == UserRanking.account_id)
+            .where(UserRanking.policy_id.in_(policy))
+        )
+        if country_code is not None:
+            statement = statement.where(Account.country_code == country_code)
+        return int(await self._session.scalar(statement) or 0)
+
+    async def list_user_scores(
+        self,
+        *,
+        account_id: int,
+        ruleset: Ruleset | None,
+        score_type: str,
+        limit: int,
+    ) -> tuple[ScoreDetailView, ...]:
+        """Return a bounded account's best or recent score details."""
+        pp = (
+            select(ScorePerformance.pp)
+            .join(CalculationRelease, CalculationRelease.id == ScorePerformance.release_id)
+            .where(
+                ScorePerformance.score_id == Score.id,
+                CalculationRelease.ruleset == Score.ruleset,
+                CalculationRelease.active.is_(True),
+            )
+            .order_by(CalculationRelease.version, CalculationRelease.id)
+            .limit(1)
+            .correlate(Score)
+            .scalar_subquery()
+        )
+        order = (
+            (Score.classic_score.desc(), Score.ended_at.asc())
+            if score_type == "best"
+            else (Score.ended_at.desc(), Score.id.desc())
+        )
+        statement = (
+            select(
+                Score,
+                AccountName.display_name,
+                Account.country_code,
+                pp.label("pp"),
+                Replay.score_id.label("replay_score_id"),
+            )
+            .join(Account, Account.id == Score.account_id)
+            .join(AccountName, and_(AccountName.account_id == Score.account_id, AccountName.ended_at.is_(None)))
+            .outerjoin(Replay, and_(Replay.score_id == Score.id, Replay.state == "ready"))
+            .where(Score.account_id == account_id, Score.outcome == DbScoreOutcome.PASSED)
+            .order_by(*order)
+            .limit(limit)
+        )
+        if ruleset is not None:
+            statement = statement.where(Score.ruleset == DbRuleset(ruleset.value))
+        rows = (await self._session.execute(statement)).all()
+        score_ids = {row.Score.id for row in rows}
+        hits = await self._score_hits_with_maximum(score_ids)
+        details: list[ScoreDetailView] = []
+        for row in rows:
+            score = row.Score
+            statistics, maximum_statistics = hits.get(score.id, ({}, {}))
+            details.append(
+                ScoreDetailView(
+                    score_id=score.id,
+                    account_id=score.account_id,
+                    display_name=row.display_name,
+                    country_code=row.country_code,
+                    beatmap_id=score.beatmap_id,
+                    ruleset=Ruleset(score.ruleset.value),
+                    total_score=score.total_score,
+                    classic_score=score.classic_score,
+                    accuracy=score.accuracy,
+                    max_combo=score.max_combo,
+                    grade=ScoreGrade(score.grade.value),
+                    outcome=ScoreOutcome(score.outcome.value),
+                    mods=_canonical_mods(score.mods_details),
+                    statistics=statistics,
+                    maximum_statistics=maximum_statistics,
+                    started_at=score.started_at,
+                    ended_at=score.ended_at,
+                    has_replay=row.replay_score_id is not None,
+                    ranked=score.outcome is DbScoreOutcome.PASSED,
+                    pp=row.pp,
+                    position=None,
+                )
+            )
+        return tuple(details)
 
     async def get_account_stats(
         self,

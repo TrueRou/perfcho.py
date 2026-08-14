@@ -561,6 +561,28 @@ class LeaderboardPage:
 
 
 @dataclass(frozen=True, slots=True)
+class UserRankingView:
+    """Describe one ranked account for a global or country ranking list."""
+
+    account_id: int
+    display_name: str
+    country_code: str | None
+    rank: int
+    performance: int
+    ranked_score: int
+    accuracy: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class UserRankingPage:
+    """Return a bounded ranking list and whether another page exists."""
+
+    rows: tuple[UserRankingView, ...]
+    has_more: bool
+    total_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class ScoreDetailView:
     """Describe one canonical score together with current ranking projections."""
 

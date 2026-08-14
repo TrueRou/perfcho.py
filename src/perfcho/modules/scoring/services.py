@@ -41,6 +41,7 @@ from perfcho.modules.scoring.models import (
     ScoreDimension,
     ScoreOutcome,
     SoloScoreToken,
+    UserRankingPage,
 )
 from perfcho.modules.scoring.mods import canonical_json_digest
 from perfcho.modules.scoring.ports import (
@@ -556,6 +557,33 @@ class RankingQueryService:
             )
         return LeaderboardPage(public, personal, total_count)
 
+    async def list_rankings(
+        self,
+        *,
+        ruleset: Ruleset,
+        sort: str = "performance",
+        country_code: str | None = None,
+        page: int = 0,
+        page_size: int = 50,
+    ) -> UserRankingPage:
+        """Return a bounded global or country ranking list."""
+        if sort not in {"performance", "score"}:
+            raise ValueError("ranking sort must be performance or score")
+        if page < 0 or not 1 <= page_size <= 100:
+            raise ValueError("ranking page is invalid")
+        async with self._uow_factory() as uow:
+            repository = self._repository_factory(uow.session)
+            rows = await repository.list_rankings(
+                ruleset=ruleset,
+                sort=sort,
+                country_code=country_code,
+                offset=page * page_size,
+                limit=page_size + 1,
+            )
+            total = await repository.count_rankings(ruleset=ruleset, sort=sort, country_code=country_code)
+        has_more = len(rows) > page_size
+        return UserRankingPage(rows[:page_size], has_more, total)
+
     def _leaderboard_key(
         self,
         kind: str,
@@ -635,6 +663,28 @@ class ScoreQueryService:
         if detail is not None and ruleset is not None and detail.ruleset is not ruleset:
             return None
         return detail
+
+    async def list_user_scores(
+        self,
+        *,
+        account_id: int,
+        ruleset: Ruleset | None = None,
+        score_type: str = "best",
+        limit: int = 50,
+    ) -> tuple[ScoreDetailView, ...]:
+        """Return a bounded account's best or recent scores."""
+        _positive_identifier("account_id", account_id)
+        if score_type not in {"best", "recent"}:
+            raise ValueError("score type must be best or recent")
+        if not 1 <= limit <= 100:
+            raise ValueError("score limit must be between 1 and 100")
+        async with self._uow_factory() as uow:
+            return await self._repository_factory(uow.session).list_user_scores(
+                account_id=account_id,
+                ruleset=ruleset,
+                score_type=score_type,
+                limit=limit,
+            )
 
 
 class AccountStatisticsQueryService:
