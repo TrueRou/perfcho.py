@@ -1,6 +1,10 @@
 .DS_Store
 Thumbs.db
 
+.env
+.env.production
+.env.development
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -133,8 +137,6 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
-.env.production
 .venv
 env/
 venv/
