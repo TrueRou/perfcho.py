@@ -44,6 +44,30 @@ async def test_subscribe_propagates_group_creation_failure() -> None:
             pass
 
 
+async def test_named_auto_acknowledged_subscription_resumes_without_replaying() -> None:
+    redis = MagicMock()
+    redis.xgroup_create = AsyncMock(side_effect=[True, ResponseError("BUSYGROUP Consumer Group name already exists")])
+    redis.expire = AsyncMock()
+    redis.xreadgroup = AsyncMock(
+        side_effect=[
+            [[b"stream", [(b"1-0", {b"payload": encode_bubble(ToastBubble("once"))})]]],
+            [],
+        ]
+    )
+    redis.xack = AsyncMock()
+    bus = RedisRealtimeBubbleBus(redis, prefix="tests:bubbles")
+
+    async with bus.subscribe(42, subscriber_id="stable", auto_acknowledge=True) as first:
+        assert await first.receive(timeout=0) == ToastBubble("once")
+    async with bus.subscribe(42, subscriber_id="stable", auto_acknowledge=True) as resumed:
+        assert await resumed.receive(timeout=0) is None
+
+    assert redis.xgroup_create.await_args_list[0].args[1] == "delivery-stable"
+    assert redis.xgroup_create.await_args_list[1].args[1] == "delivery-stable"
+    assert all(call.kwargs["noack"] is True for call in redis.xreadgroup.await_args_list)
+    redis.xack.assert_not_awaited()
+
+
 async def test_subscription_reads_pending_then_new_entries_and_acknowledges_returned_entries() -> None:
     redis = MagicMock()
     pending = ToastBubble("pending")

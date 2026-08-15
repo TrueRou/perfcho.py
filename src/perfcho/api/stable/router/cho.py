@@ -526,7 +526,11 @@ async def _poll(request: Request, body: bytes, raw_token: str, services: StableS
 
     try:
         try:
-            async with services.bubbles.subscribe(identity.account_id) as subscription:
+            async with services.bubbles.subscribe(
+                identity.account_id,
+                subscriber_id="stable",
+                auto_acknowledge=True,
+            ) as subscription:
                 return await _poll_subscribed(
                     body,
                     context,

@@ -234,9 +234,8 @@ class RealtimeBubbleSubscription(Protocol):
 class RealtimeBubbleBus(Protocol):
     """Publish and consume bounded account-scoped Bubbles.
 
-    Every subscriber opens its own consumer group so a single account's events
-    fan out to all concurrently connected consumers regardless of which worker
-    hosts each connection.
+    A stable subscriber ID resumes one transport's consumption position across
+    reconnects. Without one, each connection receives an isolated event copy.
     """
 
     async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
@@ -247,7 +246,13 @@ class RealtimeBubbleBus(Protocol):
         """Publish one Bubble to many account streams and return streams written."""
         ...
 
-    def subscribe(self, account_id: int) -> AbstractAsyncContextManager[RealtimeBubbleSubscription]:
+    def subscribe(
+        self,
+        account_id: int,
+        *,
+        subscriber_id: str | None = None,
+        auto_acknowledge: bool = False,
+    ) -> AbstractAsyncContextManager[RealtimeBubbleSubscription]:
         """Open a subscription confirmed before entering its context."""
         ...
 

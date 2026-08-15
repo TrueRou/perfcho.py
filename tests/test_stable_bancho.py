@@ -126,23 +126,26 @@ class FakeBubbleBus:
         self.drain_error: Exception | None = None
         self.acknowledge_calls = 0
         self.acknowledge_error: Exception | None = None
-        self.subscribe_calls: list[int] = []
+        self.subscribe_calls: list[tuple[int, str | None, bool]] = []
 
     async def publish(self, account_id: int, bubble: RealtimeBubble) -> int:
         self.published.append((account_id, bubble))
-        return int(self.subscribed and self.subscribe_calls[-1] == account_id)
+        return int(self.subscribed and self.subscribe_calls[-1][0] == account_id)
 
     async def publish_many(self, account_ids: tuple[int, ...], bubble: RealtimeBubble) -> int:
         self.publish_many_calls.append(account_ids)
         self.published.extend((account_id, bubble) for account_id in account_ids)
-        return sum(self.subscribed and self.subscribe_calls[-1] == account_id for account_id in account_ids)
+        return sum(self.subscribed and self.subscribe_calls[-1][0] == account_id for account_id in account_ids)
 
     @asynccontextmanager
     async def subscribe(
         self,
         account_id: int,
+        *,
+        subscriber_id: str | None = None,
+        auto_acknowledge: bool = False,
     ) -> AsyncIterator[RealtimeBubbleSubscription]:
-        self.subscribe_calls.append(account_id)
+        self.subscribe_calls.append((account_id, subscriber_id, auto_acknowledge))
         self.subscribed = True
         subscription = FakeBubbleSubscription(self)
         try:
@@ -619,6 +622,7 @@ async def test_poll_renders_local_and_remote_bubbles_without_publishing_local(
     messages = [packet.payload.read_string() for packet in PacketReader(response.content, packet_enum=ServerPacket)]
     assert messages == ["local", "remote"]
     assert bus.published == []
+    assert bus.subscribe_calls == [(3, "stable", True)]
 
 
 @pytest.mark.asyncio

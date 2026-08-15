@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import msgpack
 from redis.asyncio import Redis
+from redis.exceptions import ResponseError
 
 from perfcho.infra.db.mods import project_scoreboard_variant
 from perfcho.infra.logging import log_event
@@ -506,13 +507,22 @@ def decode_bubble(payload: bytes) -> RealtimeBubble | None:
 class RedisBubbleSubscription:
     """Consume valid Bubbles from one Redis Stream consumer group."""
 
-    def __init__(self, redis: Redis, stream: str, group: str, consumer: str) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        stream: str,
+        group: str,
+        consumer: str,
+        *,
+        auto_acknowledge: bool = False,
+    ) -> None:
         """Bind one logical consumer to a session stream."""
         self._redis = redis
         self._stream = stream
         self._group = group
         self._consumer = consumer
-        self._pending = True
+        self._auto_acknowledge = auto_acknowledge
+        self._pending = not auto_acknowledge
         self._delivered_ids: list[bytes | str] = []
         self._closed = False
 
@@ -534,6 +544,7 @@ class RedisBubbleSubscription:
                 {self._stream: ">"},
                 count=1,
                 block=None if timeout <= 0 else max(1, int(timeout * 1000)),
+                noack=self._auto_acknowledge,
             )
         if not result:
             return None
@@ -560,9 +571,11 @@ class RedisBubbleSubscription:
             entry_id, payload = entry
             bubble = decode_bubble(payload)
             if bubble is not None:
-                self._delivered_ids.append(entry_id)
+                if not self._auto_acknowledge:
+                    self._delivered_ids.append(entry_id)
                 return bubble
-            await self._redis.xack(self._stream, self._group, entry_id)
+            if not self._auto_acknowledge:
+                await self._redis.xack(self._stream, self._group, entry_id)
             if monotonic() >= deadline:
                 return None
         return None
@@ -595,9 +608,8 @@ class RedisRealtimeBubbleBus:
 
     Delivery is keyed by account rather than by session fence, so any consumer
     (a Stable Poll, a SignalR hub, or the notifications WebSocket) running in
-    any worker can reach the account's live connection. Each subscriber opens
-    its own consumer group so one account's events fan out to every
-    concurrently connected consumer.
+    any worker can reach the account's live connection. Stable subscriber IDs
+    resume one group; connection-scoped subscribers receive isolated copies.
     """
 
     def __init__(self, redis: Redis, *, prefix: str, max_entries: int = 4096, ttl_seconds: int = 360) -> None:
@@ -637,19 +649,37 @@ class RedisRealtimeBubbleBus:
         return len(account_ids)
 
     @asynccontextmanager
-    async def subscribe(self, account_id: int) -> AsyncIterator[RedisBubbleSubscription]:
-        """Ensure an isolated consumer group exists before yielding its consumer.
+    async def subscribe(
+        self,
+        account_id: int,
+        *,
+        subscriber_id: str | None = None,
+        auto_acknowledge: bool = False,
+    ) -> AsyncIterator[RedisBubbleSubscription]:
+        """Ensure a consumer group exists before yielding its consumer.
 
-        Each subscription owns a unique group so that concurrent consumers of
-        the same account stream each receive the full event history.
+        A named subscriber resumes its group across requests. Anonymous
+        subscribers own a unique group and receive an isolated event copy.
         """
         if account_id < 1:
             raise ValueError("account_id must be positive")
+        if subscriber_id is not None and not subscriber_id:
+            raise ValueError("subscriber_id must not be empty")
         stream = user_event_channel(self._prefix, account_id)
-        group = f"delivery-{uuid.uuid4().hex}"
-        await self._redis.xgroup_create(stream, group, id="0", mkstream=True)
+        group = f"delivery-{subscriber_id or uuid.uuid4().hex}"
+        try:
+            await self._redis.xgroup_create(stream, group, id="0", mkstream=True)
+        except ResponseError as error:
+            if "BUSYGROUP" not in str(error):
+                raise
         await self._redis.expire(stream, self._ttl_seconds)
-        subscription = RedisBubbleSubscription(self._redis, stream, group, self._consumer)
+        subscription = RedisBubbleSubscription(
+            self._redis,
+            stream,
+            group,
+            self._consumer,
+            auto_acknowledge=auto_acknowledge,
+        )
         try:
             yield subscription
         finally:
