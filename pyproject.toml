@@ -51,7 +51,6 @@ build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 120
-exclude = [".agent-space"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ANN", "D"]

@@ -44,21 +44,6 @@ The first application role to connect creates missing PostgreSQL schemas and map
 existing columns, constraints, or indexes, so model changes that affect an existing database still require an explicit
 operational rollout.
 
-Existing databases created before Outbox trace propagation require this idempotent upgrade before starting the new API
-or Worker image:
-
-```bash
-docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U perfcho -d perfcho \
-  < tools/schema/20260809_add_outbox_trace_id.sql
-```
-
-Databases that contain the former maintenance-state table also require the idempotent scheduler state rename:
-
-```bash
-docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U perfcho -d perfcho \
-  < tools/migration/20260810_rename_maintenance_states.sql
-```
-
 ## Local development
 
 Start the infrastructure and run the application roles as host processes:
@@ -162,15 +147,3 @@ TEST_DATABASE_URL=postgresql+asyncpg://perfcho:perfcho@127.0.0.1:55432/perfcho_t
 When `TEST_DATABASE_URL` is configured, the PostgreSQL test fixture creates the target database if it does not exist
 and resets its application schemas around each test. The configured PostgreSQL role therefore needs `CREATEDB`
 permission.
-
-## Bancho Migration
-
-The offline bancho.py v5.2.2 MySQL and asset migration is available through
-`python -m tools.migration`. Run `preflight` before `apply`; the operational prerequisites, exclusions, override
-format, recovery rules, and verification procedure are documented in
-[the migration runbook](.agent-space/docs/bancho-migration.md).
-
-## Structure
-
-See [the database architecture](.agent-space/docs/database/architecture.md) before changing a model or adding a
-business workflow.
